@@ -5,23 +5,44 @@ use std::path::PathBuf;
 pub struct ParseCallback;
 
 impl bindgen::callbacks::ParseCallbacks for ParseCallback {
-    fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
-        if name.ends_with("_UUID") || name.starts_with("GAP_APPEARE_") {
-            Some(bindgen::callbacks::IntKind::U16)
-        } else if name.starts_with("ATT_ERR_")
-            || name.starts_with("GAP_ADTYPE_")
-            || name.starts_with("ble")
-            || name.starts_with("GATT_PERMIT_")
-            || name.starts_with("GATT_PERMIT")
-        {
-            Some(bindgen::callbacks::IntKind::U8)
+    fn item_name(&self, name: &str) -> Option<String> {
+        if name.starts_with("LL_TX_POWEER_") {
+            Some(name.replace("LL_TX_POWEER_", "LL_TX_POWER_"))
         } else {
             None
         }
     }
 
+    /*
+    fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
+        if name.starts_with("LL_TX_") {
+            Some(bindgen::callbacks::IntKind::U8)
+        } else if name.ends_with("_UUID") || name.starts_with("GAP_APPEARE_") {
+            Some(bindgen::callbacks::IntKind::U16)
+        } else if name.starts_with("GAPBOND_")
+            && !name.starts_with("GAPBOND_PAIRING_")
+            && !name.starts_with("GAPBOND_IO_CAP_")
+            && !name.starts_with("GAPBOND_KEYDIST_")
+            && !name.starts_with("GAPBOND_PAIRING_")
+        {
+            Some(bindgen::callbacks::IntKind::U16)
+        } else if name.starts_with("GAP_CONNHANDLE_")
+            || name == "GATT_MAX_HANDLE"
+            || name == "GATT_MIN_HANDLE"
+            || name == "GATT_INVALID_HANDLE"
+            || name == "ATT_MAX_MTU_SIZE"
+            || name == "GATT_MAX_MTU"
+            || name == "LOOPBACK_CONNHANDLE"
+            || name == "INVALID_CONNHANDLE"
+        {
+            Some(bindgen::callbacks::IntKind::U16)
+        } else {
+            None
+        }
+    }
+    */
+
     fn process_comment(&self, comment: &str) -> Option<String> {
-        println!("comment: {}", comment);
         let mut s = comment.to_string();
         s = s.replace("@note", "\n");
         let mut first = true;
@@ -82,10 +103,12 @@ fn main() {
     println!("cargo:rerun-if-changed=CH58xBLE_LIB.h");
 
     let bindings = bindgen::Builder::default()
+        .use_core()
         .header("CH58xBLE_LIB.h")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .use_core()
+        .generate_comments(true)
+        .size_t_is_usize(true)
         .parse_callbacks(Box::new(ParseCallback))
         .blocklist_type(".*?_pthread_.*?")
         .blocklist_type("__darwin_.*?")

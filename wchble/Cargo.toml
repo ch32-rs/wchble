@@ -18,14 +18,14 @@ ch57x-ble = { path = "../ch57x-ble", version = "0.1.0", optional = true }
 ch59x-ble = { path = "../ch59x-ble", version = "0.1.0", optional = true }
 ch32v20x-ble = { path = "../ch32v20x-ble", version = "0.1.0", optional = true }
 defmt = { version = "0.3.5", optional = true }
+num_enum = { version = "0.7.1", default-features = false }
 
 [features]
 default = ["ch58x"]
 ch58x = ["dep:ch58x-ble"]
-ch57x = []
-ch59x = []
-ch32v20x = []
-
+ch57x = ["dep:ch57x-ble"]
+ch59x = ["dep:ch59x-ble"]
+ch32v20x = ["dep:ch32v20x-ble"]
 
 [package.metadata.docs.rs]
 targets = ["riscv32imac-unknown-none-elf"]

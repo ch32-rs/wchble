@@ -13,6 +13,7 @@ impl bindgen::callbacks::ParseCallbacks for ParseCallback {
             || name.starts_with("ble")
             || name.starts_with("GATT_PERMIT_")
             || name.starts_with("GATT_PERMIT")
+            || name.starts_with("LL_TX_POWER")
         {
             Some(bindgen::callbacks::IntKind::U8)
         } else {
@@ -21,7 +22,6 @@ impl bindgen::callbacks::ParseCallbacks for ParseCallback {
     }
 
     fn process_comment(&self, comment: &str) -> Option<String> {
-        println!("comment: {}", comment);
         let mut s = comment.to_string();
         s = s.replace("@note", "\n");
         let mut first = true;
