@@ -79,25 +79,13 @@ impl bindgen::callbacks::ParseCallbacks for ParseCallback {
 }
 
 fn main() {
-    // Tell cargo to look for shared libraries in the specified directory
-    // println!("cargo:rustc-link-search=/path/to/lib");
-
-    // Tell cargo to tell rustc to link the system bzip2
-    // shared library.
-    //println!("cargo:rustc-link-lib=bz2");
-
-    // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=CH58xBLE_LIB.h");
 
-    // The bindgen::Builder is the main entry point
-    // to bindgen, and lets you build up options for
-    // the resulting bindings.
     let bindings = bindgen::Builder::default()
-        // The input header we would like to generate
-        // bindings for.
         .header("CH58xBLE_LIB.h")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
+        .use_core()
         .parse_callbacks(Box::new(ParseCallback))
         .blocklist_type(".*?_pthread_.*?")
         .blocklist_type("__darwin_.*?")
