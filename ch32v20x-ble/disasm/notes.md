@@ -129,16 +129,38 @@ lw   a4, 8(a5)
 # writes W1C values back to +0x08
 ```
 
-**+0x08 is dual-purpose**: TX path writes the full 32-bit ACCESS_ADDR; IRQ path reads/clears lower bits as interrupt status flags (W1C). The hardware register likely holds both simultaneously — upper bits persist as ACCESS_ADDR, lower bits are set by hardware events and cleared by W1C writes.
+Initial hypothesis: TX path writes the full 32-bit ACCESS_ADDR; IRQ path reads/clears lower bits as interrupt status flags (W1C), with "different bits" handling the two uses.
 
-This is a common pattern in link-layer hardware: the access address register doubles as an event/status register to save address space.
+### Why "different bits" doesn't hold up
 
-### Unresolved: exact bit boundary between ACCESS_ADDR and IRQ_STATUS
+Checking which IRQ_MASK bit positions (0,1,2,3,12,13,14,15) are set in the ACCESS_ADDR value:
 
-We know bits [3:1] and bit 14 are IRQ flags. We don't yet know:
-- Are bits [15:0] all IRQ_STATUS, with ACCESS_ADDR in [31:16]? Unlikely — ACCESS_ADDR is 32 bits.
-- Or does the hardware fully overlap both uses at [31:0], relying on the IRQ bits being always zero when writing the address?
-- Need a live advertising session and trap right after an RX event to observe the lower bits being set.
+```
+0x8E89BED6:
+  bit  1 = 1  ← IRQ_RX_DONE position
+  bit  2 = 1  ← IRQ_TX_DONE position
+  bit 12 = 1  ← IRQ_CONN_EVENT_END position
+  bit 13 = 1  ← IRQ_TIMER1_EXP position
+  bit 15 = 1  ← IRQ_TIMER2_EXP position
+```
+
+Five out of eight IRQ bit positions conflict. If these shared the same physical bits:
+1. The IRQ handler would see phantom RX_DONE/TX_DONE every time it ran, even at idle.
+2. W1C writes (e.g., write 4 to clear bit 2 / TX_DONE) would corrupt the ACCESS_ADDR (0x8E89BED6 → 0x8E89BED2), breaking the next advertising packet's access address.
+
+Neither can be tolerated in a working BLE stack. So the "same physical bits" theory is ruled out.
+
+### Revised conclusion: read/write split register
+
++0x08 is almost certainly a **split register** — same address, separate read and write hardware paths:
+- **Write** → latches 32-bit value as ACCESS_ADDR in a shadow register (hardware captures it for the RF sequencer)
+- **Read** → returns IRQ_STATUS (separate hardware bits, set by RX/TX events, W1C)
+
+The W1C writes only affect the IRQ_STATUS read path; they never touch the ACCESS_ADDR shadow.
+
+This pattern is standard in embedded peripherals: UART DR (read=RX FIFO, write=TX FIFO) is the canonical example. For a BLE link-layer engine with a tight address map, it saves two register slots.
+
+**Why wlink dump returned 0x8E89BED6**: SWD/JTAG debug reads via the AHB debug bus can return the write-latch (last written value) rather than the functional CPU read path on some peripheral implementations. The chip had initialized BLE before entering SLEEP, so the write-shadow still holds the programmed ACCESS_ADDR. A CPU `lw` at +0x08 (when no IRQ is pending) would return 0x00000000.
 
 ## BB (0x40024200)
 
