@@ -150,17 +150,17 @@ Five out of eight IRQ bit positions conflict. If these shared the same physical 
 
 Neither can be tolerated in a working BLE stack. So the "same physical bits" theory is ruled out.
 
-### Revised conclusion: read/write split register
+### Hypothesis: read/write split register
 
-+0x08 is almost certainly a **split register** — same address, separate read and write hardware paths:
-- **Write** → latches 32-bit value as ACCESS_ADDR in a shadow register (hardware captures it for the RF sequencer)
-- **Read** → returns IRQ_STATUS (separate hardware bits, set by RX/TX events, W1C)
+The bit conflicts suggest +0x08 may be a split register — write sets ACCESS_ADDR, read returns IRQ_STATUS. But this is logical inference from static values, not observed hardware behavior. Static analysis of halted register state cannot distinguish between design options.
 
-The W1C writes only affect the IRQ_STATUS read path; they never touch the ACCESS_ADDR shadow.
+**What would actually confirm this:**
 
-This pattern is standard in embedded peripherals: UART DR (read=RX FIFO, write=TX FIFO) is the canonical example. For a BLE link-layer engine with a tight address map, it saves two register slots.
+Run advertising (`ll_advertise_tx`), let it complete one TX, then break in the IRQ handler before it reads +0x08, and dump the register:
+- If dump returns a small bitmask (e.g. `0x00000004` for TX_DONE) → split register confirmed
+- If dump returns `0x8E89BED6 | 0x4` (ACCESS_ADDR with status bit ORed in) → shared physical bits confirmed
 
-**Why wlink dump returned 0x8E89BED6**: SWD/JTAG debug reads via the AHB debug bus can return the write-latch (last written value) rather than the functional CPU read path on some peripheral implementations. The chip had initialized BLE before entering SLEEP, so the write-shadow still holds the programmed ACCESS_ADDR. A CPU `lw` at +0x08 (when no IRQ is pending) would return 0x00000000.
+Until then, both designs remain possible. Do not update ch32-data YAML based on this analysis alone.
 
 ## BB (0x40024200)
 
