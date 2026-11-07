@@ -29,8 +29,10 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | Feature | Status |
 | --- | --- |
 | `ch32v208` | Bases + open-driver DevInit markers; MMIO apply next |
+| `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | Bases + closed-disasm “new tables” / `nCO2522`; MMIO apply TBD |
+| `ch595` | Near-CH585 tables without `nCO2522` (`0x84` highs); MMIO TBD |
 
 Uncertain fields are tagged `UNCERTAIN` / `Certainty::*` for silicon debug — see
 [`docs/research/bringup-debug.md`](docs/research/bringup-debug.md).
@@ -62,7 +64,7 @@ cargo check --features ch32v208
 cargo check --features ch32v208,controller,phy
 ```
 
-Enable **at most one** chip feature (`ch32v208`, `ch583`, `ch585`).
+Enable **at most one** chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, `ch595`).
 
 ## HAL integration sketch
 
@@ -81,8 +83,8 @@ ctl.radio.init(&hal_clock)?;
 ## Status
 
 **Scaffold complete** (2026-11-07): open Path B crate, family stubs with DevInit
-markers for `ch32v208` / `ch583` / `ch585`, research + bring-up debug docs.
-RF MMIO apply, TX/RX, and `bt-hci` Controller impl are next.
+markers for `ch32v208` / `ch572` / `ch583` / `ch585` / `ch595`, research +
+bring-up debug docs. RF MMIO apply, TX/RX, and `bt-hci` Controller impl are next.
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

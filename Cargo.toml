@@ -40,8 +40,10 @@ defmt = { workspace = true, optional = true }
 default = []
 # Select at most one chip family backend for rf::family.
 ch32v208 = []
+ch572 = []
 ch583 = []
 ch585 = []
+ch595 = []
 # Soft HCI + LL surface for Trouble Host.
 controller = ["dep:bt-hci"]
 # PHY scheduler helpers (can be used without full controller).

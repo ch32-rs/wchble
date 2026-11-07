@@ -14,11 +14,20 @@
 //! - [`hci`] — soft HCI for Trouble (`controller` feature)
 
 #[cfg(any(
+    all(feature = "ch32v208", feature = "ch572"),
     all(feature = "ch32v208", feature = "ch583"),
     all(feature = "ch32v208", feature = "ch585"),
+    all(feature = "ch32v208", feature = "ch595"),
+    all(feature = "ch572", feature = "ch583"),
+    all(feature = "ch572", feature = "ch585"),
+    all(feature = "ch572", feature = "ch595"),
     all(feature = "ch583", feature = "ch585"),
+    all(feature = "ch583", feature = "ch595"),
+    all(feature = "ch585", feature = "ch595"),
 ))]
-compile_error!("enable at most one chip feature (`ch32v208`, `ch583`, or `ch585`)");
+compile_error!(
+    "enable at most one chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, or `ch595`)"
+);
 
 pub mod rf;
 pub mod time;

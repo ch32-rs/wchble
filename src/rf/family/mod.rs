@@ -8,11 +8,47 @@
 
 pub mod tables;
 
-#[cfg(all(feature = "ch32v208", not(feature = "ch583"), not(feature = "ch585")))]
+#[cfg(all(
+    feature = "ch32v208",
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
 pub mod ch32v208;
 
-#[cfg(all(feature = "ch583", not(feature = "ch32v208"), not(feature = "ch585")))]
+#[cfg(all(
+    feature = "ch572",
+    not(feature = "ch32v208"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
+pub mod ch572;
+
+#[cfg(all(
+    feature = "ch583",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
 pub mod ch583;
 
-#[cfg(all(feature = "ch585", not(feature = "ch32v208"), not(feature = "ch583")))]
+#[cfg(all(
+    feature = "ch585",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch595"),
+))]
 pub mod ch585;
+
+#[cfg(all(
+    feature = "ch595",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+))]
+pub mod ch595;

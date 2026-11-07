@@ -145,20 +145,88 @@ impl Radio for UnselectedRadio {
 }
 
 /// Active radio type for the enabled chip feature.
-#[cfg(all(feature = "ch32v208", not(feature = "ch583"), not(feature = "ch585")))]
+#[cfg(all(
+    feature = "ch32v208",
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
 pub type Backend = family::ch32v208::Ch32v208Radio;
 
-#[cfg(all(feature = "ch583", not(feature = "ch32v208"), not(feature = "ch585")))]
+#[cfg(all(
+    feature = "ch572",
+    not(feature = "ch32v208"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
+pub type Backend = family::ch572::Ch572Radio;
+
+#[cfg(all(
+    feature = "ch583",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch585"),
+    not(feature = "ch595"),
+))]
 pub type Backend = family::ch583::Ch583Radio;
 
-#[cfg(all(feature = "ch585", not(feature = "ch32v208"), not(feature = "ch583")))]
+#[cfg(all(
+    feature = "ch585",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch595"),
+))]
 pub type Backend = family::ch585::Ch585Radio;
+
+#[cfg(all(
+    feature = "ch595",
+    not(feature = "ch32v208"),
+    not(feature = "ch572"),
+    not(feature = "ch583"),
+    not(feature = "ch585"),
+))]
+pub type Backend = family::ch595::Ch595Radio;
 
 // No chip / illegal multi-chip (compile_error in lib.rs) — keep Backend defined.
 #[cfg(not(any(
-    all(feature = "ch32v208", not(feature = "ch583"), not(feature = "ch585")),
-    all(feature = "ch583", not(feature = "ch32v208"), not(feature = "ch585")),
-    all(feature = "ch585", not(feature = "ch32v208"), not(feature = "ch583")),
+    all(
+        feature = "ch32v208",
+        not(feature = "ch572"),
+        not(feature = "ch583"),
+        not(feature = "ch585"),
+        not(feature = "ch595"),
+    ),
+    all(
+        feature = "ch572",
+        not(feature = "ch32v208"),
+        not(feature = "ch583"),
+        not(feature = "ch585"),
+        not(feature = "ch595"),
+    ),
+    all(
+        feature = "ch583",
+        not(feature = "ch32v208"),
+        not(feature = "ch572"),
+        not(feature = "ch585"),
+        not(feature = "ch595"),
+    ),
+    all(
+        feature = "ch585",
+        not(feature = "ch32v208"),
+        not(feature = "ch572"),
+        not(feature = "ch583"),
+        not(feature = "ch595"),
+    ),
+    all(
+        feature = "ch595",
+        not(feature = "ch32v208"),
+        not(feature = "ch572"),
+        not(feature = "ch583"),
+        not(feature = "ch585"),
+    ),
 )))]
 pub type Backend = UnselectedRadio;
 

@@ -44,8 +44,8 @@ linker scripts, and the Embassy executor; this crate supplies RF → soft HCI.
 
 ## Chip selection
 
-Enable **at most one** of `ch32v208`, `ch583`, `ch585`. Bases and DevInit
-tables live under `src/rf/family/<chip>.rs` (cfg-per-family modules).
+Enable **at most one** of `ch32v208`, `ch572`, `ch583`, `ch585`, `ch595`. Bases
+and DevInit tables live under `src/rf/family/<chip>.rs` (cfg-per-family modules).
 
 Shared across families: register **offsets** / bit names in `rf::regs`, the
 `Radio` trait, and soft PHY/LL/HCI. **Not** shared: absolute bases, IRQ
@@ -56,7 +56,8 @@ Research buckets (porting order, not crate layout):
 1. **CH32V208-class** — open `wch_rf` golden path
 2. **CH583-class** — CH5xx map, DevInit ≈ V208 (rebase + audit)
 3. **CH572 / CH585 / CH595-class** — CH5xx map, **per-chip** new tables;
-   CH585 adds `nCO2522`
+   CH585 adds `nCO2522`; CH572 has unique LLE/BB immediates; CH595 ≈ CH585
+   without the 4th VCO band
 
 Each family module exports `LLE_DEV_INIT` / `BB_DEV_INIT` / `RFEND_INIT` with
 [`Certainty`](../src/rf/family/tables.rs) tags. Silicon probe order:
@@ -74,7 +75,7 @@ Each family module exports `LLE_DEV_INIT` / `BB_DEV_INIT` / `RFEND_INIT` with
 | MISC | `0x40022000` |
 | IRQ | BB=63, LLE=64 |
 
-### CH585
+### CH5xx (`ch572` / `ch583` / `ch585` / `ch595`)
 
 | Block | Base |
 | --- | --- |
@@ -85,6 +86,8 @@ Each family module exports `LLE_DEV_INIT` / `BB_DEV_INIT` / `RFEND_INIT` with
 | IRQ | BLEB=20, BLEL=21 |
 
 Relative spacing from **BB** is shared: LLE `+0x100`, AES `+0x200`, RFEND `+0xF00`.
+DevInit / WaitTune / VCO remain **per-chip** — do not share one table across these
+features.
 
 ## HAL boundary
 

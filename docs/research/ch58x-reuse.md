@@ -108,7 +108,7 @@ underlying IP map is shared and the tables are not.
 | --- | --- | --- | --- |
 | CH583 | EVT + DS | yes | extracted — “old tables” |
 | CH585 | EVT + DS | yes | extracted — “new tables” + `nCO2522` |
-| CH587 | DS only | yes (BLE 5.4 / 1M+2M per DS) | **unknown** until EVT objs |
+| CH587 | DS only | yes (BLE 5.4 / 1M+2M per DS) | **TODO** — unknown until EVT objs (may still be unpublished) |
 | CH582/584/… | not present | — | — |
 
 Until a CH587EVT `libCH58xBLE.a` (or equivalent) is carved, do **not**
@@ -129,11 +129,13 @@ Per chip module (cfg feature):
   TXCtune band list (3 vs 4)
 ```
 
-Recommended feature modules (already the locked layout):
+Recommended feature modules (locked layout; scaffolded):
 
 - `ch32v208` — open golden path
-- `ch583` — CH5xx map + near-V208 tables (scaffold when needed)
-- `ch585` — CH5xx map + new tables / `nCO2522` (stub bases done)
+- `ch572` — CH5xx map + unique new-table constants
+- `ch583` — CH5xx map + near-V208 tables
+- `ch585` — CH5xx map + new tables / `nCO2522`
+- `ch595` — CH5xx map + near-CH585 without `nCO2522`
 
 Do **not** invent a single `ch58x` backend that switches on runtime chip id
 for DevInit — wrong table bricks RF bring-up. HALs already select one chip
