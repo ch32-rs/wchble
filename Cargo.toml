@@ -1,16 +1,56 @@
 [workspace]
-members = ["ch32v20x-ble", "ch57x-ble", "ch58x-ble", "ch59x-ble", "wchble"]
 resolver = "2"
+members = ["."]
+default-members = ["."]
 
 [workspace.package]
-
-authors = ["Andelf <andelf@gmail.com>"]
+authors = ["ch32-rs contributors"]
 repository = "https://github.com/ch32-rs/wchble"
 documentation = "https://docs.rs/wchble"
 homepage = "https://github.com/ch32-rs/wchble"
-categories = ["no-std", "embedded", "device-support"]
-keywords = ["ble"]
-readme = "README.md"
+categories = ["no-std", "embedded", "hardware-support"]
+keywords = ["ble", "bluetooth", "wch", "ch32", "embassy"]
 license = "Apache-2.0"
 version = "0.1.0"
 edition = "2021"
+
+[workspace.dependencies]
+bt-hci = { version = "0.3", default-features = false }
+defmt = { version = "0.3", default-features = false }
+
+[package]
+name = "wchble"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme = "README.md"
+description = "Embassy-style BLE layer for ch32-hal / ch5xx-hal: Rust RF/LL + soft HCI (Trouble)"
+
+[dependencies]
+bt-hci = { workspace = true, optional = true }
+defmt = { workspace = true, optional = true }
+
+[features]
+default = []
+# Select at most one chip family backend for rf::family.
+ch32v208 = []
+ch583 = []
+ch585 = []
+# Soft HCI + LL surface for Trouble Host.
+controller = ["dep:bt-hci"]
+# PHY scheduler helpers (can be used without full controller).
+phy = []
+defmt = ["dep:defmt"]
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+default-target = "riscv32imac-unknown-none-elf"
+features = ["ch32v208", "controller", "phy"]

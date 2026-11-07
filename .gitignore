@@ -1,2 +1,10 @@
 /target
-Cargo.lock
+**/*.rs.bk
+.DS_Store
+*.pdb
+.idea/
+.vscode/
+
+# Closed-lib leftovers must never re-enter the tree.
+*.a
+*BLE_LIB.h
