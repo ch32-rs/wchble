@@ -58,7 +58,8 @@ RF bring-up (`wch_rf`).
 | `docs/research` | Family init research notes |
 | `examples/` | Flashable V208 RF smoke + Trouble ADV examples |
 
-Firmware examples live in the HAL repos once integration lands — not here.
+On-target bring-up examples live in this repo while the HAL integration is in
+flight; production firmware still belongs in the HAL repos.
 
 ## Features
 

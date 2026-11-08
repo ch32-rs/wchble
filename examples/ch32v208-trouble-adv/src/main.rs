@@ -25,7 +25,7 @@ use trouble_host::advertise::{Advertisement, AdvertisementParameters};
 use trouble_host::prelude::*;
 use wchble::hci::SoftRunner;
 use wchble::rf::family::ch32v208::Ch32v208Radio;
-use wchble::rf::txrx::RX_DMA_MIN;
+use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{PhyMode, Radio};
 use wchble::time::InstantUs;
 use {panic_halt as _, qingke_rt as _};
@@ -39,22 +39,13 @@ const OSC_HSE_CAL_CTRL: *mut u32 = 0x4002_202C as *mut u32;
 const ADV_AA: u32 = 0x8e89_bed6;
 const ADV_CRC_INIT: u32 = 0x55_5555;
 
-/// Force 4-byte alignment — plain `StaticCell<[u8; N]>` can land at +1.
-#[repr(align(4))]
-struct RxDma([u8; RX_DMA_MIN]);
-
-/// TX PDU buffer: the LLE DMAs it from `TXBUFPTR`, so keep it word-aligned
-/// (the driver bounces unaligned frames too, this avoids the copy).
-#[repr(align(4))]
-struct AdvPdu([u8; 40]);
-
-static RX_DMA: StaticCell<RxDma> = StaticCell::new();
+/// RX scratch: the LLE DMAs through `RXBUFPTR`, so it must be word-aligned.
+static RX_DMA: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 
 /// Bring-up counters (no SDI output on the TX path). Read from RAM with
 /// `probe-rs read` after a run to tell "loop stalled" from "TX failing".
 static TX_BURSTS: AtomicU32 = AtomicU32::new(0);
 static TX_OK: AtomicU32 = AtomicU32::new(0);
-static TX_TRY: AtomicU32 = AtomicU32::new(0);
 
 /// InstantUs over Embassy time driver (SysTick). Do not steal SYSTICK.
 struct EmbassyClock;
@@ -93,7 +84,8 @@ async fn controller_task(
     let mut next_tx = Instant::now();
     let mut was_enabled = false;
     let mut bursts: u32 = 0;
-    let mut pdu = AdvPdu([0u8; 40]);
+    let mut pdu = DmaBuf::<40>::zeroed();
+    let mut pdu_len = 0usize;
 
     loop {
         let _ = soft.poll_once().await;
@@ -103,8 +95,10 @@ async fn controller_task(
                 println!("adv enable");
                 was_enabled = true;
                 next_tx = Instant::now();
-                // One-shot PDU dump for bring-up (not on TX hot path).
+                // Build once per enabled session: HCI rejects AdvData changes
+                // while advertising. This is a one-shot dump, not the TX path.
                 if let Some(n) = soft.build_adv_pdu(&mut pdu.0) {
+                    pdu_len = n;
                     println!(
                         "pdu n={} hdr={:02x}{:02x} adva={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                         n,
@@ -121,40 +115,40 @@ async fn controller_task(
                 }
             }
 
-            if Instant::now() >= next_tx {
-                if let Some(n) = soft.build_adv_pdu(&mut pdu.0) {
-                    // No println on the TX path: SDI (even try_println while a
-                    // host is draining) stretches the adv interval enough that
-                    // macOS/phone scanners miss us.
-                    radio.shut();
-                    for ch in soft.adv_channels() {
-                        if radio.set_channel(ch).is_err() {
-                            continue;
-                        }
-                        TX_TRY.fetch_add(1, Ordering::Relaxed);
+            if pdu_len != 0 && Instant::now() >= next_tx {
+                // No println on the TX path: SDI (even try_println while a
+                // host is draining) stretches the adv interval enough that
+                // macOS/phone scanners miss us.
+                radio.shut();
+                for ch in soft.adv_channels() {
+                    if radio.set_channel(ch).is_err() {
+                        continue;
+                    }
+                    let ok = if bursts == 0 {
+                        // One-shot airtime probe: a real 1M frame of this
+                        // length takes ~250-380 us from start to TX_DONE.
                         let t0 = clock.now_us();
-                        let ok = radio.tx_basic(clock, &pdu.0[..n], 0, None).is_ok();
-                        if bursts == 0 {
-                            // One-shot airtime probe: a real 1M frame of this
-                            // length takes ~250-380 us from start to TX_DONE.
-                            println!(
-                                "tx0 ch{} us={} ok={}",
-                                ch,
-                                clock.now_us().wrapping_sub(t0),
-                                ok
-                            );
-                        }
-                        if ok {
-                            TX_OK.fetch_add(1, Ordering::Relaxed);
-                        }
-                        radio.shut();
-                        clock.delay_us(500);
+                        let ok = radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None).is_ok();
+                        println!(
+                            "tx0 ch{} us={} ok={}",
+                            ch,
+                            clock.now_us().wrapping_sub(t0),
+                            ok
+                        );
+                        ok
+                    } else {
+                        radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None).is_ok()
+                    };
+                    if ok {
+                        TX_OK.fetch_add(1, Ordering::Relaxed);
                     }
-                    TX_BURSTS.fetch_add(1, Ordering::Relaxed);
-                    bursts = bursts.saturating_add(1);
-                    if bursts == 1 {
-                        println!("tx ongoing");
-                    }
+                    radio.shut();
+                    clock.delay_us(500);
+                }
+                TX_BURSTS.fetch_add(1, Ordering::Relaxed);
+                bursts = bursts.saturating_add(1);
+                if bursts == 1 {
+                    println!("tx ongoing");
                 }
                 let interval_us = soft.adv_interval_us().clamp(20_000, 200_000);
                 next_tx = Instant::now() + Duration::from_micros(u64::from(interval_us));
@@ -164,6 +158,7 @@ async fn controller_task(
         } else {
             was_enabled = false;
             bursts = 0;
+            pdu_len = 0;
             Timer::after(Duration::from_millis(5)).await;
         }
     }
@@ -248,7 +243,7 @@ async fn main(_spawner: Spawner) -> ! {
     println!("hclk={} Hz", hclk);
 
     let clock = EmbassyClock;
-    let rx = &mut RX_DMA.init(RxDma([0; RX_DMA_MIN])).0;
+    let rx = &mut RX_DMA.init(DmaBuf::zeroed()).0;
     let mut radio = match Ch32v208Radio::new(rx) {
         Ok(r) => r,
         Err(e) => {
@@ -275,10 +270,9 @@ async fn main(_spawner: Spawner) -> ! {
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
     soft.set_bd_addr([0x00, 0x00, 0x00, 0xc1, 0xff, 0xee]);
-    // Same static-random bytes Host and Controller must share. Trouble does not
-    // send HCI LeSetRandomAddress for StackBuilder::set_random_address.
-    // HCI/AdvA are little-endian: last octet is MSB and must have bits 7..6 = 11
-    // for a valid static random address (macOS/iOS drop invalid random AdvA).
+    // Trouble sends HCI 0x2005 after Reset for this address; seeding SoftRunner
+    // is a HAL fallback. HCI/AdvA are little-endian: the last octet is MSB and
+    // must have bits 7..6 = 11 for a valid static random address.
     const RAND_ADDR: [u8; 6] = [0x42, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
     soft.set_random_addr(RAND_ADDR);
 

@@ -49,15 +49,9 @@ After `reset` + 5 s: `phy_isrs=56 tx_good=27 tx_started=27 rx_starts=2
 rx_aborts=1 rx_valid=1`. After reset + 15 s scan: `phy_isrs=44 tx_good=20
 rx_started=20 rx_starts=4 rx_aborts=3 rx_valid=1`. Advertising interval is
 100 ms × 3 channels, so a running advertiser should show ~30 TX/s; the counters
-stop after roughly 0.7–0.9 s. The Mac scan therefore sees nothing.
-
-A speculative fix that closes the RX window with `ble_ll_wfr_timer_exp(NULL)`
-when `ble_ll_rx_start()` rejects a stray PDU was tried and **did not** resolve
-the stall (TX still stopped after ~7 events). It was reverted; the reference
-checkout only keeps the `syscfg_overrides.h` addition needed to build against
-current upstream NimBLE. This stall is not blocking `wchble` anymore: our
-firmware is now visible on air, and the root cause there was a different one
-(sticky `TX_DONE`, see `docs/progress.md`).
+stop after roughly 0.7–0.9 s. The Mac scan therefore sees nothing. This stall
+is not blocking `wchble`: our firmware is visible on air, and the root cause
+there was a different one (sticky `TX_DONE`, see `docs/pitfalls.md` §1).
 
 ## Tried fix (did not resolve the stall)
 
@@ -78,8 +72,8 @@ until it is understood.
 
 ## Verification used for `wchble`
 
-- Our firmware's own counters (`TX_BURSTS`/`TX_OK`/`TX_TRY` in RAM) show
-  continuous 3-channel TX at the 100 ms interval.
+- Our firmware's own counters (`TX_BURSTS`/`TX_OK` in RAM) show continuous
+  3-channel TX at the 100 ms interval.
 - `tools/scan_wchble.swift` in `examples/ch32v208-trouble-adv` reports
   `FOUND wchble` via macOS CoreBluetooth.
 - If the baseline is visible but `wchble` is not, compare our `tx_basic`

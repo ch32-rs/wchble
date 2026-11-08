@@ -34,7 +34,8 @@ pub struct SoftRunner {
     event_mask: u64,
     le_event_mask: u64,
     bd_addr: [u8; 6],
-    random_addr: [u8; 6],
+    /// Address from `LE Set Random Address` / HAL seed; `None` = public BD_ADDR.
+    random_addr: Option<[u8; 6]>,
 }
 
 impl Default for SoftRunner {
@@ -50,7 +51,7 @@ impl SoftRunner {
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
             bd_addr: DEFAULT_BD_ADDR,
-            random_addr: [0; 6],
+            random_addr: None,
         }
     }
 
@@ -62,17 +63,32 @@ impl SoftRunner {
         }
     }
 
-    /// Seed the LE random address used as AdvA when Host advertises with
+    /// Seed the LE random address used as AdvA when advertising with
     /// Own_Address_Type = Random.
     ///
-    /// Trouble's `StackBuilder::set_random_address` only updates Host state and
-    /// does **not** emit HCI `LE Set Random Address`, so HAL apps must call this
-    /// with the same bytes. The value survives HCI Reset (unlike a Host-only
-    /// 0x2005) so SoftRunner still has a valid AdvA after Trouble host init.
+    /// This is a HAL fallback, not a substitute for HCI: the pinned Trouble
+    /// (`ControlRunner::run`) sends `Reset` followed by `LE Set Random Address`
+    /// whenever `StackBuilder::set_random_address` was used. Hosts that omit
+    /// 0x2005 (or HALs that want an address before Host init) can seed here;
+    /// the value is re-applied when `Reset` rebuilds the link layer.
     pub fn set_random_addr(&mut self, addr: [u8; 6]) {
-        self.random_addr = addr;
-        self.ll.adv.own_addr = addr;
-        self.ll.adv.random_addr = true;
+        self.random_addr = Some(addr);
+        self.sync_adv_addr();
+    }
+
+    /// Point `AdvState` at the selected own address (random if one was set,
+    /// otherwise the public BD_ADDR).
+    fn sync_adv_addr(&mut self) {
+        match self.random_addr {
+            Some(addr) => {
+                self.ll.adv.own_addr = addr;
+                self.ll.adv.random_addr = true;
+            }
+            None => {
+                self.ll.adv.own_addr = self.bd_addr;
+                self.ll.adv.random_addr = false;
+            }
+        }
     }
 
     /// True while Host has advertising enabled.
@@ -154,11 +170,10 @@ impl SoftRunner {
                 self.event_mask = u64::MAX;
                 self.le_event_mask = 0x1f;
                 self.ll = LinkLayer::new();
-                // Keep `random_addr` — Trouble never re-sends LeSetRandomAddress
-                // after Reset; HAL-seeded AdvA must survive host init.
-                if self.random_addr != [0; 6] {
-                    self.ll.adv.own_addr = self.random_addr;
-                    self.ll.adv.random_addr = true;
+                // Re-apply a HAL seed. The pinned Trouble sends 0x2005 after
+                // Reset, but Hosts that don't still get a usable AdvA.
+                if self.random_addr.is_some() {
+                    self.sync_adv_addr();
                 }
                 Ok(&[][..])
             }
@@ -205,9 +220,7 @@ impl SoftRunner {
                 if self.ll.adv.enabled {
                     Err(HCI_COMMAND_DISALLOWED)
                 } else {
-                    self.random_addr.copy_from_slice(params);
-                    self.ll.adv.own_addr = self.random_addr;
-                    self.ll.adv.random_addr = true;
+                    self.set_random_addr(params.try_into().unwrap());
                     Ok(&[][..])
                 }
             }
@@ -237,14 +250,9 @@ impl SoftRunner {
             0x200a if params.len() == 1 && params[0] <= 1 => {
                 let enable = params[0] != 0;
                 if enable {
-                    // Prefer random address when Host set one; else public BD_ADDR.
-                    if self.random_addr != [0; 6] {
-                        self.ll.adv.own_addr = self.random_addr;
-                        self.ll.adv.random_addr = true;
-                    } else {
-                        self.ll.adv.own_addr = self.bd_addr;
-                        self.ll.adv.random_addr = false;
-                    }
+                    // Resolve AdvA right before use; 0x2005 normally did this
+                    // already, but Hosts may skip it.
+                    self.sync_adv_addr();
                 }
                 self.ll.adv.enabled = enable;
                 Ok(&[][..])

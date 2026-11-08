@@ -22,7 +22,7 @@ use crate::rf::regs::{
     self, autocfg, bb, bb_irq, lle, lle_cmd, lle_irq, lle_mode, rfctrl, rfend, rssi, rxcfg,
 };
 use crate::rf::timing::{self, v208_rx_capture_reload_half_us, v208_tx_window_half_us};
-use crate::rf::txrx::{MAX_PDU, RX_DMA_MIN};
+use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
 use crate::time::InstantUs;
 use crate::{Error, Result};
@@ -87,14 +87,6 @@ pub const RFEND_INIT: RfendInit = RfendInit {
     certainty: Open,
 };
 
-/// Force 4-byte alignment for the TX bounce buffer.
-///
-/// The LLE reads `TXBUFPTR` as a DMA word address (same class as RX DMA); the
-/// open `wch_rf` driver only ever passes `__attribute__((aligned(4)))` buffers
-/// (`g_ble_phy_tx_buf`). A plain `[u8; N]` slice may land at +1 on the stack.
-#[repr(align(4))]
-struct AlignedTxBuf<const N: usize>([u8; N]);
-
 /// CH32V208 radio — DevInit + calibration ported from open `wch_rf`.
 #[derive(Debug)]
 pub struct Ch32v208Radio {
@@ -115,6 +107,8 @@ pub struct Ch32v208Radio {
     rx_dma_len: usize,
     /// Active RX DMA base (may differ from construction scratch during `rx_basic`).
     rx_active: *mut u8,
+    /// Aligned bounce target for caller frames that are not 4-byte aligned.
+    tx_bounce: DmaBuf<MAX_PDU>,
 }
 
 // Soft state only; MMIO runs through fixed bases. Safe to move across tasks.
@@ -144,6 +138,7 @@ impl Ch32v208Radio {
             rx_dma: ptr,
             rx_dma_len: rx_dma.len(),
             rx_active: ptr,
+            tx_bounce: DmaBuf::zeroed(),
         })
     }
 
@@ -777,23 +772,24 @@ impl Radio for Ch32v208Radio {
         }
 
         // The LLE DMAs the frame straight out of `TXBUFPTR`; align it the same
-        // way the open driver's `g_ble_phy_tx_buf` is aligned.
-        let mut bounce = AlignedTxBuf([0u8; MAX_PDU]);
-        let frame = if frame.as_ptr() as usize & 0x3 == 0 {
-            frame
+        // way the open driver's `g_ble_phy_tx_buf` is aligned. The examples pass
+        // aligned PDUs; this only copies when a caller hands us a misaligned
+        // slice. The bounce lives on the radio, so the TX path allocates nothing.
+        let tx_ptr = if frame.as_ptr() as usize & 0x3 == 0 {
+            frame.as_ptr()
         } else {
-            bounce.0[..frame.len()].copy_from_slice(frame);
-            &bounce.0[..frame.len()]
+            self.tx_bounce.0[..frame.len()].copy_from_slice(frame);
+            self.tx_bounce.0.as_ptr()
         };
 
         let saved = self.guard_enter();
         self.engine_stop();
         unsafe {
-            regs::write(LLE_BASE, lle::WINDOW, 0);
             // LLE IRQSTAT is W1C. `CLEAR_ARM` (0x2000) only clears the window
             // state; TX_DONE (bit1) is sticky and must be cleared explicitly,
             // otherwise the poll below sees the previous packet's completion
-            // and returns Ok without transmitting.
+            // and returns Ok without transmitting. Keep the vendor's early
+            // CLEAR_ARM as well (`set_phy_tx_mode_timed` re-arms later).
             regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::TX_DONE);
             regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
         }
@@ -809,7 +805,7 @@ impl Radio for Ch32v208Radio {
 
         // TX buffer pointer — frame must remain valid for the airtime.
         unsafe {
-            regs::write(LLE_BASE, lle::TXBUFPTR, frame.as_ptr() as u32);
+            regs::write(LLE_BASE, lle::TXBUFPTR, tx_ptr as u32);
         }
 
         self.set_phy_tx_mode_timed(clock, self.phy_tx, frame[1]);
@@ -874,7 +870,8 @@ impl Radio for Ch32v208Radio {
         rxbuf: &mut [u8],
         window_half_us: u32,
     ) -> Result<()> {
-        if rxbuf.len() < RX_DMA_MIN {
+        if rxbuf.len() < RX_DMA_MIN || (rxbuf.as_ptr() as usize) & 0x3 != 0 {
+            // LLE reads `RXBUFPTR` as a DMA word address (see `txrx::DmaBuf`).
             return Err(Error::InvalidState);
         }
         if self.channel > 39 {

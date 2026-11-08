@@ -29,7 +29,7 @@ use static_cell::StaticCell;
 use wchble::hci::SoftRunner;
 use wchble::rf::family::ch32v208::{self, Ch32v208Radio, BB_BASE, LLE_BASE, RFEND_BASE};
 use wchble::rf::regs::{self, lle, lle_irq};
-use wchble::rf::txrx::RX_DMA_MIN;
+use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{PhyMode, Radio};
 use wchble::time::InstantUs;
 use {ch32_hal as _, panic_halt as _};
@@ -45,13 +45,9 @@ const OSC_HSE_CAL_CTRL: *mut u32 = 0x4002_202C as *mut u32;
 const ADV_AA: u32 = 0x8e89_bed6;
 const ADV_CRC_INIT: u32 = 0x55_5555;
 
-/// `StaticCell<[u8; N]>` only has align(1), so the payload can land at +1 and
-/// fail `Ch32v208Radio::new`'s 4-byte DMA check. Force alignment explicitly.
-#[repr(align(4))]
-struct RxDma([u8; RX_DMA_MIN]);
-
-static RX_DMA: StaticCell<RxDma> = StaticCell::new();
-static RX_LISTEN: StaticCell<RxDma> = StaticCell::new();
+/// LLE DMAs through `RXBUFPTR`, so the scratch must be word-aligned.
+static RX_DMA: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
+static RX_LISTEN: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 
 /// Free-running µs clock on SysTick (HCLK), for WaitTune / TX deadline polls.
 struct UsClock {
@@ -231,8 +227,7 @@ fn rx_listen_poll(radio: &mut Ch32v208Radio, clock: &UsClock, rxbuf: &mut [u8]) 
 fn soft_adv_tx(radio: &mut Ch32v208Radio, clock: &UsClock) {
     let mut soft = SoftRunner::new();
     soft.set_bd_addr([0x00, 0x00, 0x00, 0xc1, 0xff, 0xee]);
-    soft.ll.adv.own_addr = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x02];
-    soft.ll.adv.random_addr = true;
+    soft.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x02]);
     soft.ll.adv.channel_map = 0x07;
     soft.ll.adv.interval_slots = 0x00a0; // 100 ms
     let ad = [
@@ -299,7 +294,7 @@ fn main() -> ! {
     let clock = UsClock::start(hclk);
     println!("hclk={} Hz", hclk);
 
-    let rx = &mut RX_DMA.init(RxDma([0; RX_DMA_MIN])).0;
+    let rx = &mut RX_DMA.init(DmaBuf::zeroed()).0;
     let mut radio = match Ch32v208Radio::new(rx) {
         Ok(r) => r,
         Err(e) => {
@@ -329,7 +324,7 @@ fn main() -> ! {
     tx_burst_on_channels(&mut radio, &clock, &frame[..n], &[37, 38, 39]);
 
     // 2) RX listen (environment-dependent; timeout still validates arm path)
-    let listen = &mut RX_LISTEN.init(RxDma([0; RX_DMA_MIN])).0;
+    let listen = &mut RX_LISTEN.init(DmaBuf::zeroed()).0;
     rx_listen_poll(&mut radio, &clock, listen);
 
     // 3) SoftRunner → RF adv schedule

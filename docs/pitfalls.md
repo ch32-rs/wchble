@@ -41,17 +41,21 @@ landed at +1.
   buffer. Prefer declaring aligned PDU buffers in apps anyway (avoids the
   copy), but never rely on stack alignment.
 
-## 3. Trouble does not send `LE Set Random Address`
+## 3. Own address: HCI `0x2005` is the real path — the HAL seed is a fallback
 
-`StackBuilder::set_random_address` updates **Host state only**; it never emits
-HCI `0x2005`. If the HAL does not seed the controller, AdvA stays zero/public
-and the Host/Controller disagree.
+The pinned Trouble checkout **does** send `LE Set Random Address` (0x2005):
+`ControlRunner::run` issues `Reset` and then 0x2005 for the address given to
+`StackBuilder::set_random_address` (`host/src/host.rs`, and advertising
+commands are gated on host init finishing). So `SoftRunner::set_random_addr`
+is not required for this Host; it exists for Hosts that never send 0x2005 and
+for HALs that want an address before Host init.
 
 **Rules:**
-- Call `SoftRunner::set_random_addr(bytes)` with the same bytes passed to
-  `Address::random(bytes)`.
-- `SoftRunner` preserves that seed across HCI Reset — do not "fix" reset by
-  clearing it, or host init will wipe the address after you set it.
+- If you seed, pass the same bytes to `SoftRunner::set_random_addr(bytes)` and
+  `Address::random(bytes)`. SoftRunner re-applies a seed after `Reset`; a
+  0x2005 that arrives later wins.
+- Investigate a wrong AdvA by checking the actual 0x2005 command/bytes, not by
+  adding another seed path.
 - The address must be valid: for a **static random** address the most
   significant octet's bits 7..6 must be `11` (e.g. `0xC1`). Invalid random
   addresses are dropped by macOS/iOS scanners.

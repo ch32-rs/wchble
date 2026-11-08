@@ -40,6 +40,14 @@ Last updated: 2026-11-08
   `docs/architecture.md`.
 - **`docs/pitfalls.md`** — consolidated bring-up invariants and false-green
   traps (W1C completions, DMA alignment, AdvA seeding, quiet TX, probe-rs).
+- **Cleanup pass (2026-11-08)** — shared `rf::txrx::DmaBuf` replaces four local
+  `#[repr(align(4))]` wrappers; the TX bounce buffer is a radio field instead
+  of a per-call stack object; CH5xx stub backends are macro-generated;
+  one-hot `family` cfg is single-source; own-address assignment is centralized
+  (`sync_adv_addr`). Corrected the AdvA note: the pinned Trouble *does* send
+  HCI 0x2005 after Reset. Re-verified on
+  `1a86:8010:2FC48F06B4A8`: SDI `tx0` ≈ 258 µs on 37/38/39 and macOS
+  CoreBluetooth `FOUND wchble rssi=-46`.
 - `cargo check` clean for each single chip feature (+ `controller,phy`),
   including `riscv32imac-unknown-none-elf` for `ch32v208`.
 
@@ -48,12 +56,12 @@ Last updated: 2026-11-08
   `rf init ok` / `hci host up` / `adv enable` / `tx ongoing` /
   `trouble adv running` on the same probe. Uses a local `embassy-rs/trouble`
   checkout (crates.io 0.8.0 still pins bt-hci 0.10; main is 0.11).
-- **AdvA seeding fix** — Trouble's `StackBuilder::set_random_address` only
-  updates Host state; it never emits HCI `LE Set Random Address` (0x2005).
-  `SoftRunner::set_random_addr` now seeds AdvA from the HAL and the value
-  survives HCI Reset; example wires one `RAND_ADDR` into both sides and uses a
-  valid static-random MSB (`0xC1`). Unit test
-  `set_random_addr_survives_reset` covers the Reset path.
+- **AdvA / random address** — the pinned Trouble `ControlRunner::run` already
+  sends HCI `LE Set Random Address` (0x2005) after `Reset` when
+  `StackBuilder::set_random_address` was used. `SoftRunner::set_random_addr`
+  remains as a HAL fallback (re-applied across Reset); the example wires one
+  `RAND_ADDR` into both sides and uses a valid static-random MSB (`0xC1`).
+  Unit test `set_random_addr_survives_reset` covers the Reset path.
 - **Quiet TX path** — `controller_task` prints nothing per channel/per burst
   (SDI on the TX path stretches the adv interval; `try_println` only on
   `adv enable` / first burst / one-shot PDU dump).

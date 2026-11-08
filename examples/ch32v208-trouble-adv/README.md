@@ -16,11 +16,12 @@ advertising bursts stretches the interval and makes scanners miss packets.
 
 ## AdvA / random address
 
-Trouble's `StackBuilder::set_random_address` updates Host state only; it does
-**not** emit HCI `LE Set Random Address` (0x2005). The HAL therefore calls
-`SoftRunner::set_random_addr(RAND_ADDR)` with the same bytes, and SoftRunner
-keeps that value across HCI Reset. `RAND_ADDR` must be a valid static random
-address (most significant octet bit 7..6 = 11, e.g. `0xC1`).
+The pinned Trouble sends HCI `LE Set Random Address` (0x2005) after `Reset`
+when `StackBuilder::set_random_address` was used, so the Host already drives
+AdvA. The HAL additionally calls `SoftRunner::set_random_addr(RAND_ADDR)` as a
+fallback (and re-seeded after `Reset`); both sides use the same bytes.
+`RAND_ADDR` must be a valid static random address (most significant octet
+bits 7..6 = 11, e.g. `0xC1`).
 
 ## macOS visibility (verified)
 

@@ -132,14 +132,18 @@ Before `radio.init(&clock)` the HAL must:
 3. Keep BB/LLE IRQs **disabled** (this crate clears IRQSTAT; HAL enables NVIC after).
 4. Provide a working `InstantUs` (WaitTune / filter polls use it).
 
-Construct the radio with a `'static` RX DMA buffer:
+Construct the radio with a `'static` RX DMA buffer. The LLE reads `RXBUFPTR`
+as a word address, so use [`DmaBuf`](../src/rf/txrx.rs) (a plain
+`StaticCell<[u8; N]>` can land at +1 and `new` rejects it):
 
 ```rust,ignore
-use wchble::rf::txrx::RX_DMA_MIN;
-static RX: StaticCell<[u8; RX_DMA_MIN]> = StaticCell::new();
+use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
+static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 let radio = wchble::rf::family::ch32v208::Ch32v208Radio::new(
-    RX.init([0; RX_DMA_MIN]),
+    &mut RX.init(DmaBuf::zeroed()).0,
 )?;
+// Or, for HAL code that picks the backend by feature:
+// let radio = wchble::rf::new_radio_with_dma(&mut RX.init(DmaBuf::zeroed()).0)?;
 ```
 
 ## Bring-up phases
@@ -148,6 +152,7 @@ See [`research/path-b-soft-hci-trouble.md`](research/path-b-soft-hci-trouble.md)
 
 - **A** — soft HCI typechecks with Trouble; Reset / Read BD_ADDR — **done**
   (`hci::new` + `SoftRunner`; join SoftRunner with Trouble runner in HAL apps)
-- **B** — legacy advertising visible on air
+- **B** — legacy advertising visible on air — **verified** on V208 (macOS
+  CoreBluetooth sees `wchble`; see `examples/ch32v208-trouble-adv`)
 - **C** — BAS peripheral via Trouble (in a HAL example)
 - **D** — additional chip families
