@@ -33,4 +33,8 @@ Do **not** reuse `ch32v208-nimble/drivers/wch_ble/` on any CH5xx part without re
 **Status (2026-11-09):** CH592 is the first CH5xx part fully brought up on air
 from this evidence — DevInit, calibration, TX and RX in
 `src/rf/family/ch592.rs`, gate `examples/ch592-rf-smoke`; see
-[ch592-baseline.md](ch592-baseline.md).
+[ch592-baseline.md](ch592-baseline.md). CH585 now has the same full backend
+(`src/rf/family/ch585.rs`, gate `examples/ch585-rf-smoke`) built from its own
+carved objects, verified on air on 2026-11-09 (macOS sees the `wch585`
+ADV_IND). Runtime differences are tabulated in
+[init-diff-table.md](init-diff-table.md).

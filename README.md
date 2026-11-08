@@ -31,7 +31,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | `ch32v208` | DevInit/cal + channel/shut/tx_basic/rx_basic/ISR (open `wch_rf`); HAL smoke next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
-| `ch585` | Bases + closed-disasm “new tables” / `nCO2522`; MMIO apply TBD |
+| `ch585` | DevInit/cal + channel/shut/tx_basic/rx_basic (carved CH585EVT lib) — **verified on air** (`examples/ch585-rf-smoke`) |
 | `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
 | `ch595` | Near-CH585 tables without `nCO2522` (`0x84` highs); MMIO TBD |
 

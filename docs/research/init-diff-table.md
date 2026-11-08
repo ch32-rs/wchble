@@ -96,11 +96,42 @@ Lesson: an `OK` TX completion is not proof of radiation — CH592 reported
 `TX_DONE` exactly at window expiry while the analog front end was misconfigured.
 Always verify with a second receiver.
 
-## TX/RX runtime (for later; not fully re-proven on CH585 this pass)
+Lesson (CH585, 2026-11-09): vendor disassembly RMWs read `w & ~field | value`,
+but `regs::rmw(base, off, clear, set)` computes `v & !clear | set`. Passing the
+vendor's AND mask as `clear` inverts the update. Three such sites
+(`RFEND+0x3C`, `RFEND+0x5C`, `BB+0x2C`) silently destroyed the analog config and
+broke VCO calibration (all bands returned the same code, VCOTAB stayed zero)
+while `TX_DONE` still fired. Convert `w & M | v` to `clear = !M`.
 
-| Item | V208 open (proven) | CH585 public API | Verdict |
+## TX/RX runtime (recovered from the CH585 objects)
+
+Recovered 2026-11-09 from `ip.o` (`RFIP_SetTx` / `RFIP_SetRx` /
+`BLE_SetPHYTxMode` / `BLE_SetPHYRxMode` / `phy_status_clear` /
+`ble_ll_hw_api_shut`), `ll_advertise.o` (`ll_advertise_tx`) and
+`ll_scan.o` (`LL_ScanSetRF`). Implemented in `src/rf/family/ch585.rs`.
+
+| Item | V208 open (proven) | CH585 closed | Verdict |
 | --- | --- | --- | --- |
-| Engine cmd `LLE+0` | RX=1, TX=2, stop `\|8` | not in headers; symbols imply same IP | **unk** (likely same) |
-| Mode word `LLE+0x50` | TX=`0x5A`, RX=`0x59` | cal uses mode word; basic RF APIs exist | **unk** |
-| PHY bits in `BB+0` | 1M=`0x1000`, 2M=`0`, coded=`0x2000` | headers: 1M/2M via `LLEMode` bits | **unk**/partial |
+| Engine cmd `LLE+0` | RX=1, TX=2, stop `\|8` | same (`RFIP_SetTx/Rx`, `ble_ll_hw_api_shut`) | **same** |
+| Mode word `LLE+0x50` | TX=`0x5A`, RX=`0x59` | TX=`0x30258`, RX=`0x30158`, INIT=`0x30558`, POST=`0x30000` | **diff** |
+| PHY bits in `BB+0` | 1M=`0x1000`, 2M=`0` | bit7: 2M set, 1M clear | **diff** |
+| LLE halfword `+0x06` | — | `2` from `LLE_DevInit`/`RFIP_SetRx` | **diff** |
+| TX DMA ptr | `+0x70` | `+0x78` | **diff** |
+| RX DMA ptr | `+0x74` | `+0x7C` | **diff** |
+| TX trigger | BB bit23 then `CMD=2` | `BB+0 \|= 0x00800000`, `BB+0x2C &= ~3`, `LLE+0 = 2` | **diff** |
+| TX window | open table | `2*((len<<3)+adj+0xEE)` 1M / `2*((len<<2)+adj+0xCA)` 2M | **same** as `v208_tx_window_half_us` with `adj=0` |
+| RX window reload | open table | `16*(len+5)+0x3C` 1M / `8*(len+5)+0x3C` 2M | **same** as `v208_rx_capture_reload_half_us` |
+| TX completion | `IRQSTAT` bit1 | soft flags from `IRQSTAT` bits 3\|1 (`ll_tx_wait_finish` also waits `LLE+0x64`) | **same shape** |
+| RX completion | `IRQSTAT` bit0 | `IRQSTAT` bits 0\|2 | **same shape** |
+| Arm-clear | `0x2000`, guard bit13 | `0x20000`, guard bit17 of `LLE+0x0C` | **diff** |
+| CRC enable | opposite polarity | `LLE+0x04` bit0 set | **diff** |
+| Channel select | BB channel table | `BB+0[6:0]` + `BB+0x5C[8:0]`, no `RFEND+0x44` | **diff** |
 | Soft IFS vs auto sequencer | soft IFS preferred | lib supports auto/basic LLE modes | product choice |
+
+Silicon verification (2026-11-09, `examples/ch585-rf-smoke`): the `0x6C` LLE
+DevInit pair, `LLE+0x06 = 2`, `LLE+0x54 = 0`, `BB+0x38 = 0x3FF` and
+`BB+0x3C = 0x0002_020C` all read back as tabulated; TX completes (bits 3|1) with
+~305 µs of airtime per ADV_IND; RX decodes real advertisers with `crc=true`;
+and a macOS CoreBluetooth scan sees the `wch585` local name. Calibration output
+(VCOTAB/GA) is bit-identical to the vendor `Peripheral.hex` golden capture.
+

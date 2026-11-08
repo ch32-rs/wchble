@@ -79,7 +79,8 @@ Research buckets (porting order, not crate layout):
 1. **CH32V208-class** — open `wch_rf` golden path
 2. **CH583-class** — CH5xx map, DevInit ≈ V208 (rebase + audit)
 3. **CH572 / CH585 / CH592 / CH595-class** — CH5xx map, **per-chip** new
-   tables; CH585 adds `nCO2522`; CH572 has unique LLE/BB immediates; CH592
+   tables; CH585 uses the `0x6C` LLE pair, adds the measured `nCO2522` band and
+   its own `RFEND_DevInit` RMW block; CH572 has unique LLE/BB immediates; CH592
    uses the `0x6E` LLE pair and TX DMA `+0x78`; CH595 ≈ CH585 without the 4th
    VCO band
 
@@ -121,7 +122,7 @@ features.
 | HSE load trim (`OSC->HSE_CAL_CTRL`) | HAL |
 | `NVIC` BB/LLE enable + priorities | HAL (vectors call into `wchble::rf` ISR hooks) |
 | Embassy time / `InstantUs` impl | HAL |
-| RX DMA scratch (`≥272` B, 4-byte aligned) | HAL / app → `Ch32v208Radio::new` / `Ch592Radio::new` |
+| RX DMA scratch (`≥272` B, 4-byte aligned) | HAL / app → `Ch32v208Radio::new` / `Ch585Radio::new` / `Ch592Radio::new` |
 | LLE/BB/RFEND DevInit + calibration | `wchble::rf` |
 | Soft HCI + Trouble Host | `wchble::hci` + app |
 
