@@ -70,25 +70,38 @@ usual “cal hangs / weird RSSI” footgun.
 **UNCERTAIN:** exact TXCtune loop / interpolation (large closed functions). Log
 per-band success/fail if you port incrementally.
 
-## 5. First TX/RX (runtime — mostly UNCERTAIN on CH58x)
+## 5. First TX/RX (runtime)
 
-Proven on **V208 open** only today:
+V208 open path is **ported** in `family::ch32v208` (`set_channel` / `shut` /
+`tx_basic` / `rx_basic` / `lle_isr` / `bb_isr`). CH5xx still UNCERTAIN:
 
-| Item | V208 open | CH583 | CH585 |
+| Item | V208 (`wchble`) | CH583 | CH585 (rusted-ch5 ref) |
 | --- | --- | --- | --- |
-| `LLE+0` cmd RX/TX/stop | 1 / 2 / `\|8` | UNCERTAIN (likely same IP) | UNCERTAIN |
-| `LLE+0x50` mode TX/RX/cal | `0x5A` / `0x59` / `0x5D` | UNCERTAIN | UNCERTAIN |
-| `BB+0` PHY bits | 1M `0x1000`, 2M `0`, coded `0x2000` (+S2 `0x4000`) | UNCERTAIN | headers stress 1M/2M |
-| Soft IFS vs auto sequencer | soft preferred | product choice | RFIP helpers exist |
+| `LLE+0` cmd RX/TX/stop | 1 / 2 / `\|8` | UNCERTAIN | same class |
+| `LLE+0x50` mode TX/RX/cal | `0x5A` / `0x59` / `0x5D` | UNCERTAIN | `0x0003_0258` / `_0158` / `_0558` |
+| DMA TX/RX ptr | `+0x70` / `+0x74` | UNCERTAIN | `+0x78` / `+0x7c` |
+| `BB+0` PHY bits | 1M `0x1000`, 2M `0`, coded `0x2000` (+S2 `0x4000`) | UNCERTAIN | bit7 2M selector |
 
-Bring-up order recommendation: get **adv TX on 1M** with V208-like mode words,
-capture `LLE+0x08` IRQSTAT + `BB+0` on success/fail, then adjust.
+### HAL smoke (V208)
+
+```rust,ignore
+// after BLE AHB + HSE trim; IRQs still off; InstantUs live:
+let mut radio = Ch32v208Radio::new(RX.init([0; RX_DMA_MIN]))?;
+radio.init(&clock)?;
+// enable NVIC 63/64 → radio.bb_isr() / radio.lle_isr()
+radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
+radio.set_channel(37)?;
+// ADV_IND hdr/len/payload…
+radio.tx_basic(&clock, &frame, 0, None)?;
+```
+
+On timeout: dump `LLE+0x08`, `LLE+0x50`, `LLE+0x64`, `BB+0`, `RFEND+0x08/+0x2c`.
 
 ## 6. Feature / module map
 
 | Cargo feature | Module | Tables |
 | --- | --- | --- |
-| `ch32v208` | `family::ch32v208` | open `wch_rf` (port in progress) |
+| `ch32v208` | `family::ch32v208` | open `wch_rf` init+runtime |
 | `ch572` | `family::ch572` | unique new-table set; MMIO apply TBD |
 | `ch583` | `family::ch583` | old tables recorded; MMIO apply TBD |
 | `ch585` | `family::ch585` | new tables + `nCO2522`; MMIO apply TBD |

@@ -56,4 +56,6 @@ pub enum Error {
     InvalidState,
     /// Busy (engine active).
     Busy,
+    /// Scheduled TX start missed its absolute deadline (open `wch_rf_tx_basic` −2).
+    Late,
 }

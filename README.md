@@ -28,7 +28,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 
 | Feature | Status |
 | --- | --- |
-| `ch32v208` | DevInit + full calibration MMIO (open `wch_rf`); TX/RX next |
+| `ch32v208` | DevInit/cal + channel/shut/tx_basic/rx_basic/ISR (open `wch_rf`); HAL smoke next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | Bases + closed-disasm “new tables” / `nCO2522`; MMIO apply TBD |
@@ -85,9 +85,10 @@ let mut ctl = SoftController::with_radio(radio);
 
 ## Status
 
-**V208 RF init/cal MMIO landed** (2026-11-07): open Path B crate; `ch32v208`
-applies LLE/BB/RFEND DevInit + TXCtune/TXFtune/RXFilter/RXAdc. Other families
-still table-only. Next: V208 TX/RX/ISR, then soft HCI Phase A.
+**V208 RF runtime landed** (2026-11-08): open Path B crate; `ch32v208` applies
+DevInit/cal and open-driver `set_channel` / `shut` / `tx_basic` / `rx_basic` /
+`lle_isr`/`bb_isr`. Other families still table-only. Next: HAL on-target smoke,
+then soft HCI Phase A.
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

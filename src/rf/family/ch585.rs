@@ -10,6 +10,12 @@
 //! Tables are the CH5xx **"new tables"** bucket (not V208, not CH583).
 //! Unique: 4th VCO band `nCO2522`, WaitTune 8000, no `RFEND_Reset`.
 //! See `docs/research/{family-comparison,ch58x-reuse,bringup-debug}.md`.
+//!
+//! External Rust CH585 RF reference (`rusted-ch5/ch58x-hal` crates/ch58x-ble):
+//! DMA TX/RX at `LLE+0x78/+0x7c` (not V208 `+0x70/+0x74`); LLE mode bank
+//! `0x0003_0x58` class; TXCtune codes `bf/e8/d4/fc`; fractional synth via
+//! `RFEND+0x44`. Full audit: `docs/research/ch58x-hal-ble-reuse.md`.
+//! Do **not** reuse V208 open mode words / DevInit soup here.
 
 use crate::rf::analog::AnalogInit;
 use crate::rf::family::tables::{
@@ -40,17 +46,18 @@ use Certainty::Unverified;
 /// `LLE_DevInit` absolute stores (`objs_CH585/lle.o`).
 ///
 /// UNCERTAIN on silicon:
-/// - Store involving `LLE+0x7C` (reloc / RX path) — confirm vs V208 `+0x74`.
-/// - RMW on `LLE+0x04` (`andi -0x1f`) intent.
+/// - `+0x2c`/`+0x3c`: carved lib says `0x6c`; rusted-ch5 RF-basic path uses `0x6e`.
+/// - RMW on `LLE+0x04` (`andi -0x1f`) + halfword `+0x06 = 1` (present in rusted-ch5).
 /// - Effect of `LLE+0x54 = 0` (CH585-only in this DevInit).
+/// - DMA: rusted-ch5 programs TX `+0x78` / RX `+0x7c` (vs V208 `+0x70/+0x74`).
 pub const LLE_DEV_INIT: LleDevInit = LleDevInit {
     stores: &[
         RegInit::new(0x14, 0x8c, Disasm),
         RegInit::new(0x1c, 0x76, Disasm),
         RegInit::new(0x24, 0x8c, Disasm),
-        RegInit::new(0x2c, 0x6c, Disasm), // differs from CH583/V208 0x3C
+        RegInit::new(0x2c, 0x6c, Disasm), // vs rusted-ch5 0x6e — resolve on silicon
         RegInit::new(0x34, 0x8c, Disasm),
-        RegInit::new(0x3c, 0x6c, Disasm), // differs from CH583/V208 0x3C
+        RegInit::new(0x3c, 0x6c, Disasm), // vs rusted-ch5 0x6e — resolve on silicon
         RegInit::new(0x44, 0x8c, Disasm),
         RegInit::new(0x4c, 0x76, Disasm),
         RegInit::new(0x54, 0x00, Disasm), // CH585-only

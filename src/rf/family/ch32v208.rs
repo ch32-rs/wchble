@@ -18,9 +18,12 @@
 use crate::rf::analog::{self, AnalogInit};
 use crate::rf::family::tables::{self, BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
-use crate::rf::regs::{self, autocfg, bb, bb_irq, lle, lle_cmd, lle_mode, rfctrl, rfend};
+use crate::rf::regs::{
+    self, autocfg, bb, bb_irq, lle, lle_cmd, lle_irq, lle_mode, rfctrl, rfend, rssi, rxcfg,
+};
+use crate::rf::timing::{self, v208_rx_capture_reload_half_us, v208_tx_window_half_us};
 use crate::rf::txrx::RX_DMA_MIN;
-use crate::rf::{Channel, PhyMode, Radio, RfCallback};
+use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
 use crate::time::InstantUs;
 use crate::{Error, Result};
 
@@ -92,11 +95,18 @@ pub struct Ch32v208Radio {
     phy_rx: PhyMode,
     whiten_disabled: bool,
     encrypt: bool,
+    /// DTM demod variant (open `wch_rf_dtm_set`); affects RXCFG10 only.
+    dtm: bool,
     access_address: u32,
     crc_init: u32,
+    /// Last synth bookkeeping value (carrier − LO inject); channel mode does not
+    /// program RFEND+0x44 on V208 open BLE path.
+    synth_khz: u32,
     isr: IsrState,
     rx_dma: *mut u8,
     rx_dma_len: usize,
+    /// Active RX DMA base (may differ from construction scratch during `rx_basic`).
+    rx_active: *mut u8,
 }
 
 // Soft state only; MMIO runs through fixed bases. Safe to move across tasks.
@@ -118,17 +128,111 @@ impl Ch32v208Radio {
             phy_rx: PhyMode::Rate1m,
             whiten_disabled: false,
             encrypt: false,
+            dtm: false,
             access_address: 0x8e89_bed6,
             crc_init: 0x55_5555,
+            synth_khz: 0,
             isr: IsrState::default(),
             rx_dma: ptr,
             rx_dma_len: rx_dma.len(),
+            rx_active: ptr,
         })
     }
 
     /// RX DMA scratch installed at construction.
     pub fn rx_dma_len(&self) -> usize {
         self.rx_dma_len
+    }
+
+    /// Last BB clock-capture timestamp (µs), valid after [`IsrState::rx_captured`].
+    pub fn last_anchor_us(&self) -> u32 {
+        self.isr.last_anchor_us
+    }
+
+    /// True after address match / clock-capture for the armed RX.
+    pub fn rx_captured(&self) -> bool {
+        self.isr.rx_captured
+    }
+
+    /// Select DTM demod CFG10 variant (open `wch_rf_dtm_set`).
+    pub fn set_dtm(&mut self, enabled: bool) {
+        self.dtm = enabled;
+    }
+
+    /// BB / LLE IRQ entry points for the HAL vector table (`BB_IRQn` / `LLE_IRQn`).
+    pub fn lle_isr(&mut self) {
+        let st = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
+        let was_rx = self.isr.rx_armed;
+        // Open passes os_cputime_get32() as the event payload. Without a clock in
+        // this ISR entry, use last_anchor_us for RX_DONE after capture, else 0;
+        // HAL may overwrite via InstantUs around the vector.
+
+        if st & lle_irq::RX_DONE != 0 {
+            let bb_st = unsafe { regs::read(BB_BASE, bb::IRQSTAT) };
+            self.isr.rx_crc_ok = bb_st & bb_irq::CRC_ERR == 0;
+            unsafe {
+                regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::RX_DONE);
+            }
+            if was_rx {
+                let len = unsafe { core::ptr::read_volatile(self.rx_active.add(1)) };
+                self.isr.last_rx_len = len;
+                self.isr.rx_armed = false;
+                let payload = if self.isr.rx_captured {
+                    self.isr.last_anchor_us
+                } else {
+                    0
+                };
+                self.isr.dispatch(RfEvent::RxDone, payload);
+            }
+        }
+        if st & lle_irq::TX_DONE != 0 {
+            unsafe {
+                regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::TX_DONE);
+            }
+            self.isr.dispatch(RfEvent::TxDone, 0);
+        }
+        if st & lle_irq::CLEAR_ARM != 0 {
+            unsafe {
+                regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
+            }
+            if was_rx && st & lle_irq::RX_DONE == 0 {
+                self.isr.rx_armed = false;
+                self.isr.dispatch(RfEvent::RxTimeout, 0);
+            }
+        }
+        unsafe {
+            regs::write(LLE_BASE, lle::IRQSTAT, st & (0xffff & !0x2003));
+        }
+    }
+
+    /// BB IRQ entry — clock-capture / address-match for basic RX.
+    pub fn bb_isr(&mut self) {
+        let st = unsafe { regs::read(BB_BASE, bb::IRQSTAT) };
+        if st & bb_irq::CLKCAP != 0 {
+            // HAL should prefer InstantUs; without a clock in ISR context we
+            // leave last_anchor_us for the caller to overwrite, or keep prior.
+            unsafe {
+                regs::write(BB_BASE, bb::IRQSTAT, bb_irq::CLKCAP_CLR);
+            }
+            if self.isr.rx_armed && !self.isr.rx_captured {
+                self.isr.rx_captured = true;
+                let reload = v208_rx_capture_reload_half_us(self.phy_rx);
+                unsafe {
+                    regs::write(LLE_BASE, lle::WINDOW, reload);
+                }
+                self.isr
+                    .dispatch(RfEvent::RxStart, self.isr.last_anchor_us);
+            }
+        }
+        unsafe {
+            regs::write(BB_BASE, bb::IRQSTAT, st & bb_irq::TIMER_ACK);
+        }
+    }
+
+    /// Stamp the BB clock-capture time from the HAL's `InstantUs` (call at the
+    /// start of `bb_isr` before or after [`Self::bb_isr`]).
+    pub fn note_anchor_us(&mut self, now_us: u32) {
+        self.isr.last_anchor_us = now_us;
     }
 
     fn lle_dev_init(&mut self) {
@@ -363,6 +467,154 @@ impl Ch32v208Radio {
             regs::rmw(RFEND_BASE, rfend::TUNE, 0, rfend::TUNE_RXADC);
         }
     }
+
+    fn guard_enter(&mut self) -> u32 {
+        let saved = unsafe { regs::read(LLE_BASE, lle::GUARD) };
+        unsafe {
+            regs::write(LLE_BASE, lle::GUARD, 0);
+        }
+        analog::fence_i();
+        saved
+    }
+
+    fn guard_exit(&mut self, saved: u32) {
+        analog::fence_i();
+        unsafe {
+            regs::write(LLE_BASE, lle::GUARD, saved);
+        }
+        analog::fence_i();
+    }
+
+    /// Open `engine_stop` / `phy_status_clear`.
+    fn engine_stop(&mut self) {
+        unsafe {
+            regs::rmw(LLE_BASE, lle::MODE, lle_mode::DIR_MASK, 0);
+            regs::rmw(LLE_BASE, lle::CMD, 0, lle_cmd::FORCE_STOP);
+            regs::write(LLE_BASE, lle::WINDOW, 0);
+        }
+    }
+
+    /// Open `dev_set_channel` — BLE channel-number mode (no RFEND+0x44 synth).
+    fn program_channel(&mut self, channel: Channel, phy: PhyMode) {
+        let whiten = if self.whiten_disabled {
+            rfctrl::WHITEN_OFF
+        } else {
+            0
+        };
+        unsafe {
+            regs::rmw(RFEND_BASE, rfend::FREQMODE, rfend::FREQMODE_EN, 0);
+            let rfctrl_v = regs::read(BB_BASE, bb::RFCTRL);
+            let v = (rfctrl_v & !(rfctrl::CH_MASK | rfctrl::WHITEN_OFF))
+                | (u32::from(channel) & rfctrl::CH_MASK)
+                | whiten;
+            regs::write(BB_BASE, bb::RFCTRL, v);
+        }
+        self.channel = channel;
+        self.synth_khz =
+            timing::freq_for_channel_khz(channel).saturating_sub(u32::from(timing::lo_inject_khz(phy)));
+    }
+
+    fn phy_bits_tx(mode: PhyMode) -> u32 {
+        match mode {
+            PhyMode::Rate2m => rfctrl::PHY_2M,
+            PhyMode::RateCodedS8 => rfctrl::PHY_CODED,
+            PhyMode::RateCodedS2 => rfctrl::PHY_CODED | rfctrl::PHY_S2,
+            PhyMode::Rate1m => rfctrl::PHY_1M,
+        }
+    }
+
+    fn phy_bits_rx(mode: PhyMode) -> u32 {
+        match mode {
+            PhyMode::Rate2m => rfctrl::PHY_2M,
+            PhyMode::RateCodedS2 | PhyMode::RateCodedS8 => rfctrl::PHY_CODED,
+            PhyMode::Rate1m => rfctrl::PHY_1M,
+        }
+    }
+
+    fn phy_is_coded(mode: PhyMode) -> bool {
+        matches!(mode, PhyMode::RateCodedS2 | PhyMode::RateCodedS8)
+    }
+
+    /// Open `set_phy_tx_mode` — programs RFCTRL PHY bits + LLE TX window.
+    fn set_phy_tx_mode_timed<T: InstantUs>(&mut self, clock: &T, mode: PhyMode, payload_len: u8) {
+        let mut mask = rfctrl::PHY_MASK;
+        if Self::phy_is_coded(mode) {
+            mask |= rfctrl::CODING_MASK;
+        }
+        let saved_guard;
+        unsafe {
+            regs::rmw(BB_BASE, bb::RFCTRL, mask, Self::phy_bits_tx(mode));
+            saved_guard = regs::read(LLE_BASE, lle::GUARD);
+            regs::write(LLE_BASE, lle::GUARD, saved_guard & !0x2000);
+        }
+        clock.delay_us(2);
+        unsafe {
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
+            regs::write(
+                LLE_BASE,
+                lle::WINDOW,
+                v208_tx_window_half_us(mode, payload_len),
+            );
+            regs::write(LLE_BASE, lle::GUARD, saved_guard);
+        }
+    }
+
+    /// Open `set_phy_rx_mode` — demod CFG group + RFCTRL PHY bits.
+    fn set_phy_rx_mode(&mut self, mode: PhyMode) {
+        unsafe {
+            if Self::phy_is_coded(mode) {
+                regs::rmw(
+                    BB_BASE,
+                    bb::RFCTRL,
+                    rfctrl::PHY_MASK,
+                    Self::phy_bits_rx(mode),
+                );
+                regs::write(BB_BASE, bb::RXCFG20, rxcfg::CFG20_CODED);
+                regs::write(BB_BASE, bb::RXCFG14, rxcfg::CFG14_CODED);
+                regs::write(BB_BASE, bb::RXCFG18, rxcfg::CFG18_CODED);
+                regs::write(BB_BASE, bb::RXCFG28, rxcfg::CFG28_CODED);
+                regs::write(BB_BASE, bb::RXCFG24, rxcfg::CFG24_CODED);
+                regs::write(
+                    BB_BASE,
+                    bb::RXCFG10,
+                    if self.dtm {
+                        rxcfg::CFG10_CODED_DTM
+                    } else {
+                        rxcfg::CFG10_CODED
+                    },
+                );
+            } else {
+                regs::write(BB_BASE, bb::RXCFG20, rxcfg::CFG20_1M2M);
+                regs::write(BB_BASE, bb::RXCFG14, rxcfg::CFG14_1M2M);
+                regs::write(BB_BASE, bb::RXCFG18, rxcfg::CFG18_1M2M);
+                regs::rmw(
+                    BB_BASE,
+                    bb::RFCTRL,
+                    rfctrl::PHY_MASK,
+                    Self::phy_bits_rx(mode),
+                );
+                regs::write(BB_BASE, bb::RXCFG28, rxcfg::CFG28_1M2M);
+                regs::write(BB_BASE, bb::RXCFG24, rxcfg::CFG24_1M2M);
+                regs::write(
+                    BB_BASE,
+                    bb::RXCFG10,
+                    if self.dtm {
+                        rxcfg::CFG10_1M2M_DTM
+                    } else {
+                        rxcfg::CFG10_1M2M
+                    },
+                );
+            }
+        }
+    }
+
+    fn apply_aa_crc_regs(&self) {
+        unsafe {
+            regs::write(BB_BASE, bb::ACCESSADDR, self.access_address);
+            regs::write(BB_BASE, bb::CRCINIT, self.crc_init & 0x00ff_ffff);
+            regs::rmw(LLE_BASE, lle::CRC_AA_CFG, 0x1, 0);
+        }
+    }
 }
 
 impl AnalogInit for Ch32v208Radio {
@@ -430,9 +682,12 @@ impl Radio for Ch32v208Radio {
         self.calibrate(clock)?;
 
         self.channel = 0xff;
+        self.isr.clear_rx_flags();
+        self.rx_active = self.rx_dma;
         unsafe {
             regs::write(BB_BASE, bb::IRQSTAT, bb_irq::POST_INIT_CLR);
             regs::write(LLE_BASE, lle::IRQSTAT, 0xffff);
+            regs::write(LLE_BASE, lle::RXBUFPTR, self.rx_dma as u32);
         }
         let _ = (IRQ_BB, IRQ_LLE);
         Ok(())
@@ -447,14 +702,25 @@ impl Radio for Ch32v208Radio {
     }
 
     fn shut(&mut self) {
-        // TODO: assert RFCTRL.SHUT / force LLE stop (wch_rf_shut) — next cut.
+        let saved = self.guard_enter();
+        self.engine_stop();
+        unsafe {
+            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::SHUT);
+            let fectrl = regs::read(RFEND_BASE, rfend::FECTRL);
+            regs::write(RFEND_BASE, rfend::FECTRL, fectrl & rfend::FECTRL_SHUT_MASK);
+            regs::write(LLE_BASE, lle::MODE, 0);
+        }
+        self.isr.clear_rx_flags();
+        self.guard_exit(saved);
     }
 
     fn set_channel(&mut self, channel: Channel) -> Result<()> {
         if channel > 39 {
             return Err(Error::InvalidState);
         }
-        self.channel = channel;
+        let saved = self.guard_enter();
+        self.program_channel(channel, self.phy_rx);
+        self.guard_exit(saved);
         Ok(())
     }
 
@@ -464,7 +730,7 @@ impl Radio for Ch32v208Radio {
 
     fn set_aa_crc(&mut self, access_address: u32, crc_init: u32) {
         self.access_address = access_address;
-        self.crc_init = crc_init;
+        self.crc_init = crc_init & 0x00ff_ffff;
     }
 
     fn set_phy(&mut self, tx: PhyMode, rx: PhyMode) {
@@ -486,34 +752,154 @@ impl Radio for Ch32v208Radio {
 
     fn tx_basic<T: InstantUs>(
         &mut self,
-        _clock: &T,
+        clock: &T,
         frame: &[u8],
         _timeout_half_us: u32,
-        _start_cputime: Option<u32>,
+        start_cputime: Option<u32>,
     ) -> Result<()> {
         if frame.len() < 2 {
             return Err(Error::InvalidState);
         }
-        Err(Error::Unsupported)
+        if self.channel > 39 {
+            return Err(Error::InvalidState);
+        }
+        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
+        if busy != 0 {
+            return Err(Error::Busy);
+        }
+
+        let saved = self.guard_enter();
+        self.engine_stop();
+        unsafe {
+            regs::write(LLE_BASE, lle::WINDOW, 0);
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
+        }
+
+        self.program_channel(self.channel, self.phy_tx);
+
+        unsafe {
+            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::DIR_RX);
+            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, rfend::FECTRL_RF_ON);
+            regs::write(LLE_BASE, lle::MODE, lle_mode::TX);
+        }
+        self.apply_aa_crc_regs();
+
+        // TX buffer pointer — frame must remain valid for the airtime.
+        unsafe {
+            regs::write(LLE_BASE, lle::TXBUFPTR, frame.as_ptr() as u32);
+        }
+
+        self.set_phy_tx_mode_timed(clock, self.phy_tx, frame[1]);
+        let hw_window = unsafe { regs::read(LLE_BASE, lle::WINDOW) };
+
+        if let Some(start) = start_cputime {
+            unsafe {
+                regs::write(LLE_BASE, lle::WINDOW, 0);
+            }
+            loop {
+                let now = clock.now_us();
+                if now.wrapping_sub(start) as i32 >= 0 {
+                    if now.wrapping_sub(start) > 10 {
+                        self.guard_exit(saved);
+                        return Err(Error::Late);
+                    }
+                    break;
+                }
+            }
+            unsafe {
+                regs::write(LLE_BASE, lle::WINDOW, hw_window);
+            }
+        }
+
+        unsafe {
+            regs::rmw(BB_BASE, bb::RFCTRL, 0, rfctrl::TX_TRIG);
+            regs::rmw(BB_BASE, bb::AUTOCFG, autocfg::ARM_MASK, 0);
+        }
+        let started = clock.now_us();
+        unsafe {
+            regs::write(LLE_BASE, lle::CMD, lle_cmd::START_TX);
+        }
+
+        let deadline = started.wrapping_add(hw_window / 2).wrapping_add(200);
+        let mut rc = Ok(());
+        loop {
+            let st = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
+            if st & lle_irq::TX_DONE != 0 {
+                break;
+            }
+            if clock.now_us().wrapping_sub(deadline) as i32 >= 0 {
+                let st = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
+                if st & lle_irq::TX_DONE == 0 {
+                    rc = Err(Error::Timeout);
+                }
+                break;
+            }
+        }
+
+        self.guard_exit(saved);
+        rc
     }
 
     fn rx_basic<T: InstantUs>(
         &mut self,
         _clock: &T,
         rxbuf: &mut [u8],
-        _window_half_us: u32,
+        window_half_us: u32,
     ) -> Result<()> {
-        if rxbuf.is_empty() {
+        if rxbuf.len() < RX_DMA_MIN {
             return Err(Error::InvalidState);
         }
-        Err(Error::Unsupported)
+        if self.channel > 39 {
+            return Err(Error::InvalidState);
+        }
+
+        let saved = self.guard_enter();
+
+        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
+        if busy != 0 {
+            unsafe {
+                regs::rmw(LLE_BASE, lle::MODE, lle_mode::DIR_MASK, 0);
+                regs::rmw(LLE_BASE, lle::CMD, 0, lle_cmd::FORCE_STOP);
+            }
+        }
+
+        unsafe {
+            regs::write(LLE_BASE, lle::WINDOW, 0);
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
+        }
+
+        self.program_channel(self.channel, self.phy_rx);
+        self.set_phy_rx_mode(self.phy_rx);
+        self.apply_aa_crc_regs();
+
+        let rx_ptr = rxbuf.as_mut_ptr();
+        self.rx_active = rx_ptr;
+        unsafe {
+            regs::write(LLE_BASE, lle::RXBUFPTR, rx_ptr as u32);
+            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::DIR_RX);
+            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, rfend::FECTRL_RF_ON);
+            regs::write(LLE_BASE, lle::MODE, lle_mode::RX);
+            regs::write(LLE_BASE, lle::WINDOW, window_half_us);
+            regs::write(BB_BASE, bb::IRQSTAT, bb_irq::POST_INIT_CLR);
+        }
+
+        self.isr.rx_armed = true;
+        self.isr.rx_captured = false;
+
+        unsafe {
+            regs::write(LLE_BASE, lle::CMD, lle_cmd::START_RX);
+        }
+
+        self.guard_exit(saved);
+        Ok(())
     }
 
     fn rssi(&self) -> i8 {
-        0
+        let v = unsafe { regs::read(BB_BASE, bb::RSSICFO) };
+        (v >> rssi::SHIFT) as u8 as i8
     }
 
     fn crc_ok(&self) -> bool {
-        false
+        self.isr.rx_crc_ok
     }
 }

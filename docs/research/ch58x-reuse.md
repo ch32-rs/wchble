@@ -114,6 +114,14 @@ underlying IP map is shared and the tables are not.
 Until a CH587EVT `libCH58xBLE.a` (or equivalent) is carved, do **not**
 alias CH587 to either CH583 or CH585.
 
+## External Rust reference (2026-11-08)
+
+Independent CH585 register-level BLE lives in
+[`rusted-ch5/ch58x-hal`](https://github.com/rusted-ch5/ch58x-hal)
+(`crates/ch58x-ble` + portable `ble-controller`). Host-tested / cross-built only
+— **not** claimed RF-accepted. Full borrow audit:
+[`ch58x-hal-ble-reuse.md`](ch58x-hal-ble-reuse.md).
+
 ## Implication for `wchble`
 
 ```text

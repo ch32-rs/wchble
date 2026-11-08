@@ -42,6 +42,24 @@ linker scripts, and the Embassy executor; this crate supplies RF → soft HCI.
 | `hci` | L3 | `bt-hci` traits, cmd/event/ACL queues | register bit soup |
 | HAL / apps | L4 | Trouble host, clocks, IRQs, flash/RAM | stack logic |
 
+### Multi-family rules (L0)
+
+`Radio` and above are family-agnostic. Below `Radio`, split three ways:
+
+| Bucket | May share | Must stay per-chip |
+| --- | --- | --- |
+| Pure helpers | channel→MHz, cal interpolation math, HCI queues | — |
+| Orchestration | init order LLE→RFEND→BB→cal; TX/RX stage names | literal mode words, DMA ptr offsets, synth path |
+| Family module | cfg-selected `family/<chip>.rs` + DevInit tables | RFEND RMW soup, band codes, BB power pack |
+
+**Do not** copy V208 `tx_basic` into CH585 with three constants changed — DMA
+(`+0x70/+0x74` vs `+0x78/+0x7c`), LLE mode bank, and synth programming diverge.
+Optional generation helpers (e.g. CH5xx bases/IRQ only) are fine; one backend for
+all CH5xx is not. See [`research/ch58x-hal-ble-reuse.md`](research/ch58x-hal-ble-reuse.md).
+
+Shared L0 modules today: `regs` (offset *names*), `analog` (wait_tune / nibble),
+`timing` (pure formulas; V208 TX window helpers are clearly named `v208_*`).
+
 ## Chip selection
 
 Enable **at most one** of `ch32v208`, `ch572`, `ch583`, `ch585`, `ch595`. Bases

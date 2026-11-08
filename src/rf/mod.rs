@@ -6,6 +6,7 @@ pub mod analog;
 pub mod family;
 pub mod isr;
 pub mod regs;
+pub mod timing;
 pub mod txrx;
 
 use crate::{Error, Result};

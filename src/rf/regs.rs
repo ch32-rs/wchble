@@ -66,8 +66,17 @@ pub mod autocfg {
 pub mod bb_irq {
     pub const CLKCAP: u32 = 0x40;
     pub const CLKCAP_CLR: u32 = 0x60;
+    /// CRC-fail sticky observed with RX_DONE (open `wch_rf_lle_isr`).
+    pub const CRC_ERR: u32 = 0x20;
     /// Post-init clear written by open `wch_rf_init`.
     pub const POST_INIT_CLR: u32 = 0xf0;
+    /// Timer flags acknowledged at end of open `wch_rf_bb_isr`.
+    pub const TIMER_ACK: u32 = 0x90;
+}
+
+/// BB RSSICFO (`BB+0x30`) field extracts.
+pub mod rssi {
+    pub const SHIFT: u32 = 15;
 }
 
 /// Byte offsets from LLE base.
@@ -119,6 +128,27 @@ pub mod rfctrl {
     pub const TX_TRIG: u32 = 0x0080_0000;
     /// BB_DevInit sets bit28.
     pub const INIT_BIT28: u32 = 0x1000_0000;
+}
+
+/// Open V208 RX demod register groups (`BLE_SetPHYRxMode`).
+pub mod rxcfg {
+    pub const CFG20_1M2M: u32 = 0x0009_0083;
+    pub const CFG14_1M2M: u32 = 0x0810_1901;
+    pub const CFG18_1M2M: u32 = 0x0003_1624;
+    pub const CFG28_1M2M: u32 = 0x28be;
+    pub const CFG24_1M2M: u32 = 0x0100_6310;
+    pub const CFG10_1M2M: u32 = 0x0032_22d0;
+    pub const CFG10_1M2M_DTM: u32 = 0x003f_a2ce;
+
+    pub const CFG20_CODED: u32 = 0x0009_0086;
+    pub const CFG14_CODED: u32 = 0x0830_1ff1;
+    pub const CFG18_CODED: u32 = 0x0003_1619;
+    pub const CFG28_CODED: u32 = 0x0000_28de;
+    pub const CFG24_CODED: u32 = 0x0100_6310;
+    /// Open header `0x034A4DF` (zero-extended).
+    pub const CFG10_CODED: u32 = 0x0034_a4df;
+    /// Open header `0x03FA4DF`.
+    pub const CFG10_CODED_DTM: u32 = 0x003f_a4df;
 }
 
 /// LLE command bits.
