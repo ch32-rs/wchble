@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "ch32v208-rf-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ch32-hal = { path = "../../../ch32-hal", features = [
+    "ch32v208wbu6",
+    "memory-x",
+    "embassy",
+    "rt",
+], default-features = false }
+wchble = { path = "../..", features = ["ch32v208"] }
+qingke-rt = "0.8"
+qingke = "0.8"
+panic-halt = "1.0"
+static_cell = "2.1"
+
+[profile.release]
+strip = false
+lto = true
+opt-level = "z"

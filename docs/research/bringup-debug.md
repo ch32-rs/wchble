@@ -84,7 +84,8 @@ V208 open path is **ported** in `family::ch32v208` (`set_channel` / `shut` /
 
 ### HAL smoke (V208)
 
-Firmware examples stay in the HAL repo (this crate is library-only). Sketch:
+Flashable firmware: [`examples/ch32v208-rf-smoke`](../../examples/ch32v208-rf-smoke)
+(`cargo run --release` with wlink on a CH32V208). Sketch of what it does:
 
 ```rust,ignore
 // after BLE AHB + HSE trim; IRQs still off; InstantUs live:

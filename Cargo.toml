@@ -2,6 +2,7 @@
 resolver = "2"
 members = ["."]
 default-members = ["."]
+exclude = ["examples/ch32v208-rf-smoke"]
 
 [workspace.package]
 authors = ["ch32-rs contributors"]

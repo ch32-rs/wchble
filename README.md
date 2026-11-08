@@ -94,11 +94,12 @@ On-target smoke (RF only, before Trouble) remains a HAL-side example:
 
 ## Status
 
-**Soft HCI Phase A landed** (2026-11-08): `hci::new()` is
+**Soft HCI Phase A + RF smoke firmware** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds
-(stubs for unsupported). V208 RF runtime already in tree. Next: Phase B
-legacy adv on air (HAL smoke + LL TX schedule), then Trouble BAS.
+(stubs for unsupported). Flashable V208 smoke lives in
+[`examples/ch32v208-rf-smoke`](examples/ch32v208-rf-smoke) (`cargo run --release`
+via wlink). Next: confirm on a V208 board, then Phase B SoftRunner→RF.
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

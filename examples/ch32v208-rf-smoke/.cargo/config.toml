@@ -1,0 +1,8 @@
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# Select the probe attached to a CH32V208 (wlink list). Example:
+#   WLINK_DEVICE=1a86:8010:<SERIAL> cargo run --release
+runner = "wlink -v flash --enable-sdi-print --watch-serial"
+# runner = "probe-rs run --chip CH32V208"

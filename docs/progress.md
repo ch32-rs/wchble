@@ -30,10 +30,9 @@ Last updated: 2026-11-08
 
 ## Not done (next)
 
-1. **HAL on-target smoke** — HAL-side example (kept out of this tree for now):
-   clock + HSE trim + `InstantUs` + `Ch32v208Radio::new` → `init` →
-   `set_channel(37)` → `tx_basic` ADV_IND; wire `lle_isr` / `bb_isr`
-   (+ `note_anchor_us`). Sketch in `docs/research/bringup-debug.md`.
+1. **Board gate** — flash `examples/ch32v208-rf-smoke` on a CH32V208 with
+   `wlink` and confirm SDI `rf init ok` / `tx ch37 ok` (firmware builds;
+   attach a V208 — current bench probes are L103 / CH592 / H417).
 2. **Phase B** — `SoftRunner` drives real legacy adv TX on 37/38/39 via RF
    runtime (store AdvData / ScanRsp; schedule `tx_basic`).
 3. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
@@ -51,6 +50,6 @@ Last updated: 2026-11-08
 | rf-init | V208 DevInit + cal MMIO | **done** |
 | rf-runtime | V208 channel/shut/tx/rx/ISR | **done** |
 | A | soft HCI typechecks with Trouble | **done** (`ExternalController` + SoftRunner) |
-| B | legacy adv on air | SoftRunner stores params; RF schedule TBD |
+| B | legacy adv on air | smoke firmware builds; SoftRunner→RF TBD |
 | C | BAS via Trouble in a HAL example | not started |
 | D | more chip packs | CH572/583/585/595 tables recorded; apply TBD |
