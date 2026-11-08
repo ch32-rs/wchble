@@ -240,16 +240,14 @@ impl Ch32v208Radio {
             regs::rmw(RFEND_BASE, rfend::FECTRL, 0, 0x2_0000);
             regs::rmw(RFEND_BASE, rfend::TUNE, 0, rfend::TUNE_FILT);
 
-            // Open: (RF(0x38) & 0xfffe00ff) | (band << 8)  → clear bits[15:8].
-            const CLEAR_BAND: u32 = 0x00ff_00;
-
+            // Open: (RF(0x38) & 0xfffe00ff) | (band << 8) → clear bits[16:8].
             for (i, &band) in TXCTUNE_BANDS.iter().enumerate() {
                 let sample = TXCTUNE_SAMPLE_INDEX[i];
                 regs::rmw(RFEND_BASE, rfend::TUNE, rfend::TUNE_TRIG, 0);
                 regs::rmw(
                     RFEND_BASE,
                     rfend::CFG38,
-                    CLEAR_BAND,
+                    !rfend::BANDCODE_MASK,
                     (u32::from(band)) << rfend::BANDCODE_SHIFT,
                 );
                 regs::rmw(RFEND_BASE, rfend::TUNE, 0, rfend::TUNE_TRIG);
