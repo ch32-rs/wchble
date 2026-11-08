@@ -230,7 +230,11 @@ pub type Backend = family::ch595::Ch595Radio;
 )))]
 pub type Backend = UnselectedRadio;
 
-/// Construct the feature-selected radio backend.
+/// Construct the feature-selected radio backend when it implements [`Default`].
+///
+/// CH32V208 requires a DMA RX scratch via [`family::ch32v208::Ch32v208Radio::new`]
+/// — there is no parameterless constructor for that backend.
+#[cfg(not(feature = "ch32v208"))]
 pub fn new_radio() -> Backend {
     Backend::default()
 }

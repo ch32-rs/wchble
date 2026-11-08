@@ -28,7 +28,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 
 | Feature | Status |
 | --- | --- |
-| `ch32v208` | Bases + open-driver DevInit markers; MMIO apply next |
+| `ch32v208` | DevInit + full calibration MMIO (open `wch_rf`); TX/RX next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | Bases + closed-disasm “new tables” / `nCO2522`; MMIO apply TBD |
@@ -69,22 +69,25 @@ Enable **at most one** chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, `ch5
 ## HAL integration sketch
 
 ```rust,ignore
-// inside ch32-hal / application after BLE AHB clock + HSE trim + NVIC:
+// inside ch32-hal / application after BLE AHB clock + HSE trim (IRQs still off):
 use wchble::hci::SoftController;
+use wchble::rf::family::ch32v208::Ch32v208Radio;
+use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::Radio;
-use wchble::time::InstantUs;
 
-let mut ctl = SoftController::new();
-ctl.radio.init(&hal_clock)?;
+static RX: StaticCell<[u8; RX_DMA_MIN]> = StaticCell::new();
+let radio = Ch32v208Radio::new(RX.init([0; RX_DMA_MIN]))?;
+radio.init(&hal_clock)?; // LLE → RFEND → BB → cal; HAL enables NVIC after
+let mut ctl = SoftController::with_radio(radio);
 // later: impl bt_hci::controller::Controller for SoftController
 // let stack = trouble_host::new(ctl, &mut resources);
 ```
 
 ## Status
 
-**Scaffold complete** (2026-11-07): open Path B crate, family stubs with DevInit
-markers for `ch32v208` / `ch572` / `ch583` / `ch585` / `ch595`, research +
-bring-up debug docs. RF MMIO apply, TX/RX, and `bt-hci` Controller impl are next.
+**V208 RF init/cal MMIO landed** (2026-11-07): open Path B crate; `ch32v208`
+applies LLE/BB/RFEND DevInit + TXCtune/TXFtune/RXFilter/RXAdc. Other families
+still table-only. Next: V208 TX/RX/ISR, then soft HCI Phase A.
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

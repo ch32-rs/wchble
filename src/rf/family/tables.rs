@@ -34,6 +34,18 @@ impl RegInit {
     }
 }
 
+/// Apply absolute `*(base + off) = val` stores from a DevInit table.
+///
+/// # Safety
+/// `base` must be the correct block base for this chip; callers are responsible
+/// for the HAL having already enabled the BLE AHB clock.
+#[inline]
+pub unsafe fn apply_stores(base: usize, stores: &[RegInit]) {
+    for s in stores {
+        crate::rf::regs::write(base, s.offset as usize, s.value);
+    }
+}
+
 /// LLE timeout / mask block written by `LLE_DevInit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LleDevInit {

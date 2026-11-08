@@ -4,6 +4,34 @@
 //! the CH32V208 open driver / CH5xx relative map (BB +0x100 LLE, +0x200 AES,
 //! +0xF00 RFEND).
 
+/// Read a 32-bit MMIO register at `base + off`.
+///
+/// # Safety
+/// `base + off` must be a valid, aligned peripheral address for this chip.
+#[inline(always)]
+pub unsafe fn read(base: usize, off: usize) -> u32 {
+    core::ptr::read_volatile((base + off) as *const u32)
+}
+
+/// Write a 32-bit MMIO register at `base + off`.
+///
+/// # Safety
+/// `base + off` must be a valid, aligned peripheral address for this chip.
+#[inline(always)]
+pub unsafe fn write(base: usize, off: usize, val: u32) {
+    core::ptr::write_volatile((base + off) as *mut u32, val);
+}
+
+/// Read-modify-write: `reg = (reg & !clear) | set`.
+///
+/// # Safety
+/// Same as [`read`] / [`write`].
+#[inline(always)]
+pub unsafe fn rmw(base: usize, off: usize, clear: u32, set: u32) {
+    let v = read(base, off);
+    write(base, off, (v & !clear) | set);
+}
+
 /// Byte offsets from BB base.
 pub mod bb {
     pub const RFCTRL: usize = 0x00;
@@ -19,6 +47,27 @@ pub mod bb {
     pub const RSSICFO: usize = 0x30;
     pub const CFG34: usize = 0x34;
     pub const IRQSTAT: usize = 0x38;
+}
+
+/// BB AUTOCFG (`BB+0x2C`) fields.
+pub mod autocfg {
+    pub const ARM_MASK: u32 = 0x0000_0003;
+    pub const ARM_RX: u32 = 0x0000_0001;
+    /// Mask applied after packing power into bits[30:25] (open `bb_dev_init`).
+    pub const CFG_MASK: u32 = 0x81ff_ffff;
+    pub const CFG_SHIFT: u32 = 25;
+    /// Vendor TX power enum for 0 dBm.
+    pub const TX_POWER_0DBM: u32 = 9;
+    /// Low bits OR'd into AUTOCFG before power pack (`0x80010EC8`).
+    pub const INIT_LO: u32 = 0x8001_0ec8;
+}
+
+/// BB IRQSTAT bits / clear values.
+pub mod bb_irq {
+    pub const CLKCAP: u32 = 0x40;
+    pub const CLKCAP_CLR: u32 = 0x60;
+    /// Post-init clear written by open `wch_rf_init`.
+    pub const POST_INIT_CLR: u32 = 0xf0;
 }
 
 /// Byte offsets from LLE base.
@@ -37,8 +86,18 @@ pub mod lle {
     pub const INIT4C: usize = 0x4c;
     pub const MODE: usize = 0x50;
     pub const WINDOW: usize = 0x64;
+    pub const TICK: usize = 0x68;
+    pub const CALLOAD: usize = 0x6c;
     pub const TXBUFPTR: usize = 0x70;
     pub const RXBUFPTR: usize = 0x74;
+}
+
+/// LLE IRQSTAT bits.
+pub mod lle_irq {
+    pub const RX_DONE: u32 = 0x0000_0001;
+    pub const TX_DONE: u32 = 0x0000_0002;
+    pub const CLEAR_ARM: u32 = 0x0000_2000;
+    pub const TICK_CLR: u32 = 0x0000_4000;
 }
 
 /// Common RFCTRL bits (BB+0).
@@ -58,6 +117,8 @@ pub mod rfctrl {
     /// bits[15:14] — clear before programming a new PHY (matches wch_rf).
     pub const CODING_MASK: u32 = 0xc000;
     pub const TX_TRIG: u32 = 0x0080_0000;
+    /// BB_DevInit sets bit28.
+    pub const INIT_BIT28: u32 = 0x1000_0000;
 }
 
 /// LLE command bits.
@@ -69,8 +130,87 @@ pub mod lle_cmd {
 }
 
 /// Vendor mode words written to LLE+0x50 on CH32V208-class IP.
+///
+/// Note: open header historically names some of these `TIMEOUT_*`, but the C
+/// runtime writes them to **MODE (+0x50)**, not TIMEOUT (+0x14).
 pub mod lle_mode {
+    pub const BASE: u32 = 0x58;
     pub const TX: u32 = 0x5a;
     pub const RX: u32 = 0x59;
     pub const CAL: u32 = 0x5d;
+    pub const CCM: u32 = 0x20;
+    pub const CCM_ARMED: u32 = 0x80;
+    pub const DIR_MASK: u32 = 0x07;
+}
+
+/// Byte offsets / bits from RFEND base (needed by DevInit + calibration).
+pub mod rfend {
+    pub const TUNE: usize = 0x04;
+    pub const FECTRL: usize = 0x08;
+    pub const CFG0C: usize = 0x0c;
+    pub const CFG28: usize = 0x28;
+    pub const FREQMODE: usize = 0x2c;
+    pub const CFG30: usize = 0x30;
+    pub const CFG38: usize = 0x38;
+    pub const CFG3C: usize = 0x3c;
+    pub const SYNTH: usize = 0x44;
+    pub const CFG48: usize = 0x48;
+    pub const CFG4C: usize = 0x4c;
+    pub const CFG50: usize = 0x50;
+    pub const CFG54: usize = 0x54;
+    pub const CFG58: usize = 0x58;
+    pub const CFG5C: usize = 0x5c;
+    pub const TUNE_CO: usize = 0x90;
+    pub const TUNE_GA: usize = 0x94;
+    pub const FILTMEAS: usize = 0x9c;
+    pub const VCOTAB: usize = 0xa0;
+    pub const VCOTAB_GA: usize = 0xc8;
+
+    pub const TUNE_TRIG: u32 = 0x0000_0001;
+    pub const TUNE_FILT: u32 = 0x0000_0010;
+    pub const TUNE_TXFTUNE: u32 = 0x0000_0100;
+    pub const TUNE_RXADC: u32 = 0x0001_0000;
+
+    pub const FECTRL_RF_ON: u32 = 0x0033_0000;
+    pub const FECTRL_RXFILT: u32 = 0x0020_0000;
+    pub const FECTRL_RXADC: u32 = 0x0001_0000;
+    /// `&=` mask used on shutdown / cal cleanup.
+    pub const FECTRL_SHUT_MASK: u32 = 0xffcd_ffff;
+
+    pub const CFG0C_FILT_TOGGLE: u32 = 0x10;
+    pub const CFG0C_RXADC: u32 = 0x100;
+    pub const CFG0C_RESET: u32 = 0x1101;
+
+    pub const CFG28_INIT: u32 = 0x480;
+
+    pub const FREQMODE_EN: u32 = 0x2;
+
+    pub const BANDCODE_MASK: u32 = 0xfffe_00ff;
+    pub const BANDCODE_SHIFT: u32 = 8;
+
+    pub const TUNE_CO_MASK: u32 = 0x3f;
+    pub const TUNE_GA_SHIFT: u32 = 10;
+    pub const TUNE_GA_MASK: u32 = 0x7f;
+    /// Both ready bits on `TUNE_CO` (bits 25+26).
+    pub const TUNE_READY: u32 = 0x0600_0000;
+
+    pub const FILTMEAS_RDY: u32 = 0x100;
+    pub const FILTMEAS_MASK: u32 = 0x1f;
+    pub const CFG50_FILT_EN: u32 = 0x1_0000;
+}
+
+/// AES block offsets (for a later HCI Encrypt cut).
+pub mod aes {
+    pub const CTRL: usize = 0x00;
+    pub const STATUS: usize = 0x04;
+    pub const CNT_LO: usize = 0x08;
+    pub const CNT_HI: usize = 0x0c;
+    pub const IV_LO: usize = 0x10;
+    pub const IV_HI: usize = 0x14;
+    pub const BLOCK0: usize = 0x18;
+    pub const KEY0: usize = 0x28;
+
+    pub const CTRL_RESET: u32 = 0x100;
+    pub const CTRL_START: u32 = 0x1;
+    pub const STATUS_BUSY: u32 = 0x1;
 }

@@ -17,3 +17,6 @@ pub fn half_to_us(half: HalfUs) -> u32 {
 
 /// Max PDU bytes accepted by basic TX/RX helpers (excluding AA/CRC).
 pub const MAX_PDU: usize = 257;
+
+/// Minimum RX DMA scratch length required by open `wch_rf` (`WCH_RF_RX_BUFFER_SIZE`).
+pub const RX_DMA_MIN: usize = 272;

@@ -97,8 +97,28 @@ features.
 | HSE load trim (`OSC->HSE_CAL_CTRL`) | HAL |
 | `NVIC` BB/LLE enable + priorities | HAL (vectors call into `wchble::rf` ISR hooks) |
 | Embassy time / `InstantUs` impl | HAL |
+| RX DMA scratch (`≥272` B, 4-byte aligned) | HAL / app → `Ch32v208Radio::new` |
 | LLE/BB/RFEND DevInit + calibration | `wchble::rf` |
 | Soft HCI + Trouble Host | `wchble::hci` + app |
+
+### `Radio::init` precondition (V208)
+
+Before `radio.init(&clock)` the HAL must:
+
+1. Enable BLE AHB clock (`RCC_AHBPeriph_BLE_CRC` class).
+2. Apply HSE load trim.
+3. Keep BB/LLE IRQs **disabled** (this crate clears IRQSTAT; HAL enables NVIC after).
+4. Provide a working `InstantUs` (WaitTune / filter polls use it).
+
+Construct the radio with a `'static` RX DMA buffer:
+
+```rust,ignore
+use wchble::rf::txrx::RX_DMA_MIN;
+static RX: StaticCell<[u8; RX_DMA_MIN]> = StaticCell::new();
+let radio = wchble::rf::family::ch32v208::Ch32v208Radio::new(
+    RX.init([0; RX_DMA_MIN]),
+)?;
+```
 
 ## Bring-up phases
 

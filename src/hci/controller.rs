@@ -20,6 +20,10 @@ pub struct SoftController<R: Radio = Backend> {
 
 impl SoftController<Backend> {
     /// Build a controller with the feature-selected radio backend.
+    ///
+    /// Unavailable for `ch32v208` — that backend needs an RX DMA buffer; use
+    /// [`SoftController::with_radio`] with [`crate::rf::family::ch32v208::Ch32v208Radio::new`].
+    #[cfg(not(feature = "ch32v208"))]
     pub fn new() -> Self {
         Self {
             radio: crate::rf::new_radio(),
@@ -29,6 +33,7 @@ impl SoftController<Backend> {
     }
 }
 
+#[cfg(not(feature = "ch32v208"))]
 impl Default for SoftController<Backend> {
     fn default() -> Self {
         Self::new()
