@@ -99,8 +99,49 @@ Basic-mode TX completion only means the LLE engine finished its programmed
 window. It says nothing about CRC, whitening, channel, PA enable, or antenna.
 Validate on air (second receiver / macOS scan) before declaring PF/LL work done.
 
+**Signature seen on CH592 (2026-11-08):** `TX_DONE` arrived *exactly* at the
+programmed window expiry (254/254 µs, 302/302, 366/366, 406/406) and the
+calibration readback was identical for every band. That means the radio never
+keyed — the analog front end was off. Compare TX duration against the window
+formula: a real 1M packet finishes a few µs before the window, and TXCtune
+CO/GA must differ per band. See `research/ch592-baseline.md`.
+
 ## 8. CH5xx tables are not transferable
 
 Bases, IRQ numbers, DevInit, WaitTune, VCO and RFEND offsets are per chip.
 Never paste V208 immediates into CH583/CH585/CH572, and never enable two chip
 features at once.
+
+## 9. CH592 W1C is gated by `LLE+0x0C` bit 17
+
+`BLE_SetPHYTxMode` clears bit 17 of the guard register `LLE+0x0C` around every
+`IRQSTAT` write. The bit shadows `IRQSTAT`'s `CLEAR_ARM` position; while it is
+set the W1C is **silently dropped**.
+
+**Symptom:** after the first TX, every `tx_basic` sees `LLE+0x00` still holding
+`2` and returns `Busy`; clearing `IRQSTAT` appears to do nothing.
+
+**Rule:** the guard-clear mask is `!CLEAR_ARM` (`0xfffd_ffff`), never V208's
+numeric bits 12..16 (`0xfffe_0fff`). Keep the guard read/restore, with
+`fence.i` between the guard write and the `IRQSTAT` write.
+
+## 10. DevInit values recovered from `lui`/`addi` pairs are field shifts
+
+Disassembly like `lui a3, 5` is not the value `5`; it is `0x5000` (bits
+12..15), and `lui a3, 0xffff1; addi -1` is a **mask**, not a value. Two CH592
+RFEND analog fields were lost this way and silently disabled the radio:
+
+- `RFEND+0x3C`: RMW set `0x0000_5000` (bits 12..15), not `0x0005_0000`.
+- `RFEND+0x30`: RMW OR `0x0000_7000` (bits 12..14), not `0x7`.
+
+**Rule:** when recovering a store, decode the full `lui`+`addi`/`ori` immediate
+and log the resulting 32-bit word (and its bit positions) next to the register;
+then verify the effect with the calibration readback on silicon.
+
+## 11. macOS reports a sparse advertiser sporadically
+
+CoreBluetooth's scan window vs. an advertiser's interval can produce zero
+reports from a device that is provably on air. Absence in one short scan is not
+evidence — confirm with a second receiver's `crc` bit, or re-scan at a dense
+test interval. Conversely, a single `seen name=…` does not prove the production
+interval works.

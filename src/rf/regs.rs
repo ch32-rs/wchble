@@ -22,6 +22,27 @@ pub unsafe fn write(base: usize, off: usize, val: u32) {
     core::ptr::write_volatile((base + off) as *mut u32, val);
 }
 
+/// Write a 16-bit MMIO register at `base + off`.
+///
+/// Used by CH5xx LLE (`LLE+0x06` command halfword is narrower than the word
+/// registers around it).
+///
+/// # Safety
+/// `base + off` must be a valid, 2-byte-aligned peripheral address for this chip.
+#[inline(always)]
+pub unsafe fn write_u16(base: usize, off: usize, val: u16) {
+    core::ptr::write_volatile((base + off) as *mut u16, val);
+}
+
+/// Write an 8-bit MMIO register at `base + off`.
+///
+/// # Safety
+/// `base + off` must be a valid peripheral byte address for this chip.
+#[inline(always)]
+pub unsafe fn write_u8(base: usize, off: usize, val: u8) {
+    core::ptr::write_volatile((base + off) as *mut u8, val);
+}
+
 /// Read-modify-write: `reg = (reg & !clear) | set`.
 ///
 /// # Safety

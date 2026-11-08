@@ -94,6 +94,20 @@ Think in three buckets when porting an open controller:
 “CH57/59 same as CH585?” → **same address window, not the same init tables.**  
 “Anyone same as V208?” → **CH583 tables ≈ V208; map still CH5xx.**
 
+## Bring-up status
+
+| Chip | Status in `wchble` |
+| --- | --- |
+| CH32V208 | Full backend (init, cal, TX/RX, ISR) — regression gate `examples/ch32v208-rf-smoke` |
+| CH592 | Full RF backend (init, cal, TX/RX) verified on air — gate `examples/ch592-rf-smoke` |
+| CH572 / CH583 / CH585 / CH595 | Tables recorded; MMIO apply pending |
+
+CH592 is the first CH5xx part whose BLE-stack runtime is fully recovered and
+proven on air. It is **not** a CH585/CH595 alias: the runtime uses
+`LLE+0x78/+0x7C` DMA pointers, `0x20000` arm-clear, a guard bit at `LLE+0x0C`
+bit17, and `0x30258/0x30158` mode words. See `ch592-baseline.md` and
+`init-diff-table.md`.
+
 ## Artifacts
 
 - Extracted libs: `wchble/_evt_probe/{CH572,CH583,CH595}/`

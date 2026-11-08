@@ -1,0 +1,9 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+# CH592 reports `misa = 0x40901105` (A, no B); do not build `+b`.
+rustflags = []
+
+[unstable]
+build-std = ["core"]
