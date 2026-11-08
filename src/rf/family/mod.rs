@@ -158,5 +158,8 @@ pub mod ch583;
 #[cfg(feature = "ch585")]
 pub mod ch585;
 
+#[cfg(feature = "ch592")]
+pub mod ch592;
+
 #[cfg(feature = "ch595")]
 pub mod ch595;

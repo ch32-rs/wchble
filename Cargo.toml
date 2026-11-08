@@ -52,6 +52,7 @@ ch32v208 = []
 ch572 = []
 ch583 = []
 ch585 = []
+ch592 = []
 ch595 = []
 # Soft HCI + LL surface for Trouble Host (`ExternalController` + runner).
 controller = ["dep:bt-hci", "dep:embassy-sync", "dep:embedded-io"]

@@ -14,6 +14,8 @@ Last updated: 2026-11-08
   - `ch572` — CH5xx map + unique new-table set (`0x64` / `0x16000F` / BB `0x14`)
   - `ch583` — CH5xx map + closed-disasm “old tables” (≈V208)
   - `ch585` — CH5xx map + “new tables” / `nCO2522` / WaitTune 8000
+  - `ch592` — CH59x EVT v1.7 disasm: `0x6E` LLE pair / `BB+0x38=0xFF` /
+    TX DMA `+0x78` / clear-arm `0x20000` (reserved, no MMIO apply yet)
   - `ch595` — CH5xx map + near-CH585 tables without `nCO2522` (`0x84` highs)
 - Shared table shapes + `Certainty` tags in `src/rf/family/tables.rs`.
 - Soft HCI Phase A: `bt-hci` 0.11 `ExternalController` + bounded embassy
@@ -72,6 +74,12 @@ Last updated: 2026-11-08
   `MYNEWT_VAL_BLE_SM_MIN_KEY_SIZE (7)` in its `syscfg_overrides.h` for current
   upstream NimBLE. This is the known-good on-air reference for macOS
   `tools/macos-ble` scans, not our firmware.
+- **CH592 feasibility (2026-11-08)** — `openwch/ch592` EVT v1.7 (`a46e008`)
+  and `LIBCH59xBLE.a` carved; bases/IRQs confirmed; LLE `0x6E` pair,
+  `BB+0x38=0xFF`, TX DMA `+0x78`, clear-arm `0x20000` recorded. `ch592`
+  feature + stub backend compile; details in
+  `docs/research/ch592-baseline.md`. On-air bring-up pending a free CH59x
+  probe (a `probe-rs ... pwm_diag` session currently holds the board).
 - **TX DMA alignment (V208)** — the LLE reads `TXBUFPTR` as a DMA word
   address. The open driver in `ch32v208-nimble` always passes a
   `__attribute__((aligned(4)))` TX buffer (`g_ble_phy_tx_buf`), while our
@@ -113,7 +121,9 @@ after ~7 events in this RF environment; that observation is kept in
 1. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
 2. Soft HCI + Trouble BAS peripheral (Phase C) — accept connection + GATT.
 3. Apply DevInit/cal + runtime on CH5xx (tables recorded; CH585 use rusted-ch5
-   as RF reference, not V208 open).
+   as RF reference, not V208 open). CH592 is next: EVT v1.7 disassembly is in
+   `docs/research/ch592-baseline.md`; then port `init` → cal → `RFIP_SetTx/Rx`
+   and validate with a dedicated RF smoke before touching SoftRunner.
 4. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
    here yet (may still be unpublished by WCH). Do **not** alias to CH583/CH585.
    Other CH57/58 without carved libs stay out of tree.

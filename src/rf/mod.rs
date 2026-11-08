@@ -161,6 +161,9 @@ pub type Backend = family::ch583::Ch583Radio;
 #[cfg(feature = "ch585")]
 pub type Backend = family::ch585::Ch585Radio;
 
+#[cfg(feature = "ch592")]
+pub type Backend = family::ch592::Ch592Radio;
+
 #[cfg(feature = "ch595")]
 pub type Backend = family::ch595::Ch595Radio;
 
@@ -169,6 +172,7 @@ pub type Backend = family::ch595::Ch595Radio;
     feature = "ch572",
     feature = "ch583",
     feature = "ch585",
+    feature = "ch592",
     feature = "ch595",
 )))]
 pub type Backend = UnselectedRadio;
