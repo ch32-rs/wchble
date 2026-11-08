@@ -1,6 +1,6 @@
 # Progress
 
-Last updated: 2026-11-08
+Last updated: 2026-11-09
 
 ## Done
 
@@ -96,6 +96,7 @@ Last updated: 2026-11-08
     (`0x5000`) and `RFEND+0x30 |= 0x7000`; the earlier recovery (`0x0005_0000`)
     left the analog front end off (TX "completed" at window expiry, TXCtune
     constant per band). Details in `docs/research/ch592-baseline.md`.
+    Committed 2026-11-09 on branch `ch592-rf-bringup`.
 
 - **TX DMA alignment (V208)** — the LLE reads `TXBUFPTR` as a DMA word
   address. The open driver in `ch32v208-nimble` always passes a

@@ -121,7 +121,7 @@ features.
 | HSE load trim (`OSC->HSE_CAL_CTRL`) | HAL |
 | `NVIC` BB/LLE enable + priorities | HAL (vectors call into `wchble::rf` ISR hooks) |
 | Embassy time / `InstantUs` impl | HAL |
-| RX DMA scratch (`≥272` B, 4-byte aligned) | HAL / app → `Ch32v208Radio::new` |
+| RX DMA scratch (`≥272` B, 4-byte aligned) | HAL / app → `Ch32v208Radio::new` / `Ch592Radio::new` |
 | LLE/BB/RFEND DevInit + calibration | `wchble::rf` |
 | Soft HCI + Trouble Host | `wchble::hci` + app |
 

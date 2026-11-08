@@ -10,6 +10,7 @@ Compare the open CH32V208 NimBLE radio driver (`~/Repos/ch32v208-nimble`) with t
 | [conclusions.md](conclusions.md) | V208 vs CH585 same-vs-different + porting implications |
 | [init-diff-table.md](init-diff-table.md) | Register-level init table (V208 open vs CH585) |
 | [family-comparison.md](family-comparison.md) | CH572 / CH583 / CH585 / CH595 cross-family matrix |
+| [ch592-baseline.md](ch592-baseline.md) | CH592 (CH59x EVT v1.7): runtime recovery + on-air status |
 | [ch58x-reuse.md](ch58x-reuse.md) | CH583 vs CH585: shared map, **not** shared DevInit tables |
 | [bringup-debug.md](bringup-debug.md) | On-silicon dump checklist; marks UNCERTAIN fields |
 | [path-b-soft-hci-trouble.md](path-b-soft-hci-trouble.md) | Path B: Rust LL + soft HCI → Trouble (refined plan) |
@@ -28,3 +29,8 @@ The **core init is not copy-paste portable**.
 - Within CH57/58/59, **DevInit tables still differ per SoC**. CH583 is closest to the V208 open-driver literals; CH585 adds a 4th VCO band (`nCO2522`) and diverges further.
 
 Do **not** reuse `ch32v208-nimble/drivers/wch_ble/` on any CH5xx part without re-basing MMIO and re-auditing that chip’s `*_DevInit` / `RFEND_*` objects.
+
+**Status (2026-11-09):** CH592 is the first CH5xx part fully brought up on air
+from this evidence — DevInit, calibration, TX and RX in
+`src/rf/family/ch592.rs`, gate `examples/ch592-rf-smoke`; see
+[ch592-baseline.md](ch592-baseline.md).

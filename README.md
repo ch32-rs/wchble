@@ -32,7 +32,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | Bases + closed-disasm “new tables” / `nCO2522`; MMIO apply TBD |
-| `ch592` | CH59x EVT v1.7 disasm: `0x6E` LLE pair, `BB+0x38=0xFF`, TX DMA `+0x78`; MMIO apply TBD |
+| `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
 | `ch595` | Near-CH585 tables without `nCO2522` (`0x84` highs); MMIO TBD |
 
 Uncertain fields are tagged `UNCERTAIN` / `Certainty::*` for silicon debug — see
