@@ -41,16 +41,22 @@ Last updated: 2026-11-08
 - `cargo check` clean for each single chip feature (+ `controller,phy`),
   including `riscv32imac-unknown-none-elf` for `ch32v208`.
 
+- **Trouble join (V208)** — `examples/ch32v208-trouble-adv` Embassy app joins
+  SoftRunner HCI pump + Trouble Host runner + AdvRadio TX; SDI confirmed
+  `rf init ok` / `hci host up` / `adv enable` / `tx ch{37,38,39}` /
+  `trouble adv running` on the same probe. Uses a local `embassy-rs/trouble`
+  checkout (crates.io 0.8.0 still pins bt-hci 0.10; main is 0.11).
+
 ## Not done (next)
 
-1. Soft HCI + Trouble on-device host init joined to SoftRunner (embassy task
-   that schedules `tx_basic` from `build_adv_pdu` while adv enabled).
-2. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
+1. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
+2. Soft HCI + Trouble BAS peripheral (Phase C) — accept connection + GATT.
 3. Apply DevInit/cal + runtime on CH5xx (tables recorded; CH585 use rusted-ch5
    as RF reference, not V208 open).
 4. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
    here yet (may still be unpublished by WCH). Do **not** alias to CH583/CH585.
    Other CH57/58 without carved libs stay out of tree.
+5. Pin `trouble-host` to a published bt-hci 0.11 release once crates.io catches up.
 
 ## Path B phases (from research)
 
@@ -59,7 +65,7 @@ Last updated: 2026-11-08
 | scaffold | crate + docs + family stubs | **done** |
 | rf-init | V208 DevInit + cal MMIO | **done** |
 | rf-runtime | V208 channel/shut/tx/rx/ISR | **done** |
-| A | soft HCI typechecks with Trouble | **done** (`ExternalController` + SoftRunner) |
-| B | legacy adv on air | **verified** multi-ch TX + SoftRunner PDU→`tx_basic` |
+| A | soft HCI typechecks with Trouble | **done** + on-device Host init verified |
+| B | legacy adv on air | **verified** Host-driven ADV via Trouble + SoftRunner |
 | C | BAS via Trouble in a HAL example | not started |
 | D | more chip packs | CH572/583/585/595 tables recorded; apply TBD |

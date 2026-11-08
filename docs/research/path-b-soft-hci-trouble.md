@@ -178,7 +178,8 @@ CH32V208 first; CH583/CH585 = swap `wch-rf` tables only if LL/HCI stay stable.
 - [x] `bt-hci` 0.11 dependency (Trouble 0.8-compatible)
 - [x] `SoftController` = `ExternalController<HciTransport, 4>` (all `ControllerCmd*` bounds via ExternalController)
 - [x] Real/stub cmd set in `SoftRunner`: `Reset`, `ReadBdAddr`, `SetEventMask*`, `LeSetEventMask`, `LeSetRandomAddr`, `LeReadBufferSize`, `HostBufferSize`, `SetControllerToHostFlowControl`, legacy adv params/data/enable (stored; no air yet)
-- [ ] HAL Embassy app links `trouble-host` and `join`s `SoftRunner::run` (kept out of this tree; sketch in README)
+- [x] HAL Embassy app links `trouble-host` and joins SoftRunner HCI pump
+  (`examples/ch32v208-trouble-adv`; interleaved `poll_once` + `tx_basic`)
 
 **Gate (crate):** Host unit tests for Command Complete path; `SoftController: Controller` bound test.
 **Gate (board):** device powers up, Trouble completes host init against soft HCI — HAL example TBD.
