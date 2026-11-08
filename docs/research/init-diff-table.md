@@ -74,6 +74,28 @@ Legend: **same** = treat as family-shared; **diff** = must change for a CH585 po
 | Cal envelope `RF+8` on/off | `0x330000` / `0xffcdffff` | same class (`0xffceffff` seen) | **same**/minor |
 | `LLE+0x50` cal mode | `0x5D` | used in cal envelope | **same** class |
 
+## CH592 deviations (verified on silicon 2026-11-08)
+
+CH592 uses the CH5xx window but its BLE-stack runtime is **not** the V208 one
+(see `ch592-baseline.md`):
+
+| Item | V208 | CH592 | Verdict |
+| --- | --- | --- | --- |
+| TX / RX DMA pointer | `LLE+0x70` / `LLE+0x74` | `LLE+0x78` / `LLE+0x7C` | **diff** |
+| TX / RX mode word `LLE+0x50` | `0x5A` / `0x59` | `0x30258` / `0x30158` | **diff** |
+| Idle / post-init `LLE+0x50` | — | `0x30` / `0x30000` | **diff** |
+| CRC enable `LLE+0x04` bit0 | clear | set | **diff polarity** |
+| Arm-clear bit in `IRQSTAT` | `0x2000` | `0x20000` | **diff** |
+| W1C guard `LLE+0x0C` | bits 12..16 | **bit 17** (`!CLEAR_ARM`) | **diff** |
+| Channel select | BB channel table | `BB+0[6:0]` + `BB+0x5C[8:0]`, no `RFEND+0x44` | **diff** |
+| RFEND analog `+0x3C` | table | RMW `0x5000` into bits 12..15 | **diff** |
+| RFEND analog `+0x30` | table | `\|= 0x7000` | **diff** |
+| TX window | open table | 1M `16*(len+10)+316` half-µs | **diff** |
+
+Lesson: an `OK` TX completion is not proof of radiation — CH592 reported
+`TX_DONE` exactly at window expiry while the analog front end was misconfigured.
+Always verify with a second receiver.
+
 ## TX/RX runtime (for later; not fully re-proven on CH585 this pass)
 
 | Item | V208 open (proven) | CH585 public API | Verdict |
