@@ -100,13 +100,23 @@ Think in three buckets when porting an open controller:
 | --- | --- |
 | CH32V208 | Full backend (init, cal, TX/RX, ISR) — regression gate `examples/ch32v208-rf-smoke` |
 | CH592 | Full RF backend (init, cal, TX/RX) verified on air — gate `examples/ch592-rf-smoke` |
-| CH572 / CH583 / CH585 / CH595 | Tables recorded; MMIO apply pending |
+| CH585 | Full RF backend (init, cal, TX/RX) built from the carved CH585EVT lib, verified on air — gate `examples/ch585-rf-smoke` |
+| CH572 / CH583 / CH595 | Tables recorded; MMIO apply pending |
 
 CH592 is the first CH5xx part whose BLE-stack runtime is fully recovered and
 proven on air. It is **not** a CH585/CH595 alias: the runtime uses
 `LLE+0x78/+0x7C` DMA pointers, `0x20000` arm-clear, a guard bit at `LLE+0x0C`
 bit17, and `0x30258/0x30158` mode words. See `ch592-baseline.md` and
 `init-diff-table.md`.
+
+CH585 reuses that runtime shape (same DMA pointers / arm-clear / mode words)
+but keeps its own DevInit and calibration: `0x6C` LLE pair, `BB+0x38 = 0x3FF`,
+a different `RFEND_DevInit` RMW block, a 4-band TXCtune (2522 MHz measured and
+discarded), and `RFEND_RXFilter` arming `TUNE` bit 12. `src/rf/family/ch585.rs`
+carries the register-by-register evidence in its module docs. Bring-up proof
+(2026-11-09): the DevInit dump matches the vendor `Peripheral.hex` golden
+registers, TX completes with ~305 µs of airtime, RX decodes advertisers with
+`crc=true`, and macOS sees the `wch585` ADV_IND.
 
 ## Artifacts
 

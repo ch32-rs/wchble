@@ -13,7 +13,10 @@ Last updated: 2026-11-09
     (open `wch_rf`)
   - `ch572` — CH5xx map + unique new-table set (`0x64` / `0x16000F` / BB `0x14`)
   - `ch583` — CH5xx map + closed-disasm “old tables” (≈V208)
-  - `ch585` — CH5xx map + “new tables” / `nCO2522` / WaitTune 8000
+  - `ch585` — CH58x EVT disasm: `0x6C` LLE pair / `BB+0x38=0x3FF` /
+    3-band interpolation + measured 2522 band; **DevInit + cal + channel /
+    shut / tx_basic / rx_basic on air**, gate `examples/ch585-rf-smoke`
+    (see the CH585 entry below)
   - `ch592` — CH59x EVT v1.7 disasm: `0x6E` LLE pair / `BB+0x38=0xFF` /
     TX DMA `+0x78` / clear-arm `0x20000`; **DevInit + cal + channel / shut /
     tx_basic / rx_basic on air** (see the CH592 entry below)
@@ -98,6 +101,35 @@ Last updated: 2026-11-09
     constant per band). Details in `docs/research/ch592-baseline.md`.
     Committed 2026-11-09 on branch `ch592-rf-bringup`.
 
+- **CH585 backend landed (2026-11-09)** — `src/rf/family/ch585.rs` is no longer
+  a stub: `LLE_DevInit` (`0x6C` pair, `+0x04 &= 0xFFFF_FFE1`, halfword `+0x06 =
+  2`, `+0x54 = 0`), the CH585 `RFEND_DevInit` RMW block, `BB_DevInit`
+  (`BB+0x38 = 0x3FF`, `BB+0x3C = 0x0002_020C`), 4-band `TXCtune`
+  (`bf/e8/d4/fc`, the 2522 sample measured but unused for interpolation),
+  `RXFilter` arming `TUNE` bit 12, and the `channel / shut / tx_basic /
+  rx_basic` runtime recovered from `RFIP_SetTx/SetRx`, `ll_advertise_tx`,
+  `LL_ScanSetRF` and `ll_tx/rx_wait_finish`. Board gate
+  `examples/ch585-rf-smoke` carries its own RAM console because `ch5xx-hal`'s
+  `SDIPrint` is still CH592-only and the LinkE does not drain the CH585 debug
+  window.
+  **Verified on air 2026-11-09**: `LLE 06=2 / 2c=6c / 3c=6c / 54=0`,
+  `BB 38=3ff / 3c=2020c`, VCO/GA tables bit-identical to the vendor
+  `Peripheral.hex` golden capture, `tx ch37/38/39` complete at ~305 µs of
+  airtime, RX decodes real advertisers with `crc=true`, and macOS
+  CoreBluetooth sees the local name `wch585` at −44 dBm.
+  The chip must be **power-cycled after flashing** (`wlink set-power
+  disable3v3/enable3v3`) — the LinkE's post-flash reset leaves the BLE block
+  idle. `rf::new_radio_with_dma` now treats `ch585` like
+  `ch32v208`/`ch592` (RX DMA scratch required). V208 + CH592 builds and host
+  tests unchanged.
+- **CH585 DevInit mask semantics** — the last blocker before on-air was three
+  `rmw` calls that passed the vendor's AND masks (`0xF8FFFFFF`, `0x81FFFFFF`)
+  where `regs::rmw(base, off, clear, set)` expects a *clear* mask, inverting
+  the intended field update on `RFEND+0x3C`, `RFEND+0x5C` and `BB+0x2C`. VCO
+  tuning then produced identical per-band codes and a zero VCOTAB. Corrected
+  to clear masks (`0x0700_0000`, `0x7e00_0000`) and documented in
+  `docs/research/init-diff-table.md`.
+
 - **TX DMA alignment (V208)** — the LLE reads `TXBUFPTR` as a DMA word
   address. The open driver in `ch32v208-nimble` always passes a
   `__attribute__((aligned(4)))` TX buffer (`g_ble_phy_tx_buf`), while our
@@ -138,15 +170,15 @@ after ~7 events in this RF environment; that observation is kept in
 
 1. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
 2. Soft HCI + Trouble BAS peripheral (Phase C) — accept connection + GATT.
-3. Apply DevInit/cal + runtime on the remaining CH5xx (tables recorded; CH585
-   use rusted-ch5 as RF reference, not V208 open). **CH592 is done at the RF
-   layer** (`docs/research/ch592-baseline.md`, `examples/ch592-rf-smoke`);
-   next is SoftRunner → `tx_basic` on CH592, then auto-ack/IFS for the other
-   CH5xx parts.
-4. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
+3. SoftRunner → `tx_basic` on CH585/CH592, then auto-ack/IFS for the other
+   CH5xx parts. (The CH585 silicon gate is **done**: init, DevInit markers,
+   `tx ch37/38/39`, RX `crc=true`, and `wch585` seen by macOS.)
+4. Remaining CH5xx (CH572/CH583/CH595) still have tables only; apply
+   DevInit/cal + runtime per chip (do not share the CH585 table).
+5. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
    here yet (may still be unpublished by WCH). Do **not** alias to CH583/CH585.
    Other CH57/58 without carved libs stay out of tree.
-5. Pin `trouble-host` to a published bt-hci 0.11 release once crates.io catches up.
+6. Pin `trouble-host` to a published bt-hci 0.11 release once crates.io catches up.
 
 ## Path B phases (from research)
 
@@ -158,4 +190,4 @@ after ~7 events in this RF environment; that observation is kept in
 | A | soft HCI typechecks with Trouble | **done** + on-device Host init verified |
 | B | legacy adv on air | **verified** — `wchble` ADV_IND seen by macOS CoreBluetooth (after the W1C `TX_DONE` fix) |
 | C | BAS via Trouble in a HAL example | not started |
-| D | more chip packs | CH592 RF layer **done + on air**; CH572/583/585/595 tables recorded, apply TBD |
+| D | more chip packs | CH592 + CH585 RF layers **done + on air**; CH572/583/595 tables recorded, apply TBD |

@@ -6,6 +6,7 @@ exclude = [
     "examples/ch32v208-rf-smoke",
     "examples/ch32v208-trouble-adv",
     "examples/ch592-rf-smoke",
+    "examples/ch585-rf-smoke",
 ]
 
 [workspace.package]

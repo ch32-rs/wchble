@@ -9,8 +9,8 @@ pub mod regs;
 pub mod timing;
 pub mod txrx;
 
-use crate::{Error, Result};
 use crate::time::InstantUs;
+use crate::{Error, Result};
 
 /// BLE channel index 0..=39.
 pub type Channel = u8;
@@ -179,8 +179,8 @@ pub type Backend = UnselectedRadio;
 
 /// Construct the feature-selected radio backend when it implements [`Default`].
 ///
-/// CH32V208 and CH592 need a DMA RX scratch — use [`new_radio_with_dma`].
-#[cfg(not(any(feature = "ch32v208", feature = "ch592")))]
+/// CH32V208 / CH585 / CH592 need a DMA RX scratch — use [`new_radio_with_dma`].
+#[cfg(not(any(feature = "ch32v208", feature = "ch585", feature = "ch592")))]
 pub fn new_radio() -> Backend {
     Backend::default()
 }
@@ -193,12 +193,12 @@ pub fn new_radio_with_dma(rx_dma: &'static mut [u8]) -> Result<Backend> {
     backend_new(rx_dma)
 }
 
-#[cfg(any(feature = "ch32v208", feature = "ch592"))]
+#[cfg(any(feature = "ch32v208", feature = "ch585", feature = "ch592"))]
 fn backend_new(rx_dma: &'static mut [u8]) -> Result<Backend> {
     Backend::new(rx_dma)
 }
 
-#[cfg(not(any(feature = "ch32v208", feature = "ch592")))]
+#[cfg(not(any(feature = "ch32v208", feature = "ch585", feature = "ch592")))]
 fn backend_new(_rx_dma: &'static mut [u8]) -> Result<Backend> {
     Ok(Backend::default())
 }
