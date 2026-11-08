@@ -4,6 +4,10 @@
 standalone firmware package: `ch32-hal` / `ch5xx-hal` apps own clocks, NVIC,
 linker scripts, and the Embassy executor; this crate supplies RF → soft HCI.
 
+> **Before changing RF/LL/HCI code, read [`docs/pitfalls.md`](pitfalls.md).**
+> It lists the invariants that silently produce "TX ok" with nothing on air
+> (sticky W1C `TX_DONE`, DMA alignment, AdvA seeding, quiet TX path).
+
 ```text
 ┌─────────────────────────────────────────┐
 │  Trouble Host (GATT / ATT / L2CAP)      │  HAL examples / apps

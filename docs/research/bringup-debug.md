@@ -110,6 +110,17 @@ let mut soft = wchble::hci::SoftRunner::new();
 
 On TX timeout: dump `LLE+0x08`, `LLE+0x50`, `LLE+0x64`, `BB+0`, `RFEND+0x08/+0x2c`.
 
+### Sticky `TX_DONE` false positives (learned 2026-11-08)
+
+`LLE+0x08` is W1C. `CLEAR_ARM` (0x2000) clears the window state but **not**
+`TX_DONE` (bit1). If the driver polls `TX_DONE` without clearing it first, the
+second and later calls observe the previous packet's completion and return
+success immediately — the radio never transmits, while logs/counters still say
+"TX ok". Detect it by timing `tx_basic`: a real 1M PDU is hundreds of µs
+(19-byte ADV_IND ≈ 262 µs on V208); a stale-bit return is ~10 µs. Clear
+`TX_DONE`/`RX_DONE` explicitly before arming and acknowledge completion after
+consuming it. Full invariant list: [`docs/pitfalls.md`](../pitfalls.md).
+
 ## 6. Feature / module map
 
 | Cargo feature | Module | Tables |

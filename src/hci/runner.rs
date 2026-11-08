@@ -62,6 +62,19 @@ impl SoftRunner {
         }
     }
 
+    /// Seed the LE random address used as AdvA when Host advertises with
+    /// Own_Address_Type = Random.
+    ///
+    /// Trouble's `StackBuilder::set_random_address` only updates Host state and
+    /// does **not** emit HCI `LE Set Random Address`, so HAL apps must call this
+    /// with the same bytes. The value survives HCI Reset (unlike a Host-only
+    /// 0x2005) so SoftRunner still has a valid AdvA after Trouble host init.
+    pub fn set_random_addr(&mut self, addr: [u8; 6]) {
+        self.random_addr = addr;
+        self.ll.adv.own_addr = addr;
+        self.ll.adv.random_addr = true;
+    }
+
     /// True while Host has advertising enabled.
     pub fn adv_enabled(&self) -> bool {
         self.ll.adv.enabled
@@ -141,7 +154,12 @@ impl SoftRunner {
                 self.event_mask = u64::MAX;
                 self.le_event_mask = 0x1f;
                 self.ll = LinkLayer::new();
-                self.random_addr = [0; 6];
+                // Keep `random_addr` — Trouble never re-sends LeSetRandomAddress
+                // after Reset; HAL-seeded AdvA must survive host init.
+                if self.random_addr != [0; 6] {
+                    self.ll.adv.own_addr = self.random_addr;
+                    self.ll.adv.random_addr = true;
+                }
                 Ok(&[][..])
             }
             // Set Event Mask / LE Set Event Mask
@@ -319,6 +337,24 @@ mod tests {
         assert_eq!(u16::from_le_bytes([payload[3], payload[4]]), opcode);
         assert_eq!(payload[5], status);
         assert_eq!(&payload[6..6 + return_data.len()], return_data);
+    }
+
+    #[test]
+    fn set_random_addr_survives_reset() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let addr = [0x42, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
+        runner.set_random_addr(addr);
+
+        pollster::block_on(async {
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+        });
+
+        assert_eq!(runner.ll.adv.own_addr, addr);
+        assert!(runner.ll.adv.random_addr);
     }
 
     #[test]

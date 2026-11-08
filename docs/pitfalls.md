@@ -1,0 +1,102 @@
+# Bring-up pitfalls (read before touching RF/LL/HCI)
+
+These are the traps that have actually cost bring-up time. Each one produces a
+**false green**: counters/logs say "ok" while nothing works on air. Treat them
+as invariants, not suggestions.
+
+## 1. LLE `IRQSTAT` is W1C — clear sticky completion bits explicitly
+
+`LLE+0x08` is write-1-to-clear. `CLEAR_ARM` (0x2000) clears the window/arm
+state but **does not clear `TX_DONE` (bit1) or `RX_DONE` (bit0)**.
+
+**Symptom (2026-11-08, cost: whole session):** macOS never saw the advertiser
+even though `tx_basic` returned `Ok` thousands of times and SDI printed
+`tx ongoing`. Only the first packet ever reached the air.
+
+**Mechanism:** `tx_basic` polled `TX_DONE` after arming. From the second call
+on, the previous packet's sticky bit was still set, so the poll returned
+"complete" almost immediately and no transmission happened.
+
+**Rules:**
+- Before arming TX: `IRQSTAT = TX_DONE` (and `RX_DONE` when arming RX), then
+  `IRQSTAT = CLEAR_ARM`.
+- After consuming a completion: write the same bit again (W1C acknowledge).
+- Never treat `Ok` from a polled-basic TX as proof of airtime. **Time it:** a
+  1M frame is hundreds of µs (19-byte ADV_IND ≈ 262 µs on V208); a stale-bit
+  return is ~10 µs.
+- If the HAL enables the LLE ISR, the ISR and `tx_basic` must agree on who
+  consumes `TX_DONE`; otherwise the poll can race the ISR and time out.
+
+## 2. TX and RX DMA buffers must be 4-byte aligned
+
+The LLE reads `TXBUFPTR` / `RXBUFPTR` as DMA word addresses. The open
+`ch32v208-nimble` driver only ever passes `__attribute__((aligned(4)))` buffers
+(`g_ble_phy_tx_buf`); our RX path already failed when a `StaticCell<[u8; N]>`
+landed at +1.
+
+**Rules:**
+- RX scratch: wrap in `#[repr(align(4))]` (as the examples do), and
+  `Ch32v208Radio::new` rejects misaligned buffers.
+- TX: `tx_basic` bounces unaligned caller frames through an internal aligned
+  buffer. Prefer declaring aligned PDU buffers in apps anyway (avoids the
+  copy), but never rely on stack alignment.
+
+## 3. Trouble does not send `LE Set Random Address`
+
+`StackBuilder::set_random_address` updates **Host state only**; it never emits
+HCI `0x2005`. If the HAL does not seed the controller, AdvA stays zero/public
+and the Host/Controller disagree.
+
+**Rules:**
+- Call `SoftRunner::set_random_addr(bytes)` with the same bytes passed to
+  `Address::random(bytes)`.
+- `SoftRunner` preserves that seed across HCI Reset — do not "fix" reset by
+  clearing it, or host init will wipe the address after you set it.
+- The address must be valid: for a **static random** address the most
+  significant octet's bits 7..6 must be `11` (e.g. `0xC1`). Invalid random
+  addresses are dropped by macOS/iOS scanners.
+- HCI/AdvA is little-endian: `[0x42, 0x00, 0x00, 0xEE, 0xFF, 0xC1]` has MSB
+  `0xC1`.
+
+## 4. Do not print from the TX hot path
+
+SDI / RTT / logging on the advertising path stretches the interval enough that
+scanners miss packets. A single `try_println` per channel or per burst is
+already too much.
+
+**Rules:** print state transitions only (`adv enable`, first burst, one-shot
+PDU dump). Use RAM counters + `probe-rs read` for ongoing telemetry.
+
+## 5. `probe-rs read` halts the core
+
+Any memory read stops the RISC-V core (and therefore BLE deadlines). Two
+consecutive identical counter snapshots mean "halted between reads", **not**
+"firmware stalled".
+
+**Rules:**
+- Take one snapshot after the measurement window, then reset the board.
+- `probe-rs reset` / `probe-rs read` may leave the target halted; use
+  `wlink reset` (or a probe-rs `run`) when the firmware must be executing.
+- Never leave a probe attached while judging on-air behavior; same lesson as
+  the NimBLE project's RTT warning.
+
+## 6. macOS caches names per identity
+
+CoreBluetooth may keep reporting an old `kCBAdvDataLocalName` for the same
+identity address after reflashing.
+
+**Rules:** match a stable secondary signal too (manufacturer bytes, service
+UUID, or the CoreBluetooth `id`). An empty name match is not proof the board is
+absent from an unfiltered scan.
+
+## 7. `Ok` from `tx_basic` is not `tx on air`
+
+Basic-mode TX completion only means the LLE engine finished its programmed
+window. It says nothing about CRC, whitening, channel, PA enable, or antenna.
+Validate on air (second receiver / macOS scan) before declaring PF/LL work done.
+
+## 8. CH5xx tables are not transferable
+
+Bases, IRQ numbers, DevInit, WaitTune, VCO and RFEND offsets are per chip.
+Never paste V208 immediates into CH583/CH585/CH572, and never enable two chip
+features at once.

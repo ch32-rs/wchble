@@ -38,14 +38,67 @@ Last updated: 2026-11-08
 - Research notes under `docs/research/` (incl. `ch58x-reuse.md`,
   `ch58x-hal-ble-reuse.md`, `bringup-debug.md`); architecture + HAL boundary in
   `docs/architecture.md`.
+- **`docs/pitfalls.md`** — consolidated bring-up invariants and false-green
+  traps (W1C completions, DMA alignment, AdvA seeding, quiet TX, probe-rs).
 - `cargo check` clean for each single chip feature (+ `controller,phy`),
   including `riscv32imac-unknown-none-elf` for `ch32v208`.
 
 - **Trouble join (V208)** — `examples/ch32v208-trouble-adv` Embassy app joins
   SoftRunner HCI pump + Trouble Host runner + AdvRadio TX; SDI confirmed
-  `rf init ok` / `hci host up` / `adv enable` / `tx ch{37,38,39}` /
+  `rf init ok` / `hci host up` / `adv enable` / `tx ongoing` /
   `trouble adv running` on the same probe. Uses a local `embassy-rs/trouble`
   checkout (crates.io 0.8.0 still pins bt-hci 0.10; main is 0.11).
+- **AdvA seeding fix** — Trouble's `StackBuilder::set_random_address` only
+  updates Host state; it never emits HCI `LE Set Random Address` (0x2005).
+  `SoftRunner::set_random_addr` now seeds AdvA from the HAL and the value
+  survives HCI Reset; example wires one `RAND_ADDR` into both sides and uses a
+  valid static-random MSB (`0xC1`). Unit test
+  `set_random_addr_survives_reset` covers the Reset path.
+- **Quiet TX path** — `controller_task` prints nothing per channel/per burst
+  (SDI on the TX path stretches the adv interval; `try_println` only on
+  `adv enable` / first burst / one-shot PDU dump).
+- **Nimble reference baseline** — sibling `ch32v208-nimble` built locally with
+  the MounRiver GCC 15 toolchain
+  (`/Applications/MounRiver Studio 2.app/.../RISC-V Embedded GCC15`) and a
+  sibling `apache/mynewt-nimble` checkout; needed
+  `MYNEWT_VAL_BLE_SM_MIN_KEY_SIZE (7)` in its `syscfg_overrides.h` for current
+  upstream NimBLE. This is the known-good on-air reference for macOS
+  `tools/macos-ble` scans, not our firmware.
+- **TX DMA alignment (V208)** — the LLE reads `TXBUFPTR` as a DMA word
+  address. The open driver in `ch32v208-nimble` always passes a
+  `__attribute__((aligned(4)))` TX buffer (`g_ble_phy_tx_buf`), while our
+  examples passed a stack `[u8; 40]` whose alignment is not guaranteed (the RX
+  DMA already needed an aligned wrapper for the same reason).
+  `Ch32v208Radio::tx_basic` now bounces unaligned frames through an internal
+  `#[repr(align(4))]` buffer before programming `TXBUFPTR`. (Hardening; the
+  actual visibility root cause was the sticky `TX_DONE` bit below.)
+
+## Solved: macOS visibility (2026-11-08)
+
+Root cause: LLE `IRQSTAT` (`LLE+0x08`) is W1C and `TX_DONE` (bit1) is sticky.
+`tx_basic` only cleared the window with `CLEAR_ARM` (0x2000) and then polled
+`TX_DONE`, so from the second transmission on it saw the **previous** packet's
+completion and returned `Ok` without transmitting. Only the very first packet
+(real airtime ~262 µs) ever reached the air; all later "TX ok" results were
+false positives. Confirmed by first-burst timing: `ch37 us=262` vs
+`ch38 us=12`.
+
+Fix: clear the sticky bits explicitly (`IRQSTAT = TX_DONE` / `RX_DONE`) before
+arming in `tx_basic` / `rx_basic`, and acknowledge `TX_DONE` after consuming it.
+
+**Read [`docs/pitfalls.md`](pitfalls.md) before touching RF/LL/HCI** — it
+collects this false-green class (sticky W1C bits, DMA alignment, AdvA seeding,
+quiet TX path, probe-rs halting the core) with detection heuristics.
+
+Verified on `1a86:8010:2FC48F06B4A8`:
+- TX counters: 374 bursts / 1122 `tx_basic` successes, all three channels.
+- macOS CoreBluetooth: `seen name=wchble rssi=-54`, `FOUND wchble`
+  (`examples/ch32v208-trouble-adv/tools/scan_wchble.swift`).
+
+The same class of bug cannot affect the NimBLE reference (its LLE ISR clears
+`TX_DONE`), but the freshly built `ch32v208-nimble` still stops advertising
+after ~7 events in this RF environment; that observation is kept in
+`docs/research/nimble-baseline.md` and is no longer blocking.
 
 ## Not done (next)
 
@@ -66,6 +119,6 @@ Last updated: 2026-11-08
 | rf-init | V208 DevInit + cal MMIO | **done** |
 | rf-runtime | V208 channel/shut/tx/rx/ISR | **done** |
 | A | soft HCI typechecks with Trouble | **done** + on-device Host init verified |
-| B | legacy adv on air | **verified** Host-driven ADV via Trouble + SoftRunner |
+| B | legacy adv on air | **verified** — `wchble` ADV_IND seen by macOS CoreBluetooth (after the W1C `TX_DONE` fix) |
 | C | BAS via Trouble in a HAL example | not started |
 | D | more chip packs | CH572/583/585/595 tables recorded; apply TBD |

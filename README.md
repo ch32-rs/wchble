@@ -37,6 +37,10 @@ RF backends (cfg-per-family under `src/rf/family/`):
 Uncertain fields are tagged `UNCERTAIN` / `Certainty::*` for silicon debug — see
 [`docs/research/bringup-debug.md`](docs/research/bringup-debug.md).
 
+> **Read [`docs/pitfalls.md`](docs/pitfalls.md) before touching RF/LL/HCI.**
+> The sticky W1C `TX_DONE` bug, DMA alignment, and AdvA seeding all fail as
+> "success with nothing on air".
+
 This repository used to wrap closed WCH `.a` BLE libraries via bindgen. That
 path is gone; the open register-level work continues from the CH32V208 NimBLE
 RF bring-up (`wch_rf`).
@@ -50,7 +54,9 @@ RF bring-up (`wch_rf`).
 | `src/ll` | L2 link layer |
 | `src/hci` | L3 soft HCI (`bt-hci` Controller) |
 | `docs/architecture.md` | Layer diagram + HAL boundary |
+| `docs/pitfalls.md` | Bring-up invariants / false-green traps |
 | `docs/research` | Family init research notes |
+| `examples/` | Flashable V208 RF smoke + Trouble ADV examples |
 
 Firmware examples live in the HAL repos once integration lands — not here.
 
@@ -94,12 +100,14 @@ On-target smoke (RF only, before Trouble) remains a HAL-side example:
 
 ## Status
 
-**Soft HCI Phase A + RF smoke firmware** (2026-11-08): `hci::new()` is
+**Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
-answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds
-(stubs for unsupported). Flashable V208 smoke lives in
-[`examples/ch32v208-rf-smoke`](examples/ch32v208-rf-smoke) (`cargo run --release`
-via wlink). Next: confirm on a V208 board, then Phase B SoftRunner→RF.
+answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.
+[`examples/ch32v208-trouble-adv`](examples/ch32v208-trouble-adv) joins
+SoftRunner with a Trouble Host and advertises ADV_IND on 37/38/39; macOS
+CoreBluetooth sees `wchble` (`RSSI ≈ -54`) via
+`examples/ch32v208-trouble-adv/tools/scan_wchble.swift`. Next: SCAN_RSP /
+connections (Phase C).
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

@@ -22,7 +22,7 @@ use crate::rf::regs::{
     self, autocfg, bb, bb_irq, lle, lle_cmd, lle_irq, lle_mode, rfctrl, rfend, rssi, rxcfg,
 };
 use crate::rf::timing::{self, v208_rx_capture_reload_half_us, v208_tx_window_half_us};
-use crate::rf::txrx::RX_DMA_MIN;
+use crate::rf::txrx::{MAX_PDU, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
 use crate::time::InstantUs;
 use crate::{Error, Result};
@@ -86,6 +86,14 @@ pub const RFEND_INIT: RfendInit = RfendInit {
     vco_mhz: &[2401, 2440, 2480],
     certainty: Open,
 };
+
+/// Force 4-byte alignment for the TX bounce buffer.
+///
+/// The LLE reads `TXBUFPTR` as a DMA word address (same class as RX DMA); the
+/// open `wch_rf` driver only ever passes `__attribute__((aligned(4)))` buffers
+/// (`g_ble_phy_tx_buf`). A plain `[u8; N]` slice may land at +1 on the stack.
+#[repr(align(4))]
+struct AlignedTxBuf<const N: usize>([u8; N]);
 
 /// CH32V208 radio — DevInit + calibration ported from open `wch_rf`.
 #[derive(Debug)]
@@ -757,7 +765,7 @@ impl Radio for Ch32v208Radio {
         _timeout_half_us: u32,
         start_cputime: Option<u32>,
     ) -> Result<()> {
-        if frame.len() < 2 {
+        if frame.len() < 2 || frame.len() > MAX_PDU {
             return Err(Error::InvalidState);
         }
         if self.channel > 39 {
@@ -768,10 +776,25 @@ impl Radio for Ch32v208Radio {
             return Err(Error::Busy);
         }
 
+        // The LLE DMAs the frame straight out of `TXBUFPTR`; align it the same
+        // way the open driver's `g_ble_phy_tx_buf` is aligned.
+        let mut bounce = AlignedTxBuf([0u8; MAX_PDU]);
+        let frame = if frame.as_ptr() as usize & 0x3 == 0 {
+            frame
+        } else {
+            bounce.0[..frame.len()].copy_from_slice(frame);
+            &bounce.0[..frame.len()]
+        };
+
         let saved = self.guard_enter();
         self.engine_stop();
         unsafe {
             regs::write(LLE_BASE, lle::WINDOW, 0);
+            // LLE IRQSTAT is W1C. `CLEAR_ARM` (0x2000) only clears the window
+            // state; TX_DONE (bit1) is sticky and must be cleared explicitly,
+            // otherwise the poll below sees the previous packet's completion
+            // and returns Ok without transmitting.
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::TX_DONE);
             regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
         }
 
@@ -837,6 +860,11 @@ impl Radio for Ch32v208Radio {
         }
 
         self.guard_exit(saved);
+        unsafe {
+            // Acknowledge the completion we just consumed so the next call
+            // cannot mistake it for its own TX_DONE.
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::TX_DONE);
+        }
         rc
     }
 
@@ -865,6 +893,9 @@ impl Radio for Ch32v208Radio {
 
         unsafe {
             regs::write(LLE_BASE, lle::WINDOW, 0);
+            // Sticky W1C completion bits from a previous arm must not be
+            // mistaken for this window's result.
+            regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::RX_DONE | lle_irq::TX_DONE);
             regs::write(LLE_BASE, lle::IRQSTAT, lle_irq::CLEAR_ARM);
         }
 

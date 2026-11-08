@@ -10,8 +10,29 @@ Embassy + SoftRunner + Trouble Host join: Host-driven legacy ADV_IND on air.
 4. Trouble 0.8 Host `Peripheral::advertise`
 5. Interleaved SoftRunner HCI pump + `tx_basic` while adv enabled
 
-SDI markers: `rf init ok`, `hci host up`, `adv enable`, `tx ch{37,38,39}`,
-`trouble adv running`.
+SDI markers: `rf init ok`, `hci host up`, `adv enable`, `tx ongoing`,
+`trouble adv running`. The TX path is intentionally quiet: SDI output between
+advertising bursts stretches the interval and makes scanners miss packets.
+
+## AdvA / random address
+
+Trouble's `StackBuilder::set_random_address` updates Host state only; it does
+**not** emit HCI `LE Set Random Address` (0x2005). The HAL therefore calls
+`SoftRunner::set_random_addr(RAND_ADDR)` with the same bytes, and SoftRunner
+keeps that value across HCI Reset. `RAND_ADDR` must be a valid static random
+address (most significant octet bit 7..6 = 11, e.g. `0xC1`).
+
+## macOS visibility (verified)
+
+`tools/scan_wchble.swift` (CoreBluetooth) reports `FOUND wchble` (RSSI ≈ -54)
+while the example advertises. If scanning stops working after driver changes,
+check the sticky `TX_DONE` W1C bit: a stale completion makes `tx_basic` return
+success without transmitting (see `docs/research/bringup-debug.md`).
+
+## Sniffer
+
+Look for ADV_IND named `wchble` on channels 37/38/39. SCAN_RSP / connections
+are out of scope for this cut.
 
 ## Build / flash
 
@@ -32,8 +53,3 @@ uses 0.11. This example expects a sibling checkout of
 [`embassy-rs/trouble`](https://github.com/embassy-rs/trouble) at
 `../../../trouble` (i.e. next to `wchble` / `ch32-hal`). Override
 `trouble-host.path` in `Cargo.toml` if your clone lives elsewhere.
-
-## Sniffer
-
-Look for ADV_IND named `wchble` on channels 37/38/39. SCAN_RSP / connections
-are out of scope for this cut.
