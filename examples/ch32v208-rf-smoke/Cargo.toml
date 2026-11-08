@@ -13,7 +13,7 @@ ch32-hal = { path = "../../../ch32-hal", features = [
     "embassy",
     "rt",
 ], default-features = false }
-wchble = { path = "../..", features = ["ch32v208"] }
+wchble = { path = "../..", features = ["ch32v208", "controller"] }
 qingke-rt = "0.8"
 qingke = "0.8"
 panic-halt = "1.0"

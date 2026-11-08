@@ -19,6 +19,19 @@ Last updated: 2026-11-08
 - Soft HCI Phase A: `bt-hci` 0.11 `ExternalController` + bounded embassy
   channels (`hci::transport`) + `SoftRunner` Phase A cmd set (Reset /
   ReadBdAddr / masks / LE buffer / legacy adv stubs). Host unit tests cover CC path.
+- Soft HCI Phase B (state): `AdvState` stores AdvData/ScanRsp/channel map;
+  SoftRunner helpers `build_adv_pdu` / `adv_channels` / `adv_interval_us`;
+  host unit test `le_set_adv_data_builds_pdu`.
+- **Board gate (V208)** — `examples/ch32v208-rf-smoke` flashed on
+  `CH32V208WBU6` (`1a86:8010:2FC48F06B4A8`); SDI confirmed
+  `rf init ok` + eight `tx ch37 ok` + `smoke done` at HCLK 96 MHz
+  (32 MHz HSE /4 ×12). Fixes needed on the way: 4-byte-aligned RX DMA
+  wrapper (plain `StaticCell<[u8;N]>` landed at +1), non-blocking
+  `try_println`, and PLL clock instead of default 8 MHz HSI.
+- **Phase 2 RF verify (V208)** — same probe; SDI confirmed DevInit dump
+  (LLE `14/1c/2c/3c` + BB `34` match; RFEND `28=0x1480` has sticky high
+  bit over DevInit `0x480`), TX on **37/38/39**, RX arm + live `rx hit`,
+  SoftRunner ADV_IND → `tx_basic` on all three channels, `smoke done`.
 
 - Thin MMIO helpers (`regs::{read,write,rmw}`) + RFEND/AES offset map +
   `rf::timing` pure helpers.
@@ -30,15 +43,12 @@ Last updated: 2026-11-08
 
 ## Not done (next)
 
-1. **Board gate** — flash `examples/ch32v208-rf-smoke` on a CH32V208 with
-   `wlink` and confirm SDI `rf init ok` / `tx ch37 ok` (firmware builds;
-   attach a V208 — current bench probes are L103 / CH592 / H417).
-2. **Phase B** — `SoftRunner` drives real legacy adv TX on 37/38/39 via RF
-   runtime (store AdvData / ScanRsp; schedule `tx_basic`).
-3. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
-4. Apply DevInit/cal + runtime on CH5xx (tables recorded; CH585 use rusted-ch5
+1. Soft HCI + Trouble on-device host init joined to SoftRunner (embassy task
+   that schedules `tx_basic` from `build_adv_pdu` while adv enabled).
+2. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
+3. Apply DevInit/cal + runtime on CH5xx (tables recorded; CH585 use rusted-ch5
    as RF reference, not V208 open).
-5. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
+4. **TODO: CH587** — DS mentions BLE 5.4; no CH587EVT / carved `libCH58xBLE`
    here yet (may still be unpublished by WCH). Do **not** alias to CH583/CH585.
    Other CH57/58 without carved libs stay out of tree.
 
@@ -50,6 +60,6 @@ Last updated: 2026-11-08
 | rf-init | V208 DevInit + cal MMIO | **done** |
 | rf-runtime | V208 channel/shut/tx/rx/ISR | **done** |
 | A | soft HCI typechecks with Trouble | **done** (`ExternalController` + SoftRunner) |
-| B | legacy adv on air | smoke firmware builds; SoftRunner→RF TBD |
+| B | legacy adv on air | **verified** multi-ch TX + SoftRunner PDU→`tx_basic` |
 | C | BAS via Trouble in a HAL example | not started |
 | D | more chip packs | CH572/583/585/595 tables recorded; apply TBD |

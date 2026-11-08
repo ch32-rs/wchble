@@ -43,7 +43,9 @@ but TX does, dump these and the DMA/buffer address you programmed.
 | `RFEND+0x28` | `0x480` | `0x480` | `0x480` | `0x480` |
 | Rest of DevInit | RMW UNCERTAIN | long RMW UNCERTAIN | short RMW UNCERTAIN | RMW UNCERTAIN |
 
-If `+0x28` is not `0x480`, you are not hitting RFEND (base wrong or clock off).
+If `+0x28` low 12 bits are not `0x480`, you are not hitting RFEND (base wrong or
+clock off). On V208 after cal, silicon may read `0x1480` (sticky high bit over
+the DevInit value) — still counts as a hit.
 
 ## 3. After `BB_DevInit`
 

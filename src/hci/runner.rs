@@ -1,8 +1,8 @@
-//! Soft HCI command pump (Phase A).
+//! Soft HCI command pump (Phase A + legacy adv state for Phase B).
 //!
 //! Owns LL scaffold state and answers Host commands arriving on
-//! [`super::transport`]. Radio TX/RX stays out of this module until Phase B
-//! (legacy adv on air).
+//! [`super::transport`]. Phase B stores AdvData / channel map and exposes
+//! [`SoftRunner::build_adv_pdu`] so a HAL task can drive `Radio::tx_basic`.
 
 use bt_hci::transport::PacketKind;
 
@@ -57,6 +57,29 @@ impl SoftRunner {
     /// Override the public address returned by `Read BD_ADDR`.
     pub fn set_bd_addr(&mut self, addr: [u8; 6]) {
         self.bd_addr = addr;
+        if !self.ll.adv.random_addr {
+            self.ll.adv.own_addr = addr;
+        }
+    }
+
+    /// True while Host has advertising enabled.
+    pub fn adv_enabled(&self) -> bool {
+        self.ll.adv.enabled
+    }
+
+    /// Advertising interval in microseconds (from HCI slots).
+    pub fn adv_interval_us(&self) -> u32 {
+        self.ll.adv.interval_us()
+    }
+
+    /// Channels selected by the current advertising channel map.
+    pub fn adv_channels(&self) -> impl Iterator<Item = u8> + '_ {
+        self.ll.adv.channels()
+    }
+
+    /// Build the current ADV_IND PDU when advertising is enabled.
+    pub fn build_adv_pdu(&self, out: &mut [u8]) -> Option<usize> {
+        self.ll.adv.build_adv_ind(out)
     }
 
     /// Process one pending Host packet if present. Returns `true` if work ran.
@@ -165,16 +188,47 @@ impl SoftRunner {
                     Err(HCI_COMMAND_DISALLOWED)
                 } else {
                     self.random_addr.copy_from_slice(params);
+                    self.ll.adv.own_addr = self.random_addr;
+                    self.ll.adv.random_addr = true;
                     Ok(&[][..])
                 }
             }
             // LE Set Advertising Parameters (store interval / channel map only).
             0x2006 if params.len() == 15 => self.set_adv_params(params),
-            // LE Set Advertising Data / Scan Response Data
-            0x2008 | 0x2009 if params.len() == 32 => Ok(&[][..]),
+            // LE Set Advertising Data
+            0x2008 if params.len() == 32 => {
+                if self.ll.adv.enabled {
+                    Err(HCI_COMMAND_DISALLOWED)
+                } else if self.ll.adv.set_adv_data(params[0], &params[1..]) {
+                    Ok(&[][..])
+                } else {
+                    Err(HCI_INVALID_PARAMETERS)
+                }
+            }
+            // LE Set Scan Response Data
+            0x2009 if params.len() == 32 => {
+                if self.ll.adv.enabled {
+                    Err(HCI_COMMAND_DISALLOWED)
+                } else if self.ll.adv.set_scan_rsp(params[0], &params[1..]) {
+                    Ok(&[][..])
+                } else {
+                    Err(HCI_INVALID_PARAMETERS)
+                }
+            }
             // LE Set Advertise Enable
             0x200a if params.len() == 1 && params[0] <= 1 => {
-                self.ll.adv.enabled = params[0] != 0;
+                let enable = params[0] != 0;
+                if enable {
+                    // Prefer random address when Host set one; else public BD_ADDR.
+                    if self.random_addr != [0; 6] {
+                        self.ll.adv.own_addr = self.random_addr;
+                        self.ll.adv.random_addr = true;
+                    } else {
+                        self.ll.adv.own_addr = self.bd_addr;
+                        self.ll.adv.random_addr = false;
+                    }
+                }
+                self.ll.adv.enabled = enable;
                 Ok(&[][..])
             }
             // LE Set Scan Enable — central not Phase A.
@@ -233,8 +287,17 @@ impl SoftRunner {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use bt_hci::transport::PacketKind;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Global HCI channels are shared; serialize tests that touch them.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn inject_cmd(opcode: u16, params: &[u8]) {
         let mut bytes = [0u8; transport::HCI_PACKET_CAPACITY];
@@ -260,6 +323,7 @@ mod tests {
 
     #[test]
     fn reset_and_read_bd_addr_roundtrip() {
+        let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
         runner.set_bd_addr([1, 2, 3, 4, 5, 6]);
@@ -276,7 +340,58 @@ mod tests {
     }
 
     #[test]
+    fn le_set_adv_data_builds_pdu() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            // Random address + params + AdvData + enable.
+            inject_cmd(0x2005, &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01]);
+            runner.serve_one().await;
+            expect_command_complete(0x2005, HCI_SUCCESS, &[]);
+
+            let mut params = [0u8; 15];
+            params[0..2].copy_from_slice(&0x00a0u16.to_le_bytes()); // 100 ms
+            params[2..4].copy_from_slice(&0x00a0u16.to_le_bytes());
+            params[4] = 0; // ADV_IND
+            params[5] = 1; // random own
+            params[13] = 0x07; // 37/38/39
+            inject_cmd(0x2006, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2006, HCI_SUCCESS, &[]);
+
+            let mut adv = [0u8; 32];
+            adv[0] = 3;
+            adv[1..4].copy_from_slice(&[0x02, 0x01, 0x06]);
+            inject_cmd(0x2008, &adv);
+            runner.serve_one().await;
+            expect_command_complete(0x2008, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+
+            assert!(runner.adv_enabled());
+            let mut chs = [0u8; 3];
+            let mut n = 0;
+            for ch in runner.adv_channels() {
+                chs[n] = ch;
+                n += 1;
+            }
+            assert_eq!(&chs[..n], &[37, 38, 39]);
+            let mut pdu = [0u8; 40];
+            let n = runner.build_adv_pdu(&mut pdu).unwrap();
+            assert_eq!(n, 2 + 6 + 3);
+            assert_eq!(pdu[0], 0x40);
+            assert_eq!(&pdu[2..8], &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01]);
+            assert_eq!(&pdu[8..11], &[0x02, 0x01, 0x06]);
+        });
+    }
+
+    #[test]
     fn le_read_buffer_size() {
+        let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
 
