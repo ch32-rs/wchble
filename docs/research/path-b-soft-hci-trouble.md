@@ -175,12 +175,13 @@ CH32V208 first; CH583/CH585 = swap `wch-rf` tables only if LL/HCI stay stable.
 
 ### Phase A — Skeleton boots Trouble
 
-- [ ] Embassy app links `bt-hci` + `trouble-host`
-- [ ] `SoftHci` implements `Controller` + **all** compile-time `ControllerCmd*` bounds (stubs OK)
-- [ ] Real: `Reset`, `ReadBdAddr`, `SetEventMask*`, `LeSetEventMask`, `LeSetRandomAddr`, `LeReadBufferSize`, `HostBufferSize`, `SetControllerToHostFlowControl`
-- [ ] `runner.run()` stays alive; no panic on init cmd sequence
+- [x] `bt-hci` 0.11 dependency (Trouble 0.8-compatible)
+- [x] `SoftController` = `ExternalController<HciTransport, 4>` (all `ControllerCmd*` bounds via ExternalController)
+- [x] Real/stub cmd set in `SoftRunner`: `Reset`, `ReadBdAddr`, `SetEventMask*`, `LeSetEventMask`, `LeSetRandomAddr`, `LeReadBufferSize`, `HostBufferSize`, `SetControllerToHostFlowControl`, legacy adv params/data/enable (stored; no air yet)
+- [ ] HAL Embassy app links `trouble-host` and `join`s `SoftRunner::run` (kept out of this tree; sketch in README)
 
-**Gate:** device powers up, Trouble completes host init against soft HCI.
+**Gate (crate):** Host unit tests for Command Complete path; `SoftController: Controller` bound test.
+**Gate (board):** device powers up, Trouble completes host init against soft HCI — HAL example TBD.
 
 ### Phase B — Legacy advertise visible
 

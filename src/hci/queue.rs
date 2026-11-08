@@ -1,4 +1,8 @@
-//! Command reply and TO_HOST packet queues for the soft HCI.
+//! Legacy queue counters kept for docs / transitional call sites.
+//!
+//! Phase A moves real Host↔Controller traffic onto
+//! [`super::transport`]'s static channels. These counters remain as a
+//! lightweight observability shell until ACL event accounting lands.
 
 /// HCI packet kinds Troubles expects from a controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -15,8 +15,10 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-bt-hci = { version = "0.3", default-features = false }
-defmt = { version = "0.3", default-features = false }
+bt-hci = { version = "0.11", default-features = false }
+defmt = { version = "1", default-features = false }
+embassy-sync = { version = "0.8", default-features = false }
+embedded-io = { version = "0.7", default-features = false }
 
 [package]
 name = "wchble"
@@ -35,6 +37,12 @@ description = "Embassy-style BLE layer for ch32-hal / ch5xx-hal: Rust RF/LL + so
 [dependencies]
 bt-hci = { workspace = true, optional = true }
 defmt = { workspace = true, optional = true }
+embassy-sync = { workspace = true, optional = true }
+embedded-io = { workspace = true, optional = true }
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+pollster = "0.4"
 
 [features]
 default = []
@@ -44,11 +52,11 @@ ch572 = []
 ch583 = []
 ch585 = []
 ch595 = []
-# Soft HCI + LL surface for Trouble Host.
-controller = ["dep:bt-hci"]
+# Soft HCI + LL surface for Trouble Host (`ExternalController` + runner).
+controller = ["dep:bt-hci", "dep:embassy-sync", "dep:embedded-io"]
 # PHY scheduler helpers (can be used without full controller).
 phy = []
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "bt-hci?/defmt"]
 
 [lib]
 path = "src/lib.rs"

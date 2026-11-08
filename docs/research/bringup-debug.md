@@ -84,6 +84,8 @@ V208 open path is **ported** in `family::ch32v208` (`set_channel` / `shut` /
 
 ### HAL smoke (V208)
 
+Firmware examples stay in the HAL repo (this crate is library-only). Sketch:
+
 ```rust,ignore
 // after BLE AHB + HSE trim; IRQs still off; InstantUs live:
 let mut radio = Ch32v208Radio::new(RX.init([0; RX_DMA_MIN]))?;
@@ -95,7 +97,15 @@ radio.set_channel(37)?;
 radio.tx_basic(&clock, &frame, 0, None)?;
 ```
 
-On timeout: dump `LLE+0x08`, `LLE+0x50`, `LLE+0x64`, `BB+0`, `RFEND+0x08/+0x2c`.
+Soft HCI Phase A (no air yet):
+
+```rust,ignore
+let controller = wchble::hci::new();
+let mut soft = wchble::hci::SoftRunner::new();
+// join(soft.run(), trouble_runner.run())
+```
+
+On TX timeout: dump `LLE+0x08`, `LLE+0x50`, `LLE+0x64`, `BB+0`, `RFEND+0x08/+0x2c`.
 
 ## 6. Feature / module map
 

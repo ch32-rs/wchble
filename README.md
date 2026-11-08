@@ -70,25 +70,35 @@ Enable **at most one** chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, `ch5
 
 ```rust,ignore
 // inside ch32-hal / application after BLE AHB clock + HSE trim (IRQs still off):
-use wchble::hci::SoftController;
+use wchble::hci::{self, SoftRunner};
 use wchble::rf::family::ch32v208::Ch32v208Radio;
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::Radio;
 
 static RX: StaticCell<[u8; RX_DMA_MIN]> = StaticCell::new();
-let radio = Ch32v208Radio::new(RX.init([0; RX_DMA_MIN]))?;
+let mut radio = Ch32v208Radio::new(RX.init([0; RX_DMA_MIN]))?;
 radio.init(&hal_clock)?; // LLE → RFEND → BB → cal; HAL enables NVIC after
-let mut ctl = SoftController::with_radio(radio);
-// later: impl bt_hci::controller::Controller for SoftController
-// let stack = trouble_host::new(ctl, &mut resources);
+
+let controller = hci::new(); // ExternalController<HciTransport, 4>
+let mut soft = SoftRunner::new();
+// soft.set_bd_addr([...]);
+
+// join Trouble's runner with SoftRunner::run — SoftRunner must reply
+// Command Complete or Host exec hangs waiting on the in-process channel.
+// let stack = trouble_host::new(controller, &mut resources);
 ```
+
+On-target smoke (RF only, before Trouble) remains a HAL-side example:
+`set_channel(37)` + `tx_basic` ADV_IND with BB/LLE IRQs wired — see
+[`docs/research/bringup-debug.md`](docs/research/bringup-debug.md).
 
 ## Status
 
-**V208 RF runtime landed** (2026-11-08): open Path B crate; `ch32v208` applies
-DevInit/cal and open-driver `set_channel` / `shut` / `tx_basic` / `rx_basic` /
-`lle_isr`/`bb_isr`. Other families still table-only. Next: HAL on-target smoke,
-then soft HCI Phase A.
+**Soft HCI Phase A landed** (2026-11-08): `hci::new()` is
+`bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
+answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds
+(stubs for unsupported). V208 RF runtime already in tree. Next: Phase B
+legacy adv on air (HAL smoke + LL TX schedule), then Trouble BAS.
 
 Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
 [`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).

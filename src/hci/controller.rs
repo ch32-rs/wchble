@@ -1,60 +1,37 @@
-//! Soft HCI controller shell implementing the Path B boundary.
+//! Soft HCI controller facade for Trouble Host.
 //!
-//! Consumed by `ch32-hal` / `ch5xx-hal` apps that plug this type into
-//! `trouble_host::new`. Full `bt-hci::controller::Controller` (+ CmdSync/Async)
-//! wiring lands once LL advertising/connection paths exist. This stub keeps the
-//! `controller` feature compiling and holds the LL + queue state Trouble will drive.
+//! [`SoftController`] is `bt_hci`'s [`ExternalController`] over [`HciTransport`].
+//! That single type already implements `Controller` plus every
+//! `ControllerCmdSync` / `ControllerCmdAsync` bound Trouble demands — commands
+//! are serialized onto the in-process channels; [`crate::hci::runner::SoftRunner`]
+//! must reply with Command Complete / Status.
 
-use crate::ll::LinkLayer;
-use crate::rf::{Backend, Radio};
-use crate::Result;
+use bt_hci::controller::ExternalController;
 
-use super::queue::PacketQueue;
+use super::transport::HciTransport;
 
-/// Soft HCI controller: Trouble Host ↔ queues ↔ [`LinkLayer`] ↔ [`Radio`].
-pub struct SoftController<R: Radio = Backend> {
-    pub radio: R,
-    pub ll: LinkLayer,
-    pub queue: PacketQueue,
+/// Number of concurrent command slots in the ExternalController state machine.
+const CMD_SLOTS: usize = 4;
+
+/// Soft HCI controller type consumed by `trouble_host::new`.
+pub type SoftController = ExternalController<HciTransport, CMD_SLOTS>;
+
+/// Build the Host-facing controller. Spawn / poll a [`super::runner::SoftRunner`]
+/// alongside it or command `exec` will wait forever for Command Complete.
+pub fn new() -> SoftController {
+    ExternalController::new(HciTransport::new())
 }
 
-impl SoftController<Backend> {
-    /// Build a controller with the feature-selected radio backend.
-    ///
-    /// Unavailable for `ch32v208` — that backend needs an RX DMA buffer; use
-    /// [`SoftController::with_radio`] with [`crate::rf::family::ch32v208::Ch32v208Radio::new`].
-    #[cfg(not(feature = "ch32v208"))]
-    pub fn new() -> Self {
-        Self {
-            radio: crate::rf::new_radio(),
-            ll: LinkLayer::new(),
-            queue: PacketQueue::new(),
-        }
-    }
-}
+/// Compile-time proof that Phase A typechecks against `bt-hci`'s Controller trait.
+#[cfg(test)]
+mod bounds {
+    use super::SoftController;
+    use bt_hci::controller::Controller;
 
-#[cfg(not(feature = "ch32v208"))]
-impl Default for SoftController<Backend> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    fn assert_controller<T: Controller>() {}
 
-impl<R: Radio> SoftController<R> {
-    /// Construct around an explicit radio backend (tests / alternate chips).
-    pub fn with_radio(radio: R) -> Self {
-        Self {
-            radio,
-            ll: LinkLayer::new(),
-            queue: PacketQueue::new(),
-        }
-    }
-
-    /// Reset controller state (HCI Reset stub).
-    pub fn reset(&mut self) -> Result<()> {
-        self.ll = LinkLayer::new();
-        self.queue = PacketQueue::new();
-        self.radio.shut();
-        Ok(())
+    #[test]
+    fn soft_controller_implements_bt_hci_controller() {
+        assert_controller::<SoftController>();
     }
 }

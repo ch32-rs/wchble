@@ -16,6 +16,10 @@ Last updated: 2026-11-08
   - `ch585` — CH5xx map + “new tables” / `nCO2522` / WaitTune 8000
   - `ch595` — CH5xx map + near-CH585 tables without `nCO2522` (`0x84` highs)
 - Shared table shapes + `Certainty` tags in `src/rf/family/tables.rs`.
+- Soft HCI Phase A: `bt-hci` 0.11 `ExternalController` + bounded embassy
+  channels (`hci::transport`) + `SoftRunner` Phase A cmd set (Reset /
+  ReadBdAddr / masks / LE buffer / legacy adv stubs). Host unit tests cover CC path.
+
 - Thin MMIO helpers (`regs::{read,write,rmw}`) + RFEND/AES offset map +
   `rf::timing` pure helpers.
 - Research notes under `docs/research/` (incl. `ch58x-reuse.md`,
@@ -26,11 +30,12 @@ Last updated: 2026-11-08
 
 ## Not done (next)
 
-1. **HAL on-target smoke** — `ch32-hal` example: clock + HSE trim + `InstantUs` +
-   `Ch32v208Radio::new` → `init` → `set_channel(37)` → `tx_basic` ADV_IND; wire
-   `lle_isr` / `bb_isr` (+ `note_anchor_us`).
-2. **Soft HCI Phase A** — real `bt-hci` `Controller` + CmdSync/Async stubs so
-   Trouble typechecks (state shell exists; traits not implemented).
+1. **HAL on-target smoke** — HAL-side example (kept out of this tree for now):
+   clock + HSE trim + `InstantUs` + `Ch32v208Radio::new` → `init` →
+   `set_channel(37)` → `tx_basic` ADV_IND; wire `lle_isr` / `bb_isr`
+   (+ `note_anchor_us`). Sketch in `docs/research/bringup-debug.md`.
+2. **Phase B** — `SoftRunner` drives real legacy adv TX on 37/38/39 via RF
+   runtime (store AdvData / ScanRsp; schedule `tx_basic`).
 3. Auto-ack / `auto_arm_rx` / IFS turnaround (needed for SCAN_RSP / conn events).
 4. Apply DevInit/cal + runtime on CH5xx (tables recorded; CH585 use rusted-ch5
    as RF reference, not V208 open).
@@ -44,8 +49,8 @@ Last updated: 2026-11-08
 | --- | --- | --- |
 | scaffold | crate + docs + family stubs | **done** |
 | rf-init | V208 DevInit + cal MMIO | **done** |
-| rf-runtime | V208 channel/shut/tx/rx/ISR | **done** (HAL smoke next) |
-| A | soft HCI typechecks with Trouble | not started |
-| B | legacy adv on air | HAL example pending |
+| rf-runtime | V208 channel/shut/tx/rx/ISR | **done** |
+| A | soft HCI typechecks with Trouble | **done** (`ExternalController` + SoftRunner) |
+| B | legacy adv on air | SoftRunner stores params; RF schedule TBD |
 | C | BAS via Trouble in a HAL example | not started |
 | D | more chip packs | CH572/583/585/595 tables recorded; apply TBD |

@@ -10,7 +10,7 @@ linker scripts, and the Embassy executor; this crate supplies RF → soft HCI.
 └──────────────────▲──────────────────────┘
                    │ bt-hci Controller traits
 ┌──────────────────┴──────────────────────┐
-│  wchble::hci  SoftController + queues   │  feature: controller
+│  wchble::hci  ExternalController + SoftRunner │  feature: controller
 └──────────────────▲──────────────────────┘
                    │ HCI cmds / events / ACL
 ┌──────────────────┴──────────────────────┐
@@ -39,7 +39,7 @@ linker scripts, and the Embassy executor; this crate supplies RF → soft HCI.
 | `rf` | L0 | MMIO, init/cal tables, TX/RX primitives, ISR dispatch | HCI, GATT, adv policy, RCC/NVIC |
 | `phy` | L1 | WFR extend, soft T_IFS, PDU↔radio mapping | HCI parsing |
 | `ll` | L2 | legacy adv, conn SM, ACL, LL control PDUs | GATT/ATT |
-| `hci` | L3 | `bt-hci` traits, cmd/event/ACL queues | register bit soup |
+| `hci` | L3 | `ExternalController` transport + SoftRunner cmds | register bit soup |
 | HAL / apps | L4 | Trouble host, clocks, IRQs, flash/RAM | stack logic |
 
 ### Multi-family rules (L0)
@@ -142,7 +142,8 @@ let radio = wchble::rf::family::ch32v208::Ch32v208Radio::new(
 
 See [`research/path-b-soft-hci-trouble.md`](research/path-b-soft-hci-trouble.md):
 
-- **A** — soft HCI typechecks with Trouble; Reset / Read BD_ADDR stubs
+- **A** — soft HCI typechecks with Trouble; Reset / Read BD_ADDR — **done**
+  (`hci::new` + `SoftRunner`; join SoftRunner with Trouble runner in HAL apps)
 - **B** — legacy advertising visible on air
 - **C** — BAS peripheral via Trouble (in a HAL example)
 - **D** — additional chip families
