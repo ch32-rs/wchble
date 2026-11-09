@@ -127,13 +127,26 @@ with clean SIGINT shutdown in that run. Packet evidence then exposed a receive
 start/completion deadline mix-up; its correction reduced missed events from
 168/339 to 1/172 and restored 1:1 data exchange in the captured links. Whole-run
 sniffer following and orderly shutdown remain intermittent, not guaranteed.
-Android/iPhone P4 acceptance and sustained reliability remain unverified. See the
-example for the finite runner and safety/recovery policy. **Further physical
-launches are blocked:** the installed probe CLI resumes CPU execution after
-preflight reads, invalidating continuous halt/idle ownership. The first phone
-launch was refused before download; smoke restoration/discovery passed. A
-single-session preflight/download fix is required before another launch. Open
-defects and acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md).
+
+The first manual P4 phone check succeeded on 2026-11-10: the user reports all
+five requested steps (read, Write Request/readback, notifications, disabled-
+notification write/read, disconnect/reconnect persistence) completed on Android,
+and a later iOS attempt also succeeded, in one directly flashed 360-second window.
+Firmware recorded four accepted connections and disconnects, six reads, five
+writes, five queued notifications, `0xAAAAAAAA` final value, no Host/bridge/RF
+stop/TX/RX/supervision error, and a clean 360.000021 s finish; smoke recovery and
+discovery passed. Both platforms' counters share that window, so platform
+attribution relies on the user's separate UI observations. This is one manual
+session per platform, not the planned three isolated acceptance rounds or
+wireless capture evidence; sustained reliability remains unverified.
+
+**Further automatic physical launches are blocked:** the installed probe CLI
+resumes CPU execution after preflight reads, invalidating continuous halt/idle
+ownership. The preceding phone launch was refused before download; the next
+window was flashed directly, bypassing that broken preflight. A single-session
+preflight/download fix is required before another automatic launch. Open defects
+and acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md). See the example for
+the finite runner and safety/recovery policy.
 
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`

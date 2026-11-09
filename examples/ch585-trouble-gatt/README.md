@@ -26,15 +26,30 @@ before building. The local Trouble checkout revision above must also match.
 
 ## Validation status
 
-**Physical-run blocker (2026-11-10): do not launch the hardware runners below
+The first manual phone check passed on 2026-11-10. In one directly flashed
+360-second window the user reported all five requested operations completed on
+Android and a later iOS attempt also succeeded: read, Write Request/readback,
+numbered notifications, a write/read with notifications disabled, and
+disconnect/reconnect persistence. Firmware recorded four accepted connections
+and disconnects, six reads, five writes, five queued notifications, final value
+`0xAAAAAAAA`, no Host/bridge/RF-stop/TX/RX/supervision error, a clean 360.000021 s
+finish and smoke restoration/discovery. Both platforms share that window's
+counters, so platform attribution is the user's separate UI report, not captured
+peer evidence. This is one manual session per platform, not three isolated
+acceptance rounds each, and its 103 missed events plus 554 retries/duplicates are
+retained rather than hidden. Sustained reliability and calibrated air timing
+remain unverified.
+
+**Automatic-launch blocker (2026-11-10): do not launch the hardware runners below
 until the preflight session fix is implemented.** The installed `probe-rs read`
 resumes CPU execution after each access, so separate stop/idle reads can let smoke
-rearm RF. The first independent phone launch was refused before download (CMD
-acknowledgements 0 then 2); no P4 phone image ran. Finally smoke restoration and
-exact-name discovery passed. Two zero samples alone do not prove continuous halt
-ownership. A single retained session must cover halt, shutdown, both idle checks
-and verified download/start; see [`BACKLOG.md`](../../BACKLOG.md). This newly found
-tooling defect does not turn prior functional GATT results into phone acceptance.
+rearm RF. An independent phone launch was refused before download (CMD
+acknowledgements 0 then 2); no P4 phone image ran in that attempt, and smoke
+restoration/discovery passed. Two zero samples alone do not prove continuous halt
+ownership. The successful phone window above was flashed directly, bypassing that
+broken preflight; it is not evidence that the automatic sequence is safe. A single
+retained session must cover halt, shutdown, both idle checks and verified
+download/start; see [`BACKLOG.md`](../../BACKLOG.md).
 
 Two subsequent isolated five-cycle Mac runs each completed twenty-five reads,
 sixty-five writes, fifty verified notifications, five normal disconnects and
