@@ -154,6 +154,8 @@ fn receive(
     if reached(now, until) || reached(now, expires) {
         return None;
     }
+    // `until` allows packet completion, not just its latest preamble start.
+    // The hardware WINDOW and software no-capture timeout must agree.
     let window = until.wrapping_sub(now).saturating_mul(2);
     if radio.rx_basic(clock, &mut rx.0, window).is_err() {
         inc(21);
@@ -301,7 +303,8 @@ fn run_connection(
             .event_start_us()
             .wrapping_add(u32::from(conn.params.interval) * 1250)
             .wrapping_sub(600);
-        let mut until = conn.rx_end_us();
+        expires = earlier(expires, event_limit);
+        let mut until = conn.rx_complete_end_us();
         let mut any_rx = false;
         // Bound packet exchanges as well as wall time; a busy Central cannot
         // make this event consume the following event or the finite run budget.
@@ -409,7 +412,7 @@ fn run_connection(
             {
                 control.start_termination(clock.now_us(), conn.params.timeout);
             }
-            expires = earlier(finish, conn.supervision_deadline_us());
+            expires = earlier(event_limit, earlier(finish, conn.supervision_deadline_us()));
             if let Some(end) = control.termination_deadline_us() {
                 expires = earlier(expires, end);
             }
@@ -509,7 +512,8 @@ fn run_connection(
 #[link_section = ".highcode"]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
-    let hz = hal::delay::measured_sysclk().0;
+    // HSE/PLL nominal is more accurate than the RC-referenced delay estimate.
+    let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
         ticks: Cell::new(ExtendingTicks::new(
             hal::pac::SYSTICK.stk_cntl().read().cntl(),

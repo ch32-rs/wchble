@@ -43,18 +43,17 @@ def idle(out, prefix):
     # stop the known CH585 engine explicitly instead of waiting for that
     # halted firmware or pretending debug reset means a power cycle.
     value = read32(0x4000c200, 1, out / f'{prefix}-cmd-before.txt')[0]
-    if value & 3:
-        mode = read32(0x4000c250, 1, out / f'{prefix}-mode-before.txt')[0]
-        bb = read32(0x4000c100, 1, out / f'{prefix}-bb-before.txt')[0]
-        rf = read32(0x4000d008, 1, out / f'{prefix}-rf-before.txt')[0]
-        # Same engine stop policy as our CH585 backend, with separate MODE
-        # writes and host USB latency providing the settling intervals.
-        write32(0x4000c250, mode & ~0x10, out / f'{prefix}-stop-mode1.log')
-        write32(0x4000c250, mode & ~0x710, out / f'{prefix}-stop-mode2.log')
-        write32(0x4000c200, value | 8, out / f'{prefix}-stop-cmd.log')
-        write32(0x4000c100, (bb & ~0x300) | 0x100, out / f'{prefix}-stop-bb.log')
-        write32(0x4000d008, rf & 0xffcdffff, out / f'{prefix}-stop-rf.log')
-        write32(0x4000c250, 0x30000, out / f'{prefix}-stop-mode3.log')
+    mode = read32(0x4000c250, 1, out / f'{prefix}-mode-before.txt')[0]
+    bb = read32(0x4000c100, 1, out / f'{prefix}-bb-before.txt')[0]
+    rf = read32(0x4000d008, 1, out / f'{prefix}-rf-before.txt')[0]
+    # Always shut, like the backend: one idle-looking CMD sample cannot prove
+    # no pending RF work. Separate MODE writes retain the settling intervals.
+    write32(0x4000c250, mode & ~0x10, out / f'{prefix}-stop-mode1.log')
+    write32(0x4000c250, mode & ~0x710, out / f'{prefix}-stop-mode2.log')
+    write32(0x4000c200, value | 8, out / f'{prefix}-stop-cmd.log')
+    write32(0x4000c100, (bb & ~0x300) | 0x100, out / f'{prefix}-stop-bb.log')
+    write32(0x4000d008, rf & 0xffcdffff, out / f'{prefix}-stop-rf.log')
+    write32(0x4000c250, 0x30000, out / f'{prefix}-stop-mode3.log')
     for i in range(2):
         if read32(0x4000c200, 1, out / f'{prefix}-cmd-{i}.txt')[0] & 3:
             raise RuntimeError('RF did not acknowledge stop; refusing flash')

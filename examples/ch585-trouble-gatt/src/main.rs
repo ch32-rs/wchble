@@ -166,6 +166,8 @@ fn receive(
     if reached(now, until) || reached(now, expires) {
         return None;
     }
+    // `until` allows packet completion, not just its latest preamble start.
+    // The hardware WINDOW and software no-capture timeout must agree.
     let window = until.wrapping_sub(now).saturating_mul(2);
     if radio.rx_basic(clock, &mut rx.0, window).is_err() {
         inc(21);
@@ -300,7 +302,10 @@ fn connection_event(
         .event_start_us()
         .wrapping_add(u32::from(s.conn.params.interval) * 1250)
         .wrapping_sub(600);
-    let mut expires = earlier(finish, s.conn.supervision_deadline_us());
+    let mut expires = earlier(
+        event_limit,
+        earlier(finish, s.conn.supervision_deadline_us()),
+    );
     if let Some(end) = s.control.termination_deadline_us() {
         expires = earlier(expires, end);
     }
@@ -316,7 +321,7 @@ fn connection_event(
     if let Some(reason) = s.expiration(clock.now_us()) {
         return Some(reason);
     }
-    let mut until = s.conn.rx_end_us();
+    let mut until = s.conn.rx_complete_end_us();
     let mut any_rx = false;
     for _ in 0..32 {
         if reached(clock.now_us(), finish) || reached(clock.now_us(), event_limit) {
@@ -418,7 +423,10 @@ fn connection_event(
             RxStatus::Backpressure => inc(31),
             RxStatus::Invalid => unreachable!(),
         }
-        expires = earlier(finish, s.conn.supervision_deadline_us());
+        expires = earlier(
+            event_limit,
+            earlier(finish, s.conn.supervision_deadline_us()),
+        );
         if let Some(end) = s.control.termination_deadline_us() {
             expires = earlier(expires, end);
         }
@@ -566,7 +574,8 @@ fn idle<F: Future>(
 #[link_section = ".highcode"]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
-    let hz = hal::delay::measured_sysclk().0;
+    // HSE/PLL nominal is more accurate than the RC-referenced delay estimate.
+    let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
         ticks: Cell::new(ExtendingTicks::new(
             hal::pac::SYSTICK.stk_cntl().read().cntl(),

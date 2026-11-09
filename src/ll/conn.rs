@@ -338,6 +338,15 @@ impl PeripheralConnection {
             .wrapping_add(self.window_width_us + self.widening_us())
     }
 
+    /// Allow the latest-starting legacy LE 1M packet to finish: 80 us overhead
+    /// plus 27 payload bytes. Address match cannot occur before the 40 us
+    /// preamble/AA reception; its exact hardware flag latency is not assumed.
+    /// Use this for the initial hardware window and software no-capture timeout,
+    /// while still honoring earlier finite, supervision and event deadlines.
+    pub fn rx_complete_end_us(&self) -> u32 {
+        self.rx_end_us().wrapping_add(80 + 27 * 8)
+    }
+
     /// Until the first valid data PDU, establishment is bounded by six
     /// connection intervals. Afterwards use the negotiated supervision timer.
     pub fn supervision_deadline_us(&self) -> u32 {
@@ -458,6 +467,77 @@ mod tests {
 
     fn params() -> ConnectParams {
         ConnectParams::parse(&connect_pdu(), true, [0xc0; 6], true).unwrap()
+    }
+
+    #[test]
+    fn hse_rate_keeps_the_next_anchor_in_the_declared_window() {
+        use crate::time::TickRate;
+
+        // A 62.4 MHz HSE/PLL counter: anchor at 10 ms, then a 30 ms interval.
+        // No oscillator drift or IRQ latency is needed to reproduce the error
+        // from substituting an RC-referenced rate for the crystal clock.
+        for (hz, inside_window) in [(62_400_000, true), (62_509_688, false)] {
+            let rate = TickRate::new(hz).unwrap();
+            let mut conn = PeripheralConnection::new(params(), 0);
+            let first_anchor_ticks = 624_000;
+            let empty_airtime_ticks = 4_992;
+            assert!(conn.on_rx_anchor(rate.micros(first_anchor_ticks + empty_airtime_ticks), 0));
+            conn.next_event().unwrap();
+            let next_anchor = rate.micros(first_anchor_ticks + 1_872_000);
+            let inside = time_reached(next_anchor, conn.rx_start_us())
+                && time_reached(conn.rx_end_us(), next_anchor);
+            assert_eq!(inside, inside_window, "rate={hz}");
+            if !inside {
+                assert!(!time_reached(next_anchor, conn.rx_start_us()));
+            }
+        }
+    }
+
+    #[test]
+    fn latest_starting_packet_can_match_and_complete_across_time_wrap() {
+        for origin in [0u32, u32::MAX - 5_000] {
+            let mut p = params();
+            p.sca = 1;
+            let mut conn = PeripheralConnection::new(p, origin);
+            let anchor = origin.wrapping_add(2_500);
+            assert!(conn.on_rx_anchor(anchor.wrapping_add(80), 0));
+            conn.next_event().unwrap();
+            let latest = conn.rx_end_us();
+            for start in [latest.wrapping_sub(1), latest] {
+                let address_match = start.wrapping_add(40);
+                let full_packet = start.wrapping_add(80 + 27 * 8);
+                assert!(time_reached(address_match, latest));
+                assert!(time_reached(conn.rx_complete_end_us(), address_match));
+                assert!(time_reached(conn.rx_complete_end_us(), full_packet));
+            }
+            // Completion allowance must not revive an expired link.
+            assert!(!conn.on_rx_anchor(conn.supervision_deadline_us(), 27));
+        }
+    }
+
+    #[test]
+    fn packet_start_cutoff_reproduces_alternating_misses_but_completion_does_not() {
+        for completion_allowance in [false, true] {
+            let mut p = params();
+            p.sca = 1;
+            let mut conn = PeripheralConnection::new(p, 0);
+            let first_anchor = 2_500u32;
+            assert!(conn.on_rx_anchor(first_anchor + 80, 0));
+            for event in 1..=8 {
+                conn.next_event().unwrap();
+                let anchor = first_anchor + event * 30_000;
+                let cutoff = if completion_allowance {
+                    conn.rx_complete_end_us()
+                } else {
+                    conn.rx_end_us()
+                };
+                let captured = time_reached(cutoff, anchor + 40);
+                assert_eq!(captured, completion_allowance || event % 2 == 0);
+                if captured {
+                    assert!(conn.on_rx_anchor(anchor + 80, 0));
+                }
+            }
+        }
     }
 
     #[test]

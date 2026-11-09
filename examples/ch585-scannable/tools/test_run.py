@@ -1,5 +1,7 @@
 """Runner must reject partial success even when the scanner sees a name."""
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 import run as runner
 
 
@@ -36,6 +38,37 @@ class ResultTests(unittest.TestCase):
                 obs = self.good()
                 obs[index] = value
                 self.assertTrue(runner.evaluate_stats(obs, 0))
+
+
+class IdleTests(unittest.TestCase):
+    def check_idle(self, initial, confirmations):
+        reads = [[value] for value in [initial, 0x30710, 0x300, 0xffffffff, *confirmations]]
+        with patch.object(runner, 'read32', side_effect=reads) as read, \
+                patch.object(runner, 'write32') as write, \
+                patch.object(runner.time, 'sleep') as sleep:
+            if any(value & 3 for value in confirmations):
+                with self.assertRaisesRegex(RuntimeError, 'refusing flash'):
+                    runner.idle(Path('/unused'), 'test')
+            else:
+                runner.idle(Path('/unused'), 'test')
+                self.assertEqual(read.call_count, 6)
+                self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(write.call_count, 6)
+            self.assertEqual(write.call_args_list[2].args[:2], (0x4000c200, initial | 8))
+            self.assertEqual(write.call_args_list[-1].args[:2], (0x4000c250, 0x30000))
+            return read.call_count
+
+    def test_initial_zero_still_requires_explicit_shut(self):
+        self.check_idle(0, [0, 0])
+
+    def test_active_engine_requires_shut_and_two_idle_acknowledgements(self):
+        self.check_idle(2, [0, 0])
+
+    def test_first_active_confirmation_refuses_without_retry(self):
+        self.assertEqual(self.check_idle(0, [2]), 5)
+
+    def test_second_active_confirmation_refuses_without_retry(self):
+        self.assertEqual(self.check_idle(0, [0, 2]), 6)
 
 
 if __name__ == '__main__':
