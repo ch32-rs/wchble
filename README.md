@@ -35,12 +35,13 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
 | `ch595` | Near-CH585 tables without `nCO2522` (`0x84` highs); MMIO TBD |
 
-Uncertain fields are tagged `UNCERTAIN` / `Certainty::*` for silicon debug — see
-[`docs/research/bringup-debug.md`](docs/research/bringup-debug.md).
+Uncertain fields are tagged `UNCERTAIN` / `Certainty::*` for silicon debug.
 
-> **Read [`docs/pitfalls.md`](docs/pitfalls.md) before touching RF/LL/HCI.**
-> The sticky W1C `TX_DONE` bug, DMA alignment, and AdvA seeding all fail as
-> "success with nothing on air".
+> **RF/LL/HCI bring-up requires independent on-air verification.** A stale
+> sticky W1C `TX_DONE` can make TX report success without transmitting; clear
+> completion status before a new TX. Respect the radio's DMA alignment
+> requirements and seed a valid AdvA. Verify radiation with a second receiver,
+> not merely a TX completion or timeout.
 
 This repository used to wrap closed WCH `.a` BLE libraries via bindgen. That
 path is gone; the open register-level work continues from the CH32V208 NimBLE
@@ -54,10 +55,7 @@ RF bring-up (`wch_rf`).
 | `src/phy` | L1 schedule / IFS / WFR |
 | `src/ll` | L2 link layer |
 | `src/hci` | L3 soft HCI (`bt-hci` Controller) |
-| `docs/architecture.md` | Layer diagram + HAL boundary |
-| `docs/pitfalls.md` | Bring-up invariants / false-green traps |
-| `docs/research` | Family init research notes |
-| `examples/` | Flashable V208 RF smoke + Trouble ADV examples |
+| `examples/` | Flashable RF smoke + Trouble ADV examples |
 
 On-target bring-up examples live in this repo while the HAL integration is in
 flight; production firmware still belongs in the HAL repos.
@@ -97,9 +95,9 @@ let mut soft = SoftRunner::new();
 // let stack = trouble_host::new(controller, &mut resources);
 ```
 
-On-target smoke (RF only, before Trouble) remains a HAL-side example:
-`set_channel(37)` + `tx_basic` ADV_IND with BB/LLE IRQs wired — see
-[`docs/research/bringup-debug.md`](docs/research/bringup-debug.md).
+For on-target RF smoke before Trouble, see
+[`examples/ch32v208-rf-smoke`](examples/ch32v208-rf-smoke) and the CH585 and
+CH592 RF smoke examples. Verify transmitted packets with a second receiver.
 
 ## Status
 
@@ -111,9 +109,6 @@ SoftRunner with a Trouble Host and advertises ADV_IND on 37/38/39; macOS
 CoreBluetooth sees `wchble` (`RSSI ≈ -54`) via
 `examples/ch32v208-trouble-adv/tools/scan_wchble.swift`. Next: SCAN_RSP /
 connections (Phase C).
-
-Tracked in [`docs/progress.md`](docs/progress.md). Phased gates:
-[`docs/research/path-b-soft-hci-trouble.md`](docs/research/path-b-soft-hci-trouble.md).
 
 ## License
 

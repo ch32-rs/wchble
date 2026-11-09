@@ -104,7 +104,7 @@ fn mmio(base: usize, off: usize) -> u32 {
     unsafe { regs::read(base, off) }
 }
 
-/// Dump sticky DevInit markers from bringup-debug.md (V208 open path).
+/// Dump sticky DevInit markers for the V208 open path.
 fn dump_and_check_regs() -> bool {
     let lle_14 = mmio(LLE_BASE, 0x14);
     let lle_1c = mmio(LLE_BASE, 0x1c);

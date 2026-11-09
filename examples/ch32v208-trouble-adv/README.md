@@ -28,7 +28,7 @@ bits 7..6 = 11, e.g. `0xC1`).
 `tools/scan_wchble.swift` (CoreBluetooth) reports `FOUND wchble` (RSSI ≈ -54)
 while the example advertises. If scanning stops working after driver changes,
 check the sticky `TX_DONE` W1C bit: a stale completion makes `tx_basic` return
-success without transmitting (see `docs/research/bringup-debug.md`).
+success without transmitting; clear the completion status before a new TX.
 
 ## Sniffer
 

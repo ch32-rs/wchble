@@ -39,7 +39,7 @@ The DevInit values this backend writes (CH585 carved `libCH58xBLE.a`):
 | `RFEND 28` | `480` (sticky high bits may differ) | `480` |
 
 `tx chN ok` must be checked against a **second receiver** — a "TX ok" whose
-window expired is not radiation (`docs/pitfalls.md` §7). A macOS scan for the
+window expired is not radiation. A macOS scan for the
 local name `wch585` is the cheapest second receiver.
 
 ## Build / flash

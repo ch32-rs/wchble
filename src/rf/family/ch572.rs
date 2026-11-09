@@ -9,7 +9,7 @@
 //!
 //! Tables are CH5xx **"new tables"** but **not** a copy of CH585: LLE timeouts
 //! are mostly `0x64`, mask `0x16000F`, BB+0x34=`0x14`, WaitTune 8000, 3-band VCO
-//! (no `nCO2522`). See `docs/research/family-comparison.md`.
+//! (no `nCO2522`).
 
 use crate::rf::analog::AnalogInit;
 use crate::rf::family::tables::{

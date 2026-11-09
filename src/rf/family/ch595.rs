@@ -9,8 +9,7 @@
 //!
 //! Tables sit near CH585 ("new tables"): LLE `0x6C` pair + mask `0x1F000F`,
 //! BB+0x34=`0x50`, WaitTune 8000 — but **no** 4th VCO band `nCO2522`, and LLE
-//! timeout highs are `0x84` (not CH585's `0x8C`). See
-//! `docs/research/family-comparison.md`.
+//! timeout highs are `0x84` (not CH585's `0x8C`).
 
 use crate::rf::analog::AnalogInit;
 use crate::rf::family::tables::{

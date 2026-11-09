@@ -26,9 +26,6 @@
 //! (`TRIG`/`SEQ`), RX completion bits 0|2, arm-clear bit 17 behind guard bit 17
 //! of `LLE+0x0C`, CRC enable is `LLE+0x04` bit 0, and the channel goes to
 //! `BB+0[6:0]` (plus `BB+0x5C[8:0]` in `BLE_CheckChannel`).
-//!
-//! See `docs/research/family-comparison.md` and the CH585 rows of
-//! `docs/research/init-diff-table.md` for the cross-chip evidence.
 
 use crate::rf::analog::{self, AnalogInit};
 use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
