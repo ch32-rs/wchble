@@ -156,6 +156,34 @@ must sample more often than one raw rollover (about 69–72 seconds at these clo
 rates); this is not a general sleep-safe or interrupt-shared time driver. A host
 regression models repeated raw-counter rollovers over six minutes.
 
+The current source uses `hal::rcc::clocks().sysclk` for the HSE/PLL time conversion
+(nominal 62.4 MHz for this configuration), not `delay::measured_sysclk()`, whose
+internal 32 kHz RC reference introduced approximately 1755 ppm scaling error in
+later packet comparisons. Nominal conversion and next-anchor window regressions
+cover this separately from counter rollover. The archived run12/run13 images
+predate this rate-source fix: their outcomes below are unchanged, and this
+source change alone does not revalidate P3 hardware or calibrate air timing.
+
+A separate nominal-rate hardware regression passed three 3-second Mac
+connect/hold/disconnect cycles in a 25-second image. Firmware reported the selected
+62,400,000 Hz rate, three normal terminations, 162 data RX/TX, no supervision,
+TX late/error, RX error or stop error, and a clean finite finish with smoke
+restoration/discovery. It also recorded 158 missed events, 27 bad-CRC and 118
+bad-PDU observations; this short functional pass is not zero-loss, long-run,
+phone, calibrated clock or IFS acceptance. Evidence:
+`local-docs/research/experiments/ch585-p3-nominal-21/`.
+
+Packet analysis subsequently found the receive adapter had treated the latest
+preamble start as an address-match timeout. The completion-deadline correction
+allows a full legacy 27-byte LE1M packet (296 us) while retaining earlier hard
+limits; it does not widen the SCA budget or alter IFS. A separate three-cycle
+3-second-hold regression passed with 308 data RX/TX, 6 misses in 313 events,
+three normal terminations and zero supervision/TX/RX/stop errors, with smoke
+recovery. Evidence: `ch585-p3-rx-window-25`. The preceding `ch585-p3-rx-window-24`
+was refused at RF preflight before flashing; that failure remains recorded.
+The shared preflight now always issues explicit shut, even after an initial
+CMD=0 sample, and still refuses flash unless both subsequent idle checks pass.
+
 **Run12 passed all ten 10-second connect/disconnect/reconnect cycles** after
 this fix, using firmware SHA-256
 `02b084b6234481e445e75fb23187f6b3aac03979ead46caf69340578d59d823e`.

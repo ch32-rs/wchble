@@ -112,18 +112,24 @@ with supervision timeout; it is not reported as passing. This example bypasses
 the scaffold HCI runner: it is not yet a Trouble/GATT peripheral, and air IFS is
 unmeasured.
 
-**CH585 P4 real Host/GATT integration** (2026-11-09):
+**CH585 P4 real Host/GATT integration** (2026-11-10):
 [`ch585-trouble-gatt`](examples/ch585-trouble-gatt) connects the event-level radio
 pump to a bounded single-connection soft HCI/ACL bridge and real Trouble Host.
 The native real-Host fixture passes discovery, read/write, notification, credit
-recycling and reconnect tests. One controlled macOS physical cycle passed service
-and characteristic discovery, five reads, thirteen writes, ten verified sequence
-notifications, unsubscribe and normal disconnect, with a clean finite RF finish
-and smoke recovery. Earlier failed attempts are retained. The successful run's
-sniffer did not follow its data channel and required forced shutdown, so that
-capture gate is not verified. Android/iPhone P4 acceptance, repeated physical
-reconnects and sustained reliability are also unverified. See the example for the
-finite runner and safety/recovery policy.
+recycling and reconnect tests. With nominal HSE/PLL timing and a corrected RX
+completion deadline, two separate five-cycle macOS runs passed service/
+characteristic discovery, reads, writes, verified sequence notifications,
+unsubscribe and normal disconnect/reconnect. Each run completed 25 reads,
+65 writes and 50 notifications, with clean finite RF finish and smoke recovery. Earlier failed attempts are retained. The original
+single-cycle capture had a CRC-bad CONNECT and required forced shutdown. A separate
+new capture verified all three connections, bidirectional data and notifications,
+with clean SIGINT shutdown in that run. Packet evidence then exposed a receive
+start/completion deadline mix-up; its correction reduced missed events from
+168/339 to 1/172 and restored 1:1 data exchange in the captured links. Whole-run
+sniffer following and orderly shutdown remain intermittent, not guaranteed.
+Android/iPhone P4 acceptance and sustained reliability remain unverified. See the
+example for the finite runner and safety/recovery policy. Open defects and
+acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md).
 
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`

@@ -98,6 +98,20 @@ mod tests {
     }
 
     #[test]
+    fn hse_nominal_rate_avoids_rc_reference_scaling_error() {
+        let nominal = TickRate::new(62_400_000).unwrap();
+        let rc_referenced = TickRate::new(62_509_688).unwrap();
+        for (ticks, exact_us, rc_us) in [
+            (1_872_000, 30_000, 29_947),
+            (7_488_000, 120_000, 119_789),
+            (7_488_000_000, 120_000_000, 119_789_431),
+        ] {
+            assert!(exact_us - nominal.micros(ticks) <= 2);
+            assert_eq!(rc_referenced.micros(ticks), rc_us);
+        }
+    }
+
+    #[test]
     fn wide_ticks_are_continuous_across_low_word_rollover() {
         let rate = TickRate::new(60_000_000).unwrap();
         let before = rate.micros((1u64 << 32) - 600);

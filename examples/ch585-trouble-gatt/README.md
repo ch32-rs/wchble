@@ -1,9 +1,11 @@
 # CH585 Trouble GATT peripheral (P4)
 
 This example combines the CH585 polling radio/LL with the real `trouble-host`
-GATT server. It is not the P3 hand-written ATT responder. One controlled macOS
-physical GATT cycle passed (2026-11-09); this is not Android/iPhone acceptance,
-repeated physical reconnect validation, sustained stability, or air compliance.
+GATT server. It is not the P3 hand-written ATT responder. Two separate five-cycle
+macOS GATT runs passed with nominal HSE/PLL timing and the RX completion fix
+(2026-11-10); this is not Android/iPhone acceptance, sustained stability, or air
+compliance. Open defects and acceptance gaps are tracked in the repository
+[`BACKLOG.md`](../../BACKLOG.md).
 
 The local Trouble checkout at `../../../trouble/host` must be at
 `3aa6fd27b89cd5fc35f5c9b4f0c7f66795a14f70` (the `bt-hci` 0.11 revision).
@@ -24,7 +26,33 @@ before building. The local Trouble checkout revision above must also match.
 
 ## Validation status
 
-The controlled macOS cycle completed discovery, five reads, thirteen writes,
+Two subsequent isolated five-cycle Mac runs each completed twenty-five reads,
+sixty-five writes, fifty verified notifications, five normal disconnects and
+return to advertising. The latest run finished its client sequence in 11.756 s,
+with 287 data RX/TX, 1 miss in 286 events, zero supervision/TX/RX/stop/Host/bridge
+errors or poll overruns, and maximum observed Host/HCI poll 987 us. Both firmware
+budgets and smoke restoration/discovery passed. Capture remained incomplete in
+both runs (despite clean capture-process exits), so their combined capture gates
+are FAIL, not reclassified by their functional successes.
+
+After correcting the receive deadline, the initial three-cycle Mac regression
+completed fifteen reads, thirty-nine writes, thirty checked notifications and
+three normal terminations in 6.209 s total client time. Misses dropped to 1/172
+events (171 data RX/TX), without TX late/error, supervision expiration, Host/bridge
+error or poll overrun. The two fully captured links each have 57 central and
+57 peripheral packets, eliminating the prior alternating-event pattern.
+Firmware finished its 25-second budget and smoke recovery/discovery passed.
+
+The prior nominal-rate-only regression completed three Mac discovery/read/write/notify/
+unsubscribe/disconnect/reconnect cycles: fifteen reads, thirty-nine writes,
+thirty checked notifications, three normal terminations, and return to
+advertising after each disconnect. Firmware confirmed 62,400,000 Hz, 173 data
+RX/TX, 171 missed events out of 344, no supervision expiration, TX late/error,
+RX/stop/Host/bridge error or poll overrun. Maximum observed Host/HCI poll was
+987 us; the 25-second budget and smoke restoration/discovery passed. Missed events
+remain visible, not hidden as zero-loss or stability acceptance.
+
+The earlier single controlled macOS cycle completed discovery, five reads, thirteen writes,
 ten checked notifications (101–110), unsubscribe, final readback 110, and expected
 disconnect. Firmware recorded 65 data RX/TX, three missed events, normal terminate
 0x13, no supervision expiration, TX late/error, RF stop error, Host/bridge error,
@@ -39,12 +67,27 @@ repeated outer-loop snapshots that can overshoot it. Channel setup is also done
 early, as in P3. Trace kind 8 records RX arm entry/return times outside the
 RX-to-TX response deadline.
 
-The successful functional run's optional sniffer capture did **not** follow data
-channels and needed forced shutdown. It does not independently verify that cycle's
-ATT packets or air timing; client and firmware evidence establish the functional
-result. Earlier failed captures did observe actual Trouble MTU/service replies.
-No multi-round physical reconnect, Android/iPhone P4, long-run P4, or calibrated
-IFS acceptance is claimed.
+The original single-cycle run's optional capture did **not** follow data channels:
+its only CONNECT was CRC-bad, and capture needed forced shutdown. Those records
+remain unchanged. A new nominal-rate three-cycle capture separately passed valid
+CONNECT/bidirectional data/ATT/notifications for every cycle and clean SIGINT
+exit0, with finite-run smoke recovery. The capture wrapper explicitly uses a
+100 ms serial read timeout; this is not a capture duration or a calibrated air
+timing measurement. No TERM/KILL fallback was needed in that run.
+
+The later RX correction separates the latest preamble start (`rx_end_us`) from
+full reception (`rx_complete_end_us`). Both initial hardware WINDOW and software
+no-capture timeout allow the longest 27-byte LE1M PDU (296 us) to finish; earlier
+finite/supervision/terminate/event limits remain authoritative. This is not a
+larger SCA/clock-error budget or an assumed exact CLKCAP latency. Model tests
+reproduce the old alternating-event misses and cover late starts/time wrap.
+
+That correction's physical run passed all three functional cycles and captured
+two complete 1:1 links, but missed one CONNECT and needed SIGTERM during cleanup.
+Its combined capture result therefore remains FAIL, despite the firmware result
+passing. The earlier all-three capture/clean-stop pass does not establish reliable
+whole-run capture or shutdown. Android/iPhone P4, long-run P4 and calibrated IFS
+acceptance remain unverified.
 
 ## GATT contract
 
@@ -108,6 +151,15 @@ the twelve Host counters above, followed by four reserved zero words. A 2 ms
 pre-poll guard is not a preemptible execution budget; actual poll duration and
 wireless deadlines must still be checked on hardware.
 
+The current source converts SysTick HCLK ticks with the nominal HSE/PLL frequency
+from `hal::rcc::clocks().sysclk` (62.4 MHz here). The HAL delay estimate uses an
+internal low-speed RC reference and is not the preferred rate for a crystal/PLL
+clock. Separate conversion/window tests reproduce the approximately 1755 ppm
+error seen with the old rate. The earlier successful single cycle used the old
+rate; the separate three-cycle regression above validates the functional change.
+It does not retroactively alter archived images, reclassify earlier failures, or
+validate calibrated clock/IFS compliance.
+
 ## Build and validate
 
 Build from this directory with `cargo build --release --locked`. The default
@@ -145,7 +197,67 @@ custom service and characteristic, performs three write/readback pairs, subscrib
 and checks ten numbered notifications, unsubscribes, reads back 110, and waits for
 its expected disconnect. No phone client should run concurrently.
 
-The runner does not start the optional nRF Sniffer itself. Capture its separate
-`C1:FF:EE:00:00:14 random` target before flashing when air evidence is required.
+The runner does not start the optional nRF Sniffer itself. `tools/capture.py`
+wraps the same safe runner with capture of `C1:FF:EE:00:00:14 random`. Confirm the
+sniffer's USB serial and current port before using it; the following paths are
+local installed-tool examples, not fresh-machine installation instructions:
+
+```sh
+python3 examples/ch585-trouble-gatt/tools/capture.py \
+  --sniffer /tmp/wchble-nrfutil-state-20261109/bin/nrfutil-ble-sniffer \
+  --nrfutil-home /tmp/wchble-nrfutil-state-20261109 \
+  --sniffer-port /dev/cu.usbmodem21301 \
+  --sniffer-serial 8D4391AA608D9EE4 --serial-timeout-ms 100 \
+  --out local-docs/research/experiments/ch585-p4-unique-capture \
+  --run-seconds 25 --cycles 3 --timeout 20
+```
+
+The experimental wrapper flag `--follow-by-name` keeps scanning until `wch585-p4`
+appears after flashing, instead of sending an address-follow request while the
+board is still smoke. Name mode enables scan-response following because the
+local name is in SCAN_RSP; analysis still requires the fixed target address and
+actual connection/data packets. Scan startup is not declared connection success.
+The first physical name-mode comparison did not follow all links and failed its
+capture gate; it is not a proven repair or the default mode.
+
+`--serial-timeout-ms` controls serial reads, not the capture duration. Capture
+startup and shutdown are bounded; loss of capture never shortens the firmware's
+safe budget/recovery sequence. The outer `capture-result.json` reports functional,
+capture and shutdown gates separately; the original `run/result.json` remains the
+independent client/firmware/recovery result. Capture requires a CRC-valid target
+CONNECT for every requested cycle, both CRC-valid data directions, actual ATT
+reads/writes and the notification sequence. An advertisement or CRC-bad CONNECT
+is not connection-following success. SIGTERM/SIGKILL shutdown fallback is retained
+as unclean, never silently promoted to a pass. Offline helper tests:
+`python3 examples/ch585-trouble-gatt/tools/test_capture.py`.
+
 Build/native success, macOS GATT acceptance, Android/iPhone acceptance, sustained
 reliability, and calibrated air timing are separate validation claims.
+
+## Separate phone acceptance
+
+Use a dedicated finite phone-only firmware window, not a concurrent Mac central.
+The normal runner above always starts the Mac client; do not use it as a phone
+launcher. A separately built `long-run` image provides a 360-second budget, but
+still requires the same deferred probe collection and smoke recovery policy.
+Test Android and iPhone in separate windows so the observed peer has unambiguous
+platform attribution. Neither platform is accepted just because its UI connects.
+
+For each of three connect/discover/read/write/disconnect/reconnect rounds in
+nRF Connect, select `wch585-p4` and the custom service/characteristic above:
+
+1. Read the four-byte value; it may retain the previous connection's last value.
+2. Send a **Write Request (with response)** of hex `01 00 00 00`; read back the
+   same bytes. Do not select Write Command or assume a text/decimal encoding.
+3. Enable notifications, then write u32LE sequence values 101–110 (`65 00 00 00`
+   through `6e 00 00 00`), checking exactly one matching notification per write.
+4. Disable notifications, write another four-byte value and read it back; no
+   notification should arrive while disabled.
+5. Disconnect explicitly, reconnect and verify the value persists and CCCD
+   subscription starts disabled. Enable notifications again only when requested.
+
+Keep the phone operation log/platform separate from captured address attribution.
+A timeout before discovery, repeated LL control exchange, missing ATT response,
+wrong value and notification failure are different outcomes and must not be
+collapsed into one generic GATT failure. No automatic retries should erase a
+failed round.
