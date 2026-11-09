@@ -853,10 +853,24 @@ impl Radio for Ch585Radio {
             self.tx_bounce.0.as_ptr()
         };
 
-        // `ll_advertise_tx` pre-arm.
+        // Unscheduled advertising retains its proven 60-us pre-arm. A
+        // scheduled response follows the working V208 basic-TX ordering:
+        // prepare with the countdown stopped, then wait for the absolute
+        // deadline below. Spending an advertising pre-arm here made every
+        // CH585 scan response miss the RX_DONE + 120-us starting deadline.
+        let advertising_prearm = start_cputime.is_none();
         unsafe {
-            regs::write(LLE_BASE, lle::WINDOW, 0x78);
-            regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0x1);
+            regs::write(
+                LLE_BASE,
+                lle::WINDOW,
+                if advertising_prearm { 0x78 } else { 0 },
+            );
+            regs::rmw(
+                BB_BASE,
+                bb::AUTOCFG,
+                0x3,
+                if advertising_prearm { 0x1 } else { 0 },
+            );
             regs::rmw(BB_BASE, bb::RFCTRL, bb5::DIR_MASK, 0);
             regs::rmw(BB_BASE, bb::RFCTRL, bb5::DIR_MASK, bb5::DIR_RX);
             regs::rmw(RFEND_BASE, rfend5::FECTRL, 0, rfend::FECTRL_RF_ON);
@@ -874,7 +888,7 @@ impl Radio for Ch585Radio {
         // Before `BLE_SetPHYTxMode` rewrites `LLE+0x64`, `ll_tx_wait_finish`
         // lets the `0x78` pre-arm countdown expire.
         let arm_wait = clock.now_us();
-        while unsafe { regs::read(LLE_BASE, lle::WINDOW) } != 0 {
+        while advertising_prearm && unsafe { regs::read(LLE_BASE, lle::WINDOW) } != 0 {
             if clock.now_us().wrapping_sub(arm_wait) > 100 {
                 break;
             }

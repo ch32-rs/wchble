@@ -39,29 +39,35 @@ The DevInit values this backend writes (CH585 carved `libCH58xBLE.a`):
 | `RFEND 28` | `480` (sticky high bits may differ) | `480` |
 
 `tx chN ok` must be checked against a **second receiver** — a "TX ok" whose
-window expired is not radiation. A macOS scan for the
-local name `wch585` is the cheapest second receiver.
+window expired is not radiation. On macOS, the following checks for the exact
+advertised local name and returns 0 if seen, 1 if not seen before the deadline,
+or 2 if Bluetooth is unavailable or the arguments are invalid:
+
+```bash
+swift tools/scan_ch585.swift wch585 10
+```
+
+This is a discovery check, not an air capture: it does not verify the address,
+channel, CRC, scan response, connection, or inter-frame timing. A negative scan
+alone does not prove the device is off air.
 
 ## Build / flash
 
 ```bash
 cd examples/ch585-rf-smoke
 cargo build --release
-wlink -d 1a86:8010:<SERIAL> flash \
-  target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke
-# Power-cycle the target, or the BLE block stays idle:
-wlink -d 1a86:8010:<SERIAL> set-power disable3v3
-wlink -d 1a86:8010:<SERIAL> set-power enable3v3
+probe-rs download --probe 1a86:8010:<SERIAL> --chip CH585 --protocol jtag \
+  --verify --start target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke
 ```
 
 Requires a sibling checkout of
 [`ch5xx-hal`](https://github.com/ch32-rs/ch5xx-hal) at `../../../ch5xx-hal` and
-`wlink` on `PATH`. Flash needs a WCH-LinkE with recent firmware (v3.6/v42 was
-used here; v2.11/v31 times out on CH585 attach).
+`probe-rs` on `PATH`. Flash needs a WCH-LinkE with recent firmware (v3.6/v42
+was used here; v2.11/v31 times out on CH585 attach).
 
-**The power cycle matters.** The LinkE's post-flash reset leaves the BLE block
-idle — the same image that advertises fine after a `set-power` cycle was
-invisible to macOS when only `wlink flash`'s reset was used.
+A real power cycle was needed in some earlier runs after `wlink flash`; the
+`probe-rs download --verify --start` sequence above has also been observed to
+start advertising without a power cycle.
 
 If the board has no 32 MHz crystal, `hse_nearest` cannot produce the BLE
 reference clock; use a CH585 board with the crystal fitted (all WCH EVT boards
@@ -102,3 +108,7 @@ before running the scanner (or scan before reading).
    `Peripheral.hex` capture, with differences in some words.
 4. RX decodes nearby advertisers with `crc=true`; TX is confirmed by an
    external macOS scan seeing `wch585`.
+
+For the separate experimental scannable broadcaster, see
+[`../ch585-scannable`](../ch585-scannable/README.md). Its automatic runner checks
+scan response data, then restores this non-scannable smoke and scans it again.
