@@ -128,8 +128,12 @@ start/completion deadline mix-up; its correction reduced missed events from
 168/339 to 1/172 and restored 1:1 data exchange in the captured links. Whole-run
 sniffer following and orderly shutdown remain intermittent, not guaranteed.
 Android/iPhone P4 acceptance and sustained reliability remain unverified. See the
-example for the finite runner and safety/recovery policy. Open defects and
-acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md).
+example for the finite runner and safety/recovery policy. **Further physical
+launches are blocked:** the installed probe CLI resumes CPU execution after
+preflight reads, invalidating continuous halt/idle ownership. The first phone
+launch was refused before download; smoke restoration/discovery passed. A
+single-session preflight/download fix is required before another launch. Open
+defects and acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md).
 
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`

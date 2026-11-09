@@ -26,6 +26,16 @@ before building. The local Trouble checkout revision above must also match.
 
 ## Validation status
 
+**Physical-run blocker (2026-11-10): do not launch the hardware runners below
+until the preflight session fix is implemented.** The installed `probe-rs read`
+resumes CPU execution after each access, so separate stop/idle reads can let smoke
+rearm RF. The first independent phone launch was refused before download (CMD
+acknowledgements 0 then 2); no P4 phone image ran. Finally smoke restoration and
+exact-name discovery passed. Two zero samples alone do not prove continuous halt
+ownership. A single retained session must cover halt, shutdown, both idle checks
+and verified download/start; see [`BACKLOG.md`](../../BACKLOG.md). This newly found
+tooling defect does not turn prior functional GATT results into phone acceptance.
+
 Two subsequent isolated five-cycle Mac runs each completed twenty-five reads,
 sixty-five writes, fifty verified notifications, five normal disconnects and
 return to advertising. The latest run finished its client sequence in 11.756 s,

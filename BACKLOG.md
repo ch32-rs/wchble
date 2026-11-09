@@ -22,6 +22,32 @@ See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
+## Priority: safe pre-flash stop reliability
+
+- [ ] **Further physical launches are blocked by the preflight CLI sequence.**
+  The first P4 phone-only attempt refused to flash: CMD was 2 before shut, then
+  0 and 2 at the required acknowledgements. No P4 test image ran and no phone
+  result was obtained. Independent final smoke restoration and exact-name
+  discovery passed; the board is smoke, not ready for phone GATT. The same
+  attempt's sniffer needed SIGTERM and remains unclean.
+- [ ] **Retain one halted probe session through shut, acknowledgements and
+  verified download/start.** Installed `probe-rs` 0.32.0
+  (`b580f1a0b96c1880871c30892343287b1aed716f`) unconditionally resumes all cores
+  after `read`. Consequently every separate preflight read, including the first
+  zero acknowledgement, lets smoke run and rearm RF. Even two sampled zeros do
+  not establish uninterrupted CPU/RF ownership. The current read/write CLI has
+  no keep-halted option. Separate debug REPL invocations are not a safe substitute:
+  startup resumes Request-halted cores before processing `break`, and the REPL
+  lacks generic MMIO writes. Do not rerun the current physical launch sequence
+  or bypass acknowledgements; implement a bounded single-session helper first.
+
+Acceptance: with the fixed probe selector, establish halted CPU/RF ownership
+through the complete pre-flash sequence, retain both zero idle acknowledgements
+and failure refusal, then perform a new archived phone-only launch with real
+successful-flash readiness. Preserve the failed attempt separately; smoke
+recovery is not successful phone-image installation. Historical client/firmware
+functional results remain separate from this newly identified preflight gap.
+
 ## Priority: independent phone acceptance
 
 - [ ] **Android P4:** complete at least three isolated connect/discover/read/
