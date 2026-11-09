@@ -22,31 +22,23 @@ See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
-## Priority: safe pre-flash stop reliability
+## Resolved: safe pre-flash stop
 
-- [ ] **Further physical launches are blocked by the preflight CLI sequence.**
-  The first P4 phone-only attempt refused to flash: CMD was 2 before shut, then
-  0 and 2 at the required acknowledgements. No P4 test image ran and no phone
-  result was obtained. Independent final smoke restoration and exact-name
-  discovery passed; the board is smoke, not ready for phone GATT. The same
-  attempt's sniffer needed SIGTERM and remains unclean.
-- [ ] **Retain one halted probe session through shut, acknowledgements and
-  verified download/start.** Installed `probe-rs` 0.32.0
-  (`b580f1a0b96c1880871c30892343287b1aed716f`) unconditionally resumes all cores
-  after `read`. Consequently every separate preflight read, including the first
-  zero acknowledgement, lets smoke run and rearm RF. Even two sampled zeros do
-  not establish uninterrupted CPU/RF ownership. The current read/write CLI has
-  no keep-halted option. Separate debug REPL invocations are not a safe substitute:
-  startup resumes Request-halted cores before processing `break`, and the REPL
-  lacks generic MMIO writes. Do not rerun the current physical launch sequence
-  or bypass acknowledgements; implement a bounded single-session helper first.
-
-Acceptance: with the fixed probe selector, establish halted CPU/RF ownership
-through the complete pre-flash sequence, retain both zero idle acknowledgements
-and failure refusal, then perform a new archived phone-only launch with real
-successful-flash readiness. Preserve the failed attempt separately; smoke
-recovery is not successful phone-image installation. Historical client/firmware
-functional results remain separate from this newly identified preflight gap.
+- [x] **Single-session preflight (`tools/ch585-preflight`).** Standalone
+  `probe-rs read` resumes all cores, so the old separate stop/idle reads could
+  rearm RF. The helper halts once, performs engine shutdown, requires two zero
+  CMD acknowledgements, then verifies the download and starts the image; any
+  nonzero/missing acknowledgement refuses the download. Test and recovery
+  flashes use it. Built against the pinned sibling probe-rs checkout because the
+  published 0.32.0 target list predates CH585.
+- [x] **Re-validated on hardware:** smoke flash/start/discovery, then two clean
+  three-cycle macOS P4 acceptance runs (three connections, fifteen reads,
+  thirty-nine writes, thirty notifications, zero missed/retry/supervision/bridge
+  errors, smoke recovery). The earlier refusal and direct-flash phone window
+  remain archived as separate attempts.
+- [ ] **Supervision-timeout recovery is still untested.** The Mac central never
+  withholds LL acknowledgements, so the planned phone walk-away/disconnect case
+  remains open.
 
 ## Priority: independent phone acceptance
 
@@ -57,11 +49,15 @@ functional results remain separate from this newly identified preflight gap.
 - [x] **First manual iPhone check (2026-11-10):** the user separately reports a
   successful iOS attempt. It shares the same window's counters, so attribution
   rests on the user's UI observations rather than captured peer evidence.
-- [ ] **Formal Android acceptance:** at least three isolated rounds, ten numbered
-  notifications per subscribed round, and reconnects in a window with no other
-  phone or Mac central. The first manual check did not exercise ten notifications
-  or three rounds.
-- [ ] **Formal iPhone acceptance:** the same rounds in a separate window.
+- [x] **Multi-round acceptance via controlled Mac central (2026-11-10).** By
+  project decision, repeated rounds use the scripted Mac client instead of
+  repeated manual phone operation. Two clean three-cycle runs passed every
+  read/write/notification/unsubscribe/disconnect/reconnect step with zero missed
+  events or retries. This does not replace the separate one-round platform smoke
+  checks above.
+- [ ] **Optional deeper per-platform rounds:** if a platform-specific defect is
+  suspected, repeat three isolated phone rounds with ten notifications each and
+  no competing central. Not required by the current Mac-centered acceptance plan.
 - [ ] **Classify any phone connection/discovery failure from evidence.** An
   uncontrolled phone attempt saw services but did not complete the intended
   workflow. This is neither acceptance nor proof of interference. Retain the
