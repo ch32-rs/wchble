@@ -6,6 +6,7 @@ use core::future::pending;
 
 use embassy_futures::join::join;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use heapless::Vec;
 use trouble_host::prelude::*;
 
 pub const LOCAL_NAME: &[u8] = b"wch585-p4";
@@ -18,9 +19,19 @@ pub const SERVICE_UUID: Uuid =
     Uuid::new_long(0x00001000_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
 pub const VALUE_UUID: Uuid =
     Uuid::new_long(0x00001001_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
+// Nordic UART Service UUIDs: a de facto write/notify pipe understood by many
+// phone BLE tools, without implying a product profile.
+pub const UART_SERVICE_UUID: Uuid =
+    Uuid::new_long(0x6e400001_b5a3_f393_e0a9_e50e24dcca9eu128.to_le_bytes());
+pub const UART_RX_UUID: Uuid =
+    Uuid::new_long(0x6e400002_b5a3_f393_e0a9_e50e24dcca9eu128.to_le_bytes());
+pub const UART_TX_UUID: Uuid =
+    Uuid::new_long(0x6e400003_b5a3_f393_e0a9_e50e24dcca9eu128.to_le_bytes());
+#[allow(dead_code)]
+pub const UART_CHARACTERISTIC_UUID_TEXT: &str = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 pub const RANDOM_ADDRESS: [u8; 6] = [0x14, 0x00, 0x00, 0xee, 0xff, 0xc1];
 
-pub const HOST_STATS_WORDS: usize = 12;
+pub const HOST_STATS_WORDS: usize = 16;
 pub const STAT_PHASE: usize = 0;
 pub const STAT_CONNECTIONS: usize = 1;
 pub const STAT_DISCONNECTS: usize = 2;
@@ -33,6 +44,9 @@ pub const STAT_LAST_ERROR: usize = 8;
 pub const STAT_OTHER: usize = 9;
 pub const STAT_SUBSCRIBED: usize = 10;
 pub const STAT_ADVERTISE_ATTEMPTS: usize = 11;
+pub const STAT_UART_WRITES: usize = 12;
+pub const STAT_UART_NOTIFICATIONS: usize = 13;
+pub const STAT_UART_LEN: usize = 14;
 
 pub const PHASE_STARTING: u32 = 1;
 pub const PHASE_ADVERTISING: u32 = 2;
@@ -95,12 +109,23 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
 
     let appearance = [0u8, 0];
     let mut storage = [0u8; 4];
-    let mut table: AttributeTable<'_, NoopRawMutex, 10> = AttributeTable::new();
+    let mut uart_rx_storage = [0u8; 64];
+    let mut uart_tx_storage = [0u8; 64];
+    let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
     let mut gap = table.add_service(Service::new(0x1800u16));
     gap.add_characteristic_ro(0x2a00u16, LOCAL_NAME);
     gap.add_characteristic_ro(0x2a01u16, &appearance);
     gap.build();
     table.add_service(Service::new(0x1801u16)).build();
+
+    // Standard Device Information Service, read-only so a client can identify
+    // this build without any vendor-specific schema.
+    let mut info = table.add_service(Service::new(0x180Au16));
+    info.add_characteristic_ro(0x2a29u16, "wchble");
+    info.add_characteristic_ro(0x2a24u16, "ch585-trouble-gatt");
+    info.add_characteristic_ro(0x2a26u16, "p5-0.1");
+    info.build();
+
     let value: Characteristic<u32> = table
         .add_service(Service::new(SERVICE_UUID))
         .add_characteristic(
@@ -114,7 +139,27 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             &mut storage,
         )
         .build();
-    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 10, 1>::new(table);
+
+    // UART pipe: writes to RX are echoed as notifications on TX.
+    let mut uart = table.add_service(Service::new(UART_SERVICE_UUID));
+    let uart_rx: Characteristic<Vec<u8, 64>> = uart
+        .add_characteristic(
+            UART_RX_UUID,
+            &[CharacteristicProp::Write],
+            Vec::new(),
+            &mut uart_rx_storage,
+        )
+        .build();
+    let uart_tx: Characteristic<Vec<u8, 64>> = uart
+        .add_characteristic(
+            UART_TX_UUID,
+            &[CharacteristicProp::Notify],
+            Vec::new(),
+            &mut uart_tx_storage,
+        )
+        .build();
+    uart.build();
+    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 24, 1>::new(table);
 
     let runner_task = async {
         let _ = runner.run().await;
@@ -177,12 +222,16 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     }
                     GattConnectionEvent::Gatt { event } => {
                         let mut wrote_value = false;
+                        let mut wrote_uart = false;
                         match &event {
                             GattEvent::Read(event) if event.handle() == value.handle => {
                                 stats.inc(STAT_READS);
                             }
                             GattEvent::Write(event) if event.handle() == value.handle => {
                                 wrote_value = true;
+                            }
+                            GattEvent::Write(event) if event.handle() == uart_rx.handle => {
+                                wrote_uart = true;
                             }
                             _ => stats.inc(STAT_OTHER),
                         }
@@ -205,6 +254,20 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                                 match value.notify(&connection, &current, false).await {
                                     Ok(()) => stats.inc(STAT_NOTIFICATIONS),
                                     Err(_) => stats.error(9),
+                                }
+                            }
+                        }
+                        if wrote_uart {
+                            let bytes = match connection.get(&uart_rx) {
+                                Ok(bytes) => bytes,
+                                Err(_) => fatal(stats, 11).await,
+                            };
+                            stats.inc(STAT_UART_WRITES);
+                            stats.set(STAT_UART_LEN, bytes.len() as u32);
+                            if uart_tx.should_notify(&connection) {
+                                match uart_tx.notify(&connection, &bytes, false).await {
+                                    Ok(()) => stats.inc(STAT_UART_NOTIFICATIONS),
+                                    Err(_) => stats.error(12),
                                 }
                             }
                         }

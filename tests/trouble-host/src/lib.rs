@@ -12,6 +12,7 @@ mod tests {
     use core::pin::{pin, Pin};
     use core::task::{Context, Waker};
 
+    use trouble_host::attribute::Uuid;
     use wchble::hci::{ConnectionInfo, RadioRequest, SoftRunner, TxAcl, TxTag};
 
     use super::host;
@@ -147,6 +148,90 @@ mod tests {
             replies[0][1..].to_vec()
         }
 
+        fn find_service(&mut self, uuid: u16) -> (u16, u16) {
+            let [lo, hi] = uuid.to_le_bytes();
+            let replies = self.exchange(
+                &[0x06, 1, 0, 0xff, 0xff, 0x00, 0x28, lo, hi],
+                1,
+            );
+            assert_eq!(replies[0][0], 0x07);
+            (
+                u16::from_le_bytes([replies[0][1], replies[0][2]]),
+                u16::from_le_bytes([replies[0][3], replies[0][4]]),
+            )
+        }
+
+        fn find_service_long(&mut self, uuid: &Uuid) -> (u16, u16) {
+            let mut bytes = [0; 16];
+            uuid.bytes(&mut bytes);
+            let mut request = vec![0x06, 1, 0, 0xff, 0xff, 0x00, 0x28];
+            request.extend_from_slice(&bytes);
+            let replies = self.exchange(&request, 1);
+            assert_eq!(replies[0][0], 0x07);
+            (
+                u16::from_le_bytes([replies[0][1], replies[0][2]]),
+                u16::from_le_bytes([replies[0][3], replies[0][4]]),
+            )
+        }
+
+        fn find_characteristic_long(
+            &mut self,
+            start: u16,
+            end: u16,
+            uuid: &Uuid,
+        ) -> (u16, u8, Option<u16>) {
+            let [sl, sh] = start.to_le_bytes();
+            let [el, eh] = end.to_le_bytes();
+            let mut wanted = [0; 16];
+            uuid.bytes(&mut wanted);
+            let replies = self.exchange(&[0x08, sl, sh, el, eh, 0x03, 0x28], 1);
+            assert_eq!(replies[0][0], 0x09);
+            let stride = replies[0][1] as usize;
+            for reply in &replies {
+                for entry in reply[2..].chunks_exact(stride) {
+                    if entry.len() == 21 && entry[5..] == wanted {
+                        let value = u16::from_le_bytes([entry[3], entry[4]]);
+                        let props = entry[2];
+                        let [vl, vh] = value.wrapping_add(1).to_le_bytes();
+                        let desc = self.exchange(&[0x04, vl, vh, el, eh], 1);
+                        let cccd = desc.iter().find_map(|row| {
+                            (row.len() == 6 && row[4] == 0x02 && row[5] == 0x29)
+                                .then(|| u16::from_le_bytes([row[2], row[3]]))
+                        });
+                        return (value, props, cccd);
+                    }
+                }
+            }
+            panic!("128-bit characteristic not found");
+        }
+
+        /// Returns value handle, properties and optional CCCD handle.
+        fn find_characteristic(&mut self, start: u16, end: u16, uuid: u16) -> (u16, u8, Option<u16>) {
+            let [sl, sh] = start.to_le_bytes();
+            let [el, eh] = end.to_le_bytes();
+            let [lo, hi] = uuid.to_le_bytes();
+            let replies = self.exchange(&[0x08, sl, sh, el, eh, 0x03, 0x28], 1);
+            assert_eq!(replies[0][0], 0x09);
+            let stride = replies[0][1] as usize;
+            let mut found = None;
+            for reply in &replies {
+                for entry in reply[2..].chunks_exact(stride) {
+                    if entry.len() >= 7 && entry[5] == lo && entry[6] == hi {
+                        let value = u16::from_le_bytes([entry[3], entry[4]]);
+                        let props = entry[2];
+                        let [vl, vh] = value.to_le_bytes();
+                        let desc = self.exchange(&[0x04, vl, vh, el, eh], 1);
+                        let cccd = desc.iter().find_map(|row| {
+                            (row.len() == 6 && row[4] == 0x02 && row[5] == 0x29)
+                                .then(|| u16::from_le_bytes([row[2], row[3]]))
+                        });
+                        found = Some((value, props, cccd));
+                    }
+                }
+            }
+            found.expect("characteristic not found")
+        }
+
         fn write(&mut self, handle: u16, value: &[u8], notifications: usize) -> Vec<Vec<u8>> {
             let [lo, hi] = handle.to_le_bytes();
             let mut request = vec![0x12, lo, hi];
@@ -251,6 +336,34 @@ mod tests {
         assert_eq!(stats.word(host::STAT_VALUE), 110);
         assert!(fixture.acknowledged > 5);
 
+        // Device Information Service: standard read-only identity.
+        let (info_start, info_end) = fixture.find_service(0x180a);
+        let (manufacturer, props, _) = fixture.find_characteristic(info_start, info_end, 0x2a29);
+        assert_eq!(props & 0x02, 0x02);
+        assert_eq!(fixture.read(manufacturer), b"wchble");
+        let (model, _, _) = fixture.find_characteristic(info_start, info_end, 0x2a24);
+        assert_eq!(fixture.read(model), b"ch585-trouble-gatt");
+        let (revision, _, _) = fixture.find_characteristic(info_start, info_end, 0x2a26);
+        assert_eq!(fixture.read(revision), b"p5-0.1");
+
+        // Nordic UART pipe: a write to RX is echoed once as a TX notification.
+        let (uart_start, uart_end) = fixture.find_service_long(&host::UART_SERVICE_UUID);
+        let (uart_rx, rx_props, _) = fixture.find_characteristic_long(uart_start, uart_end, &host::UART_RX_UUID);
+        assert_eq!(rx_props & 0x08, 0x08);
+        // MTU 23 fits one 128-bit declaration per response, so continue after RX.
+        let (uart_tx, tx_props, tx_cccd) =
+            fixture.find_characteristic_long(uart_rx + 1, uart_end, &host::UART_TX_UUID);
+        assert_eq!(tx_props & 0x10, 0x10);
+        assert!(fixture.write(tx_cccd.unwrap(), &[1, 0], 0).is_empty());
+        let notifications = fixture.write(uart_rx, b"hi", 1);
+        let mut expected = vec![0x1b];
+        expected.extend_from_slice(&uart_tx.to_le_bytes());
+        expected.extend_from_slice(b"hi");
+        assert_eq!(notifications, [expected]);
+        assert_eq!(stats.word(host::STAT_UART_WRITES), 1);
+        assert_eq!(stats.word(host::STAT_UART_NOTIFICATIONS), 1);
+        assert_eq!(stats.word(host::STAT_UART_LEN), 2);
+
         // Leave a real Host ACL in flight. Disconnect must invalidate its credit/tag.
         let old_tag = fixture.hold_read_response(value_handle);
         fixture.disconnect(1);
@@ -285,6 +398,7 @@ mod tests {
         assert_eq!(stats.word(host::STAT_LAST_ERROR), 0);
         assert_eq!(stats.word(host::STAT_PHASE), host::PHASE_ADVERTISING);
         assert_eq!(stats.word(host::STAT_ADVERTISE_ATTEMPTS), 3);
-        assert_eq!(fixture.acknowledged, 68);
+        // Includes the DIS/NUS discovery traffic and the UART echo notification.
+        assert_eq!(fixture.acknowledged, 86);
     }
 }

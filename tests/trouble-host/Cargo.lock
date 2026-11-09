@@ -381,6 +381,7 @@ dependencies = [
  "critical-section",
  "embassy-futures",
  "embassy-sync",
+ "heapless",
  "portable-atomic",
  "trouble-host",
  "wchble",

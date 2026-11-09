@@ -123,6 +123,35 @@ passing. The earlier all-three capture/clean-stop pass does not establish reliab
 whole-run capture or shutdown. Android/iPhone P4, long-run P4 and calibrated IFS
 acceptance remain unverified.
 
+## P5 services
+
+On top of the P4 value characteristic, the same image exposes:
+
+- Device Information Service `180A`: Manufacturer Name `2A29` = `wchble`,
+  Model Number `2A24` = `ch585-trouble-gatt`, Firmware Revision `2A26` = `p5-0.1`
+  (all read-only).
+- Nordic UART Service `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`:
+  - RX `6E400002-...` (Write): accepts up to 64 bytes in RAM; at MTU 23 the
+    client can send at most 20 bytes per Write Request.
+  - TX `6E400003-...` (Notify): each accepted RX write is echoed once as a TX
+    notification with the same bytes.
+
+The echo is driven only by writes; there is no periodic traffic or UART
+flow-control protocol. `HOST_STATS[12..14]` record UART writes, echo
+notifications queued, and the last accepted byte count. Standard reads and the
+UART pipe stay in the Host/application layer; the radio hot path is unchanged.
+ATT MTU remains 23, and the default packet pool stays at 27-byte chunks.
+
+Validation: the native fixture discovers and reads all three DIS fields, then
+subscribes to TX, writes `hi` to RX and requires exactly one matching echo
+notification (alongside the existing P4 lifecycle). A three-cycle macOS run read
+three DIS fields per cycle and echoed `p5-1`..`p5-3`; firmware recorded three
+connections/terminations, zero missed events, retries, supervision, TX/RX/stop,
+Host or bridge errors, and smoke restoration/discovery passed. Three earlier
+client attempts failed on Swift-side discovery/callback ordering before a clean
+run; they are retained in the local experiment records. MTU exchange, long data,
+and sustained UART throughput remain unverified.
+
 ## GATT contract
 
 - Complete local name: `wch585-p4`.
@@ -207,7 +236,13 @@ example's embedded target configuration:
 cargo test --locked --manifest-path tests/trouble-host/Cargo.toml
 python3 examples/ch585-trouble-gatt/tools/test_run.py
 swiftc -typecheck examples/ch585-trouble-gatt/tools/central.swift
+swiftc -typecheck examples/ch585-trouble-gatt/tools/p5_uart.swift
 ```
+
+`tools/p5_uart.swift` is the manual P5 client: for each cycle it reads the three
+Device Information fields, subscribes to UART TX, writes `p5-<cycle>` to RX and
+requires exactly one matching echo notification before unsubscribing and
+disconnecting. It is intentionally separate from the P4 acceptance runner.
 
 The native fixture covers service/characteristic/CCCD discovery, read/write and
 readback, notifications 101–110, more than five real ACL credit cycles, disconnect

@@ -12,5 +12,6 @@ wchble = { path = "../..", features = ["ch585", "controller"] }
 trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-27"] }
 embassy-sync = { version = "0.8", default-features = false }
 embassy-futures = "0.1"
+heapless = "0.9"
 critical-section = { version = "1", features = ["std"] }
 portable-atomic = { version = "1.11", features = ["critical-section"] }

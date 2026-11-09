@@ -29,7 +29,8 @@ CHARACTERISTIC = '00001001-b0cd-11ec-871f-d45ddf138840'
 STAT_NAMES = p3.STAT_NAMES[:61] + ['max_host_poll_us', 'host_poll_overrun', 'bridge_error']
 STAT_NAMES[31] = 'backpressure'
 HOST_NAMES = '''phase connections disconnects reads writes notifications value errors last_error
-    gatt_other subscribed advertise_attempts reserved_12 reserved_13 reserved_14 reserved_15'''.split()
+    gatt_other subscribed advertise_attempts uart_writes uart_notifications uart_len
+    reserved_15'''.split()
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
 

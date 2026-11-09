@@ -82,6 +82,7 @@ dependencies = [
  "ch5xx-hal",
  "embassy-futures",
  "embassy-sync",
+ "heapless",
  "panic-halt",
  "portable-atomic",
  "qingke-rt",
