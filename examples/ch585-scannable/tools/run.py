@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -12,6 +13,8 @@ import time
 ROOT = Path(__file__).resolve().parents[3]
 PROBE = ['--probe', '1a86:8010:F93D8F067E10', '--chip', 'CH585',
          '--protocol', 'jtag', '--non-interactive']
+PREFLIGHT = Path(os.environ.get(
+    'CH585_PREFLIGHT', ROOT / 'tools/ch585-preflight/target/release/ch585-preflight'))
 NM = '/opt/homebrew/opt/llvm/bin/llvm-nm'
 SCANNER = ROOT / 'examples/ch585-rf-smoke/tools/scan_ch585.swift'
 
@@ -61,9 +64,13 @@ def idle(out, prefix):
 
 
 def flash(elf, out, prefix, check_idle=True):
-    if check_idle:
-        idle(out, prefix)
-    command(['probe-rs', 'download', *PROBE, '--verify', '--start', str(elf)],
+    # One retained probe session halts, stops the engine, requires two zero
+    # acknowledgements, then downloads and starts. Standalone reads would resume
+    # the core between those steps, so this helper replaces the old sequence.
+    if not PREFLIGHT.is_file():
+        raise RuntimeError(f'preflight helper missing: {PREFLIGHT}; run cargo build --release in tools/ch585-preflight')
+    command([str(PREFLIGHT), '--probe', '1a86:8010:F93D8F067E10', '--chip', 'CH585',
+             '--protocol', 'jtag', '--verify', str(elf)],
             out / f'{prefix}-flash.log')
 
 

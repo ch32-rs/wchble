@@ -257,22 +257,6 @@ class ExecutionTests(unittest.TestCase):
                     if mode == 'flash_memcpy_body':
                         symbols['_RNvNtNtCtest17compiler_builtins3mem6memcpy'] = 0x4508
                     text = ''.join(f'{address:08x} T {name}\n' for name, address in symbols.items())
-                elif argv[0] == '/usr/bin/script':
-                    self.assertEqual(argv, ['/usr/bin/script', '-q', '/dev/null',
-                                            'probe-rs', 'debug', *runner.PROBE,
-                                            '-c', 'break', '-c', 'quit'])
-                    self.assertEqual(timeout, 15)
-                    prefix = path.name.removesuffix('-halt.log')
-                    calls.append(('halt', prefix, now[0]))
-                    if mode == f'{prefix}_halt_fail':
-                        raise RuntimeError(f'{prefix} halt failed')
-                    if mode == f'{prefix}_halt_timeout':
-                        raise subprocess.TimeoutExpired(argv, timeout)
-                    text = ('Debug Session Terminated\n' if mode == f'{prefix}_halt_unconfirmed'
-                            else 'Stopped on your request at 0x20000100.\r\nDebug Session Terminated\r\n')
-                    if mode == f'{prefix}_halt_panic':
-                        path.write_text(text + 'thread main panicked: Device not configured\n')
-                        raise RuntimeError(f'command failed (101): {path}')
                 elif argv[0] == 'swiftc' and mode == 'compiler_fail':
                     raise RuntimeError('compiler failed')
                 elif argv[0] == 'swift' and mode == 'recovery_scan_fail':
@@ -283,15 +267,21 @@ class ExecutionTests(unittest.TestCase):
                 return text
 
             def flash(path, destination, prefix, check_idle=True):
+                # The helper owns halt, engine shutdown, both idle checks, and
+                # verified download; simulate its former halt failures here.
                 calls.append(('flash', prefix, now[0]))
-                self.assertFalse(check_idle, 'halt_and_idle must be the only idle operation')
-                if prefix == 'test':
-                    self.assertEqual(path.read_bytes(), elf.read_bytes())
-                    self.assertFalse(check_idle)
-                    if mode == 'flash_fail':
-                        raise RuntimeError('download failed after possible boot')
-                else:
-                    self.assertEqual(path.read_bytes(), smoke.read_bytes())
+                self.assertFalse(check_idle, 'the preflight helper owns the idle gate')
+                self.assertEqual(path.read_bytes(), elf.read_bytes() if prefix == 'test' else smoke.read_bytes())
+                if mode == f'{prefix}_halt_fail':
+                    raise RuntimeError('preflight halt failed')
+                if mode == f'{prefix}_halt_timeout':
+                    raise subprocess.TimeoutExpired(['mock-preflight'], 1)
+                if mode == f'{prefix}_halt_unconfirmed':
+                    raise RuntimeError('halt not confirmed')
+                if mode == f'{prefix}_halt_panic':
+                    raise RuntimeError('command failed (101): mock')
+                if prefix == 'test' and mode == 'flash_fail':
+                    raise RuntimeError('download failed after possible boot')
 
             def read(address, count, path):
                 self.assertGreaterEqual(now[0], 128.0, 'probe read occurred during firmware execution')
@@ -353,13 +343,13 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn('PASS', result['smoke_recovery'])
         self.assertTrue({'firmware.elf', 'smoke.elf', 'symbols.txt', 'central.jsonl',
                          'stats.json', 'trace.json', 'result.json'}.issubset(files))
-        self.assertLess(calls.index(('halt', 'test', 100.0)), calls.index(('idle', 'test', 100.0)))
-        self.assertLess(calls.index(('idle', 'test', 100.0)), calls.index(('flash', 'test', 100.0)))
-        self.assertLess(calls.index(('read', 8, 128.0)), calls.index(('halt', 'restore', 128.0)))
-        self.assertLess(calls.index(('halt', 'restore', 128.0)), calls.index(('idle', 'restore', 128.0)))
-        self.assertLess(calls.index(('idle', 'restore', 128.0)), calls.index(('flash', 'restore', 128.0)))
-        self.assertEqual(sum(call[0] == 'idle' for call in calls), 2)
+        # One combined helper flash gate replaces the former halt/idle/download
+        # sequence for both test and restore.
+        self.assertLess(calls.index(('flash', 'test', 100.0)), calls.index(('client', 'start', 100.0)))
+        self.assertLess(calls.index(('read', 8, 128.0)), calls.index(('flash', 'restore', 128.0)))
+        self.assertFalse(any(call[0] in ('halt', 'idle') for call in calls))
         self.assertEqual(sum(call[:2] == ('flash', 'test') for call in calls), 1)
+        self.assertEqual(sum(call[:2] == ('flash', 'restore') for call in calls), 1)
 
     def test_preflight_no_hardware(self):
         for mode, seconds in [('pass', 360), ('compiler_fail', 25), ('flash_memcpy', 25),
@@ -370,39 +360,49 @@ class ExecutionTests(unittest.TestCase):
                 self.assertFalse(any(call[0] in ('read', 'flash', 'idle', 'client', 'halt') for call in calls))
                 self.assertIn('NOT ATTEMPTED', result['smoke_recovery'])
 
-    def test_initial_halt_failure_prevents_test_idle_and_flash(self):
-        for mode in ('test_halt_fail', 'test_halt_timeout', 'test_halt_unconfirmed', 'test_halt_panic'):
+    def test_initial_preflight_failure_prevents_client_but_recovery_flashes(self):
+        messages = {'test_halt_fail': 'preflight halt failed',
+                    'test_halt_timeout': 'TimeoutExpired',
+                    'test_halt_unconfirmed': 'halt not confirmed',
+                    'test_halt_panic': '(101)'}
+        for mode, message in messages.items():
             with self.subTest(mode=mode):
                 code, result, calls, _ = self.run_mocked(mode)
                 self.assertEqual(code, 1)
-                self.assertFalse(any(call[0] in ('read', 'client') for call in calls))
-                self.assertFalse(any(call[:2] == ('idle', 'test') for call in calls))
-                self.assertFalse(any(call[:2] == ('flash', 'test') for call in calls))
-                self.assertEqual(sum(call[:2] == ('halt', 'test') for call in calls), 1)
+                self.assertFalse(any(call[0] == 'client' for call in calls))
+                self.assertFalse(any(call[0] in ('halt', 'idle') for call in calls))
+                # The failing combined flash gate is attempted exactly once.
+                self.assertEqual(sum(call[:2] == ('flash', 'test') for call in calls), 1)
+                self.assertTrue(any(message in error for error in result['errors']))
                 self.assertIn('PASS', result['smoke_recovery'])
-                self.assertTrue(any(call[:2] == ('flash', 'restore') for call in calls))
+                self.assertEqual(sum(call[:2] == ('flash', 'restore') for call in calls), 1)
 
-    def test_recovery_halt_failure_prevents_restore_flash_and_scan(self):
-        for mode in ('restore_halt_fail', 'restore_halt_timeout', 'restore_halt_unconfirmed', 'restore_halt_panic'):
+    def test_recovery_preflight_failure_prevents_restore_scan(self):
+        messages = {'restore_halt_fail': 'preflight halt failed',
+                    'restore_halt_timeout': 'timed out',
+                    'restore_halt_unconfirmed': 'halt not confirmed',
+                    'restore_halt_panic': '(101)'}
+        for mode, message in messages.items():
             with self.subTest(mode=mode):
                 code, result, calls, _ = self.run_mocked(mode)
                 self.assertEqual(code, 1)
                 self.assertEqual(result['smoke_recovery'], 'NOT VERIFIED')
                 self.assertTrue(result['errors'])
-                self.assertIn(('halt', 'restore', 128.0), calls)
-                self.assertFalse(any(call[:2] == ('idle', 'restore') for call in calls))
-                self.assertFalse(any(call[:2] == ('flash', 'restore') for call in calls))
+                self.assertTrue(any(message in error for error in result['errors']))
+                # No separate halt/idle step; the combined restore flash failed.
+                self.assertEqual(sum(call[:2] == ('flash', 'restore') for call in calls), 1)
+                self.assertFalse(any(call[0] in ('halt', 'idle') for call in calls))
                 self.assertFalse(any(call[:2] == ('command', 'swift') for call in calls))
 
-    def test_positive_halt_output_cannot_hide_panic_exit_101(self):
+    def test_preflight_panic_exit_101_is_fatal(self):
         for mode in ('test_halt_panic', 'restore_halt_panic'):
             with self.subTest(mode=mode):
                 code, result, calls, _ = self.run_mocked(mode)
                 self.assertEqual(code, 1)
                 self.assertTrue(any('(101)' in error for error in result['errors']))
                 prefix = mode.split('_')[0]
-                self.assertFalse(any(call[:2] == ('idle', prefix) for call in calls))
-                self.assertFalse(any(call[:2] == ('flash', prefix) for call in calls))
+                self.assertEqual(sum(call[:2] == ('flash', prefix) for call in calls), 1)
+                self.assertFalse(any(call[0] in ('halt', 'idle') for call in calls))
 
     def test_all_failures_recover_after_finite_run_without_retry(self):
         for mode in ('flash_fail', 'popen_fail', 'client_fail', 'client_timeout', 'malformed',
@@ -416,6 +416,8 @@ class ExecutionTests(unittest.TestCase):
                 recovery = [call for call in calls if call[:2] == ('flash', 'restore')]
                 self.assertEqual(len(recovery), 1)
                 self.assertGreaterEqual(recovery[0][2], 128)
+                self.assertTrue(all(call[2] >= 128 for call in calls if call[0] == 'read'),
+                                'observations must wait for the full embedded budget')
                 self.assertTrue(any(call[:2] == ('command', 'swift') for call in calls))
                 if mode != 'recovery_scan_fail': self.assertIn('PASS', result['smoke_recovery'])
 

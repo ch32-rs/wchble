@@ -1,0 +1,13 @@
+[package]
+name = "ch585-preflight"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The published probe-rs 0.32.0 target list predates CH585 support; use the
+# pinned sibling checkout (see BACKLOG.md) so the same target data as the
+# installed CLI is available.
+[dependencies]
+probe-rs = { path = "../../../probe-rs/probe-rs" }
+
+[workspace]
