@@ -1,4 +1,4 @@
-//! CH585 on-target RF verification — init, DevInit registers, ADV_IND TX, RX.
+//! CH585 on-target RF verification — init, DevInit registers, ADV_NONCONN_IND TX, RX.
 //!
 //! HAL owns clocks / SysTick; `wchble` owns RF. Flash with
 //! `wlink -d 1a86:8010:<SERIAL> flash <elf>` and then **power-cycle the
@@ -25,7 +25,7 @@
 //! - `LLE …` / `RFEND …` / `BB …` (DevInit markers)
 //! - `tx ch{37,38,39} ok`
 //! - `rx listen hit|arm-clear` (arm path; a hit needs a nearby advertiser)
-//! - `adv loop` (keeps ADV_IND and the RF_PHY reference frame on air)
+//! - `adv loop` (keeps ADV_NONCONN_IND and the RF_PHY reference frame on air)
 //! - a macOS CoreBluetooth scan sees the local name `wch585`
 
 #![no_std]
@@ -156,10 +156,11 @@ fn dump_regs(out: &mut Log) {
     );
 }
 
-/// Minimal ADV_IND: header + AdvA + flags + complete local name "wch585".
-fn build_adv_ind(out: &mut [u8; 32]) -> usize {
+/// Minimal ADV_NONCONN_IND: header + AdvA + flags + complete local name "wch585".
+fn build_adv_nonconn_ind(out: &mut [u8; 32]) -> usize {
     let name = b"wch585";
-    let adv_a = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x02];
+    // Static random address C1:FF:EE:00:00:02, least-significant byte first.
+    let adv_a = [0x02, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
     let mut payload_len = 0usize;
     let mut buf = [0u8; 30];
     buf[payload_len..payload_len + 6].copy_from_slice(&adv_a);
@@ -173,7 +174,8 @@ fn build_adv_ind(out: &mut [u8; 32]) -> usize {
     buf[payload_len + 2..payload_len + 2 + name.len()].copy_from_slice(name);
     payload_len += 2 + name.len();
 
-    out[0] = 0x40;
+    // Random AdvA, non-connectable and non-scannable legacy advertising.
+    out[0] = 0x42;
     out[1] = payload_len as u8;
     out[2..2 + payload_len].copy_from_slice(&buf[..payload_len]);
     2 + payload_len
@@ -189,7 +191,7 @@ fn tx_burst(radio: &mut Ch585Radio, clock: &UsClock, out: &mut Log, frame: &[u8]
             let t0 = clock.now_us();
             match radio.tx_basic(clock, frame, 0, None) {
                 Ok(()) => {
-                    let us = t0.wrapping_sub(clock.now_us());
+                    let us = clock.now_us().wrapping_sub(t0);
                     let st = mmio(LLE_BASE, lle::IRQSTAT);
                     let win = mmio(LLE_BASE, lle::WINDOW);
                     let _ = writeln!(
@@ -339,7 +341,7 @@ fn main() -> ! {
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
     let mut frame = [0u8; 32];
-    let n = build_adv_ind(&mut frame);
+    let n = build_adv_nonconn_ind(&mut frame);
     let _ = writeln!(out, "adv len {}", n);
     tx_burst(&mut radio, &clock, &mut out, &frame[..n]);
     for window_half_us in [2_000u32, 10_000] {
@@ -353,7 +355,7 @@ fn main() -> ! {
     }
 
     // Keep two signals on air for external observers:
-    // - ADV_IND on 37/38/39 (real BLE AA/CRC) for a phone / Mac scanner;
+    // - ADV_NONCONN_IND on 37/38/39 (real BLE AA/CRC) for a phone / Mac scanner;
     // - the CH585 SDK `RF_PHY` reference frame on channel 39 (AA 0x71764129 /
     //   CRC 0x555555) which a V208/CH592 reference receiver decodes.
     let _ = writeln!(out, "adv loop");

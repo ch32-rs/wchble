@@ -145,3 +145,32 @@ reports from a device that is provably on air. Absence in one short scan is not
 evidence — confirm with a second receiver's `crc` bit, or re-scan at a dense
 test interval. Conversely, a single `seen name=…` does not prove the production
 interval works.
+
+## 12. Do not advertise scan/connect support that the firmware does not provide
+
+**Symptom (CH585, 2026-11-09):** iPhone nRF Connect saw the smoke-test
+advertiser, but Android nRF Connect did not, even though it could see other
+BLE devices and had no scan filters. Changing the random address to a static
+random address did not help. With the same static address, name and loop,
+changing the PDU from `ADV_IND` to `ADV_NONCONN_IND` made it visible on that
+Android phone. The latter remains visible on macOS as well.
+
+**Likely mechanism, not yet confirmed on that phone:** `ADV_IND` declares a
+connectable, scannable advertiser, but the smoke firmware only transmits; it
+does not receive a `SCAN_REQ` and send `SCAN_RSP`, or accept a connection.
+Some active-scanning implementations may wait for a scan response before
+reporting an advertisement to the application. For example, one version of
+[Android's scan reassembler](https://chromium.googlesource.com/aosp/platform/packages/modules/Bluetooth/+/d7e980b0bc8754f7bd2eb24b6810044b76083be6/system/gd/hci/le_scanning_reassembler.cc)
+caches a scannable advertisement while awaiting its response under certain
+configurations. Its behavior is version- and configuration-dependent; no HCI
+snoop or air trace was captured from the affected phone, so this does not prove
+its exact failure path. A missed response can have other causes too.
+
+**Rules:**
+- For a TX-only smoke test, use `ADV_NONCONN_IND` (with TxAdd matching the
+  address type); do not claim scan or connection support.
+- Use `ADV_IND` only when the intended implementation handles scan requests
+  and connection events. An on-air advertisement alone is not proof of either.
+- When scanners disagree, compare PDU types with the address, payload and
+  timing held constant. Use an air capture or Android HCI snoop to distinguish
+  a missing `SCAN_RSP` from scan-window, filtering or other issues.

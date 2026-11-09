@@ -112,11 +112,12 @@ Last updated: 2026-11-09
   `examples/ch585-rf-smoke` carries its own RAM console because `ch5xx-hal`'s
   `SDIPrint` is still CH592-only and the LinkE does not drain the CH585 debug
   window.
-  **Verified on air 2026-11-09**: `LLE 06=2 / 2c=6c / 3c=6c / 54=0`,
-  `BB 38=3ff / 3c=2020c`, VCO/GA tables bit-identical to the vendor
-  `Peripheral.hex` golden capture, `tx ch37/38/39` complete at ~305 µs of
-  airtime, RX decodes real advertisers with `crc=true`, and macOS
-  CoreBluetooth sees the local name `wch585` at −44 dBm.
+  **Verified on air 2026-11-09**: LLE readback included `06=2 / 2c=6c /
+  3c=6c / 54=0`; RX decoded nearby packets with `crc=true` and macOS
+  CoreBluetooth saw `wch585` at −44 dBm. The BB `0x38=0x3ff` value is a W1C
+  write, not a readback assertion. Calibration tables were populated and
+  broadly resembled the vendor capture, but some words differed. The earlier
+  TX elapsed-time log subtracted backwards and does not establish airtime.
   The chip must be **power-cycled after flashing** (`wlink set-power
   disable3v3/enable3v3`) — the LinkE's post-flash reset leaves the BLE block
   idle. `rf::new_radio_with_dma` now treats `ch585` like

@@ -114,9 +114,9 @@ but keeps its own DevInit and calibration: `0x6C` LLE pair, `BB+0x38 = 0x3FF`,
 a different `RFEND_DevInit` RMW block, a 4-band TXCtune (2522 MHz measured and
 discarded), and `RFEND_RXFilter` arming `TUNE` bit 12. `src/rf/family/ch585.rs`
 carries the register-by-register evidence in its module docs. Bring-up proof
-(2026-11-09): the DevInit dump matches the vendor `Peripheral.hex` golden
-registers, TX completes with ~305 µs of airtime, RX decodes advertisers with
-`crc=true`, and macOS sees the `wch585` ADV_IND.
+(2026-11-09): selected DevInit registers matched the vendor `Peripheral.hex`
+capture; RX reported packets with `crc=true`, and macOS saw `wch585`. The
+initial TX elapsed-time log did not measure air-interface timing.
 
 ## Artifacts
 
