@@ -25,7 +25,7 @@ CoreBluetooth sees the local name `wch592` at ≈ −43 dBm.
 
 Two CH592-specific traps this example guards: `TX_DONE` at window expiry is not
 radiation (verify with the second receiver), and the `IRQSTAT` W1C is gated by
-`LLE+0x0C` bit 17. See `docs/pitfalls.md` §7/§9.
+`LLE+0x0C` bit 17.
 
 ## Build / flash
 

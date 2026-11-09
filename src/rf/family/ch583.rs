@@ -8,8 +8,7 @@
 //! - IRQs BB=`BLEB`=20, LLE=`BLEL`=21
 //!
 //! Tables are the CH5xx **"old tables"** bucket — closest to open V208 among
-//! CH57/58/59. See `docs/research/{family-comparison,ch58x-reuse}.md` and
-//! `docs/research/bringup-debug.md` for silicon probe points.
+//! CH57/58/59.
 //!
 //! Certainty legend on table constants:
 //! - [`Certainty::FromClosedDisasm`] — recovered from `objs_CH583`; not yet

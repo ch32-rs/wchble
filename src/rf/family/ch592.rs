@@ -25,8 +25,6 @@
 //! `BB+0` bit6 = whitening off, `BB+0x5C[8:0]` = channel. The RFEND fractional
 //! synth (`+0x44`) is also programmed so the standalone-RF path and BLE path
 //! agree; it is written exactly like vendor `RFIP_DevSetChannel`.
-//!
-//! See `docs/research/ch592-baseline.md` for the raw disassembly evidence.
 
 use crate::rf::analog::{self, AnalogInit};
 use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};

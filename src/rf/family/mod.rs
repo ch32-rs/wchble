@@ -47,7 +47,7 @@ macro_rules! stub_radio {
 
         impl AnalogInit for $name {
             fn rfend_dev_init<T: InstantUs>(&mut self, _clock: &T) -> Result<()> {
-                // Tables recorded; MMIO apply not ported — see bringup-debug.md.
+                // Tables recorded; MMIO apply not ported.
                 let _ = &RFEND_INIT;
                 Err(Error::Unsupported)
             }

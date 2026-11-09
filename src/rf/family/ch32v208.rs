@@ -1,6 +1,6 @@
 //! CH32V208 BLE IP bases and open-driver radio backend.
 //!
-//! Absolute map (from open `wch_rf.h` / `docs/research/init-diff-table.md`):
+//! Absolute map (from open `wch_rf.h`):
 //! - TOP   `0x4002_4000`
 //! - BB    `0x4002_4100`
 //! - LLE   `0x4002_4200`
