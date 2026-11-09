@@ -140,13 +140,17 @@ attribution relies on the user's separate UI observations. This is one manual
 session per platform, not the planned three isolated acceptance rounds or
 wireless capture evidence; sustained reliability remains unverified.
 
-**Further automatic physical launches are blocked:** the installed probe CLI
-resumes CPU execution after preflight reads, invalidating continuous halt/idle
-ownership. The preceding phone launch was refused before download; the next
-window was flashed directly, bypassing that broken preflight. A single-session
-preflight/download fix is required before another automatic launch. Open defects
-and acceptance gaps are tracked in [`BACKLOG.md`](BACKLOG.md). See the example for
-the finite runner and safety/recovery policy.
+The preflight defect is fixed in `tools/ch585-preflight`: one retained probe
+session halts, stops the engine, requires two zero acknowledgements, verifies
+the download and starts the image. Two clean three-cycle macOS acceptance runs
+then passed with exactly three connections/disconnects, fifteen reads, thirty-
+nine writes, thirty notifications and no missed events, retries, supervision or
+bridge errors; smoke recovery passed both times. Earlier attempts are retained:
+one had an extra connection while a phone was still present, and one hit a
+transient download failure. Sustained reliability, supervision-timeout recovery,
+queue-pressure stress and calibrated air timing remain unverified. Open gaps are
+tracked in [`BACKLOG.md`](BACKLOG.md). See the example for the finite runner and
+safety/recovery policy.
 
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`

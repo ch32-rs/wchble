@@ -40,16 +40,25 @@ acceptance rounds each, and its 103 missed events plus 554 retries/duplicates ar
 retained rather than hidden. Sustained reliability and calibrated air timing
 remain unverified.
 
-**Automatic-launch blocker (2026-11-10): do not launch the hardware runners below
-until the preflight session fix is implemented.** The installed `probe-rs read`
-resumes CPU execution after each access, so separate stop/idle reads can let smoke
-rearm RF. An independent phone launch was refused before download (CMD
-acknowledgements 0 then 2); no P4 phone image ran in that attempt, and smoke
-restoration/discovery passed. Two zero samples alone do not prove continuous halt
-ownership. The successful phone window above was flashed directly, bypassing that
-broken preflight; it is not evidence that the automatic sequence is safe. A single
-retained session must cover halt, shutdown, both idle checks and verified
-download/start; see [`BACKLOG.md`](../../BACKLOG.md).
+**Preflight fix (2026-11-10).** The installed `probe-rs read` resumes CPU
+execution after each access, so the old separate stop/idle reads could let smoke
+rearm RF; an unrelated phone launch was refused before download (CMD
+acknowledgements 0 then 2). `tools/ch585-preflight` now performs halt, engine
+shutdown, two zero acknowledgements, verified download and start in one retained
+session, and refuses to download on any nonzero or missing acknowledgement. The
+runners use it for test and recovery flashes. The previously successful direct
+phone window did not use this helper.
+
+With the helper, two new three-cycle macOS acceptance runs passed. Each recorded
+exactly three accepted connections and normal terminations, fifteen reads,
+thirty-nine writes, thirty checked notifications, final value 110, Host
+back-to-advertising phase, and no Host/bridge/RF-stop/error counters. One run had
+172 data RX/TX with zero missed events or retries; the other 171 each, also zero.
+Both finished the 25-second budget and restored/discovered smoke. Retained
+failures: the preceding attempt had a fourth connection and final connected phase
+while a phone was still present (counts therefore mismatched), and the next
+attempt hit a transient download failure before the test image was written.
+Neither is reclassified as a pass.
 
 Two subsequent isolated five-cycle Mac runs each completed twenty-five reads,
 sixty-five writes, fifty verified notifications, five normal disconnects and
