@@ -1,4 +1,4 @@
-//! Legacy advertising state + ADV_IND PDU builder.
+//! Legacy advertising state and pure advertising PDU helpers.
 
 /// Max HCI advertising / scan-response data payload (Core Vol 4 Part E).
 pub const ADV_DATA_MAX: usize = 31;
@@ -73,6 +73,55 @@ impl AdvState {
         true
     }
 
+    /// Build a legacy ADV_SCAN_IND PDU (header + AdvA + advertising data).
+    ///
+    /// Returns `None` if advertising is disabled, the stored length is invalid,
+    /// or the output is too small. No bytes are written on failure.
+    pub fn build_adv_scan_ind(&self, out: &mut [u8]) -> Option<usize> {
+        self.build_scannable_pdu(out, 0x06, self.data_len, &self.data)
+    }
+
+    /// Build a legacy SCAN_RSP PDU (header + AdvA + scan response data).
+    ///
+    /// Returns `None` under the same conditions as [`Self::build_adv_scan_ind`].
+    pub fn build_scan_rsp(&self, out: &mut [u8]) -> Option<usize> {
+        self.build_scannable_pdu(out, 0x04, self.scan_rsp_len, &self.scan_rsp)
+    }
+
+    fn build_scannable_pdu(
+        &self,
+        out: &mut [u8],
+        pdu_type: u8,
+        data_len: u8,
+        data: &[u8; ADV_DATA_MAX],
+    ) -> Option<usize> {
+        let n = usize::from(data_len);
+        let total = 8 + n;
+        if !self.enabled || n > ADV_DATA_MAX || out.len() < total {
+            return None;
+        }
+        out[0] = pdu_type | if self.random_addr { 0x40 } else { 0 };
+        out[1] = (6 + n) as u8;
+        out[2..8].copy_from_slice(&self.own_addr);
+        out[8..total].copy_from_slice(&data[..n]);
+        Some(total)
+    }
+
+    /// Check a received legacy SCAN_REQ addressed to this advertiser.
+    ///
+    /// `pdu` is exactly the two-byte header and twelve-byte payload, without
+    /// access address or CRC; `crc_ok` is the receiver's CRC result. Scanner
+    /// address and TxAdd may have either value. RFU header bits are ignored.
+    /// This only validates the packet, independently of advertising enable state.
+    pub fn validate_scan_req(&self, pdu: &[u8], crc_ok: bool) -> bool {
+        crc_ok
+            && pdu.len() == 14
+            && pdu[0] & 0x0f == 0x03
+            && pdu[1] == 12
+            && (pdu[0] & 0x80 != 0) == self.random_addr
+            && pdu[8..14] == self.own_addr
+    }
+
     /// Build a legacy ADV_IND PDU into `out` (header + AdvA + AD).
     ///
     /// Returns `None` when advertising is disabled or `out` is too small.
@@ -100,6 +149,111 @@ impl AdvState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scannable_builders_encode_lengths_addresses_and_distinct_data() {
+        for random in [false, true] {
+            for len in [0, 1, 31] {
+                let mut adv = AdvState::default();
+                adv.enabled = true;
+                adv.random_addr = random;
+                adv.own_addr = [1, 2, 3, 4, 5, 6];
+                assert!(adv.set_adv_data(len, &[0xa5; 31]));
+                assert!(adv.set_scan_rsp(len, &[0x5a; 31]));
+                for (build, kind, value) in [
+                    (
+                        AdvState::build_adv_scan_ind as fn(&AdvState, &mut [u8]) -> Option<usize>,
+                        0x06,
+                        0xa5,
+                    ),
+                    (AdvState::build_scan_rsp, 0x04, 0x5a),
+                ] {
+                    let mut out = [0xcc; 40];
+                    let total = build(&adv, &mut out).unwrap();
+                    assert_eq!(total, 8 + usize::from(len));
+                    assert_eq!(out[0], kind | if random { 0x40 } else { 0 });
+                    assert_eq!(out[1], 6 + len);
+                    assert_eq!(&out[2..8], &adv.own_addr);
+                    assert!(out[8..total].iter().all(|&b| b == value));
+                    assert!(out[total..].iter().all(|&b| b == 0xcc));
+                    assert_eq!(build(&adv, &mut out[..total]), Some(total));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scannable_builders_reject_bad_bounds_without_writing() {
+        let mut adv = AdvState::default();
+        for build in [
+            AdvState::build_adv_scan_ind as fn(&AdvState, &mut [u8]) -> Option<usize>,
+            AdvState::build_scan_rsp,
+        ] {
+            let mut out = [0xcc; 40];
+            assert_eq!(build(&adv, &mut out), None);
+            assert_eq!(out, [0xcc; 40]);
+            adv.enabled = true;
+            for size in 0..8 {
+                assert_eq!(build(&adv, &mut out[..size]), None);
+                assert_eq!(out, [0xcc; 40]);
+            }
+            adv.data_len = 31;
+            adv.scan_rsp_len = 31;
+            assert_eq!(build(&adv, &mut out[..38]), None);
+            assert_eq!(out, [0xcc; 40]);
+            for invalid in [32, 255] {
+                adv.data_len = invalid;
+                adv.scan_rsp_len = invalid;
+                assert_eq!(build(&adv, &mut out), None);
+                assert_eq!(out, [0xcc; 40]);
+            }
+            adv = AdvState::default();
+        }
+    }
+
+    #[test]
+    fn scan_req_checks_crc_type_exact_lengths_address_and_rxadd() {
+        let mut adv = AdvState::default();
+        adv.own_addr = [1, 2, 3, 4, 5, 6];
+        let mut req = [0u8; 15];
+        req[0] = 0x83;
+        req[1] = 12;
+        req[2..8].copy_from_slice(&[9, 8, 7, 6, 5, 4]);
+        req[8..14].copy_from_slice(&adv.own_addr);
+        assert!(adv.validate_scan_req(&req[..14], true));
+        assert!(!adv.validate_scan_req(&req[..14], false));
+        for len in 0..14 {
+            assert!(!adv.validate_scan_req(&req[..len], true));
+        }
+        assert!(!adv.validate_scan_req(&req, true));
+        for kind in 0..16 {
+            req[0] = 0x80 | kind;
+            assert_eq!(adv.validate_scan_req(&req[..14], true), kind == 3);
+        }
+        req[0] = 0x83;
+        for len in 0..=255 {
+            req[1] = len;
+            assert_eq!(adv.validate_scan_req(&req[..14], true), len == 12);
+        }
+        req[1] = 12;
+        for i in 8..14 {
+            req[i] ^= 1;
+            assert!(!adv.validate_scan_req(&req[..14], true));
+            req[i] ^= 1;
+        }
+        for random in [false, true] {
+            adv.random_addr = random;
+            for rxadd in [false, true] {
+                for txadd in [false, true] {
+                    req[0] = 0x03 | if rxadd { 0x80 } else { 0 } | if txadd { 0x40 } else { 0 };
+                    assert_eq!(adv.validate_scan_req(&req[..14], true), rxadd == random);
+                }
+            }
+        }
+        // RFU bits do not affect reception.
+        req[0] = 0xb3;
+        assert!(adv.validate_scan_req(&req[..14], true));
+    }
 
     #[test]
     fn channels_follow_map_bits() {
