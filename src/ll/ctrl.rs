@@ -1,4 +1,6 @@
-//! LL Control PDU opcodes / handlers (stub).
+//! Minimal unencrypted legacy peripheral LL control procedures.
+
+use super::conn::{le16, ConnError, ConnectionUpdate, PeripheralConnection};
 
 /// Subset of LL Control opcodes used during bring-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,4 +20,386 @@ pub enum LlCtrlOpcode {
     VersionInd = 0x0c,
     ConnectionParamReq = 0x0f,
     ConnectionParamRsp = 0x10,
+}
+
+/// Identity must be supplied by the application, not copied from a vendor
+/// controller. `version` is the Bluetooth version number (0x0d for Core 5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalVersion {
+    pub version: u8,
+    pub company_id: u16,
+    pub subversion: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(4))]
+pub struct ControlPdu {
+    bytes: [u8; 12],
+    len: u8,
+}
+
+impl ControlPdu {
+    fn new(payload: &[u8]) -> Self {
+        let mut pdu = Self {
+            bytes: [0; 12],
+            len: payload.len() as u8,
+        };
+        pdu.bytes[..payload.len()].copy_from_slice(payload);
+        pdu
+    }
+
+    /// Payload only. Queue using `LinkSequence::queue(3, pdu.as_bytes())` so
+    /// controls use exactly the same acknowledgment/retry path as ACL data.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAction {
+    None,
+    Reply(ControlPdu),
+    /// Stop only after sending the link-layer acknowledgment when possible.
+    Terminate(u8),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ControlState {
+    pub peer_version: Option<LocalVersion>,
+    pub peer_features: Option<[u8; 8]>,
+    version_sent: bool,
+    termination_deadline_us: Option<u32>,
+}
+
+impl ControlState {
+    pub const fn new() -> Self {
+        Self {
+            peer_version: None,
+            peer_features: None,
+            version_sent: false,
+            termination_deadline_us: None,
+        }
+    }
+
+    /// Start when local termination is requested, even if an older PDU is still
+    /// outstanding. Later received packets must not restart this deadline.
+    pub fn start_termination(&mut self, now_us: u32, timeout_slots: u16) {
+        self.termination_deadline_us
+            .get_or_insert(now_us.wrapping_add(u32::from(timeout_slots) * 10_000));
+    }
+
+    pub fn termination_deadline_us(&self) -> Option<u32> {
+        self.termination_deadline_us
+    }
+
+    pub fn termination_expired(&self, now_us: u32) -> bool {
+        self.termination_deadline_us
+            .is_some_and(|end| super::conn::time_reached(now_us, end))
+    }
+
+    /// Invoke once for each newly accepted LLID=3 packet, never for retries.
+    /// Reserve a response slot before accepting the peer's SN. The caller must
+    /// retain a reply until `LinkSequence::queue` succeeds (an empty packet may
+    /// still be awaiting its acknowledgment).
+    pub fn on_pdu(
+        &mut self,
+        conn: &mut PeripheralConnection,
+        payload: &[u8],
+        local: LocalVersion,
+    ) -> Result<ControlAction, ConnError> {
+        let Some(&opcode) = payload.first() else {
+            return Err(ConnError::Length);
+        };
+        let reply = match opcode {
+            0x00 => {
+                exact_len(payload, 12)?;
+                conn.schedule_update(ConnectionUpdate {
+                    win_size: payload[1],
+                    win_offset: le16(&payload[2..]),
+                    interval: le16(&payload[4..]),
+                    latency: le16(&payload[6..]),
+                    timeout: le16(&payload[8..]),
+                    instant: le16(&payload[10..]),
+                })?;
+                return Ok(ControlAction::None);
+            }
+            0x01 => {
+                exact_len(payload, 8)?;
+                let mut map = [0; 5];
+                map.copy_from_slice(&payload[1..6]);
+                map[4] &= 0x1f; // Ignore RFU bits 37..39 on reception.
+                conn.schedule_channel_map(map, le16(&payload[6..]))?;
+                return Ok(ControlAction::None);
+            }
+            0x02 => {
+                exact_len(payload, 2)?;
+                return Ok(ControlAction::Terminate(payload[1]));
+            }
+            0x07 => {
+                exact_len(payload, 2)?;
+                return Ok(ControlAction::None);
+            }
+            0x08 | 0x09 => {
+                exact_len(payload, 9)?;
+                let mut features = [0; 8];
+                features.copy_from_slice(&payload[1..9]);
+                self.peer_features = Some(features);
+                if opcode == 0x09 {
+                    return Ok(ControlAction::None);
+                }
+                // No encryption, DLE, PHY update, CSA #2, or optional control
+                // procedures are advertised. Mandatory legacy procedures do
+                // not require feature bits.
+                ControlPdu::new(&[0x09, 0, 0, 0, 0, 0, 0, 0, 0])
+            }
+            0x0c => {
+                exact_len(payload, 6)?;
+                self.peer_version = Some(LocalVersion {
+                    version: payload[1],
+                    company_id: le16(&payload[2..]),
+                    subversion: le16(&payload[4..]),
+                });
+                if self.version_sent {
+                    return Ok(ControlAction::None);
+                }
+                self.version_sent = true;
+                let company = local.company_id.to_le_bytes();
+                let subversion = local.subversion.to_le_bytes();
+                ControlPdu::new(&[
+                    0x0c,
+                    local.version,
+                    company[0],
+                    company[1],
+                    subversion[0],
+                    subversion[1],
+                ])
+            }
+            0x0d => {
+                exact_len(payload, 2)?; // LL_REJECT_IND.
+                return Ok(ControlAction::None);
+            }
+            0x11 => {
+                exact_len(payload, 3)?; // LL_REJECT_EXT_IND.
+                return Ok(ControlAction::None);
+            }
+            // Unsupported encryption, connection parameter request, DLE, PHY,
+            // and future opcodes are explicitly reported as unknown. Never
+            // fake an encryption response or negotiate a larger data length.
+            _ => ControlPdu::new(&[0x07, opcode]),
+        };
+        Ok(ControlAction::Reply(reply))
+    }
+}
+
+fn exact_len(payload: &[u8], len: usize) -> Result<(), ConnError> {
+    if payload.len() == len {
+        Ok(())
+    } else {
+        Err(ConnError::Length)
+    }
+}
+
+/// Error reason for ending a link after an invalid mandatory procedure.
+pub fn termination_reason(error: ConnError) -> u8 {
+    match error {
+        ConnError::InstantPassed => 0x28,
+        ConnError::ProcedureCollision => 0x23,
+        _ => 0x1e, // Invalid LL Parameters.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ll::acl::LinkSequence;
+    use crate::ll::conn::ConnectParams;
+
+    const LOCAL: LocalVersion = LocalVersion {
+        version: 0x0d,
+        company_id: 0xffff,
+        subversion: 1,
+    };
+
+    fn connection() -> PeripheralConnection {
+        PeripheralConnection::new(
+            ConnectParams {
+                peer_addr: [1; 6],
+                peer_random: false,
+                access_addr: 0x1234_5678,
+                crc_init: 0,
+                win_size: 1,
+                win_offset: 0,
+                interval: 24,
+                latency: 0,
+                timeout: 200,
+                channel_map: [0xff, 0xff, 0xff, 0xff, 0x1f],
+                hop: 5,
+                sca: 0,
+            },
+            1000,
+        )
+    }
+
+    #[test]
+    fn control_pdu_is_word_aligned_without_exposing_padding() {
+        assert_eq!(core::mem::size_of::<ControlPdu>(), 16);
+        assert_eq!(core::mem::align_of::<ControlPdu>(), 4);
+        let pdu = ControlPdu::new(&[7, 0x14]);
+        assert_eq!(pdu.as_bytes(), &[7, 0x14]);
+        let full = ControlPdu::new(&[0; 12]);
+        assert_eq!(full.as_bytes().len(), 12);
+    }
+
+    fn reply(action: ControlAction) -> ControlPdu {
+        match action {
+            ControlAction::Reply(pdu) => pdu,
+            _ => panic!("expected reply"),
+        }
+    }
+
+    #[test]
+    fn local_termination_is_not_extended_by_valid_non_acknowledging_packets() {
+        let mut conn = connection();
+        conn.params.timeout = 10;
+        let mut ctrl = ControlState::new();
+        let mut link = LinkSequence::new();
+        let start = u32::MAX - 50_000;
+        conn = PeripheralConnection::new(conn.params, start.wrapping_sub(1000));
+        assert!(conn.on_rx_anchor(start, 0));
+        ctrl.start_termination(start, 10);
+        link.queue(3, &[2, 0x13]).unwrap();
+        link.tx_pdu();
+        for elapsed in (10_000..=1_200_000).step_by(10_000) {
+            let now = start.wrapping_add(elapsed);
+            ctrl.start_termination(now, 10);
+            let rx = link.on_rx(1, &[], true, true);
+            assert!(!rx.tx_acked);
+            // Even a link whose supervision is refreshed cannot extend the
+            // independent local termination deadline.
+            assert!(conn.on_rx_anchor(now, 0));
+            assert!(!conn.supervision_expired(now));
+            assert_eq!(ctrl.termination_expired(now), elapsed >= 100_000);
+        }
+        assert!(link.has_outstanding());
+        assert_eq!(
+            ctrl.termination_deadline_us(),
+            Some(start.wrapping_add(100_000))
+        );
+    }
+
+    #[test]
+    fn mandatory_feature_and_version_without_vendor_impersonation() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        let features = reply(
+            ctrl.on_pdu(
+                &mut c,
+                &[8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                LOCAL,
+            )
+            .unwrap(),
+        );
+        assert_eq!(features.as_bytes(), &[9, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let version = reply(
+            ctrl.on_pdu(&mut c, &[0x0c, 9, 0x34, 0x12, 2, 0], LOCAL)
+                .unwrap(),
+        );
+        assert_eq!(version.as_bytes(), &[0x0c, 0x0d, 0xff, 0xff, 1, 0]);
+        assert_eq!(ctrl.peer_version.unwrap().company_id, 0x1234);
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x0c, 9, 0x34, 0x12, 2, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        let mut link = LinkSequence::new();
+        link.queue(3, version.as_bytes()).unwrap();
+        let first = link.tx_pdu();
+        assert_eq!(first.llid(), 3);
+        assert_eq!(link.tx_pdu(), first);
+    }
+
+    #[test]
+    fn unsupported_features_receive_unknown_not_fake_success() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        for opcode in [0x03, 0x0f, 0x12, 0x14, 0x16, 0xff] {
+            let response = reply(ctrl.on_pdu(&mut c, &[opcode], LOCAL).unwrap());
+            assert_eq!(response.as_bytes(), &[0x07, opcode]);
+        }
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[7, 0x14], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[2, 0x13], LOCAL),
+            Ok(ControlAction::Terminate(0x13))
+        );
+    }
+
+    #[test]
+    fn known_controls_require_exact_length() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        assert_eq!(ctrl.on_pdu(&mut c, &[], LOCAL), Err(ConnError::Length));
+        for (opcode, len) in [
+            (0, 12),
+            (1, 8),
+            (2, 2),
+            (7, 2),
+            (8, 9),
+            (9, 9),
+            (12, 6),
+            (13, 2),
+            (17, 3),
+        ] {
+            let mut bytes = [0; 13];
+            bytes[0] = opcode;
+            for actual in 1..=13 {
+                if actual != len {
+                    assert_eq!(
+                        ctrl.on_pdu(&mut c, &bytes[..actual], LOCAL),
+                        Err(ConnError::Length)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_map_update_and_connection_update_are_deferred() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[1, 1, 0, 0, 0, 0x10, 2, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0, 1, 0, 0, 40, 0, 0, 0, 200, 0, 2, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(c.params.interval, 24);
+        c.next_event().unwrap();
+        assert_eq!(c.channel(), 10);
+        c.next_event().unwrap();
+        assert_eq!(c.channel(), 36);
+        assert_eq!(c.params.interval, 40);
+    }
+
+    #[test]
+    fn invalid_map_past_instant_and_invalid_timeout() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[1, 1, 0, 0, 0, 0, 2, 0], LOCAL),
+            Err(ConnError::ChannelMap)
+        );
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[1, 3, 0, 0, 0, 0, 0xff, 0xff], LOCAL),
+            Err(ConnError::InstantPassed)
+        );
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0, 1, 0, 0, 40, 0, 0, 0, 10, 0, 2, 0], LOCAL),
+            Err(ConnError::Parameters)
+        );
+        assert_eq!(termination_reason(ConnError::InstantPassed), 0x28);
+    }
 }

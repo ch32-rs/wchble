@@ -1,13 +1,14 @@
-//! Soft HCI command pump (Phase A + legacy adv state for Phase B).
+//! Soft HCI command/ACL pump and bounded single-connection bridge.
 //!
-//! Owns LL scaffold state and answers Host commands arriving on
-//! [`super::transport`]. Phase B stores AdvData / channel map and exposes
-//! [`SoftRunner::build_adv_pdu`] so a HAL task can drive `Radio::tx_basic`.
+//! A cooperative RF owner calls [`SoftRunner::pump_once`] only while idle and
+//! synchronizes connection lifecycle through [`SoftRunner::bridge`]. LL radio
+//! timing, retransmission and sequence numbers remain outside this module.
 
 use bt_hci::transport::PacketKind;
 
 use crate::ll::LinkLayer;
 
+use super::connection::{BridgeError, ConnectionBridge};
 use super::transport::{self, Packet};
 
 /// HCI success.
@@ -20,9 +21,9 @@ const HCI_INVALID_PARAMETERS: u8 = 0x12;
 const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 
 /// ACL data packet length reported by `LE Read Buffer Size` (no DLE yet).
-const ACL_DATA_PACKET_LENGTH: u16 = 27;
+const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
 /// Number of ACL credits advertised to the Host.
-const ACL_CREDITS: u8 = 5;
+const ACL_CREDITS: u8 = super::connection::ACL_CREDITS as u8;
 
 /// Default public BD_ADDR placeholder (HAL / OTP can override later).
 const DEFAULT_BD_ADDR: [u8; 6] = [0x00, 0x00, 0x00, 0xc1, 0xff, 0xee];
@@ -31,6 +32,10 @@ const DEFAULT_BD_ADDR: [u8; 6] = [0x00, 0x00, 0x00, 0xc1, 0xff, 0xee];
 #[derive(Debug)]
 pub struct SoftRunner {
     pub ll: LinkLayer,
+    pub bridge: ConnectionBridge,
+    pending_reply: Option<Packet>,
+    pending_input: Option<(Packet, u32)>,
+    reset_pending: bool,
     event_mask: u64,
     le_event_mask: u64,
     bd_addr: [u8; 6],
@@ -48,6 +53,10 @@ impl SoftRunner {
     pub fn new() -> Self {
         Self {
             ll: LinkLayer::new(),
+            bridge: ConnectionBridge::new(),
+            pending_reply: None,
+            pending_input: None,
+            reset_pending: false,
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
             bd_addr: DEFAULT_BD_ADDR,
@@ -111,40 +120,95 @@ impl SoftRunner {
         self.ll.adv.build_adv_ind(out)
     }
 
-    /// Process one pending Host packet if present. Returns `true` if work ran.
-    pub async fn poll_once(&mut self) -> bool {
-        let Some(packet) = transport::try_receive_host_packet() else {
-            return false;
+    /// Bounded, non-blocking idle-time pump. It never borrows the RF owner
+    /// across an await, and retains owned input/output packets under backpressure.
+    pub fn pump_once(&mut self) -> bool {
+        let mut progressed = false;
+        if self.reset_pending && self.bridge.take_reset_done() {
+            self.finish_reset();
+            progressed = true;
+        }
+        if let Some(reply) = self.pending_reply {
+            if transport::try_send_controller_packet(reply).is_err() {
+                return progressed;
+            }
+            self.pending_reply = None;
+            return true;
+        }
+        if self.reset_pending {
+            return progressed;
+        }
+        // One output at most, with lifecycle events ahead of ACL data.
+        if self.bridge.flush_one() {
+            return true;
+        }
+        let input = self
+            .pending_input
+            .take()
+            .filter(|(_, epoch)| *epoch == self.bridge.epoch());
+        let Some((packet, epoch)) = input.or_else(|| {
+            transport::try_receive_host_packet().map(|packet| (packet, self.bridge.epoch()))
+        }) else {
+            return progressed;
         };
-        self.dispatch(packet).await;
+        match packet.kind {
+            PacketKind::Cmd => self.handle_command(packet.payload()),
+            PacketKind::AclData => {
+                if self.bridge.enqueue_tx(&packet) == Err(BridgeError::Full) {
+                    self.pending_input = Some((packet, epoch));
+                    return progressed;
+                }
+            }
+            _ => {}
+        }
+        if let Some(reply) = self.pending_reply {
+            if transport::try_send_controller_packet(reply).is_ok() {
+                self.pending_reply = None;
+            }
+        }
         true
     }
 
-    /// Block until a Host packet arrives, then handle it.
-    pub async fn serve_one(&mut self) {
-        let packet = transport::receive_host_packet().await;
-        self.dispatch(packet).await;
+    /// Compatibility entry point for existing cooperative async callers.
+    pub async fn poll_once(&mut self) -> bool {
+        self.pump_once()
     }
 
-    /// Forever pump — HAL apps `join` this with Trouble's runner.
+    /// Legacy advertising-only async service. Connected RF applications use
+    /// pump_once at idle boundaries instead of holding this future across RF.
+    pub async fn serve_one(&mut self) {
+        loop {
+            let progressed = self.pump_once();
+            if self.pending_reply.is_some() || self.bridge.has_output() {
+                transport::wait_for_output_space().await;
+            } else if progressed {
+                return;
+            } else {
+                transport::wait_for_host_packet().await;
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> ! {
         loop {
             self.serve_one().await;
         }
     }
 
-    async fn dispatch(&mut self, packet: Packet) {
-        match packet.kind {
-            PacketKind::Cmd => self.handle_command(packet.payload()).await,
-            PacketKind::AclData => {
-                // Phase A: no connections yet.
-                let _ = packet;
-            }
-            _ => {}
+    fn finish_reset(&mut self) {
+        self.reset_pending = false;
+        self.pending_input = None;
+        self.event_mask = u64::MAX;
+        self.le_event_mask = 0x1f;
+        self.bridge.set_masks(self.event_mask, self.le_event_mask);
+        self.ll = LinkLayer::new();
+        if self.random_addr.is_some() {
+            self.sync_adv_addr();
         }
+        self.pending_reply = Some(transport::command_complete_packet(0x0c03, HCI_SUCCESS, &[]));
     }
 
-    async fn handle_command(&mut self, bytes: &[u8]) {
+    fn handle_command(&mut self, bytes: &[u8]) {
         if bytes.len() < 3 || bytes.len() != 3 + usize::from(bytes[2]) {
             return;
         }
@@ -153,30 +217,44 @@ impl SoftRunner {
 
         // Async commands answer with Command Status, not Complete.
         match opcode {
-            // Disconnect / LE Create Connection / LE Connection Update
-            0x0406 | 0x200d | 0x2013 => {
-                transport::command_status(opcode, HCI_COMMAND_DISALLOWED).await;
+            0x0406 => {
+                let status = if params.len() != 3
+                    || !matches!(params[2], 0x05 | 0x13 | 0x14 | 0x15 | 0x1a | 0x29 | 0x3b)
+                {
+                    HCI_INVALID_PARAMETERS
+                } else {
+                    self.bridge
+                        .request_disconnect(u16::from_le_bytes([params[0], params[1]]), params[2])
+                };
+                self.pending_reply = Some(transport::command_status_packet(opcode, status));
+                return;
+            }
+            0x200d | 0x2013 => {
+                self.pending_reply = Some(transport::command_status_packet(
+                    opcode,
+                    HCI_COMMAND_DISALLOWED,
+                ));
+                return;
+            }
+            0x0c03 if params.is_empty() => {
+                if self.bridge.is_connected() || self.ll.adv.enabled {
+                    self.reset_pending = true;
+                    self.bridge.request_reset();
+                } else {
+                    self.bridge.request_reset();
+                    self.bridge.reset_finished();
+                    self.bridge.take_reset_done();
+                    self.finish_reset();
+                }
                 return;
             }
             _ => {}
         }
 
-        // Copy BD_ADDR before any await that needs &mut self across the reply.
+        // Own the address while the command handler mutates advertising state.
         let bd_addr = self.bd_addr;
 
         let result: Result<&[u8], u8> = match opcode {
-            // Reset
-            0x0c03 if params.is_empty() => {
-                self.event_mask = u64::MAX;
-                self.le_event_mask = 0x1f;
-                self.ll = LinkLayer::new();
-                // Re-apply a HAL seed. The pinned Trouble sends 0x2005 after
-                // Reset, but Hosts that don't still get a usable AdvA.
-                if self.random_addr.is_some() {
-                    self.sync_adv_addr();
-                }
-                Ok(&[][..])
-            }
             // Set Event Mask / LE Set Event Mask
             0x0c01 | 0x2001 if params.len() == 8 => {
                 let mask = u64::from_le_bytes(params.try_into().unwrap());
@@ -185,7 +263,7 @@ impl SoftRunner {
                 } else {
                     self.le_event_mask = mask;
                 }
-                let _ = (self.event_mask, self.le_event_mask);
+                self.bridge.set_masks(self.event_mask, self.le_event_mask);
                 Ok(&[][..])
             }
             // Set Event Mask Page 2
@@ -210,9 +288,9 @@ impl SoftRunner {
                 ];
                 Ok(&BUFFER_SIZE)
             }
-            // LE Read Local Supported Features — peripheral + conn (no encryption).
+            // Match the implemented, unencrypted LE 1M air-interface features.
             0x2003 if params.is_empty() => {
-                static FEATURES: [u8; 8] = [0x06, 0, 0, 0, 0, 0, 0, 0];
+                static FEATURES: [u8; 8] = [0; 8];
                 Ok(&FEATURES)
             }
             // LE Set Random Address
@@ -268,12 +346,11 @@ impl SoftRunner {
             // LE Rand
             0x2018 if params.is_empty() => {
                 // Deterministic placeholder; HAL should seed real entropy later.
-                transport::command_complete(
+                self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
                     &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
-                )
-                .await;
+                ));
                 return;
             }
             // LE Set Ext Advertising / Scan Enable — legacy-only controller.
@@ -281,10 +358,10 @@ impl SoftRunner {
             _ => Err(HCI_UNKNOWN_COMMAND),
         };
 
-        match result {
-            Ok(return_data) => transport::command_complete(opcode, HCI_SUCCESS, return_data).await,
-            Err(status) => transport::command_complete(opcode, status, &[]).await,
-        }
+        self.pending_reply = Some(match result {
+            Ok(return_data) => transport::command_complete_packet(opcode, HCI_SUCCESS, return_data),
+            Err(status) => transport::command_complete_packet(opcode, status, &[]),
+        });
     }
 
     fn set_adv_params(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
@@ -330,8 +407,7 @@ mod tests {
         bytes[0..2].copy_from_slice(&opcode.to_le_bytes());
         bytes[2] = params.len() as u8;
         bytes[3..3 + params.len()].copy_from_slice(params);
-        let packet =
-            Packet::from_bytes(PacketKind::Cmd, &bytes[..3 + params.len()]).unwrap();
+        let packet = Packet::from_bytes(PacketKind::Cmd, &bytes[..3 + params.len()]).unwrap();
         transport::try_send_host_packet(packet).unwrap();
     }
 
@@ -431,6 +507,333 @@ mod tests {
             assert_eq!(&pdu[2..8], &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01]);
             assert_eq!(&pdu[8..11], &[0x02, 0x01, 0x06]);
         });
+    }
+
+    fn connection_info() -> super::super::connection::ConnectionInfo {
+        super::super::connection::ConnectionInfo {
+            handle: 1,
+            peer_address_type: 1,
+            peer_address: [1, 2, 3, 4, 5, 0xc6],
+            interval: 24,
+            latency: 0,
+            supervision_timeout: 200,
+        }
+    }
+
+    fn acl(handle: u16, pb: u16, data: &[u8]) -> Packet {
+        let mut packet = Packet::empty(PacketKind::AclData);
+        packet.bytes[..2].copy_from_slice(&(handle | (pb << 12)).to_le_bytes());
+        packet.bytes[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        packet.bytes[4..4 + data.len()].copy_from_slice(data);
+        packet.len = data.len() + 4;
+        packet
+    }
+
+    fn open(runner: &mut SoftRunner) {
+        runner.bridge.connected(connection_info()).unwrap();
+        assert!(runner.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(&event.payload()[..3], &[0x3e, 19, 1]);
+        assert_eq!(&event.payload()[4..8], &[1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn acl_five_real_slots_and_more_than_five_credit_cycles() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        for cycle in 0..4 {
+            for n in 0..5 {
+                runner
+                    .bridge
+                    .enqueue_tx(&acl(1, n % 2, &[cycle as u8; 27]))
+                    .unwrap();
+            }
+            assert_eq!(
+                runner.bridge.enqueue_tx(&acl(1, 0, &[0])),
+                Err(BridgeError::Full)
+            );
+            let mut tags = [None; 5];
+            for (n, tag) in tags.iter_mut().enumerate() {
+                let tx = runner.bridge.take_tx_acl().unwrap();
+                assert_eq!(tx.llid, if n % 2 == 0 { 2 } else { 1 });
+                assert_eq!(tx.len, 27);
+                assert_eq!(&tx.bytes, &[cycle as u8; 27]);
+                *tag = Some(tx.tag);
+            }
+            assert!(runner.bridge.take_tx_acl().is_none());
+            assert_eq!(
+                runner.bridge.enqueue_tx(&acl(1, 0, &[0])),
+                Err(BridgeError::Full)
+            );
+            assert!(transport::try_receive_controller_packet().is_none());
+            for tag in tags.into_iter().flatten() {
+                assert!(runner.bridge.ack_tx(tag));
+                assert!(!runner.bridge.ack_tx(tag));
+            }
+            assert!(runner.pump_once());
+            assert_eq!(
+                transport::try_receive_controller_packet()
+                    .unwrap()
+                    .payload(),
+                &[0x13, 5, 1, 1, 0, 5, 0]
+            );
+            assert!(!runner.pump_once());
+        }
+    }
+
+    #[test]
+    fn acl_validates_handle_pb_bc_and_exact_27_byte_limit() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        assert_eq!(
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1])),
+            Err(BridgeError::NotConnected)
+        );
+        open(&mut runner);
+        for packet in [
+            acl(2, 0, &[1]),
+            acl(1, 2, &[1]),
+            acl(1, 3, &[1]),
+            acl(0x4001, 0, &[1]),
+            acl(1, 0, &[1; 28]),
+        ] {
+            assert_eq!(
+                runner.bridge.enqueue_tx(&packet),
+                Err(BridgeError::InvalidPacket)
+            );
+        }
+        let mut truncated = acl(1, 0, &[1, 2]);
+        truncated.len -= 1;
+        assert_eq!(
+            runner.bridge.enqueue_tx(&truncated),
+            Err(BridgeError::InvalidPacket)
+        );
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+    }
+
+    #[test]
+    fn rx_backpressure_pb_mapping_and_empty_control_packets() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.bridge.connected(connection_info()).unwrap();
+        assert!(!runner.bridge.can_receive_acl(3, 1));
+        assert!(!runner.bridge.can_receive_acl(2, 28));
+        assert_eq!(
+            runner.bridge.receive_acl(3, &[0]),
+            Err(BridgeError::InvalidPacket)
+        );
+        for n in 0..5 {
+            assert!(runner.bridge.can_receive_acl(2, 27));
+            runner
+                .bridge
+                .receive_acl(if n == 0 { 2 } else { 1 }, &[n; 27])
+                .unwrap();
+        }
+        assert!(!runner.bridge.can_receive_acl(2, 1));
+        assert_eq!(runner.bridge.receive_acl(2, &[9]), Err(BridgeError::Full));
+        assert!(runner.bridge.can_receive_acl(1, 0));
+        runner.bridge.receive_acl(1, &[]).unwrap();
+        assert!(runner.pump_once());
+        assert_eq!(
+            &transport::try_receive_controller_packet()
+                .unwrap()
+                .payload()[..3],
+            &[0x3e, 19, 1]
+        );
+        for n in 0..5 {
+            assert!(runner.pump_once());
+            let packet = transport::try_receive_controller_packet().unwrap();
+            assert_eq!(packet.kind, PacketKind::AclData);
+            assert_eq!(packet.bytes[1] >> 4, if n == 0 { 2 } else { 1 });
+            assert_eq!(&packet.payload()[4..], &[n; 27]);
+        }
+        assert!(!runner.pump_once()); // No ACL/credits for empty or control.
+    }
+
+    #[test]
+    fn transport_full_retains_lifecycle_acl_and_command_reply() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        for _ in 0..4 {
+            transport::try_send_controller_packet(transport::command_complete_packet(
+                0x1009,
+                0,
+                &[],
+            ))
+            .unwrap();
+        }
+        inject_cmd(0x2003, &[]);
+        assert!(runner.pump_once());
+        runner.bridge.connected(connection_info()).unwrap();
+        runner.bridge.receive_acl(2, &[7]).unwrap();
+        assert!(!runner.pump_once());
+        for _ in 0..4 {
+            transport::try_receive_controller_packet().unwrap();
+        }
+        assert!(runner.pump_once());
+        expect_command_complete(0x2003, 0, &[0; 8]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet().unwrap().bytes[0],
+            0x3e
+        );
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet().unwrap().kind,
+            PacketKind::AclData
+        );
+    }
+
+    #[test]
+    fn disconnect_status_precedes_completion_and_old_epoch_cannot_ack() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        runner.bridge.enqueue_tx(&acl(1, 0, &[1])).unwrap();
+        let old = runner.bridge.take_tx_acl().unwrap().tag;
+        inject_cmd(0x0406, &[2, 0, 0x13]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 2, 1, 6, 4]
+        );
+        assert!(runner.bridge.take_radio_request().is_none());
+        inject_cmd(0x0406, &[1, 0, 0x13]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0, 1, 6, 4]
+        );
+        assert_eq!(
+            runner.bridge.take_radio_request(),
+            Some(super::super::connection::RadioRequest::Disconnect { reason: 0x13 })
+        );
+        assert!(!runner.pump_once()); // Completion waits for actual RF teardown.
+        runner.bridge.disconnected(0x16);
+        runner.bridge.connected(connection_info()).unwrap();
+        assert!(!runner.bridge.ack_tx(old));
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[5, 4, 0, 1, 0, 0x16]
+        );
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet().unwrap().bytes[0],
+            0x3e
+        );
+        assert!(!runner.pump_once());
+    }
+
+    #[test]
+    fn connected_reset_waits_for_rf_and_preserves_next_command() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        runner.bridge.enqueue_tx(&acl(1, 0, &[1])).unwrap();
+        let old = runner.bridge.take_tx_acl().unwrap().tag;
+        runner.bridge.receive_acl(2, &[9]).unwrap();
+        // RX may be published first; Reset must remove it before reusing handle.
+        assert!(runner.pump_once());
+        inject_cmd(0x0c03, &[]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            runner.bridge.take_radio_request(),
+            Some(super::super::connection::RadioRequest::Reset)
+        );
+        inject_cmd(0x1009, &[]);
+        assert!(!runner.pump_once());
+        runner.bridge.reset_finished();
+        assert!(transport::try_receive_controller_packet().is_none());
+        assert!(runner.pump_once());
+        expect_command_complete(0x0c03, 0, &[]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x1009, 0, &DEFAULT_BD_ADDR);
+        assert!(!runner.bridge.ack_tx(old));
+        assert!(!runner.bridge.is_connected());
+        open(&mut runner);
+        assert!(!runner.pump_once());
+    }
+
+    #[test]
+    fn update_mask_and_lifecycle_slots_remain_bounded() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        runner.bridge.connection_updated(30, 1, 300).unwrap();
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x3e, 10, 3, 0, 1, 0, 30, 0, 1, 0, 44, 1]
+        );
+        inject_cmd(0x2001, &[0; 8]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2001, 0, &[]);
+        runner.bridge.connection_updated(32, 0, 300).unwrap();
+        assert!(!runner.pump_once());
+        runner.bridge.set_masks(u64::MAX, 0x1f);
+        for _ in 0..7 {
+            runner.bridge.connection_updated(32, 0, 300).unwrap();
+        }
+        assert_eq!(
+            runner.bridge.connection_updated(32, 0, 300),
+            Err(BridgeError::Full)
+        );
+        runner.bridge.disconnected(0x08); // Reserved slot, even with seven updates.
+        assert!(!runner.bridge.is_connected());
+        assert_eq!(
+            runner.bridge.connected(connection_info()),
+            Err(BridgeError::Full)
+        );
+        for _ in 0..7 {
+            assert!(runner.pump_once());
+            assert_eq!(
+                transport::try_receive_controller_packet().unwrap().bytes[0],
+                0x3e
+            );
+        }
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet().unwrap().bytes[0],
+            5
+        );
+    }
+
+    #[test]
+    fn stale_full_input_cannot_cross_handle_reuse() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        for _ in 0..5 {
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1])).unwrap();
+        }
+        transport::try_send_host_packet(acl(1, 0, &[99])).unwrap();
+        assert!(!runner.pump_once());
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        for _ in 0..2 {
+            assert!(runner.pump_once());
+            transport::try_receive_controller_packet().unwrap();
+        }
+        runner.pump_once();
+        assert!(runner.bridge.take_tx_acl().is_none());
     }
 
     #[test]

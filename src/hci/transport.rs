@@ -7,7 +7,9 @@
 
 use core::convert::Infallible;
 
-use bt_hci::transport::{PacketKind, PacketToController, PacketToHost, Transport as TransportTrait};
+use bt_hci::transport::{
+    PacketKind, PacketToController, PacketToHost, Transport as TransportTrait,
+};
 use bt_hci::{FromHciBytesError, ReadHciError};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -27,7 +29,7 @@ static CONTROLLER_TO_HOST: Channel<CriticalSectionRawMutex, Packet, CONTROLLER_T
     Channel::new();
 
 /// Owned HCI packet stored in the static channels.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Packet {
     pub kind: PacketKind,
     pub len: usize,
@@ -198,37 +200,60 @@ pub async fn event(event_code: u8, parameters: &[u8]) -> Result<(), Error> {
 
 /// HCI Command Complete (event 0x0e).
 pub async fn command_complete(opcode: u16, status: u8, return_data: &[u8]) {
-    let parameter_len = 4usize.saturating_add(return_data.len());
-    let mut bytes = [0u8; HCI_PACKET_CAPACITY];
-    bytes[0] = 0x0e;
-    bytes[1] = parameter_len as u8;
-    bytes[2] = 1; // Num_HCI_Command_Packets
-    bytes[3..5].copy_from_slice(&opcode.to_le_bytes());
-    bytes[5] = status;
-    bytes[6..6 + return_data.len()].copy_from_slice(return_data);
-    send_controller_packet(
-        Packet::from_bytes(PacketKind::Event, &bytes[..6 + return_data.len()]).unwrap(),
-    )
-    .await;
+    send_controller_packet(command_complete_packet(opcode, status, return_data)).await;
 }
 
 /// HCI Command Status (event 0x0f) — used for async cmds we still stub.
 pub async fn command_status(opcode: u16, status: u8) {
-    send_controller_packet(
-        Packet::from_bytes(
-            PacketKind::Event,
-            &[
-                0x0f,
-                0x04,
-                status,
-                0x01,
-                opcode as u8,
-                (opcode >> 8) as u8,
-            ],
-        )
-        .unwrap(),
-    )
-    .await;
+    send_controller_packet(command_status_packet(opcode, status)).await;
+}
+
+/// Remove obsolete connection data without discarding command replies or a
+/// subsequent Host command. Called only by the single cooperative RF/HCI owner.
+pub(crate) fn discard_connection_data() {
+    let mut retained = [None; CONTROLLER_TO_HOST_CAPACITY];
+    let mut count = 0;
+    while let Ok(packet) = CONTROLLER_TO_HOST.try_receive() {
+        if packet.kind == PacketKind::AclData
+            || (packet.kind == PacketKind::Event && packet.payload().first() == Some(&0x13))
+        {
+            continue;
+        }
+        retained[count] = Some(packet);
+        count += 1;
+    }
+    for packet in retained.into_iter().flatten() {
+        let _ = CONTROLLER_TO_HOST.try_send(packet);
+    }
+    if let Ok(packet) = HOST_TO_CONTROLLER.try_receive() {
+        if packet.kind != PacketKind::AclData {
+            let _ = HOST_TO_CONTROLLER.try_send(packet);
+        }
+    }
+}
+
+pub(crate) async fn wait_for_host_packet() {
+    core::future::poll_fn(|cx| HOST_TO_CONTROLLER.poll_ready_to_receive(cx)).await
+}
+
+pub(crate) async fn wait_for_output_space() {
+    core::future::poll_fn(|cx| CONTROLLER_TO_HOST.poll_ready_to_send(cx)).await
+}
+
+pub(crate) fn command_complete_packet(opcode: u16, status: u8, data: &[u8]) -> Packet {
+    let mut packet = Packet::empty(PacketKind::Event);
+    packet.bytes[0] = 0x0e;
+    packet.bytes[1] = (4 + data.len()) as u8;
+    packet.bytes[2] = 1;
+    packet.bytes[3..5].copy_from_slice(&opcode.to_le_bytes());
+    packet.bytes[5] = status;
+    packet.bytes[6..6 + data.len()].copy_from_slice(data);
+    packet.len = 6 + data.len();
+    packet
+}
+
+pub(crate) fn command_status_packet(opcode: u16, status: u8) -> Packet {
+    super::connection::event_packet(0x0f, &[status, 1, opcode as u8, (opcode >> 8) as u8])
 }
 
 /// Test helper: drop any residual channel state between unit tests.

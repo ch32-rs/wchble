@@ -101,6 +101,30 @@ CH592 RF smoke examples. Verify transmitted packets with a second receiver.
 
 ## Status
 
+**CH585 direct-radio bring-up** (2026-11-09):
+[`ch585-scannable`](examples/ch585-scannable) has verified scan responses;
+[`ch585-peripheral`](examples/ch585-peripheral) adds an unencrypted LE 1M,
+CSA #1 connection prototype. macOS connect/hold/disconnect has passed ten
+successive 10-second cycles with firmware data RX/TX evidence and a clean
+360-second finite run. A separate 120-second client hold completed, but joint
+firmware acceptance failed on a duration discrepancy and a later extra connection
+with supervision timeout; it is not reported as passing. This example bypasses
+the scaffold HCI runner: it is not yet a Trouble/GATT peripheral, and air IFS is
+unmeasured.
+
+**CH585 P4 real Host/GATT integration** (2026-11-09):
+[`ch585-trouble-gatt`](examples/ch585-trouble-gatt) connects the event-level radio
+pump to a bounded single-connection soft HCI/ACL bridge and real Trouble Host.
+The native real-Host fixture passes discovery, read/write, notification, credit
+recycling and reconnect tests. One controlled macOS physical cycle passed service
+and characteristic discovery, five reads, thirteen writes, ten verified sequence
+notifications, unsubscribe and normal disconnect, with a clean finite RF finish
+and smoke recovery. Earlier failed attempts are retained. The successful run's
+sniffer did not follow its data channel and required forced shutdown, so that
+capture gate is not verified. Android/iPhone P4 acceptance, repeated physical
+reconnects and sustained reliability are also unverified. See the example for the
+finite runner and safety/recovery policy.
+
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.
