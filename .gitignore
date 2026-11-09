@@ -1,4 +1,5 @@
 /target
+/tools/ch585-preflight/target/
 /local-docs/
 **/*.rs.bk
 .DS_Store

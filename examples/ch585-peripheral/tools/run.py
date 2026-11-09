@@ -282,6 +282,9 @@ def stop_client(client):
 
 
 def halt_and_idle(out, prefix):
+    # Legacy diagnostic only: standalone reads resume the core after each
+    # access, so this cannot establish continuous halt ownership. Runners use
+    # io.flash and its single-session preflight helper instead.
     # probe-rs b580f1a0b calls an argument-free `break` a halt. `quit`
     # suspends on disconnect; `halt`/`exit` are not console commands.
     # The debug CLI constructs Readline even after `quit`; macOS needs a PTY.
@@ -330,8 +333,9 @@ def execute(args):
         binary = (args.out / 'central').resolve()
         io.command(['swiftc', str(source), '-o', str(binary)], args.out / 'central-build.log', timeout=120)
         touched = True
-        halt_and_idle(args.out, 'test')
         try:
+            # The helper performs halt, engine shutdown, both idle checks and
+            # verified download in one retained probe session.
             io.flash(archived, args.out, 'test', check_idle=False)
         finally:
             # A failed download can still have started firmware. Wait the full
@@ -386,7 +390,6 @@ def execute(args):
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
                     errors.append(f'observations: {error}')
             try:
-                halt_and_idle(args.out, 'restore')
                 io.flash(args.out / 'smoke.elf', args.out, 'restore', check_idle=False)
                 io.command(['swift', str(io.SCANNER), 'wch585', '8'], args.out / 'restore-scan.log', 20)
                 metadata['smoke_recovery'] = 'flash verify and macOS discovery PASS'

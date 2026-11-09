@@ -193,8 +193,9 @@ def execute(args):
         shutil.copyfile(EXAMPLE / 'tools/central.swift', source)
         io.command(['swiftc', str(source), '-o', str(binary)], args.out / 'central-build.log', timeout=120)
         touched = True
-        halt_and_idle(args.out, 'test')
         try:
+            # The helper performs halt, engine shutdown, both idle checks and
+            # verified download in one retained probe session.
             io.flash(archived, args.out, 'test', check_idle=False)
         finally:
             # Even a failed download may boot the finite image. Never probe it
@@ -260,7 +261,6 @@ def execute(args):
                     errors.append(f'TRACE observations: {error}')
                 errors.extend(evaluate_stats(obs, observations.get('HOST_STATS', []), args.cycles, args.run_seconds))
             try:
-                halt_and_idle(args.out, 'restore')
                 io.flash(args.out / 'smoke.elf', args.out, 'restore', check_idle=False)
                 io.command(['swift', str(io.SCANNER), 'wch585', '8'], args.out / 'restore-scan.log', 20)
                 metadata['smoke_recovery'] = 'flash verify and exact-name macOS discovery PASS'
