@@ -89,6 +89,18 @@ and received notification sequence; stop cleanly within the SIGINT budget.
 Startup/configuration logs alone are not proof of following. Do not weaken
 capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
+## P5 service expansion gaps
+
+- [x] **Device Information + UART echo v1:** standard DIS reads and a Nordic
+  UART-style write/notify echo run in the Host/application layer. Native fixture
+  and a three-cycle macOS run pass.
+- [ ] **ATT MTU negotiation and long data:** the image still fixes MTU 23 and a
+  27-byte packet pool. MTU exchange, longer writes, L2CAP fragmentation and
+  reads across multiple ACL packets are unimplemented/unvalidated.
+- [ ] **UART flow and throughput stress:** bursts beyond the Host credit window,
+  backpressure with large payloads, and sustained bidirectional throughput are
+  not tested. The current echo accepts at most 20 bytes per write at MTU 23.
+
 ## Sustained radio/Host reliability
 
 - [ ] **P4 sustained connection and long-run traffic:** short five-cycle runs do

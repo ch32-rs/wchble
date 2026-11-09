@@ -152,6 +152,16 @@ queue-pressure stress and calibrated air timing remain unverified. Open gaps are
 tracked in [`BACKLOG.md`](BACKLOG.md). See the example for the finite runner and
 safety/recovery policy.
 
+**CH585 P5 service expansion** (2026-11-10):
+[`ch585-trouble-gatt`](examples/ch585-trouble-gatt) now also exposes the
+standard Device Information Service (manufacturer/model/revision) and a Nordic
+UART-style write/notify pipe. The native real-Host fixture covers DIS discovery
+and reads plus a UART write/echo notification; a three-cycle macOS run read all
+three information fields and echoed three distinct strings without RF, Host or
+bridge errors, then restored smoke. ATT MTU remains 23, so long-data/MTU
+negotiation and UART flow stress are not yet validated. See
+[`BACKLOG.md`](BACKLOG.md).
+
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.
