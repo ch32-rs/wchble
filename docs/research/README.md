@@ -14,6 +14,7 @@ Compare the open CH32V208 NimBLE radio driver (`~/Repos/ch32v208-nimble`) with t
 | [ch58x-reuse.md](ch58x-reuse.md) | CH583 vs CH585: shared map, **not** shared DevInit tables |
 | [bringup-debug.md](bringup-debug.md) | On-silicon dump checklist; marks UNCERTAIN fields |
 | [path-b-soft-hci-trouble.md](path-b-soft-hci-trouble.md) | Path B: Rust LL + soft HCI → Trouble (refined plan) |
+| [ch585-connection-research.md](ch585-connection-research.md) | CH585 scan response and peripheral connection: timing risks, baselines and staged verification |
 | [upstream-disasm/notes.md](upstream-disasm/notes.md) | Preserved notes from old `ch32v20x-ble/disasm` |
 | [../architecture.md](../architecture.md) | Repo layer / HAL boundary / module map |
 | [../progress.md](../progress.md) | Scaffold / Path B phase progress |

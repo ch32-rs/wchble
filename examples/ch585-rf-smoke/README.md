@@ -1,8 +1,9 @@
 # CH585 RF verify smoke
 
-On-target verification for `wchble`'s CH585 (CH58x) RF path. **Verified on air
-2026-11-09**: the DevInit dump matches the vendor golden registers, TX/RX work,
-and macOS CoreBluetooth sees the `wch585` ADV_IND at −44 dBm.
+On-target verification for `wchble`'s CH585 (CH58x) RF path. On 2026-11-09,
+TX/RX were exercised on air and macOS saw an earlier `wch585` ADV_IND. The
+current non-connectable, non-scannable advertisement was seen by macOS and an
+Android phone. This smoke example does not support scanning responses or connections.
 
 ## What it does
 
@@ -13,9 +14,9 @@ and macOS CoreBluetooth sees the `wch585` ADV_IND at −44 dBm.
    BB_DevInit → calibration`)
 4. Dump DevInit markers (`LLE+0x06/14/2c/3c/50/54/0c`, `RFEND+0x28/30/3c/44`,
    `BB+0x00/10/2c/34/38`)
-5. Multi-channel ADV_IND TX on **37 / 38 / 39**
+5. Multi-channel ADV_NONCONN_IND TX on **37 / 38 / 39**
 6. Two RX arming rounds on ch38 (arm-clear / timeout still proves the path)
-7. Loop: ADV_IND on 37/38/39 + the vendor `RF_PHY` reference frame on ch39,
+7. Loop: ADV_NONCONN_IND on 37/38/39 + the vendor `RF_PHY` reference frame on ch39,
    with a periodic RX check on ch37
 
 Console markers: `rf init ok`, `LLE …` / `RFEND …` / `BB …`,
@@ -91,12 +92,13 @@ before running the scanner (or scan before reading).
 
 1. `LLE+0x2C/+0x3C = 0x6C` (not CH592's `0x6E`) and `LLE+0x06 = 2`, exactly as
    carved from the CH585 lib.
-2. TX completion lands on `IRQSTAT` bits 3|1 as modeled; each ADV_IND occupies
-   ~305 µs of airtime.
+2. TX completion was observed and macOS decoded the advertisement. The
+   earlier elapsed-time log subtracted timestamps backwards; it was not an
+   air-interface timing measurement.
 3. `RFEND_DevInit` masks matter: passing the vendor's AND masks
    (`0xF8FFFFFF`, `0x81FFFFFF`) to `regs::rmw` as *clear* masks inverted the
    update and left VCO calibration constant across bands. With the corrected
-   masks the VCOTAB/GA tables are bit-identical to the vendor `Peripheral.hex`
-   golden capture.
+   masks the calibration tables were populated and broadly matched the vendor
+   `Peripheral.hex` capture, with differences in some words.
 4. RX decodes nearby advertisers with `crc=true`; TX is confirmed by an
    external macOS scan seeing `wch585`.

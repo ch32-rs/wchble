@@ -129,9 +129,10 @@ Recovered 2026-11-09 from `ip.o` (`RFIP_SetTx` / `RFIP_SetRx` /
 | Soft IFS vs auto sequencer | soft IFS preferred | lib supports auto/basic LLE modes | product choice |
 
 Silicon verification (2026-11-09, `examples/ch585-rf-smoke`): the `0x6C` LLE
-DevInit pair, `LLE+0x06 = 2`, `LLE+0x54 = 0`, `BB+0x38 = 0x3FF` and
-`BB+0x3C = 0x0002_020C` all read back as tabulated; TX completes (bits 3|1) with
-~305 µs of airtime per ADV_IND; RX decodes real advertisers with `crc=true`;
-and a macOS CoreBluetooth scan sees the `wch585` local name. Calibration output
-(VCOTAB/GA) is bit-identical to the vendor `Peripheral.hex` golden capture.
+DevInit pair, `LLE+0x06 = 2` and `LLE+0x54 = 0` read back as tabulated; RX
+reported packets with `crc=true`, and macOS saw `wch585`. `BB+0x38 = 0x3FF`
+is a W1C initialization write, not a readback assertion. Calibration tables
+were populated and broadly resembled the vendor capture, but some words
+differed. The early elapsed-time log used reversed subtraction and did not
+measure air-interface timing.
 
