@@ -106,7 +106,7 @@ fn run() -> Result<(), (u8, String)> {
     options.verify = verify;
     let download_started = Instant::now();
     download_file_with_options(&mut session, &elf, ElfLoader(ElfOptions::default()), options)
-        .map_err(|e| (4, format!("download: {e}")))?;
+        .map_err(|e| (4, format!("download: {e:?}")))?;
     let download_ms = download_started.elapsed().as_millis();
 
     {
