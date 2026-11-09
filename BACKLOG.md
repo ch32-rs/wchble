@@ -50,11 +50,18 @@ functional results remain separate from this newly identified preflight gap.
 
 ## Priority: independent phone acceptance
 
-- [ ] **Android P4:** complete at least three isolated connect/discover/read/
-  Write Request/readback/notify/unsubscribe/disconnect/reconnect rounds. Verify
-  ten numbered notifications, value persistence and cleared CCCD on reconnect.
-- [ ] **iPhone P4:** repeat the same acceptance in its own finite window, with
-  no Android or macOS central competing for the single connection.
+- [x] **First manual Android check (2026-11-10):** the user reports all five
+  requested operations succeeded in a directly flashed 360-second window. Board
+  counters show four accepted connections/disconnects, six reads, five writes,
+  five queued notifications, `0xAAAAAAAA` final value and no Host/RF error.
+- [x] **First manual iPhone check (2026-11-10):** the user separately reports a
+  successful iOS attempt. It shares the same window's counters, so attribution
+  rests on the user's UI observations rather than captured peer evidence.
+- [ ] **Formal Android acceptance:** at least three isolated rounds, ten numbered
+  notifications per subscribed round, and reconnects in a window with no other
+  phone or Mac central. The first manual check did not exercise ten notifications
+  or three rounds.
+- [ ] **Formal iPhone acceptance:** the same rounds in a separate window.
 - [ ] **Classify any phone connection/discovery failure from evidence.** An
   uncontrolled phone attempt saw services but did not complete the intended
   workflow. This is neither acceptance nor proof of interference. Retain the
