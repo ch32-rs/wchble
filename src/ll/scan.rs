@@ -54,6 +54,15 @@ impl PduType {
         }
     }
 
+    /// Legacy types a scanner may answer with `SCAN_REQ`.
+    ///
+    /// Exactly `ADV_IND` and `ADV_SCAN_IND`; `ADV_DIRECT_IND`,
+    /// `ADV_NONCONN_IND`, `SCAN_RSP`, `CONNECT_IND` and extended types are
+    /// not scannable.
+    pub const fn is_scannable(self) -> bool {
+        matches!(self, Self::AdvInd | Self::AdvScanInd)
+    }
+
     /// Types that carry an AdvA at the start of the payload.
     pub const fn has_adv_a(self) -> bool {
         matches!(
@@ -165,6 +174,35 @@ impl<'a> Pdu<'a> {
             .find(|ad| ad.ad_type == 0xff)
             .map(|ad| ad.data)
     }
+}
+
+/// Build a legacy `SCAN_REQ` addressed to one advertiser.
+///
+/// Layout: `[header, 12, ScanA[6], AdvA[6]]`. `scan_random` sets TxAdd (the
+/// scanner address type). `adv_random` must be the TxAdd bit of the received
+/// advertisement, i.e. the AdvA address type, which becomes this PDU's RxAdd;
+/// it is **not** the advertisement's own RxAdd bit.
+///
+/// Returns the 14-byte PDU length, or `None` if `out` is too small. No bytes
+/// are written on failure.
+pub fn build_scan_req(
+    out: &mut [u8],
+    scan_addr: &[u8; 6],
+    scan_random: bool,
+    adv_addr: &[u8; 6],
+    adv_random: bool,
+) -> Option<usize> {
+    const LEN: usize = 14;
+    if out.len() < LEN {
+        return None;
+    }
+    out[0] = 0x03
+        | if scan_random { 0x40 } else { 0 }
+        | if adv_random { 0x80 } else { 0 };
+    out[1] = 12;
+    out[2..8].copy_from_slice(scan_addr);
+    out[8..14].copy_from_slice(adv_addr);
+    Some(LEN)
 }
 
 /// One AD structure: `[length, type, data..]` with `length = 1 + data.len()`.
@@ -382,6 +420,64 @@ mod tests {
         assert!(!pdu.tx_add());
         assert!(!pdu.rx_add());
         assert!(!pdu.chsel());
+    }
+
+    #[test]
+    fn scannable_types_are_exactly_adv_ind_and_adv_scan_ind() {
+        for ty in [PduType::AdvInd, PduType::AdvScanInd] {
+            assert!(ty.is_scannable(), "{ty:?}");
+        }
+        for ty in [
+            PduType::AdvDirectInd,
+            PduType::AdvNonconnInd,
+            PduType::ScanReq,
+            PduType::ScanRsp,
+            PduType::ConnectInd,
+            PduType::AdvExtInd,
+            PduType::Unknown(0x0a),
+        ] {
+            assert!(!ty.is_scannable(), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn build_scan_req_layout_and_validation() {
+        let scan = [0x31, 0, 0, 0xee, 0xff, 0xc1];
+        let adv = [0xb5, 0x45, 0xb0, 0xf3, 0x89, 0xc8];
+        let mut out = [0xaa; 16];
+        let len = build_scan_req(&mut out, &scan, true, &adv, false).unwrap();
+        assert_eq!(len, 14);
+        assert_eq!(
+            &out[..len],
+            &[
+                0x43, 12, // header: SCAN_REQ, ScanA random
+                0x31, 0, 0, 0xee, 0xff, 0xc1, // ScanA
+                0xb5, 0x45, 0xb0, 0xf3, 0x89, 0xc8, // AdvA
+            ]
+        );
+
+        // Same PDU read by the advertiser-side validator.
+        let mut adv_state = crate::ll::adv::AdvState {
+            enabled: true,
+            own_addr: adv,
+            random_addr: false,
+            ..Default::default()
+        };
+        assert!(adv_state.validate_scan_req(&out[..len], true));
+        assert!(!adv_state.validate_scan_req(&out[..len], false));
+        adv_state.random_addr = true;
+        assert!(!adv_state.validate_scan_req(&out[..len], true));
+
+        // Public scanner / random advertiser flips both header bits.
+        let len = build_scan_req(&mut out, &scan, false, &adv, true).unwrap();
+        assert_eq!(out[0], 0x83);
+    }
+
+    #[test]
+    fn build_scan_req_rejects_short_buffer_without_writing() {
+        let mut out = [0xaa; 13];
+        assert_eq!(build_scan_req(&mut out, &[0; 6], true, &[0; 6], true), None);
+        assert_eq!(out, [0xaa; 13]);
     }
 
     #[test]
