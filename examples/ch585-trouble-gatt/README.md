@@ -162,13 +162,17 @@ firmware path, not the Android behavior below.
 
 Phone results (2026-11-10, user-reported; no captured peer evidence): on iPhone,
 DIS reads, subscription and UART echo all succeeded after the address change.
-On Android, reading DIS and enabling notifications worked, but writing the same
-six Chinese bytes to `6E400002` disconnected the link. A dedicated window showed
-seven UART writes/notifications, one normal termination and three supervision
-timeouts with no Host error. The same bytes pass on macOS, so the current working
-assumption is an Android/central- or link-specific problem, not a proven
-firmware defect; attribution stays open pending an ATT-level capture of that
-Android session.
+On Android, reading DIS and enabling notifications worked, but any write to
+`6E400002` (`hello` or the same six Chinese bytes) disconnected the link. An
+address-followed sniffer capture reproduced this on two Android links: the
+firmware accepted each write and queued the echo, but the Android central never
+acknowledged the echo notification at link layer (its NESN never changed) and
+stopped sending new packets. The peripheral retransmitted the identical,
+well-formed notification once per 30 ms event for 4.95 s until the Android
+requested 5 s supervision timeout expired. The short ATT Write Response was
+acknowledged; only the longer UART notification was not. The two iPhone links in
+that window performed discovery only, so an OS-specific cause is not yet proven;
+the same echo passes on macOS and in the native fixture.
 
 ## GATT contract
 
@@ -250,6 +254,14 @@ validate calibrated clock/IFS compliance.
 Build from this directory with `cargo build --release --locked`. The default
 image has a finite 25-second RF budget; `--features long-run` selects 360 seconds.
 The runner checks `RUN_SECONDS` in the exact archived ELF before touching hardware.
+
+`--features conn-params-30` / `conn-params-48` are test-only builds used to
+separate phone-controller behavior from connection-interval effects. Once per
+connection, on the first GATT write, they send an L2CAP Connection Parameter
+Update Request for 30 ms or 48.75 ms and record the send result in host stats
+word 15. They never change the default image. The radio `STATS[45]`
+(`last_interval`) is the CONNECT_IND interval, not the current one; confirm a
+later update from the air cadence or a dedicated counter.
 
 Run the native real-Trouble fixture **from the repository root**, avoiding this
 example's embedded target configuration:

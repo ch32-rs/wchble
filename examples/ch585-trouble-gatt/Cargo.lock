@@ -82,6 +82,7 @@ dependencies = [
  "ch5xx-hal",
  "embassy-futures",
  "embassy-sync",
+ "embassy-time",
  "heapless",
  "panic-halt",
  "portable-atomic",
@@ -110,7 +111,7 @@ dependencies = [
 [[package]]
 name = "ch5xx-metapac"
 version = "0.1.2"
-source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=8750739#87507390e512058f10cba5e761edfcafaf7c34b9"
+source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=4a32a7f#4a32a7f634481267800f5772be6385a8d8cc6550"
 dependencies = [
  "cortex-m",
  "riscv",
