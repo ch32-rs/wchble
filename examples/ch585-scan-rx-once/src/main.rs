@@ -51,7 +51,7 @@ fn trace(clock: &UsClock, started: u32, phase: u32, count: &mut usize) {
         read_reg(BB_BASE, bb::RFCTRL),
         read_reg(RFEND_BASE, 0x08),
         read_reg(LLE_BASE, 0x7c),
-        hal::pac::SYSTICK.stk_cntl().read().cntl(),
+        hal::pac::SYSTICK.cntl().read().cntl(),
     ];
     for (i, word) in row.into_iter().enumerate() {
         unsafe {
@@ -96,7 +96,7 @@ fn park() -> ! {
 struct UsClock(u32);
 impl InstantUs for UsClock {
     fn now_us(&self) -> u32 {
-        hal::pac::SYSTICK.stk_cntl().read().cntl() / self.0
+        hal::pac::SYSTICK.cntl().read().cntl() / self.0
     }
     fn delay_us(&self, us: u32) {
         let start = self.now_us();

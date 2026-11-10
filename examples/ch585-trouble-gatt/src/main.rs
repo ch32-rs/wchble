@@ -85,7 +85,7 @@ struct Clock {
 impl InstantUs for Clock {
     fn now_us(&self) -> u32 {
         let mut ticks = self.ticks.get();
-        let elapsed = ticks.sample(hal::pac::SYSTICK.stk_cntl().read().cntl());
+        let elapsed = ticks.sample(hal::pac::SYSTICK.cntl().read().cntl());
         self.ticks.set(ticks);
         self.rate.micros(elapsed)
     }
@@ -474,11 +474,13 @@ fn connection_event(
             let p = s.conn.params;
             let info = ConnectionInfo {
                 handle: 1,
+                role: wchble::ll::Role::Peripheral,
                 peer_address_type: u8::from(p.peer_random),
                 peer_address: p.peer_addr,
                 interval: p.interval,
                 latency: p.latency,
                 supervision_timeout: p.timeout,
+                master_clock_accuracy: p.sca,
             };
             if bridge.connected(info).is_err() {
                 inc(63);
@@ -578,7 +580,7 @@ fn main() -> ! {
     let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
         ticks: Cell::new(ExtendingTicks::new(
-            hal::pac::SYSTICK.stk_cntl().read().cntl(),
+            hal::pac::SYSTICK.cntl().read().cntl(),
         )),
         rate: TickRate::new(hz).unwrap(),
     };
