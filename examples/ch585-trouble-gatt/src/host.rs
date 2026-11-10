@@ -29,7 +29,9 @@ pub const UART_TX_UUID: Uuid =
     Uuid::new_long(0x6e400003_b5a3_f393_e0a9_e50e24dcca9eu128.to_le_bytes());
 #[allow(dead_code)]
 pub const UART_CHARACTERISTIC_UUID_TEXT: &str = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-pub const RANDOM_ADDRESS: [u8; 6] = [0x14, 0x00, 0x00, 0xee, 0xff, 0xc1];
+// P5 changes the service database, so use a new static identity. iOS caches a
+// peer's GATT database by address and can otherwise keep the P4 layout.
+pub const RANDOM_ADDRESS: [u8; 6] = [0x15, 0x00, 0x00, 0xee, 0xff, 0xc1];
 
 pub const HOST_STATS_WORDS: usize = 16;
 pub const STAT_PHASE: usize = 0;

@@ -100,6 +100,15 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [ ] **UART flow and throughput stress:** bursts beyond the Host credit window,
   backpressure with large payloads, and sustained bidirectional throughput are
   not tested. The current echo accepts at most 20 bytes per write at MTU 23.
+- [ ] **Android six-byte UART write disconnect (2026-11-10):** the user reports
+  that writing UTF-8 "中文" (`e4 b8 ad e6 96 87`) to `6E400002` with TX
+  notifications enabled drops the Android link. The dedicated firmware window
+  recorded seven UART writes/notifications, one normal termination and three
+  supervision timeouts with no Host error. The identical sequence passes on
+  macOS (write ack, one matching six-byte echo, link held three seconds, normal
+  disconnect) and in the native fixture. Not reproduced, not explained; open
+  pending an ATT-level capture of the Android session. Do not record it as
+  either a firmware or an Android defect yet.
 
 ## Sustained radio/Host reliability
 
