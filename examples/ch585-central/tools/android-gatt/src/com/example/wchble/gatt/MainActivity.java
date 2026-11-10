@@ -84,6 +84,9 @@ public final class MainActivity extends Activity {
     private String name = "wch585-c1";
     private boolean noService;
     private int timeoutSeconds = 90;
+    // Test-only: delay ATT read responses so the runner can take the adapter
+    // down while a request is outstanding.
+    private int holdMs;
     private int value = INITIAL_VALUE;
     private int reads;
     private int writes;
@@ -209,7 +212,28 @@ public final class MainActivity extends Activity {
                         + ",\"reason\":\"invalid_offset\"");
                 return;
             }
-            byte[] slice = Arrays.copyOfRange(bytes, offset, bytes.length);
+            final byte[] slice = Arrays.copyOfRange(bytes, offset, bytes.length);
+            if (holdMs > 0) {
+                final int heldRequestId = requestId;
+                final int heldOffset = offset;
+                handler.postDelayed(() -> {
+                    boolean sent = respond(device, heldRequestId,
+                            BluetoothGatt.GATT_SUCCESS, heldOffset, slice);
+                    reads++;
+                    logEvent("\"event\":\"read\",\"address\":" + quote(address)
+                            + ",\"value\":" + value
+                            + ",\"offset\":" + heldOffset
+                            + ",\"length\":" + slice.length
+                            + ",\"held_ms\":" + holdMs
+                            + ",\"status\":" + BluetoothGatt.GATT_SUCCESS
+                            + ",\"sent\":" + sent
+                            + ",\"reads\":" + reads);
+                }, holdMs);
+                logEvent("\"event\":\"read_held\",\"address\":" + quote(address)
+                        + ",\"hold_ms\":" + holdMs
+                        + ",\"reads\":" + reads);
+                return;
+            }
             boolean sent = respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice);
             reads++;
             logEvent("\"event\":\"read\",\"address\":" + quote(address)
@@ -313,6 +337,10 @@ public final class MainActivity extends Activity {
         if (requestedTimeout > 0) {
             timeoutSeconds = requestedTimeout;
         }
+        int requestedHold = intent == null ? 0 : intent.getIntExtra("hold_ms", 0);
+        if (requestedHold > 0) {
+            holdMs = requestedHold;
+        }
 
         logEvent("\"event\":\"start\",\"name\":" + quote(name)
                 + ",\"timeout_seconds\":" + timeoutSeconds
@@ -320,7 +348,8 @@ public final class MainActivity extends Activity {
                 + ",\"service\":\"" + SERVICE_UUID + "\""
                 + ",\"characteristic\":\"" + CHARACTERISTIC_UUID + "\""
                 + ",\"initial\":" + value
-                + ",\"initial_hex\":" + quote(hex32(value)));
+                + ",\"initial_hex\":" + quote(hex32(value))
+                + ",\"hold_ms\":" + holdMs);
 
         timeoutRunnable = () -> {
             timeoutRunnable = null;
