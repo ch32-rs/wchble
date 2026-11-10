@@ -1,6 +1,6 @@
 //! Minimal unencrypted legacy peripheral LL control procedures.
 
-use super::conn::{le16, ConnError, ConnectionUpdate, PeripheralConnection};
+use super::conn::{le16, ConnError, ConnectionUpdate, LinkTiming};
 
 /// Subset of LL Control opcodes used during bring-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,54 @@ impl ControlPdu {
         };
         pdu.bytes[..payload.len()].copy_from_slice(payload);
         pdu
+    }
+
+    pub fn terminate(reason: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::TerminateInd as u8, reason])
+    }
+
+    pub fn unknown(opcode: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::UnknownRsp as u8, opcode])
+    }
+
+    pub fn connection_update(update: &ConnectionUpdate) -> Self {
+        let mut bytes = [0; 12];
+        bytes[0] = LlCtrlOpcode::ConnectionUpdateInd as u8;
+        bytes[1] = update.win_size;
+        bytes[2..4].copy_from_slice(&update.win_offset.to_le_bytes());
+        bytes[4..6].copy_from_slice(&update.interval.to_le_bytes());
+        bytes[6..8].copy_from_slice(&update.latency.to_le_bytes());
+        bytes[8..10].copy_from_slice(&update.timeout.to_le_bytes());
+        bytes[10..12].copy_from_slice(&update.instant.to_le_bytes());
+        Self::new(&bytes)
+    }
+
+    pub fn channel_map(map: [u8; 5], instant: u16) -> Self {
+        let mut bytes = [0; 8];
+        bytes[0] = LlCtrlOpcode::ChannelMapInd as u8;
+        bytes[1..6].copy_from_slice(&map);
+        bytes[6..8].copy_from_slice(&instant.to_le_bytes());
+        Self::new(&bytes)
+    }
+
+    pub fn version_ind(local: LocalVersion) -> Self {
+        let company = local.company_id.to_le_bytes();
+        let subversion = local.subversion.to_le_bytes();
+        Self::new(&[
+            LlCtrlOpcode::VersionInd as u8,
+            local.version,
+            company[0],
+            company[1],
+            subversion[0],
+            subversion[1],
+        ])
+    }
+
+    pub fn feature_rsp(features: [u8; 8]) -> Self {
+        let mut bytes = [0; 9];
+        bytes[0] = LlCtrlOpcode::FeatureRsp as u8;
+        bytes[1..9].copy_from_slice(&features);
+        Self::new(&bytes)
     }
 
     /// Payload only. Queue using `LinkSequence::queue(3, pdu.as_bytes())` so
@@ -101,9 +149,9 @@ impl ControlState {
     /// Reserve a response slot before accepting the peer's SN. The caller must
     /// retain a reply until `LinkSequence::queue` succeeds (an empty packet may
     /// still be awaiting its acknowledgment).
-    pub fn on_pdu(
+    pub fn on_pdu<C: LinkTiming>(
         &mut self,
-        conn: &mut PeripheralConnection,
+        conn: &mut C,
         payload: &[u8],
         local: LocalVersion,
     ) -> Result<ControlAction, ConnError> {
@@ -150,7 +198,7 @@ impl ControlState {
                 // No encryption, DLE, PHY update, CSA #2, or optional control
                 // procedures are advertised. Mandatory legacy procedures do
                 // not require feature bits.
-                ControlPdu::new(&[0x09, 0, 0, 0, 0, 0, 0, 0, 0])
+                ControlPdu::feature_rsp([0; 8])
             }
             0x0c => {
                 exact_len(payload, 6)?;
@@ -163,16 +211,7 @@ impl ControlState {
                     return Ok(ControlAction::None);
                 }
                 self.version_sent = true;
-                let company = local.company_id.to_le_bytes();
-                let subversion = local.subversion.to_le_bytes();
-                ControlPdu::new(&[
-                    0x0c,
-                    local.version,
-                    company[0],
-                    company[1],
-                    subversion[0],
-                    subversion[1],
-                ])
+                ControlPdu::version_ind(local)
             }
             0x0d => {
                 exact_len(payload, 2)?; // LL_REJECT_IND.
@@ -185,7 +224,7 @@ impl ControlState {
             // Unsupported encryption, connection parameter request, DLE, PHY,
             // and future opcodes are explicitly reported as unknown. Never
             // fake an encryption response or negotiate a larger data length.
-            _ => ControlPdu::new(&[0x07, opcode]),
+            _ => ControlPdu::unknown(opcode),
         };
         Ok(ControlAction::Reply(reply))
     }
@@ -212,7 +251,7 @@ pub fn termination_reason(error: ConnError) -> u8 {
 mod tests {
     use super::*;
     use crate::ll::acl::LinkSequence;
-    use crate::ll::conn::ConnectParams;
+    use crate::ll::conn::{ConnectParams, PeripheralConnection};
 
     const LOCAL: LocalVersion = LocalVersion {
         version: 0x0d,

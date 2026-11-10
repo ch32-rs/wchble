@@ -643,6 +643,8 @@ impl Ch585Radio {
     /// on this path) takes the 1M branch. CH585 computes
     /// `2*((len<<3) + adj + 0xEE)` / `2*((len<<2) + adj + 0xCA)`, identical to
     /// [`v208_tx_window_half_us`] with a zero DTM adjustment byte.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
     fn set_phy_tx_mode(&mut self, mode: PhyMode, payload_len: u8) {
         let is_2m = matches!(mode, PhyMode::Rate2m);
         let phy = if is_2m {
@@ -692,6 +694,79 @@ impl Ch585Radio {
                 regs::rmw(BB_BASE, bb::RFCTRL, bb5::PHY_2M, 0);
                 regs::rmw(BB_BASE, bb::RXCFG18, 0x3ff, BB_RXCFG18_1M);
                 regs::write_u8(BB_BASE, 0x13, BB_RXGAIN_1M);
+            }
+        }
+    }
+
+    /// Vendor `ll_initiate_tx` (`ll_initiate.o`): arm the prepared
+    /// CONNECT_IND while the LLE is still inside its advertising RX window and
+    /// let the engine itself start the packet at T_IFS.
+    ///
+    /// The vendor initiator never switches `LLE+0x50` to TX and never writes
+    /// `CMD=2`. It stores the TX buffer, sets the BB START_TX bit, clears
+    /// `AUTOCFG[1:0]`, and waits for the RX side to finish; the hardware
+    /// performs the RX→TX transition. `LL_InitiateSetRF` prepares that mode
+    /// (advertising AA/CRC, `CRC_AA_CFG` bit 0, `LLE+0x50 = RX`, `CMD=1`).
+    ///
+    /// Returns the completion timestamp, which ends the CONNECT_IND on air and
+    /// anchors the first connection event.
+    ///
+    /// The whole arm sequence runs from `.highcode` RAM: it sits between
+    /// RX_DONE and the hardware T_IFS TX start, where flash fetch time would
+    /// eat most of the 150 us budget.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
+    pub fn initiate_tx<T: InstantUs>(&mut self, clock: &T, frame: &[u8]) -> Result<u32> {
+        if frame.len() < 2 || frame.len() > MAX_PDU || self.channel > 39 {
+            return Err(Error::InvalidState);
+        }
+        let tx_ptr = if frame.as_ptr() as usize & 0x3 == 0 {
+            frame.as_ptr()
+        } else {
+            self.tx_bounce.0[..frame.len()].copy_from_slice(frame);
+            self.tx_bounce.0.as_ptr()
+        };
+
+        // `ll_initiate_generated_req_pdu` closes with this BB/RFEND
+        // configuration before `ll_initiate_tx` arms the engine.
+        unsafe {
+            let cfg = regs::read(BB_BASE, bb::AUTOCFG);
+            regs::write(BB_BASE, bb::AUTOCFG, (cfg & 0x81ff_ffff) | 0x7600_0000);
+            let rf = regs::read(RFEND_BASE, rfend5::CFG5C);
+            regs::write(RFEND_BASE, rfend5::CFG5C, rf | 0x7000_0000);
+        }
+
+        // `BLE_SetPHYTxMode(mode, 34)` runs before the frame is armed and also
+        // replaces the RX window timer with the TX completion window.
+        self.set_phy_tx_mode(self.phy_tx, frame[1]);
+        let hw_window = unsafe { regs::read(LLE_BASE, lle::WINDOW) };
+
+        // The vendor IRQ handler consumes the pending RX bits before the
+        // initiator handler arms TX; completion is the TX half (bits 0/3).
+        const TX_DONE_IRQ: u32 = 0x0000_0009;
+        unsafe {
+            let pending = regs::read(LLE_BASE, lle::IRQSTAT);
+            regs::write(LLE_BASE, lle::IRQSTAT, pending & (TX_DONE_IRQ | 0x6));
+            regs::write(LLE_BASE, lle5::TXBUFPTR, tx_ptr as u32);
+            // START_TX, then the vendor's `AUTOCFG &= ~3` (the IRQ handler
+            // re-arms bits 0/1 afterwards).
+            regs::rmw(BB_BASE, bb::RFCTRL, 0, bb5::TX_TRIG);
+            regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0);
+        }
+
+        let started = clock.now_us();
+        let deadline = started
+            .wrapping_add(hw_window / 2)
+            .wrapping_add(200);
+        loop {
+            if unsafe { regs::read(LLE_BASE, lle::IRQSTAT) } & TX_DONE_IRQ != 0 {
+                unsafe {
+                    regs::write(LLE_BASE, lle::IRQSTAT, TX_DONE_IRQ);
+                }
+                return Ok(clock.now_us());
+            }
+            if clock.now_us().wrapping_sub(deadline) as i32 >= 0 {
+                return Err(Error::Timeout);
             }
         }
     }
