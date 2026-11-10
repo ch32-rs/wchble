@@ -49,7 +49,7 @@ HOST_NAMES = '''phase connections disconnects scan_reports target_matches connec
 reads writes notifications subscriptions gatt_errors last_error cycles_completed
 last_hci_status reserved_14 reserved_15'''.split()
 PHASES = ('positive', 'negative-nosource', 'negative-wrong-name',
-          'negative-no-service', 'negative-bogus-peer')
+          'negative-no-service', 'negative-bogus-peer', 'peer-vanish')
 ANDROID_SERIAL = '55VS4H8TRW45KVQS'
 PKG = 'com.example.wchble.gatt'
 
@@ -131,6 +131,10 @@ def source_for(phase):
         return {'name': NAME + '-neg', 'no_service': False}
     if phase == 'negative-no-service':
         return {'name': NAME, 'no_service': True}
+    if phase == 'peer-vanish':
+        # Hold the first ATT read response long enough for the runner to turn
+        # the phone's Bluetooth off, then let the link die underneath it.
+        return {'name': NAME, 'no_service': False, 'hold_ms': 5000}
     return {'name': NAME, 'no_service': False}
 
 
@@ -190,10 +194,11 @@ class MacSource:
 
 
 class AndroidSource:
-    def __init__(self, out, name, no_service):
+    def __init__(self, out, name, no_service, hold_ms=0):
         self.out = out
         self.name = name
         self.no_service = no_service
+        self.hold_ms = hold_ms
         self.started = False
 
     def build(self):
@@ -218,10 +223,13 @@ class AndroidSource:
         self.adb('install', '-r', '-g', str(self.apk), timeout=90)
         self.adb('logcat', '-c')
         self.adb('shell', 'am', 'force-stop', PKG)
-        self.adb('shell', 'am', 'start', '-W', '-n', f'{PKG}/.MainActivity',
-                 '--es', 'name', self.name,
-                 '--ez', 'no_service', 'true' if self.no_service else 'false',
-                 '--ei', 'timeout', str(timeout), timeout=30)
+        args = ['shell', 'am', 'start', '-W', '-n', f'{PKG}/.MainActivity',
+                '--es', 'name', self.name,
+                '--ez', 'no_service', 'true' if self.no_service else 'false',
+                '--ei', 'timeout', str(timeout)]
+        if self.hold_ms:
+            args.extend(['--ei', 'hold_ms', str(self.hold_ms)])
+        self.adb(*args, timeout=30)
         self.started = True
         time.sleep(0.8)
 
@@ -345,6 +353,23 @@ def evaluate_stats(s, host, phase, cycles, run_seconds, identity):
                 errors.append('Host did not report a GATT discovery error')
             if host[12] != 0:
                 errors.append('GATT cycle counted as complete without the service')
+    elif phase == 'peer-vanish':
+        # The peer is made unreachable mid-connection. Exactly one connection
+        # and one disconnection must be observed, and the link must end through
+        # exactly one mechanism: supervision timeout or a peer terminate.
+        if s[34] != 1:
+            errors.append(f'expected exactly one completed connection, got {s[34]}')
+        if s[35] != 1:
+            errors.append(f'expected exactly one disconnection event, got {s[35]}')
+        if s[31] + s[33] != 1:
+            errors.append(f'link ended {s[31] + s[33]} times '
+                          f'(supervision={s[31]} remote_term={s[33]})')
+        if s[59]:
+            errors.append(f'bridge errors recorded: {s[59]}')
+        if host_ok and (host[1] != 1 or host[2] != 1):
+            errors.append(f'Host disconnect counts wrong: {host[:3]}')
+        if not s[21]:
+            errors.append('first connection event RX never observed')
     elif phase == 'negative-bogus-peer':
         if s[14] or s[34]:
             errors.append('CONNECT_IND/complete happened for a nonexistent peer')
@@ -366,7 +391,8 @@ def start_source(args, phase, out, run_seconds):
     if args.source == 'mac':
         source = MacSource(out, spec['name'], spec['no_service'])
     else:
-        source = AndroidSource(out, spec['name'], spec['no_service'])
+        source = AndroidSource(out, spec['name'], spec['no_service'],
+                               spec.get('hold_ms', 0))
     source.build()
     source.start(run_seconds + 10)
     return source
@@ -399,6 +425,8 @@ def run_phase(args, phase, out):
         if embedded != args.run_seconds:
             raise PhaseError(f'ELF RUN_SECONDS={embedded}, but --run-seconds={args.run_seconds}')
 
+        if phase == 'peer-vanish' and args.source != 'android':
+            raise PhaseError('peer-vanish needs the Android source (adapter off)')
         source = start_source(args, phase, out, args.run_seconds)
         touched = True
         try:
@@ -406,7 +434,15 @@ def run_phase(args, phase, out):
         finally:
             safe_read_at = time.monotonic() + args.run_seconds + 3
         started = time.monotonic()
+        vanished = False
         while time.monotonic() - started < args.run_seconds + 3:
+            if (phase == 'peer-vanish' and not vanished
+                    and time.monotonic() - started >= 5.5):
+                io.command(['adb', '-s', ANDROID_SERIAL, 'shell',
+                            'svc', 'bluetooth', 'disable'],
+                           out / 'vanish.log', 30)
+                metadata['vanish_at_seconds'] = round(time.monotonic() - started, 2)
+                vanished = True
             time.sleep(0.25)
         metadata['safe_read_at_seconds'] = round(safe_read_at - started, 3)
         if source is not None:
@@ -415,6 +451,8 @@ def run_phase(args, phase, out):
         host = io.read32(symbols['HOST_STATS'], 16, out / 'host-stats.txt')
         metadata['stats'] = dict(zip(STAT_NAMES, obs))
         metadata['host_stats'] = dict(zip(HOST_NAMES, host))
+        metadata['end_mechanism'] = ('supervision' if obs[31] else
+                                     'remote_terminate' if obs[33] else 'none')
         trace_count = io.read32(symbols['TRACE_COUNT'], 1, out / 'trace-count.txt')[0]
         trace_overflow = io.read32(symbols['TRACE_OVERFLOW'], 1, out / 'trace-overflow.txt')[0]
         metadata['trace_count'] = trace_count
@@ -431,6 +469,13 @@ def run_phase(args, phase, out):
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         errors.append(f'{type(error).__name__}: {error}')
     finally:
+        if phase == 'peer-vanish':
+            try:
+                io.command(['adb', '-s', ANDROID_SERIAL, 'shell',
+                            'svc', 'bluetooth', 'enable'],
+                           out / 'restore-bt.log', 30)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                errors.append(f'bluetooth restore: {error}')
         if source is not None:
             try:
                 source.stop()

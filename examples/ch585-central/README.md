@@ -90,9 +90,12 @@ length, bogus flag), flashes through the single-session
 restores `ch585-rf-smoke` afterwards, requiring macOS to discover `wch585`.
 
 Phases: `positive` (3 connect/GATT/disconnect cycles, both sides checked),
-`negative-nosource`, `negative-wrong-name`, `negative-no-service`, and
+`negative-nosource`, `negative-wrong-name`, `negative-no-service`,
 `negative-bogus-peer` (initiator timeout, no CONNECT_IND, Host receives
-`0x3e`).
+`0x3e`), and `peer-vanish` (hold the first ATT read, turn the phone's Bluetooth
+off, require exactly one disconnection and a clean idle end). `peer-vanish`
+needs the Android source and records whether the link ended by supervision or a
+peer terminate in `end_mechanism`.
 
 ## Validation status
 
@@ -106,10 +109,16 @@ normally, and the panic-location recorder was added afterwards.
 **2026-11-11 (Android formal acceptance).** `c1-android-accept-02` passed all
 five phases plus smoke recovery on CPH2411 (Android 15). Positive: 85 scan
 arms, 3 target reports, 3/3 attempts sent, 54 connection events, 3 first-event
-RX, 6 GATT reads, 3 writes, 0 bridge errors. The first acceptance attempt
-(`c1-android-accept-01`) failed the positive phase because of the missing
-Android CCCD; the failure and its ATT-level evidence (`c1-android-diag-01/02`)
-are preserved.
+RX, 6 GATT reads, 3 writes, 0 bridge errors. Three further isolated positive
+rounds (`c1-android-round-01/02/03`) and a second isolated Mac round
+(`c1-mac-round-02`) all passed. `c1-android-accept-03` reran all phases with
+`peer-vanish` included. The first acceptance attempt (`c1-android-accept-01`)
+failed the positive phase because of the missing Android CCCD; the failure and
+its ATT-level evidence (`c1-android-diag-01/02`) are preserved.
+
+The `peer-vanish` run ended through an Android `LL_TERMINATE_IND`
+(`remote_terminate`), not a supervision timeout; on-air supervision expiry is
+still unverified.
 
 **2026-11-11 (regressions).** The P3 connect-only run (`c1-regress-p3-01`)
 completed one 37-event connection with a clean terminate and idle RF; the P4

@@ -17,11 +17,11 @@ failures or retroactively change archived results.
   notify/unsubscribe/disconnect/reconnect cycles: 25 reads, 65 writes and 50
   independently checked notifications per run. Finite RF finish and smoke
   restoration/discovery passed. Neither run passed its whole-run capture gate.
-- C1 central (`examples/ch585-central`) passed one 60-second macOS positive run
-  and one complete Android five-phase runner run (CPH2411, Android 15): three
-  connect/GATT/disconnect cycles per positive run, all negative phases, and
-  smoke restoration with macOS discovery. CONNECT_IND is hardware-timed by the
-  LLE; `CONNECT_OFFSET` is 0. P3 and P4 one-cycle regressions passed afterwards.
+- C1 central (`examples/ch585-central`) passed two isolated macOS positive runs
+  and three isolated Android positive runs (CPH2411, Android 15), plus the
+  Android five-phase runner (positive, three negatives, bogus peer) and a
+  `peer-vanish` phase. CONNECT_IND is hardware-timed by the LLE;
+  `CONNECT_OFFSET` is 0. P3 and P4 one-cycle regressions passed afterwards.
 
 See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README.md)
 for the GATT contract, test commands, counters and detailed validation boundaries.
@@ -183,13 +183,19 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 ## C1 central gaps
 
-- [ ] **Single positive run per platform:** three cycles each on macOS and
-  Android do not establish sustained central stability. Repeat isolated rounds
-  and keep late/retry/supervision counters under observation.
+- [ ] **Repeated but short rounds:** two macOS and three Android positive runs
+  (three cycles each) passed, but this is not multi-minute stability. Longer
+  holds and repeated phone rounds keep late/retry/supervision counters under
+  observation.
 - [ ] **Unexplained short-run freeze (2026-11-11):** one 25-second Mac run
   stopped updating firmware counters after the connection phase while the Mac
   logged three GATT cycles. Not reproduced in five later runs. A panic-location
   recorder now writes `STATS[63]`/`STATS[59]`; no diagnosis exists yet.
+- [ ] **On-air supervision timeout:** the `peer-vanish` phase (adapter off,
+  first ATT read held) ended through an Android `LL_TERMINATE_IND`
+  (`remote_term=1`, `supervision=0`). No controlled peer goes silent without
+  terminating, so supervision expiry is covered only by unit tests. Record the
+  mechanism rather than relabelling the result.
 - [ ] **Test-only link constants:** AA `0x12345678` and CRCInit `0x00555555` are
   fixed for the test sources. Production operation needs a real access-address
   and CRC policy, not a claim that this configuration is interoperable.
