@@ -152,10 +152,29 @@ client attempts failed on Swift-side discovery/callback ordering before a clean
 run; they are retained in the local experiment records. MTU exchange, long data,
 and sustained UART throughput remain unverified.
 
+A separate macOS client wrote the six-byte UTF-8 sequence for "中文"
+(`e4 b8 ad e6 96 87`) to RX with TX notifications enabled. The write was
+acknowledged, exactly one matching six-byte echo arrived, the link stayed up for
+three further seconds and then disconnected normally; firmware recorded one UART
+write/notification of length six, one normal termination and zero supervision or
+TX errors. The native fixture asserts the same six-byte echo. This confirms the
+firmware path, not the Android behavior below.
+
+Phone results (2026-11-10, user-reported; no captured peer evidence): on iPhone,
+DIS reads, subscription and UART echo all succeeded after the address change.
+On Android, reading DIS and enabling notifications worked, but writing the same
+six Chinese bytes to `6E400002` disconnected the link. A dedicated window showed
+seven UART writes/notifications, one normal termination and three supervision
+timeouts with no Host error. The same bytes pass on macOS, so the current working
+assumption is an Android/central- or link-specific problem, not a proven
+firmware defect; attribution stays open pending an ATT-level capture of that
+Android session.
+
 ## GATT contract
 
 - Complete local name: `wch585-p4`.
-- Static random address: `C1:FF:EE:00:00:14`.
+- Static random address: `C1:FF:EE:00:00:15` (changed from `...:14` when the P5
+  service database was added, because iOS caches a peer's GATT layout by address).
 - GAP service `1800`: Device Name `2A00` and Appearance `2A01` (unknown, zero).
 - GATT service `1801`.
 - Custom service: `00001000-b0cd-11ec-871f-d45ddf138840`.
@@ -199,6 +218,9 @@ by the radio main loop; out-of-range indices return zero.
 | 9 | Other GATT events, including discovery and CCCD access |
 | 10 | Current connection's notification subscription (0/1) |
 | 11 | Advertising attempts |
+| 12 | UART RX writes accepted |
+| 13 | UART TX echo notifications queued |
+| 14 | Byte length of the last UART write |
 
 Error stages: 1 runner exit, 2 advertising-data encode, 3 scan-response encode,
 4 advertise, 5 accept, 6 attribute-server attachment, 7 GATT accept, 8 value
@@ -210,7 +232,7 @@ The exported `STATS[64]` retains the P3 radio counters, with P4 magic
 `0x50343538`; word 31 is RX backpressure (not automatically a fatal error).
 Words 61–63 record the maximum single Host/HCI poll duration in microseconds,
 poll deadline overruns, and bridge invariant errors. `HOST_STATS[16]` snapshots
-the twelve Host counters above, followed by four reserved zero words. A 2 ms
+the fifteen Host counters above, followed by one reserved zero word. A 2 ms
 pre-poll guard is not a preemptible execution budget; actual poll duration and
 wireless deadlines must still be checked on hardware.
 
@@ -267,7 +289,7 @@ and checks ten numbered notifications, unsubscribes, reads back 110, and waits f
 its expected disconnect. No phone client should run concurrently.
 
 The runner does not start the optional nRF Sniffer itself. `tools/capture.py`
-wraps the same safe runner with capture of `C1:FF:EE:00:00:14 random`. Confirm the
+wraps the same safe runner with capture of `C1:FF:EE:00:00:15 random`. Confirm the
 sniffer's USB serial and current port before using it; the following paths are
 local installed-tool examples, not fresh-machine installation instructions:
 

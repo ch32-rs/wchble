@@ -364,6 +364,17 @@ mod tests {
         assert_eq!(stats.word(host::STAT_UART_NOTIFICATIONS), 1);
         assert_eq!(stats.word(host::STAT_UART_LEN), 2);
 
+        // UTF-8 Chinese "中文" is six bytes and must echo unchanged.
+        let cjk = [0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87];
+        let notifications = fixture.write(uart_rx, &cjk, 1);
+        let mut expected = vec![0x1b];
+        expected.extend_from_slice(&uart_tx.to_le_bytes());
+        expected.extend_from_slice(&cjk);
+        assert_eq!(notifications, [expected]);
+        assert_eq!(stats.word(host::STAT_UART_WRITES), 2);
+        assert_eq!(stats.word(host::STAT_UART_NOTIFICATIONS), 2);
+        assert_eq!(stats.word(host::STAT_UART_LEN), 6);
+
         // Leave a real Host ACL in flight. Disconnect must invalidate its credit/tag.
         let old_tag = fixture.hold_read_response(value_handle);
         fixture.disconnect(1);
@@ -398,7 +409,7 @@ mod tests {
         assert_eq!(stats.word(host::STAT_LAST_ERROR), 0);
         assert_eq!(stats.word(host::STAT_PHASE), host::PHASE_ADVERTISING);
         assert_eq!(stats.word(host::STAT_ADVERTISE_ATTEMPTS), 3);
-        // Includes the DIS/NUS discovery traffic and the UART echo notification.
-        assert_eq!(fixture.acknowledged, 86);
+        // Includes DIS/NUS discovery and both UART echo notifications.
+        assert_eq!(fixture.acknowledged, 88);
     }
 }
