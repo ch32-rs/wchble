@@ -1,0 +1,10 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+# CH585 is a QingKe V3C RV32IMBC core (no A extension); B/C come from the
+# QingKe extension flags in ch5xx-hal.
+rustflags = []
+
+[unstable]
+build-std = ["core"]

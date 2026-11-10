@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "ch585-observer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# Test only: match a fixed controlled source name and record its PDUs. The RX
+# path is identical; this only adds a comparison and a second ring.
+target-src = []
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }
+wchble = { path = "../..", features = ["ch585", "controller"] }
+qingke-rt = "0.8.4"
+panic-halt = "1.0"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+
+[profile.release]
+strip = false
+lto = true
+opt-level = 3
