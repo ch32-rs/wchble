@@ -49,6 +49,13 @@ pub const STAT_ADVERTISE_ATTEMPTS: usize = 11;
 pub const STAT_UART_WRITES: usize = 12;
 pub const STAT_UART_NOTIFICATIONS: usize = 13;
 pub const STAT_UART_LEN: usize = 14;
+// 0 = not requested, 1 = L2CAP request sent, 2 = send failed (test feature).
+pub const STAT_CONN_PARAMS: usize = 15;
+
+#[cfg(feature = "conn-params-30")]
+const CONN_INTERVAL_US: u64 = 30_000;
+#[cfg(feature = "conn-params-48")]
+const CONN_INTERVAL_US: u64 = 48_750;
 
 pub const PHASE_STARTING: u32 = 1;
 pub const PHASE_ADVERTISING: u32 = 2;
@@ -225,6 +232,8 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     GattConnectionEvent::Gatt { event } => {
                         let mut wrote_value = false;
                         let mut wrote_uart = false;
+                        #[cfg(any(feature = "conn-params-30", feature = "conn-params-48"))]
+                        let is_write = matches!(&event, GattEvent::Write(_));
                         match &event {
                             GattEvent::Read(event) if event.handle() == value.handle => {
                                 stats.inc(STAT_READS);
@@ -241,6 +250,33 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         match event.accept() {
                             Ok(reply) => reply.send().await,
                             Err(_) => fatal(stats, 7).await,
+                        }
+                        // Test-only: after discovery settles, ask for one fixed
+                        // interval over the LE signaling channel (L2CAP 0x12).
+                        #[cfg(any(feature = "conn-params-30", feature = "conn-params-48"))]
+                        if is_write && stats.word(STAT_CONN_PARAMS) == 0 {
+                            let requested = RequestedConnParams {
+                                min_connection_interval: embassy_time::Duration::from_micros(
+                                    CONN_INTERVAL_US,
+                                ),
+                                max_connection_interval: embassy_time::Duration::from_micros(
+                                    CONN_INTERVAL_US,
+                                ),
+                                max_latency: 0,
+                                min_event_length: embassy_time::Duration::from_micros(0),
+                                max_event_length: embassy_time::Duration::from_micros(0),
+                                supervision_timeout: embassy_time::Duration::from_millis(5_000),
+                            };
+                            let sent = connection
+                                .raw()
+                                .update_connection_params(&stack, &requested)
+                                .await;
+                            if sent.is_ok() {
+                                stats.set(STAT_CONN_PARAMS, 1);
+                            } else {
+                                stats.error(13);
+                                stats.set(STAT_CONN_PARAMS, 2)
+                            }
                         }
                         let subscribed = value.should_notify(&connection);
                         stats.set(STAT_SUBSCRIBED, u32::from(subscribed));

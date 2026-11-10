@@ -100,15 +100,36 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [ ] **UART flow and throughput stress:** bursts beyond the Host credit window,
   backpressure with large payloads, and sustained bidirectional throughput are
   not tested. The current echo accepts at most 20 bytes per write at MTU 23.
-- [ ] **Android six-byte UART write disconnect (2026-11-10):** the user reports
-  that writing UTF-8 "中文" (`e4 b8 ad e6 96 87`) to `6E400002` with TX
-  notifications enabled drops the Android link. The dedicated firmware window
-  recorded seven UART writes/notifications, one normal termination and three
-  supervision timeouts with no Host error. The identical sequence passes on
-  macOS (write ack, one matching six-byte echo, link held three seconds, normal
-  disconnect) and in the native fixture. Not reproduced, not explained; open
-  pending an ATT-level capture of the Android session. Do not record it as
-  either a firmware or an Android defect yet.
+- [ ] **Certain phone models: BLE link stability (2026-11-10):** some Android
+  models lose bursts of peripheral PDUs and can drop the link. The visible
+  symptom is the UART echo test: writing `hello` or UTF-8 "中文" to `6E400002`
+  with TX notifications enabled disconnects on the affected phones. An
+  address-followed sniffer capture reproduced it on two Android links (30 ms
+  interval, 5 s supervision): the firmware accepted each write and queued the
+  echo, but the Android central never acknowledged the echo notification at LL
+  level (its NESN never changed) and stopped sending new packets. The
+  peripheral retransmitted the identical, well-formed notification PDU (~165
+  times over 4.95 s) until supervision timeout. The short Write Response was
+  acknowledged; only the longer UART notification was not. The two iPhone links
+  in that window performed discovery only, so OS specificity is not proven. The
+  same echo passes on macOS and in the native fixture. Evidence:
+  `local-docs/research/experiments/ch585-p5-android-capture-3/`.
+
+  Follow-up (2026-11-10): the failing links all settled at 30 ms while the
+  working CPH2411 used 48.75 ms, so a test feature was added to request a fixed
+  interval over L2CAP (`conn-params-30`/`conn-params-48`, not in default
+  builds). CPH2411 accepted the 30 ms request, and ten writes at 30 ms all
+  echoed with zero retries; **the interval hypothesis is rejected**. At the
+  same RSSI (-51 dBm) the failing phones lose bursts of eight to twelve
+  peripheral PDUs even during discovery, while CPH2411 loses none, so the
+  remaining question is the failing controllers' receive behavior and
+  controller-to-host delivery. An HCI snoop bugreport for the failing PJZ110
+  was generated on-device (file under
+  `/data/user_de/0/com.android.shell/files/bugreports/`) but not yet pulled.
+  Next: pull it, and capture a failing phone on the sniffer together with the
+  enhanced probe (phone-side RSSI, repeated writes). Do not treat this as a
+  firmware defect or an accepted phone behavior until one of those runs
+  explains it. Evidence: `local-docs/research/experiments/ch585-app-conn30-*/`.
 
 ## Sustained radio/Host reliability
 
