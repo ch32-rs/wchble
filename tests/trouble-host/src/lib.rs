@@ -70,11 +70,13 @@ mod tests {
                 .bridge
                 .connected(ConnectionInfo {
                     handle: HANDLE,
+                    role: wchble::ll::Role::Peripheral,
                     peer_address_type: 1,
                     peer_address: [1, 2, 3, 4, 5, 0xc6],
                     interval: 24,
                     latency: 0,
                     supervision_timeout: 200,
+                    master_clock_accuracy: 0,
                 })
                 .unwrap();
             self.until("Host accepts connection", |f| {

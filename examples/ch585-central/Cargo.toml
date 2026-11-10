@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "ch585-central"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+long-run = []
+# Bring-up/first-event tests: a 25 s budget instead of 60 s.
+short-run = []
+# Test-only: make the Host connect to a fixed address that never advertises.
+bogus-peer = []
+# Bring-up diagnostic: at boot, transmit a small ADV_IND and the 36-byte
+# CONNECT_IND repeatedly so a sniffer can prove what reaches the air.
+tx-probe = []
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }
+wchble = { path = "../..", features = ["ch585", "controller"] }
+qingke-rt = { version = "0.8.4", features = ["highcode"] }
+panic-halt = "1.0"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+# Local Trouble checkout: 3aa6fd27b89cd5fc35f5c9b4f0c7f66795a14f70 (bt-hci 0.11).
+trouble-host = { path = "../../../trouble/host", default-features = false, features = ["central", "scan", "gatt", "default-packet-pool", "default-packet-pool-mtu-27"] }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", default-features = false }
+embassy-time-driver = "0.2"
+heapless = "0.9"
+
+[profile.release]
+strip = false
+lto = true
+opt-level = 3

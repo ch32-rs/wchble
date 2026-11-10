@@ -3,21 +3,29 @@
 
 use bt_hci::transport::PacketKind;
 
+use crate::ll::Role;
+
 use super::transport::{self, Packet};
 
 pub const ACL_DATA_PACKET_LENGTH: usize = 27;
 pub const ACL_CREDITS: usize = 5;
-const EVENT_CAPACITY: usize = 8;
+/// Scan reports share this queue with lifecycle events. Two slots stay
+/// reserved for Connection/Disconnection Complete.
+const EVENT_CAPACITY: usize = 16;
+const LIFECYCLE_RESERVE: usize = 2;
 const RX_CAPACITY: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionInfo {
     pub handle: u16,
+    pub role: Role,
     pub peer_address_type: u8,
     pub peer_address: [u8; 6],
     pub interval: u16,
     pub latency: u16,
     pub supervision_timeout: u16,
+    /// Master clock accuracy (SCA) reported in LE Connection Complete.
+    pub master_clock_accuracy: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +122,11 @@ impl ConnectionBridge {
         if self.info.is_some() || self.resetting {
             return Err(BridgeError::AlreadyConnected);
         }
-        if info.handle > 0x0eff || info.peer_address_type > 1 {
+        if info.handle > 0x0eff
+            || info.peer_address_type > 1
+            || !matches!(info.role, Role::Central | Role::Peripheral)
+            || info.master_clock_accuracy > 7
+        {
             return Err(BridgeError::InvalidPacket);
         }
         if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
@@ -127,14 +139,39 @@ impl ConnectionBridge {
             let mut parameters = [0; 19];
             parameters[0] = 1; // LE Connection Complete
             parameters[2..4].copy_from_slice(&info.handle.to_le_bytes());
-            parameters[4] = 1; // Peripheral
+            parameters[4] = match info.role {
+                Role::Central => 0,
+                Role::Peripheral => 1,
+                _ => unreachable!("role checked above"),
+            };
             parameters[5] = info.peer_address_type;
             parameters[6..12].copy_from_slice(&info.peer_address);
             parameters[12..14].copy_from_slice(&info.interval.to_le_bytes());
             parameters[14..16].copy_from_slice(&info.latency.to_le_bytes());
             parameters[16..18].copy_from_slice(&info.supervision_timeout.to_le_bytes());
+            parameters[18] = info.master_clock_accuracy;
             self.push_event(event_packet(0x3e, &parameters));
         }
+        Ok(())
+    }
+
+    /// Report a connection attempt that never produced a link. The Host uses
+    /// this to release the pending create-connection command (for example
+    /// after a cancel or an initiator timeout).
+    pub fn connection_failed(&mut self, status: u8) -> Result<(), BridgeError> {
+        if self.info.is_some() || self.resetting {
+            return Err(BridgeError::AlreadyConnected);
+        }
+        if !self.le_event_enabled(1) {
+            return Ok(());
+        }
+        if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
+            return Err(BridgeError::Full);
+        }
+        let mut parameters = [0; 19];
+        parameters[0] = 1; // LE Connection Complete
+        parameters[1] = status;
+        self.push_event(event_packet(0x3e, &parameters));
         Ok(())
     }
 
@@ -380,7 +417,7 @@ impl ConnectionBridge {
         self.event_mask & (1u64 << (code - 1)) != 0
     }
 
-    fn le_event_enabled(&self, subevent: u8) -> bool {
+    pub(crate) fn le_event_enabled(&self, subevent: u8) -> bool {
         self.event_enabled(0x3e) && self.le_event_mask & (1u64 << (subevent - 1)) != 0
     }
 
@@ -390,6 +427,18 @@ impl ConnectionBridge {
             .iter_mut()
             .find(|slot| slot.is_none())
             .expect("reserved lifecycle slot") = Some(packet);
+    }
+
+    /// Best-effort event for droppable diagnostics such as scan reports.
+    /// Keeps `LIFECYCLE_RESERVE` slots free so a connect/disconnect event can
+    /// always be queued.
+    pub(crate) fn try_push_event(&mut self, packet: Packet) -> bool {
+        let free = self.events.iter().filter(|slot| slot.is_none()).count();
+        if free <= LIFECYCLE_RESERVE {
+            return false;
+        }
+        self.push_event(packet);
+        true
     }
 }
 

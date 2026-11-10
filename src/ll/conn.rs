@@ -115,6 +115,55 @@ impl ConnectParams {
         }
         Ok(())
     }
+
+    /// Build a complete legacy CONNECT_IND PDU: two header bytes plus 34
+    /// payload bytes, without access address or CRC.
+    ///
+    /// `init_addr`/`init_random` are the initiator address (InitA) and its
+    /// TxAdd; `self.peer_addr`/`self.peer_random` are the advertiser address
+    /// (AdvA) and its TxAdd, which becomes RxAdd on the wire. The caller owns
+    /// the access address and CRC configuration for transmission.
+    pub fn build_connect_ind(
+        &self,
+        out: &mut [u8],
+        init_addr: [u8; 6],
+        init_random: bool,
+    ) -> Option<usize> {
+        const LEN: usize = 36;
+        if out.len() < LEN {
+            return None;
+        }
+        self.validate().ok()?;
+        // The transmit window must fit inside the first connection interval.
+        if u32::from(self.win_offset) + u32::from(self.win_size) > u32::from(self.interval) {
+            return None;
+        }
+        out[0] = 0x05
+            | if init_random { 0x40 } else { 0 }
+            | if self.peer_random { 0x80 } else { 0 };
+        out[1] = 34;
+        out[2..8].copy_from_slice(&init_addr);
+        out[8..14].copy_from_slice(&self.peer_addr);
+        out[14..18].copy_from_slice(&self.access_addr.to_le_bytes());
+        out[18..21].copy_from_slice(&self.crc_init.to_le_bytes()[..3]);
+        out[21] = self.win_size;
+        out[22..24].copy_from_slice(&self.win_offset.to_le_bytes());
+        out[24..26].copy_from_slice(&self.interval.to_le_bytes());
+        out[26..28].copy_from_slice(&self.latency.to_le_bytes());
+        out[28..30].copy_from_slice(&self.timeout.to_le_bytes());
+        out[30..35].copy_from_slice(&self.channel_map);
+        out[35] = self.hop | (self.sca << 5);
+        Some(LEN)
+    }
+}
+
+/// Timing hooks shared by peripheral and central link objects. `ControlState`
+/// uses them to defer channel-map and connection-parameter changes to an
+/// instant without knowing which role owns the link.
+pub trait LinkTiming {
+    fn event_counter(&self) -> u16;
+    fn schedule_channel_map(&mut self, map: [u8; 5], instant: u16) -> Result<(), ConnError>;
+    fn schedule_update(&mut self, update: ConnectionUpdate) -> Result<(), ConnError>;
 }
 
 pub(crate) fn le16(bytes: &[u8]) -> u16 {
@@ -445,6 +494,20 @@ impl PeripheralConnection {
     }
 }
 
+impl LinkTiming for PeripheralConnection {
+    fn event_counter(&self) -> u16 {
+        self.event_counter
+    }
+
+    fn schedule_channel_map(&mut self, map: [u8; 5], instant: u16) -> Result<(), ConnError> {
+        PeripheralConnection::schedule_channel_map(self, map, instant)
+    }
+
+    fn schedule_update(&mut self, update: ConnectionUpdate) -> Result<(), ConnError> {
+        PeripheralConnection::schedule_update(self, update)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +530,54 @@ mod tests {
 
     fn params() -> ConnectParams {
         ConnectParams::parse(&connect_pdu(), true, [0xc0; 6], true).unwrap()
+    }
+
+    #[test]
+    fn connect_ind_builder_round_trips_all_address_types() {
+        for peer_random in [false, true] {
+            for init_random in [false, true] {
+                let mut expected = params();
+                expected.peer_random = peer_random;
+                expected.win_size = 2;
+                expected.win_offset = 3;
+                let init_addr = [9, 8, 7, 6, 5, 4];
+                let mut out = [0xaa; 36];
+                assert_eq!(
+                    expected.build_connect_ind(&mut out, init_addr, init_random),
+                    Some(36)
+                );
+                assert_eq!(out[0] & 0x40 != 0, init_random);
+                assert_eq!(out[0] & 0x80 != 0, peer_random);
+                assert_eq!(&out[2..8], &init_addr);
+                // From the advertiser's perspective, parse sees InitA as the
+                // peer; every other field must round-trip unchanged.
+                let parsed =
+                    ConnectParams::parse(&out, true, expected.peer_addr, peer_random).unwrap();
+                assert_eq!(parsed.peer_addr, init_addr);
+                assert_eq!(parsed.peer_random, init_random);
+                let mut expected_peer_view = expected;
+                expected_peer_view.peer_addr = init_addr;
+                expected_peer_view.peer_random = init_random;
+                assert_eq!(parsed, expected_peer_view);
+            }
+        }
+    }
+
+    #[test]
+    fn connect_ind_builder_rejects_short_buffers_and_window_overflow() {
+        let params = params();
+        let mut short = [0x5a; 35];
+        assert_eq!(
+            params.build_connect_ind(&mut short, [0; 6], false),
+            None
+        );
+        assert!(short.iter().all(|byte| *byte == 0x5a));
+
+        let mut overflow = params;
+        overflow.win_size = 8;
+        overflow.win_offset = 20; // 20 + 8 exceeds the 24-slot interval.
+        let mut out = [0; 36];
+        assert_eq!(overflow.build_connect_ind(&mut out, [0; 6], false), None);
     }
 
     #[test]

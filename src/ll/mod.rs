@@ -2,6 +2,7 @@
 
 pub mod acl;
 pub mod adv;
+pub mod central;
 pub mod conn;
 pub mod ctrl;
 pub mod scan;
