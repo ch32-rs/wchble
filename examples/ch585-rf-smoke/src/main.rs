@@ -105,7 +105,7 @@ impl UsClock {
     }
 
     fn ticks(&self) -> u32 {
-        hal::pac::SYSTICK.stk_cntl().read().cntl()
+        hal::pac::SYSTICK.cntl().read().cntl()
     }
 }
 

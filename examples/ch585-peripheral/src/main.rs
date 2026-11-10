@@ -73,7 +73,7 @@ impl InstantUs for Clock {
         // CH585 SysTick is only 32 bits. This polling executor has one clock
         // owner and samples continuously, including all deadline waits.
         let mut ticks = self.ticks.get();
-        let elapsed = ticks.sample(hal::pac::SYSTICK.stk_cntl().read().cntl());
+        let elapsed = ticks.sample(hal::pac::SYSTICK.cntl().read().cntl());
         self.ticks.set(ticks);
         self.rate.micros(elapsed)
     }
@@ -516,7 +516,7 @@ fn main() -> ! {
     let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
         ticks: Cell::new(ExtendingTicks::new(
-            hal::pac::SYSTICK.stk_cntl().read().cntl(),
+            hal::pac::SYSTICK.cntl().read().cntl(),
         )),
         rate: TickRate::new(hz).unwrap(),
     };

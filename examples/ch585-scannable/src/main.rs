@@ -55,7 +55,7 @@ struct Clock {
 impl InstantUs for Clock {
     fn now_us(&self) -> u32 {
         hal::pac::SYSTICK
-            .stk_cntl()
+            .cntl()
             .read()
             .cntl()
             .wrapping_sub(self.epoch)
@@ -94,7 +94,7 @@ fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
     let clock = Clock {
         ticks_per_us: (hal::delay::measured_sysclk().0 / 1_000_000).max(1),
-        epoch: hal::pac::SYSTICK.stk_cntl().read().cntl(),
+        epoch: hal::pac::SYSTICK.cntl().read().cntl(),
     };
     put(0, 0x5032_3538);
     put(1, 1);
