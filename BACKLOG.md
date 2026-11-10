@@ -17,6 +17,11 @@ failures or retroactively change archived results.
   notify/unsubscribe/disconnect/reconnect cycles: 25 reads, 65 writes and 50
   independently checked notifications per run. Finite RF finish and smoke
   restoration/discovery passed. Neither run passed its whole-run capture gate.
+- C1 central (`examples/ch585-central`) passed one 60-second macOS positive run
+  and one complete Android five-phase runner run (CPH2411, Android 15): three
+  connect/GATT/disconnect cycles per positive run, all negative phases, and
+  smoke restoration with macOS discovery. CONNECT_IND is hardware-timed by the
+  LLE; `CONNECT_OFFSET` is 0. P3 and P4 one-cycle regressions passed afterwards.
 
 See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README.md)
 for the GATT contract, test commands, counters and detailed validation boundaries.
@@ -176,8 +181,25 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   unresolved reproducibility gap. Repair and validate deliberately, without
   unrelated lockfile regeneration or claiming the original command passed.
 
+## C1 central gaps
+
+- [ ] **Single positive run per platform:** three cycles each on macOS and
+  Android do not establish sustained central stability. Repeat isolated rounds
+  and keep late/retry/supervision counters under observation.
+- [ ] **Unexplained short-run freeze (2026-11-11):** one 25-second Mac run
+  stopped updating firmware counters after the connection phase while the Mac
+  logged three GATT cycles. Not reproduced in five later runs. A panic-location
+  recorder now writes `STATS[63]`/`STATS[59]`; no diagnosis exists yet.
+- [ ] **Test-only link constants:** AA `0x12345678` and CRCInit `0x00555555` are
+  fixed for the test sources. Production operation needs a real access-address
+  and CRC policy, not a claim that this configuration is interoperable.
+- [ ] **Android CCCD requirement:** `BluetoothGattServer` does not synthesize
+  `0x2902` for a NOTIFY characteristic; the test source publishes it. Verify
+  any future Android-based acceptance source does the same instead of treating
+  the first failure as a controller defect.
+
 ## Explicitly outside this milestone
 
-Pairing/encryption, multiple connections, Central role, DLE, 2M, CSA2, long
-attributes and product profiles are not implemented or accepted by this P4
-milestone. They are future scope decisions, not compatibility claims.
+Pairing/encryption, multiple connections, DLE, 2M, CSA2, long attributes and
+product profiles are not implemented or accepted by the current peripheral or
+central examples. They are future scope decisions, not compatibility claims.
