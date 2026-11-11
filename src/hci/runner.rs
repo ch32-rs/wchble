@@ -7,6 +7,7 @@
 use bt_hci::transport::PacketKind;
 
 use crate::ll::{scan, LinkLayer};
+use crate::rand::ChaCha20Drbg;
 
 use super::connection::{event_packet, BridgeError, ConnectionBridge};
 use super::transport::{self, Packet};
@@ -74,6 +75,10 @@ pub struct SoftRunner {
     bd_addr: [u8; 6],
     /// Address from `LE Set Random Address` / HAL seed; `None` = public BD_ADDR.
     random_addr: Option<[u8; 6]>,
+    /// DRBG backing `HCI_LE_Rand` and LL random values.
+    drbg: ChaCha20Drbg,
+    /// True once a HAL supplied a measured entropy seed.
+    entropy_seeded: bool,
 }
 
 impl Default for SoftRunner {
@@ -97,7 +102,34 @@ impl SoftRunner {
             le_event_mask: 0x1f,
             bd_addr: DEFAULT_BD_ADDR,
             random_addr: None,
+            drbg: ChaCha20Drbg::from_seed(&[0u8; 32]),
+            entropy_seeded: false,
         }
+    }
+
+    /// Install a 32-byte entropy seed collected by the HAL / series code.
+    ///
+    /// Returns `false` if `seed` equals the current key (a HAL that failed to
+    /// collect fresh entropy must not silently "reseed"). The controller still
+    /// answers `HCI_LE_Rand` before this is called, but with a publicly
+    /// deterministic stream; [`Self::entropy_seeded`] lets firmware refuse to
+    /// claim a secure connection in that state.
+    pub fn set_entropy_seed(&mut self, seed: &[u8; 32]) -> bool {
+        let installed = self.drbg.reseed(seed);
+        if installed {
+            self.entropy_seeded = true;
+        }
+        installed
+    }
+
+    /// Whether a measured entropy seed has been installed.
+    pub fn entropy_seeded(&self) -> bool {
+        self.entropy_seeded
+    }
+
+    /// A 32-bit random value for LL use (access address / CRCInit).
+    pub fn rand_u32(&mut self) -> u32 {
+        self.drbg.next_u32()
     }
 
     /// Override the public address returned by `Read BD_ADDR`.
@@ -474,13 +506,14 @@ impl SoftRunner {
             0x200f if params.is_empty() => Ok(&[0][..]),
             0x2010 if params.is_empty() => Ok(&[][..]),
             0x2011 => Err(HCI_COMMAND_DISALLOWED),
-            // LE Rand
+            // LE Rand — DRBG output; the HAL seeds it from measured entropy.
             0x2018 if params.is_empty() => {
-                // Deterministic placeholder; HAL should seed real entropy later.
+                let mut rand = [0u8; 8];
+                self.drbg.fill(&mut rand);
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
-                    &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                    &rand,
                 ));
                 return;
             }
@@ -1195,6 +1228,44 @@ mod tests {
             runner.serve_one().await;
             expect_command_status(0x200d, HCI_INVALID_PARAMETERS);
         });
+    }
+
+    fn le_rand_once(runner: &mut SoftRunner) -> [u8; 8] {
+        transport::drain_channels_for_test();
+        inject_cmd(0x2018, &[]);
+        pollster::block_on(runner.serve_one());
+        let packet = transport::try_receive_controller_packet().expect("missing LE Rand CC");
+        let payload = packet.payload();
+        assert_eq!(payload[0], 0x0e);
+        assert_eq!(payload[2], 1);
+        assert_eq!(u16::from_le_bytes([payload[3], payload[4]]), 0x2018);
+        assert_eq!(payload[5], HCI_SUCCESS);
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&payload[6..14]);
+        out
+    }
+
+    #[test]
+    fn le_rand_advances_and_tracks_seed() {
+        let _guard = test_lock();
+        let mut runner = SoftRunner::new();
+        assert!(!runner.entropy_seeded());
+
+        let first = le_rand_once(&mut runner);
+        let second = le_rand_once(&mut runner);
+        assert_ne!(first, second);
+        assert_ne!(first, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+
+        let seed = [0x42u8; 32];
+        assert!(runner.set_entropy_seed(&seed));
+        assert!(runner.entropy_seeded());
+        let seeded = le_rand_once(&mut runner);
+        let expected = crate::rand::chacha20_block(&seed, 0, &[0u8; 12]);
+        assert_eq!(seeded, expected[..8]);
+
+        // Re-installing the same seed is rejected and does not rewind.
+        assert!(!runner.set_entropy_seed(&seed));
+        assert_ne!(le_rand_once(&mut runner), seeded);
     }
 
     #[test]

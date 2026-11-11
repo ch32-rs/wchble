@@ -41,6 +41,12 @@ pub mod time;
 pub mod phy;
 
 #[cfg(feature = "controller")]
+pub mod crypto;
+
+#[cfg(feature = "controller")]
+pub mod rand;
+
+#[cfg(feature = "controller")]
 pub mod ll;
 
 #[cfg(feature = "controller")]
