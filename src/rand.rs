@@ -24,6 +24,7 @@ pub const SAMPLE_SLOTS: usize = 32;
 
 /// ChaCha20 block function (RFC 8439 §2.3): 64 keystream bytes for
 /// `counter`/`nonce` under `key`.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut state = [0u32; 16];
     state[0] = 0x6170_7865;
@@ -124,6 +125,7 @@ impl ChaCha20Drbg {
         true
     }
 
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     fn rekey(&mut self) {
         // Consume a block that is not handed to the caller, so the next state
         // is not derivable from any published output.
@@ -133,6 +135,7 @@ impl ChaCha20Drbg {
         self.counter = 0;
     }
 
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     fn next_block(&mut self) -> [u8; 64] {
         if self.counter >= REKEY_BLOCKS {
             self.rekey();
@@ -145,6 +148,7 @@ impl ChaCha20Drbg {
     /// Fill `out` with keystream. Bytes from a partially used block are
     /// discarded at the end of the call, so a short request advances the
     /// generator by a whole block.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn fill(&mut self, out: &mut [u8]) {
         for chunk in out.chunks_mut(64) {
             let block = self.next_block();
@@ -153,6 +157,7 @@ impl ChaCha20Drbg {
     }
 
     /// One 32-bit value for LL access addresses / CRCInit.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn next_u32(&mut self) -> u32 {
         let mut b = [0u8; 4];
         self.fill(&mut b);
@@ -190,6 +195,7 @@ impl EntropyPool {
 
     /// Absorb one raw sample. Samples wrap around the slot array, so a long
     /// run keeps mixing instead of saturating.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn add_sample(&mut self, sample: u32) {
         let i = (self.count as usize) % SAMPLE_SLOTS;
         self.samples[i] = self.samples[i].wrapping_mul(0x9e37_79b9).rotate_left(5) ^ sample;
@@ -211,6 +217,7 @@ impl EntropyPool {
     }
 
     /// Condition the accumulated samples into a 32-byte seed.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn seed(&self) -> [u8; SEED_LEN] {
         // Fold all slots into the 8 key words so every sample reaches the
         // conditioner, then run one ChaCha20 block over the result.

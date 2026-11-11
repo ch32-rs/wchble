@@ -32,6 +32,7 @@ pub enum CcmError {
 
 /// Encrypt `plaintext` under `nonce` and `aad`, writing the ciphertext to
 /// `out` and the MIC to `mic`. `out.len()` must be at least `plaintext.len()`.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 pub fn encrypt<const M: usize>(
     aes: &Aes128,
     nonce: &[u8; BLE_NONCE_LEN],
@@ -52,6 +53,7 @@ pub fn encrypt<const M: usize>(
 /// Decrypt `ciphertext` under `nonce` and `aad`, writing plaintext to `out`
 /// and verifying `mic`. On [`CcmError::AuthFailed`] `out` contains the
 /// unauthenticated plaintext and must be discarded by the caller.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 pub fn decrypt<const M: usize>(
     aes: &Aes128,
     nonce: &[u8; BLE_NONCE_LEN],
@@ -78,6 +80,7 @@ pub fn decrypt<const M: usize>(
     Ok(())
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn validate<const M: usize>(aad: &[u8], msg: &[u8], out: &[u8]) -> Result<(), CcmError> {
     if M < 4 || M > 16 || M % 2 != 0 {
         return Err(CcmError::BadMicLen);
@@ -93,6 +96,7 @@ fn validate<const M: usize>(aad: &[u8], msg: &[u8], out: &[u8]) -> Result<(), Cc
 
 /// CBC-MAC over `B0 || AAD (length-prefixed, zero padded) || msg`, plus the
 /// CTR block `S0` used to mask the MAC.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn mac_and_s0<const M: usize>(
     aes: &Aes128,
     nonce: &[u8; BLE_NONCE_LEN],
@@ -158,6 +162,7 @@ fn mac_and_s0<const M: usize>(
 }
 
 /// CTR mode starting at counter 1.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn ctr(aes: &Aes128, nonce: &[u8; BLE_NONCE_LEN], input: &[u8], out: &mut [u8]) {
     let mut a = [0u8; BLOCK];
     a[0] = (BLE_L - 1) as u8;
@@ -178,6 +183,7 @@ fn ctr(aes: &Aes128, nonce: &[u8; BLE_NONCE_LEN], input: &[u8], out: &mut [u8]) 
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn xor_block(dst: &mut [u8; BLOCK], src: &[u8; BLOCK]) {
     for i in 0..BLOCK {
         dst[i] ^= src[i];

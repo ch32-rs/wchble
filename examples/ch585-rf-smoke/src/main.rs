@@ -312,43 +312,58 @@ pub extern "C" fn ExceptionHandler() -> ! {
 /// mode word) to `+0x00`, key to `+0x28..0x34`, input to `+0x18..0x24`, starts
 /// through `+0x04` and polls `+0x04` bit 0.
 #[cfg(feature = "aes-kat")]
-fn be_word(b: &[u8]) -> u32 {
-    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+fn le_word(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// AES-128 through the RF IP block, following the working ch32fun sequence
+/// (`examples_ch5xx/aes/aes.c`): command `0x100`, mode, little-endian key and
+/// data words, then `CFG |= 1` and poll `CFG` bit 0. The earlier probe used
+/// big-endian words and a fixed delay, which cannot produce AES output.
 #[cfg(feature = "aes-kat")]
-fn aes_block(
+fn aes_block(mode: u32, key: &[u8; 16], input: &[u8; 16], out: &mut [u8; 16]) -> bool {
+    aes_block_step(true, true, mode, key, input, out)
+}
+
+/// One block with optional peripheral enable / mode / key loads, so repeated
+/// blocks can measure where the per-block cost actually sits.
+#[cfg(feature = "aes-kat")]
+fn aes_block_step(
+    enable: bool,
+    load_key: bool,
     mode: u32,
     key: &[u8; 16],
     input: &[u8; 16],
     out: &mut [u8; 16],
-    clock: &UsClock,
 ) -> bool {
     unsafe {
-        // `AES_DevPktEnc` enables the block through `+0x50` bit 7 before it
-        // touches key/data; the standalone `AES_DevAESEnc` path omits it.
-        regs::rmw(AES_BASE, 0x50, 0, 0x80);
-        regs::write(AES_BASE, 0x00, 0x100);
-        for _ in 0..4 {
-            core::hint::spin_loop();
+        if enable {
+            regs::write(AES_BASE, 0x00, 0x100);
+            regs::write(AES_BASE, 0x00, mode);
+        } else if load_key {
+            regs::write(AES_BASE, 0x00, mode);
         }
-        regs::write(AES_BASE, 0x00, mode);
+        if load_key {
+            for i in 0..4 {
+                regs::write(AES_BASE, 0x28 + 4 * i, le_word(&key[4 * i..]));
+            }
+        }
         for i in 0..4 {
-            regs::write(AES_BASE, 0x28 + 4 * i, be_word(&key[4 * i..]));
-            regs::write(AES_BASE, 0x18 + 4 * i, be_word(&input[4 * i..]));
+            regs::write(AES_BASE, 0x18 + 4 * i, le_word(&input[4 * i..]));
         }
-        let v = regs::read(AES_BASE, 0x04) & !0x2;
-        regs::write(AES_BASE, 0x04, v);
-        regs::write(AES_BASE, 0x04, regs::read(AES_BASE, 0x04) | 0x1);
         regs::write(AES_BASE, 0x00, regs::read(AES_BASE, 0x00) | 0x1);
 
-        // Do not poll the status bit here: reading it appears to keep the
-        // engine busy. Give it a fixed budget, then read the state once.
-        clock.delay_us(1_000);
-        let _ = regs::read(AES_BASE, 0x04);
+        let mut spins = 0u32;
+        while regs::read(AES_BASE, 0x00) & 0x1 != 0 {
+            spins += 1;
+            if spins > 200_000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
         for i in 0..4 {
             let w = regs::read(AES_BASE, 0x18 + 4 * i);
-            out[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
         }
     }
     true
@@ -390,7 +405,7 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
 
     let mut got = [0u8; 16];
     let t0 = clock.now_us();
-    if aes_block(0, &key, &pt, &mut got, clock) {
+    if aes_block(0, &key, &pt, &mut got) {
         let dt = clock.now_us().wrapping_sub(t0);
         if got == ct {
             let _ = writeln!(out, "aes kat enc ok {}us", dt);
@@ -414,7 +429,7 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
         );
     }
 
-    if aes_block(0, &zero, &zero, &mut got, clock) {
+    if aes_block(0, &zero, &zero, &mut got) {
         if got == zero_ct {
             let _ = writeln!(out, "aes kat zero ok");
         } else {
@@ -426,7 +441,7 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
         let _ = writeln!(out, "aes kat zero TIMEOUT");
     }
 
-    if aes_block(2, &key, &ct, &mut got, clock) {
+    if aes_block(2, &key, &ct, &mut got) {
         if got == pt {
             let _ = writeln!(out, "aes kat dec ok");
         } else {
@@ -437,6 +452,65 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
     } else {
         let _ = writeln!(out, "aes kat dec TIMEOUT");
     }
+
+    // Repeated blocks: a BLE CCM operation needs several, and the per-block
+    // command/key/data setup is part of the cost.
+    let iters = 1000u32;
+    let t0 = clock.now_us();
+    for i in 0..iters {
+        let mut block = pt;
+        block[0] ^= i as u8;
+        if !aes_block(0, &key, &block, &mut got) {
+            let _ = writeln!(out, "aes kat loop TIMEOUT after {}", i);
+            return;
+        }
+    }
+    let dt = clock.now_us().wrapping_sub(t0);
+    let _ = writeln!(
+        out,
+        "aes kat loop n={} us={} us/block={}",
+        iters,
+        dt,
+        dt / iters
+    );
+
+    // Same loop without the 0x100 enable handshake per block.
+    let t0 = clock.now_us();
+    for i in 0..iters {
+        let mut block = pt;
+        block[0] ^= i as u8;
+        if !aes_block_step(false, true, 0, &key, &block, &mut got) {
+            let _ = writeln!(out, "aes kat loop-mk TIMEOUT after {}", i);
+            return;
+        }
+    }
+    let dt = clock.now_us().wrapping_sub(t0);
+    let _ = writeln!(
+        out,
+        "aes kat loop-mode-key n={} us={} us/block={}",
+        iters,
+        dt,
+        dt / iters
+    );
+
+    // Data + start + poll only: mode and key persist in the block.
+    let t0 = clock.now_us();
+    for i in 0..iters {
+        let mut block = pt;
+        block[0] ^= i as u8;
+        if !aes_block_step(false, false, 0, &key, &block, &mut got) {
+            let _ = writeln!(out, "aes kat loop-do TIMEOUT after {}", i);
+            return;
+        }
+    }
+    let dt = clock.now_us().wrapping_sub(t0);
+    let _ = writeln!(
+        out,
+        "aes kat loop-data-only n={} us={} us/block={}",
+        iters,
+        dt,
+        dt / iters
+    );
 }
 
 #[entry]
