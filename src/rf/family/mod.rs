@@ -8,6 +8,10 @@
 
 pub mod tables;
 
+/// Shared CH58x/CH59x runtime; each family keeps its own DevInit and quirks.
+#[cfg(any(feature = "ch585", feature = "ch592"))]
+pub(crate) mod ch58x_common;
+
 /// Generate the bookkeeping-only backend for a chip whose MMIO path is not
 /// ported yet.
 ///
@@ -142,7 +146,6 @@ macro_rules! stub_radio {
         }
     };
 }
-
 
 // One feature per module. Multi-chip builds are rejected by the `compile_error!`
 // in `lib.rs`, so the modules do not repeat `not(feature = ...)` guards.
