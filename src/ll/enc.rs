@@ -575,4 +575,71 @@ mod tests {
         assert_eq!(p_enc.tx_counter(), 2);
         assert_eq!(p_enc.rx_counter(), 2);
     }
+
+    /// The pause procedure is three encrypted PDUs on the old session; a
+    /// resume is a fresh start procedure whose new session resets counters.
+    #[test]
+    fn pause_exchange_then_resume_with_fresh_counters() {
+        let mut c_enc = central();
+        let mut p_enc = peripheral();
+        c_enc.enable_tx();
+        c_enc.enable_rx();
+        p_enc.enable_tx();
+        p_enc.enable_rx();
+        let mut wire = [0; MAX_ENCRYPTED];
+        let mut plain = [0; MAX_PLAINTEXT];
+
+        // One data packet first so the counters are non-zero.
+        let len = c_enc.encrypt(0x02, &[0x11, 0x22, 0x33], &mut wire).unwrap();
+        assert_eq!(p_enc.decrypt(0x02, &wire[..len], &mut plain), Ok(3));
+
+        let req = ControlPdu::pause_enc_req();
+        let rsp = ControlPdu::pause_enc_rsp();
+        // PAUSE_ENC_REQ (Central -> Peripheral).
+        let len = c_enc.encrypt(0x03, req.as_bytes(), &mut wire).unwrap();
+        assert_eq!(p_enc.decrypt(0x03, &wire[..len], &mut plain), Ok(1));
+        // PAUSE_ENC_RSP (Peripheral -> Central).
+        let len = p_enc.encrypt(0x03, rsp.as_bytes(), &mut wire).unwrap();
+        assert_eq!(c_enc.decrypt(0x03, &wire[..len], &mut plain), Ok(1));
+        // PAUSE_ENC_RSP (Central -> Peripheral).
+        let len = c_enc.encrypt(0x03, rsp.as_bytes(), &mut wire).unwrap();
+        assert_eq!(p_enc.decrypt(0x03, &wire[..len], &mut plain), Ok(1));
+
+        // Resume: new SKDs/IVs, counters restart at zero.
+        let new_skds = [0x77; 8];
+        let new_ivs = [0x99; 4];
+        let c_key = SessionKey::from_parts(&LTK, &SKDM, &new_skds, &IVM, &new_ivs);
+        let p_key = SessionKey::from_parts(&LTK, &SKDM, &new_skds, &IVM, &new_ivs);
+        let c_engine = Aes128::new(c_key.key());
+        let p_engine = Aes128::new(p_key.key());
+        let mut c_enc = Encryption::new(c_key, EncRole::Central, c_engine);
+        let mut p_enc = Encryption::new(p_key, EncRole::Peripheral, p_engine);
+        c_enc.enable_tx();
+        p_enc.enable_rx();
+        let len = c_enc.encrypt(0x03, rsp.as_bytes(), &mut wire).unwrap();
+        assert_eq!(p_enc.decrypt(0x03, &wire[..len], &mut plain), Ok(1));
+        assert_eq!(c_enc.tx_counter(), 1);
+        assert_eq!(p_enc.rx_counter(), 1);
+    }
+
+    #[test]
+    fn counter_exhaustion_is_reported() {
+        let mut enc = central();
+        enc.enable_tx();
+        enc.enable_rx();
+        let mut out = [0; MAX_ENCRYPTED];
+        enc.tx_counter = COUNTER_MAX;
+        assert!(enc.encrypt(0x02, &[1], &mut out).is_ok());
+        assert_eq!(enc.tx_counter(), COUNTER_MAX + 1);
+        assert_eq!(
+            enc.encrypt(0x02, &[1], &mut out),
+            Err(EncError::CounterExhausted)
+        );
+
+        enc.rx_counter = COUNTER_MAX + 1;
+        assert_eq!(
+            enc.decrypt(0x02, &out[..5], &mut [0; MAX_PLAINTEXT]),
+            Err(EncError::CounterExhausted)
+        );
+    }
 }
