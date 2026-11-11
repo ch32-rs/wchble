@@ -37,7 +37,7 @@ use hal::rcc;
 use hal::time::Hertz;
 use qingke_rt::entry;
 use static_cell::StaticCell;
-use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE, RFEND_BASE};
+use wchble::rf::family::ch585::{Ch585Radio, AES_BASE, BB_BASE, LLE_BASE, RFEND_BASE};
 use wchble::rf::regs::{self, bb, lle, rfend};
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
@@ -301,6 +301,144 @@ pub extern "C" fn ExceptionHandler() -> ! {
     }
 }
 
+/// One-shot AES block KAT against the vendor `AES_DevAESEnc/Dec` sequence.
+///
+/// **Current status: negative.** The block is present and writable, but this
+/// sequence does not produce AES output; the vendor LL uses the packet engine
+/// `AES_DevPktEnc` instead. See `local-docs/research/ch585-aes-kat-results.md`.
+/// Kept as a reproducible probe, not as a passing test.
+///
+/// The engine lives at [`AES_BASE`]. The vendor block writes `0x100` (then the
+/// mode word) to `+0x00`, key to `+0x28..0x34`, input to `+0x18..0x24`, starts
+/// through `+0x04` and polls `+0x04` bit 0.
+#[cfg(feature = "aes-kat")]
+fn be_word(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[cfg(feature = "aes-kat")]
+fn aes_block(
+    mode: u32,
+    key: &[u8; 16],
+    input: &[u8; 16],
+    out: &mut [u8; 16],
+    clock: &UsClock,
+) -> bool {
+    unsafe {
+        // `AES_DevPktEnc` enables the block through `+0x50` bit 7 before it
+        // touches key/data; the standalone `AES_DevAESEnc` path omits it.
+        regs::rmw(AES_BASE, 0x50, 0, 0x80);
+        regs::write(AES_BASE, 0x00, 0x100);
+        for _ in 0..4 {
+            core::hint::spin_loop();
+        }
+        regs::write(AES_BASE, 0x00, mode);
+        for i in 0..4 {
+            regs::write(AES_BASE, 0x28 + 4 * i, be_word(&key[4 * i..]));
+            regs::write(AES_BASE, 0x18 + 4 * i, be_word(&input[4 * i..]));
+        }
+        let v = regs::read(AES_BASE, 0x04) & !0x2;
+        regs::write(AES_BASE, 0x04, v);
+        regs::write(AES_BASE, 0x04, regs::read(AES_BASE, 0x04) | 0x1);
+        regs::write(AES_BASE, 0x00, regs::read(AES_BASE, 0x00) | 0x1);
+
+        // Do not poll the status bit here: reading it appears to keep the
+        // engine busy. Give it a fixed budget, then read the state once.
+        clock.delay_us(1_000);
+        let _ = regs::read(AES_BASE, 0x04);
+        for i in 0..4 {
+            let w = regs::read(AES_BASE, 0x18 + 4 * i);
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+        }
+    }
+    true
+}
+
+#[cfg(feature = "aes-kat")]
+fn write_hex(out: &mut Log, b: &[u8; 16]) {
+    for byte in b {
+        let _ = write!(out, "{:02x}", byte);
+    }
+}
+
+#[cfg(feature = "aes-kat")]
+fn aes_kat(out: &mut Log, clock: &UsClock) {
+    let _ = writeln!(
+        out,
+        "aes kat start pre ctrl={:08x} st={:08x} key0={:08x}",
+        mmio(AES_BASE, 0x00),
+        mmio(AES_BASE, 0x04),
+        mmio(AES_BASE, 0x28)
+    );
+    let key = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    let pt = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let ct = [
+        0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5,
+        0x5a,
+    ];
+    let zero = [0u8; 16];
+    let zero_ct = [
+        0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b, 0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34, 0x2b,
+        0x2e,
+    ];
+
+    let mut got = [0u8; 16];
+    let t0 = clock.now_us();
+    if aes_block(0, &key, &pt, &mut got, clock) {
+        let dt = clock.now_us().wrapping_sub(t0);
+        if got == ct {
+            let _ = writeln!(out, "aes kat enc ok {}us", dt);
+        } else {
+            let _ = write!(out, "aes kat enc FAIL {}us got=", dt);
+            write_hex(out, &got);
+            let _ = writeln!(out);
+        }
+    } else {
+        let dt = clock.now_us().wrapping_sub(t0);
+        let _ = writeln!(
+            out,
+            "aes kat enc TIMEOUT {}us ctrl={:08x} st={:08x} o={:08x},{:08x},{:08x},{:08x}",
+            dt,
+            mmio(AES_BASE, 0x00),
+            mmio(AES_BASE, 0x04),
+            mmio(AES_BASE, 0x18),
+            mmio(AES_BASE, 0x1c),
+            mmio(AES_BASE, 0x20),
+            mmio(AES_BASE, 0x24)
+        );
+    }
+
+    if aes_block(0, &zero, &zero, &mut got, clock) {
+        if got == zero_ct {
+            let _ = writeln!(out, "aes kat zero ok");
+        } else {
+            let _ = write!(out, "aes kat zero FAIL got=");
+            write_hex(out, &got);
+            let _ = writeln!(out);
+        }
+    } else {
+        let _ = writeln!(out, "aes kat zero TIMEOUT");
+    }
+
+    if aes_block(2, &key, &ct, &mut got, clock) {
+        if got == pt {
+            let _ = writeln!(out, "aes kat dec ok");
+        } else {
+            let _ = write!(out, "aes kat dec FAIL got=");
+            write_hex(out, &got);
+            let _ = writeln!(out);
+        }
+    } else {
+        let _ = writeln!(out, "aes kat dec TIMEOUT");
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
@@ -333,6 +471,35 @@ fn main() -> ! {
             let _ = writeln!(out, "rf init err {:?}", e);
             dump_regs(&mut out);
             loop {}
+        }
+    }
+
+    #[cfg(feature = "aes-kat")]
+    {
+        // The AES block sits in the RF IP; keep its analog clock on while the
+        // engine runs (no TX/RX is armed).
+        unsafe {
+            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, rfend::FECTRL_RF_ON);
+        }
+        // The vendor runs AES while the RF window is active; arm a long RX
+        // window (1 s) so the block has its clock while the KAT runs.
+        let _ = radio.set_channel(37);
+        match radio.rx_basic(&clock, &mut rx_listen_buf.0[..], 2_000_000) {
+            Ok(()) => {
+                let _ = writeln!(out, "aes kat entered");
+                aes_kat(&mut out, &clock);
+                radio.shut();
+            }
+            Err(e) => {
+                let _ = writeln!(out, "aes kat rx arm err {:?}", e);
+            }
+        }
+        unsafe {
+            regs::rmw(RFEND_BASE, rfend::FECTRL, rfend::FECTRL_RF_ON, 0);
+        }
+        // RF stays off; park so the probe read is safe.
+        loop {
+            core::hint::spin_loop();
         }
     }
 

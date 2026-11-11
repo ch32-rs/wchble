@@ -19,6 +19,11 @@ panic-halt = "1.0"
 static_cell = "2.1"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
 
+[features]
+# One-shot AES known-answer test: init the radio, run the KAT, log to RAM and
+# park with RF off so the probe can read the result safely.
+aes-kat = []
+
 [profile.release]
 strip = false
 lto = true
