@@ -50,7 +50,19 @@ pub const STAT_UART_WRITES: usize = 12;
 pub const STAT_UART_NOTIFICATIONS: usize = 13;
 pub const STAT_UART_LEN: usize = 14;
 // 0 = not requested, 1 = L2CAP request sent, 2 = send failed (test feature).
+#[allow(dead_code)]
 pub const STAT_CONN_PARAMS: usize = 15;
+
+#[cfg(feature = "secure")]
+pub const STAT_SECURITY: usize = 15;
+#[cfg(feature = "secure")]
+pub const SECURITY_REQUESTED: u32 = 1;
+#[cfg(feature = "secure")]
+pub const SECURITY_PAIRED: u32 = 2;
+#[cfg(feature = "secure")]
+pub const SECURITY_ENCRYPTED: u32 = 3;
+#[cfg(feature = "secure")]
+pub const SECURITY_FAILED: u32 = 4;
 
 #[cfg(feature = "conn-params-30")]
 const CONN_INTERVAL_US: u64 = 30_000;
@@ -221,6 +233,18 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             stats.inc(STAT_CONNECTIONS);
             stats.phase(PHASE_CONNECTED);
             stats.set(STAT_SUBSCRIBED, 0);
+            // S2: ask the central to pair. Android also calls createBond(); a
+            // Security Request is what makes macOS initiate pairing without a
+            // protected attribute. Failure is recorded, not fatal: the phone
+            // may still start pairing on its own.
+            #[cfg(feature = "secure")]
+            match connection.raw().request_security() {
+                Ok(()) => stats.set(STAT_SECURITY, SECURITY_REQUESTED),
+                Err(_) => {
+                    stats.error(14);
+                    stats.set(STAT_SECURITY, SECURITY_FAILED);
+                }
+            }
 
             loop {
                 match connection.next().await {
@@ -314,6 +338,19 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         if request.reject(&stack).await.is_err() {
                             stats.error(10);
                         }
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::PairingComplete { .. } => {
+                        stats.set(STAT_SECURITY, SECURITY_PAIRED);
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::Encrypted { .. } => {
+                        stats.set(STAT_SECURITY, SECURITY_ENCRYPTED);
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::PairingFailed(_) => {
+                        stats.error(15);
+                        stats.set(STAT_SECURITY, SECURITY_FAILED);
                     }
                     _ => {}
                 }
