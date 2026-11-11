@@ -24,7 +24,7 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 /// Unknown connection identifier.
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 
-/// ACL data packet length reported by `LE Read Buffer Size` (no DLE yet).
+/// Default ACL data packet length reported by `LE Read Buffer Size` (no DLE).
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
 /// Number of ACL credits advertised to the Host.
 const ACL_CREDITS: u8 = super::connection::ACL_CREDITS as u8;
@@ -105,6 +105,10 @@ pub struct SoftRunner {
     pending_encryption: Option<EnableEncryption>,
     /// Host answer waiting for the RF owner (Peripheral role).
     ltk_reply: Option<LtkReply>,
+    /// LE features advertised both through HCI and LL_FEATURE_RSP.
+    le_features: [u8; 8],
+    /// ACL payload length advertised through `LE Read Buffer Size`.
+    acl_packet_length: u16,
 }
 
 impl Default for SoftRunner {
@@ -132,6 +136,8 @@ impl SoftRunner {
             entropy_seeded: false,
             pending_encryption: None,
             ltk_reply: None,
+            le_features: [0; 8],
+            acl_packet_length: ACL_DATA_PACKET_LENGTH,
         }
     }
 
@@ -153,6 +159,36 @@ impl SoftRunner {
     /// Whether a measured entropy seed has been installed.
     pub fn entropy_seeded(&self) -> bool {
         self.entropy_seeded
+    }
+
+    /// Advertise the LE feature set implemented by this controller build.
+    ///
+    /// Both `LE Read Local Supported Features` and the LL feature response use
+    /// this value. The default is all zero (P3/P4); a build that drives the
+    /// start-encryption procedure must set bit 0.
+    pub fn set_le_features(&mut self, features: [u8; 8]) {
+        self.le_features = features;
+    }
+
+    pub fn le_features(&self) -> [u8; 8] {
+        self.le_features
+    }
+
+    /// Report a smaller ACL payload than the legacy maximum.
+    ///
+    /// Encrypted links must cap Host fragments at 23 octets: the controller
+    /// adds a 4-octet MIC and the on-air payload limit is 27. Returns false
+    /// for values outside 23..=27.
+    pub fn set_acl_packet_length(&mut self, len: u16) -> bool {
+        if !self.bridge.set_acl_packet_length(len) {
+            return false;
+        }
+        self.acl_packet_length = len;
+        true
+    }
+
+    pub fn acl_packet_length(&self) -> u16 {
+        self.acl_packet_length
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -501,17 +537,24 @@ impl SoftRunner {
             0x1405 => Err(HCI_COMMAND_DISALLOWED),
             // LE Read Buffer Size (v1)
             0x2002 if params.is_empty() => {
-                static BUFFER_SIZE: [u8; 3] = [
-                    ACL_DATA_PACKET_LENGTH as u8,
-                    (ACL_DATA_PACKET_LENGTH >> 8) as u8,
-                    ACL_CREDITS,
-                ];
-                Ok(&BUFFER_SIZE)
+                let [lo, hi] = self.acl_packet_length.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[lo, hi, ACL_CREDITS],
+                ));
+                return;
             }
-            // Match the implemented, unencrypted LE 1M air-interface features.
+            // Features implemented by this controller build (bit 0 = LE
+            // Encryption when the RF owner drives the start procedure).
             0x2003 if params.is_empty() => {
-                static FEATURES: [u8; 8] = [0; 8];
-                Ok(&FEATURES)
+                let features = self.le_features;
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &features,
+                ));
+                return;
             }
             // LE Set Random Address
             0x2005 if params.len() == 6 => {
@@ -584,6 +627,23 @@ impl SoftRunner {
             0x200f if params.is_empty() => Ok(&[0][..]),
             0x2010 if params.is_empty() => Ok(&[][..]),
             0x2011 => Err(HCI_COMMAND_DISALLOWED),
+            // Resolving list and privacy: accepted but not implemented.
+            //
+            // The controller never generates or resolves RPAs yet (S4), and
+            // the examples use a static random address. Trouble's `security`
+            // feature still issues the full startup sync, so answer success
+            // while keeping the list logically empty. HCI commands:
+            // 0x2027 add, 0x2028 remove, 0x2029 clear, 0x202A read size,
+            // 0x202D address resolution enable, 0x202E RPA timeout,
+            // 0x204E privacy mode.
+            0x2027 if params.len() == 39 => Ok(&[][..]),
+            0x2028 if params.len() == 7 => Ok(&[][..]),
+            0x2029 if params.is_empty() => Ok(&[][..]),
+            0x202a if params.is_empty() => Ok(&[0][..]),
+            0x202d if params.len() == 1 && params[0] <= 1 => Ok(&[][..]),
+            0x202e if params.len() == 2 => Ok(&[][..]),
+            0x204e if params.len() == 8 => Ok(&[][..]),
+            0x2027 | 0x2028 | 0x202d | 0x202e | 0x204e => Err(HCI_INVALID_PARAMETERS),
             // LE Encrypt — one AES-128 block, software engine (Host utility;
             // not on the connection timing path).
             0x2017 if params.len() == 32 => {
@@ -1000,6 +1060,70 @@ mod tests {
             Err(BridgeError::InvalidPacket)
         );
         assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+    }
+
+    #[test]
+    fn encrypted_build_can_cap_host_acl_at_23_octets() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        assert!(!runner.set_acl_packet_length(22));
+        assert!(!runner.set_acl_packet_length(28));
+        assert!(runner.set_acl_packet_length(23));
+        open(&mut runner);
+        assert_eq!(
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 24])),
+            Err(BridgeError::InvalidPacket)
+        );
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 23])).is_ok());
+    }
+
+    #[test]
+    fn host_reads_configured_buffer_size_and_features() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_acl_packet_length(23);
+        runner.set_le_features([1, 0, 0, 0, 0, 0, 0, 0]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2002, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2002, HCI_SUCCESS, &[23, 0, ACL_CREDITS]);
+
+            inject_cmd(0x2003, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2003, HCI_SUCCESS, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn privacy_commands_are_accepted_without_a_resolving_list() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            for (opcode, params) in [
+                (0x202d, &[1u8][..]),
+                (0x2029, &[][..]),
+                (0x2027, &[0u8; 39][..]),
+                (0x2028, &[0u8; 7][..]),
+                (0x202e, &[0x10, 0x00][..]),
+                (0x204e, &[0u8; 8][..]),
+            ] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_SUCCESS, &[]);
+            }
+            inject_cmd(0x202a, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x202a, HCI_SUCCESS, &[0]);
+
+            inject_cmd(0x202d, &[2]);
+            runner.serve_one().await;
+            expect_command_complete(0x202d, HCI_INVALID_PARAMETERS, &[]);
+        });
     }
 
     #[test]

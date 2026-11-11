@@ -225,6 +225,9 @@ pub enum ControlAction {
 pub struct ControlState {
     pub peer_version: Option<LocalVersion>,
     pub peer_features: Option<[u8; 8]>,
+    /// Feature bits this controller build implements. Bit 0 (LE Encryption)
+    /// must be set by an RF owner that drives the start-encryption procedure.
+    pub local_features: [u8; 8],
     version_sent: bool,
     termination_deadline_us: Option<u32>,
 }
@@ -234,6 +237,7 @@ impl ControlState {
         Self {
             peer_version: None,
             peer_features: None,
+            local_features: [0; 8],
             version_sent: false,
             termination_deadline_us: None,
         }
@@ -305,10 +309,10 @@ impl ControlState {
                 if opcode == 0x09 {
                     return Ok(ControlAction::None);
                 }
-                // No encryption, DLE, PHY update, CSA #2, or optional control
-                // procedures are advertised. Mandatory legacy procedures do
-                // not require feature bits.
-                ControlPdu::feature_rsp([0; 8])
+                // Only the features the owner explicitly enabled. DLE, PHY
+                // update, CSA #2 and optional control procedures remain
+                // unadvertised. Mandatory legacy procedures need no bit.
+                ControlPdu::feature_rsp(self.local_features)
             }
             0x0c => {
                 exact_len(payload, 6)?;
@@ -464,6 +468,29 @@ mod tests {
         let first = link.tx_pdu();
         assert_eq!(first.llid(), 3);
         assert_eq!(link.tx_pdu(), first);
+    }
+
+    #[test]
+    fn local_features_are_reported_only_when_the_owner_enables_them() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        assert_eq!(
+            reply(
+                ctrl.on_pdu(&mut c, &[8, 1, 0, 0, 0, 0, 0, 0, 0], LOCAL)
+                    .unwrap()
+            )
+            .as_bytes(),
+            &[9, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        ctrl.local_features = [1, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            reply(
+                ctrl.on_pdu(&mut c, &[8, 1, 0, 0, 0, 0, 0, 0, 0], LOCAL)
+                    .unwrap()
+            )
+            .as_bytes(),
+            &[9, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
