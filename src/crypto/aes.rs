@@ -1,15 +1,20 @@
 //! Software AES-128 (FIPS-197).
 //!
-//! The CH585 AES block exists but its programming model is not verified (see
-//! `local-docs/research/ch585-aes-kat-results.md`), so the controller uses a
-//! small, testable software implementation. Only AES-128 is needed: BLE LE
-//! encryption uses a 128-bit key and AES-CCM.
+//! This is the portable implementation: it runs on the host for tests and is
+//! the fallback on parts without a usable AES block. CH585 exposes a faster
+//! hardware engine at `0x4000_C300` (verified 2026-11-11; ~2.3× per block);
+//! S1 wires that through the same `AesEngine` boundary rather than calling it
+//! here. Only AES-128 is needed: BLE LE encryption uses a 128-bit key and
+//! AES-CCM.
 //!
 //! This is a table-based implementation and is not constant-time. The CH585
 //! has no data cache, and the security spec's threat model excludes local
 //! timing/power analysis; do not reuse it where that model differs.
 
-const SBOX: [u8; 256] = [
+/// S-box accesses dominate the hot path; on RISC-V place the table next to
+/// the code so both are copied to `.highcode` RAM at boot.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+static SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
     0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -28,7 +33,8 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-const INV_SBOX: [u8; 256] = [
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+static INV_SBOX: [u8; 256] = [
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
     0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
@@ -65,6 +71,7 @@ impl core::fmt::Debug for Aes128 {
 }
 
 impl Aes128 {
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn new(key: &[u8; 16]) -> Self {
         let mut w = [[0u8; 4]; 44];
         for (i, word) in w.iter_mut().take(4).enumerate() {
@@ -93,6 +100,7 @@ impl Aes128 {
         Self { round_keys }
     }
 
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn encrypt_block(&self, block: &mut [u8; 16]) {
         add_round_key(block, &self.round_keys[0]);
         for rk in &self.round_keys[1..10] {
@@ -106,6 +114,7 @@ impl Aes128 {
         add_round_key(block, &self.round_keys[10]);
     }
 
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn decrypt_block(&self, block: &mut [u8; 16]) {
         add_round_key(block, &self.round_keys[10]);
         for rk in self.round_keys[1..10].iter().rev() {
@@ -120,18 +129,21 @@ impl Aes128 {
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn add_round_key(s: &mut [u8; 16], rk: &[u8; 16]) {
     for i in 0..16 {
         s[i] ^= rk[i];
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn sub_bytes(s: &mut [u8; 16]) {
     for b in s {
         *b = SBOX[*b as usize];
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn inv_sub_bytes(s: &mut [u8; 16]) {
     for b in s {
         *b = INV_SBOX[*b as usize];
@@ -139,6 +151,7 @@ fn inv_sub_bytes(s: &mut [u8; 16]) {
 }
 
 /// State is column-major: `s[4 * column + row]`.
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn shift_rows(s: &mut [u8; 16]) {
     for row in 0..4 {
         let a = [s[row], s[row + 4], s[row + 8], s[row + 12]];
@@ -148,6 +161,7 @@ fn shift_rows(s: &mut [u8; 16]) {
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn inv_shift_rows(s: &mut [u8; 16]) {
     for row in 0..4 {
         let a = [s[row], s[row + 4], s[row + 8], s[row + 12]];
@@ -157,10 +171,12 @@ fn inv_shift_rows(s: &mut [u8; 16]) {
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn xtime(x: u8) -> u8 {
     (x << 1) ^ (((x >> 7) & 1) * 0x1b)
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn gmul(mut a: u8, mut b: u8) -> u8 {
     let mut r = 0u8;
     while b != 0 {
@@ -173,6 +189,7 @@ fn gmul(mut a: u8, mut b: u8) -> u8 {
     r
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn mix_columns(s: &mut [u8; 16]) {
     for c in 0..4 {
         let i = 4 * c;
@@ -184,6 +201,7 @@ fn mix_columns(s: &mut [u8; 16]) {
     }
 }
 
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn inv_mix_columns(s: &mut [u8; 16]) {
     for c in 0..4 {
         let i = 4 * c;
