@@ -140,7 +140,7 @@ fn main() -> ! {
     let t0 = systick();
     for i in 0..CCM27_ITERS {
         pt[0] = i as u8;
-        let _ = ccm::encrypt::<4>(&aes, &nonce, &aad, &pt[..27], &mut ct[..27], &mut mic);
+        let _ = ccm::encrypt::<4>(&mut aes, &nonce, &aad, &pt[..27], &mut ct[..27], &mut mic);
     }
     let ccm27_ticks = systick().wrapping_sub(t0);
     put(8, CCM27_ITERS);
@@ -156,7 +156,7 @@ fn main() -> ! {
     let t0 = systick();
     for i in 0..CCM251_ITERS {
         pt[0] = i as u8;
-        let _ = ccm::encrypt::<4>(&aes, &nonce, &aad, &pt[..251], &mut ct[..251], &mut mic);
+        let _ = ccm::encrypt::<4>(&mut aes, &nonce, &aad, &pt[..251], &mut ct[..251], &mut mic);
     }
     let ccm251_ticks = systick().wrapping_sub(t0);
     put(10, CCM251_ITERS);
@@ -172,7 +172,7 @@ fn main() -> ! {
     // AES-CCM decrypt of the 251-byte payload (RX cost).
     let t0 = systick();
     for _ in 0..CCM251_ITERS {
-        let _ = ccm::decrypt::<4>(&aes, &nonce, &aad, &ct[..251], &mic, &mut pt[..251]);
+        let _ = ccm::decrypt::<4>(&mut aes, &nonce, &aad, &ct[..251], &mic, &mut pt[..251]);
     }
     let ccm251_dec_ticks = systick().wrapping_sub(t0);
     put(12, CCM251_ITERS);

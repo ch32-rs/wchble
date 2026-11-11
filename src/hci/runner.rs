@@ -6,6 +6,7 @@
 
 use bt_hci::transport::PacketKind;
 
+use crate::crypto::Aes128;
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -20,6 +21,8 @@ const HCI_UNKNOWN_COMMAND: u8 = 0x01;
 const HCI_INVALID_PARAMETERS: u8 = 0x12;
 /// Command disallowed.
 const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
+/// Unknown connection identifier.
+const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 
 /// ACL data packet length reported by `LE Read Buffer Size` (no DLE yet).
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
@@ -59,6 +62,25 @@ pub struct CreateConnRequest {
     pub max_ce: u16,
 }
 
+/// `LE Enable Encryption` request waiting for the RF owner to run the LL
+/// start-encryption procedure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnableEncryption {
+    pub handle: u16,
+    /// Random number from the Host (zeros for LE Secure Connections).
+    pub rand: [u8; 8],
+    /// Encrypted diversifier (zero for LE Secure Connections).
+    pub ediv: u16,
+    pub ltk: [u8; 16],
+}
+
+/// Host answer to an `LE LTK Request` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtkReply {
+    Key([u8; 16]),
+    Rejected,
+}
+
 /// Drains Host→Controller packets and emits Command Complete / Status.
 #[derive(Debug)]
 pub struct SoftRunner {
@@ -79,6 +101,10 @@ pub struct SoftRunner {
     drbg: ChaCha20Drbg,
     /// True once a HAL supplied a measured entropy seed.
     entropy_seeded: bool,
+    /// Pending `LE Enable Encryption` for the RF owner (Central role).
+    pending_encryption: Option<EnableEncryption>,
+    /// Host answer waiting for the RF owner (Peripheral role).
+    ltk_reply: Option<LtkReply>,
 }
 
 impl Default for SoftRunner {
@@ -104,6 +130,8 @@ impl SoftRunner {
             random_addr: None,
             drbg: ChaCha20Drbg::from_seed(&[0u8; 32]),
             entropy_seeded: false,
+            pending_encryption: None,
+            ltk_reply: None,
         }
     }
 
@@ -130,6 +158,47 @@ impl SoftRunner {
     /// A 32-bit random value for LL use (access address / CRCInit).
     pub fn rand_u32(&mut self) -> u32 {
         self.drbg.next_u32()
+    }
+
+    /// Fill `out` from the DRBG for LL_ENC_REQ SKDm/IVm and similar values.
+    pub fn fill_random(&mut self, out: &mut [u8]) {
+        self.drbg.fill(out);
+    }
+
+    /// Take the pending `LE Enable Encryption` request (Central role).
+    pub fn take_encryption_request(&mut self) -> Option<EnableEncryption> {
+        self.pending_encryption.take()
+    }
+
+    /// Take the Host's answer to an `LE LTK Request` (Peripheral role).
+    pub fn take_ltk_reply(&mut self) -> Option<LtkReply> {
+        self.ltk_reply.take()
+    }
+
+    /// Drop encryption state when the link is gone or Reset is processed.
+    pub fn clear_encryption(&mut self) {
+        self.pending_encryption = None;
+        self.ltk_reply = None;
+    }
+
+    /// Emit `LE LTK Request` for the connected handle. Returns false when the
+    /// Host has not enabled the event or the queue is full; the RF owner must
+    /// then reject `LL_ENC_REQ` instead of starting encryption.
+    pub fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool {
+        let Some(handle) = self.bridge.handle() else {
+            return false;
+        };
+        self.bridge.ltk_request(handle, rand, ediv).is_ok()
+    }
+
+    /// Report the outcome of the start-encryption procedure.
+    ///
+    /// `enabled` is the HCI Encryption_Enabled value: 0x00 off, 0x01 on.
+    /// Returns false if the handle is gone or the event queue is full.
+    pub fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8) -> bool {
+        self.bridge
+            .encryption_change(handle, status, enabled)
+            .is_ok()
     }
 
     /// Override the public address returned by `Read BD_ADDR`.
@@ -248,7 +317,10 @@ impl SoftRunner {
         parameters[11..11 + data.len()].copy_from_slice(data);
         parameters[11 + data.len()] = rssi as u8;
         let len = 12 + data.len();
-        if !self.bridge.try_push_event(event_packet(0x3e, &parameters[..len])) {
+        if !self
+            .bridge
+            .try_push_event(event_packet(0x3e, &parameters[..len]))
+        {
             self.adv_reports_dropped = self.adv_reports_dropped.wrapping_add(1);
             return false;
         }
@@ -339,6 +411,7 @@ impl SoftRunner {
         self.ll = LinkLayer::new();
         self.scan = ScanState::default();
         self.pending_connect = None;
+        self.clear_encryption();
         if self.random_addr.is_some() {
             self.sync_adv_addr();
         }
@@ -376,6 +449,11 @@ impl SoftRunner {
                     opcode,
                     HCI_COMMAND_DISALLOWED,
                 ));
+                return;
+            }
+            0x2019 => {
+                let status = self.enable_encryption(params);
+                self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x0c03 if params.is_empty() => {
@@ -506,6 +584,41 @@ impl SoftRunner {
             0x200f if params.is_empty() => Ok(&[0][..]),
             0x2010 if params.is_empty() => Ok(&[][..]),
             0x2011 => Err(HCI_COMMAND_DISALLOWED),
+            // LE Encrypt — one AES-128 block, software engine (Host utility;
+            // not on the connection timing path).
+            0x2017 if params.len() == 32 => {
+                let mut block = [0u8; 16];
+                block.copy_from_slice(&params[16..32]);
+                Aes128::new(params[..16].try_into().unwrap()).encrypt_block(&mut block);
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &block,
+                ));
+                return;
+            }
+            0x2017 => Err(HCI_INVALID_PARAMETERS),
+            // LE LTK Request Reply / Negative Reply (Peripheral role).
+            0x201a if params.len() == 18 => {
+                if self.bridge.handle() != Some(le16_from(params)) {
+                    Err(HCI_UNKNOWN_CONNECTION)
+                } else {
+                    let mut ltk = [0u8; 16];
+                    ltk.copy_from_slice(&params[2..18]);
+                    self.ltk_reply = Some(LtkReply::Key(ltk));
+                    Ok(&[][..])
+                }
+            }
+            0x201a => Err(HCI_INVALID_PARAMETERS),
+            0x201b if params.len() == 2 => {
+                if self.bridge.handle() != Some(le16_from(params)) {
+                    Err(HCI_UNKNOWN_CONNECTION)
+                } else {
+                    self.ltk_reply = Some(LtkReply::Rejected);
+                    Ok(&[][..])
+                }
+            }
+            0x201b => Err(HCI_INVALID_PARAMETERS),
             // LE Rand — DRBG output; the HAL seeds it from measured entropy.
             0x2018 if params.is_empty() => {
                 let mut rand = [0u8; 8];
@@ -631,6 +744,34 @@ impl SoftRunner {
         self.scan.enabled = false;
         HCI_SUCCESS
     }
+
+    fn enable_encryption(&mut self, params: &[u8]) -> u8 {
+        if params.len() != 29 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        let handle = le16_from(params);
+        if self.bridge.handle() != Some(handle) || self.bridge.is_disconnecting() {
+            return HCI_UNKNOWN_CONNECTION;
+        }
+        if self.pending_encryption.is_some() {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        let mut rand = [0u8; 8];
+        rand.copy_from_slice(&params[2..10]);
+        let mut ltk = [0u8; 16];
+        ltk.copy_from_slice(&params[12..28]);
+        self.pending_encryption = Some(EnableEncryption {
+            handle,
+            rand,
+            ediv: u16::from_le_bytes([params[10], params[11]]),
+            ltk,
+        });
+        HCI_SUCCESS
+    }
+}
+
+fn le16_from(params: &[u8]) -> u16 {
+    u16::from_le_bytes([params[0], params[1]])
 }
 
 #[cfg(test)]
@@ -1192,7 +1333,10 @@ mod tests {
         let request = runner.pending_connect().unwrap();
         assert_eq!(request.peer_addr, peer);
         assert!(request.peer_random && request.own_random);
-        assert_eq!(runner.own_addr(), ([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21], true));
+        assert_eq!(
+            runner.own_addr(),
+            ([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21], true)
+        );
 
         pollster::block_on(async {
             inject_cmd(0x200e, &[]);
@@ -1266,6 +1410,146 @@ mod tests {
         // Re-installing the same seed is rejected and does not rewind.
         assert!(!runner.set_entropy_seed(&seed));
         assert_ne!(le_rand_once(&mut runner), seeded);
+    }
+
+    #[test]
+    fn le_encrypt_matches_fips_197() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let mut params = [0u8; 32];
+        for i in 0..16 {
+            params[i] = i as u8; // key 000102..0f
+            params[16 + i] = (i as u8) * 0x11; // plaintext 001122..ff
+        }
+
+        pollster::block_on(async {
+            inject_cmd(0x2017, &params);
+            runner.serve_one().await;
+            expect_command_complete(
+                0x2017,
+                HCI_SUCCESS,
+                &[
+                    0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
+                    0xb4, 0xc5, 0x5a,
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn enable_encryption_waits_for_radio_owner_and_validates_state() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 29];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..10].copy_from_slice(&[0xa0; 8]);
+        params[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
+        params[12..28].copy_from_slice(&[0x5a; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_SUCCESS);
+
+            // A second request before the RF owner consumes the first.
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_COMMAND_DISALLOWED);
+
+            // Unknown handle.
+            let mut bad = params;
+            bad[0] = 2;
+            inject_cmd(0x2019, &bad);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_UNKNOWN_CONNECTION);
+
+            // Short parameters.
+            inject_cmd(0x2019, &params[..28]);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_INVALID_PARAMETERS);
+        });
+
+        let request = runner.take_encryption_request().unwrap();
+        assert_eq!(request.handle, 1);
+        assert_eq!(request.rand, [0xa0; 8]);
+        assert_eq!(request.ediv, 0x1234);
+        assert_eq!(request.ltk, [0x5a; 16]);
+        assert!(runner.take_encryption_request().is_none());
+    }
+
+    #[test]
+    fn ltk_reply_commands_reach_the_radio_owner() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x33; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x201a, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[]);
+            assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
+
+            inject_cmd(0x201b, &[1, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x201b, HCI_SUCCESS, &[]);
+            assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Rejected));
+
+            let mut bad = params;
+            bad[0] = 2;
+            inject_cmd(0x201a, &bad);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[]);
+
+            inject_cmd(0x201b, &[2, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x201b, HCI_UNKNOWN_CONNECTION, &[]);
+        });
+    }
+
+    #[test]
+    fn ltk_request_and_encryption_change_events() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        assert!(runner.push_ltk_request([0xa5; 8], 0xbeef));
+        assert!(runner.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(
+            event.payload(),
+            &[0x3e, 13, 5, 1, 0, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xef, 0xbe,]
+        );
+
+        assert!(runner.encryption_change(1, 0, 1));
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x08, 4, 0, 1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn ltk_request_is_refused_when_the_host_disabled_the_event() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        runner.bridge.set_masks(u64::MAX, 0);
+        assert!(!runner.push_ltk_request([0; 8], 0));
+        // Encryption Change is a normal event; a disabled mask is not an error.
+        assert!(runner.encryption_change(1, 0, 1));
     }
 
     #[test]

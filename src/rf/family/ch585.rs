@@ -742,3 +742,79 @@ ch58x_common! {
         rc
     }
 }
+
+/// AES-128 block engine for CH585.
+///
+/// The register block at [`AES_BASE`] is shared with the RF IP and is only
+/// usable after [`Ch585Radio::init`]. The key and encrypt mode stay loaded;
+/// each block writes data, starts and polls, measured at ~69 us/block
+/// (see `local-docs/research/ch585-aes-kat-results.md`). This is the engine
+/// S1 uses for LE link-layer CCM; the software [`crate::crypto::Aes128`] stays
+/// for host tests and other series.
+#[cfg(feature = "controller")]
+pub use aes_block::Ch585Aes;
+
+#[cfg(feature = "controller")]
+mod aes_block {
+    use super::AES_BASE;
+    use crate::crypto::{AesEngine, AesEngineError};
+    use crate::rf::regs;
+
+    const CFG: usize = 0x00;
+    const DATA: usize = 0x18;
+    const KEY: usize = 0x28;
+    /// Enable/reset handshake written before the mode word.
+    const RESET: u32 = 0x100;
+    /// Encrypt mode (`2` selects decrypt).
+    const MODE_ENCRYPT: u32 = 0;
+    const START: u32 = 0x1;
+    const TIMEOUT_SPINS: u32 = 200_000;
+
+    #[derive(Debug)]
+    pub struct Ch585Aes {
+        _private: (),
+    }
+
+    impl Ch585Aes {
+        /// Load a session key. Call `Ch585Radio::init` first.
+        pub fn new(key: &[u8; 16]) -> Self {
+            unsafe {
+                regs::write(AES_BASE, CFG, RESET);
+                regs::write(AES_BASE, CFG, MODE_ENCRYPT);
+                for i in 0..4 {
+                    regs::write(AES_BASE, KEY + 4 * i, le_word(&key[4 * i..]));
+                }
+            }
+            Self { _private: () }
+        }
+    }
+
+    fn le_word(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    impl AesEngine for Ch585Aes {
+        #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+        fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), AesEngineError> {
+            unsafe {
+                for i in 0..4 {
+                    regs::write(AES_BASE, DATA + 4 * i, le_word(&block[4 * i..]));
+                }
+                regs::write(AES_BASE, CFG, regs::read(AES_BASE, CFG) | START);
+                let mut spins = 0u32;
+                while regs::read(AES_BASE, CFG) & START != 0 {
+                    spins += 1;
+                    if spins > TIMEOUT_SPINS {
+                        return Err(AesEngineError::Timeout);
+                    }
+                    core::hint::spin_loop();
+                }
+                for i in 0..4 {
+                    let word = regs::read(AES_BASE, DATA + 4 * i);
+                    block[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            Ok(())
+        }
+    }
+}
