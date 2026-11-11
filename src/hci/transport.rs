@@ -158,8 +158,10 @@ pub fn try_receive_host_packet() -> Option<Packet> {
     HOST_TO_CONTROLLER.try_receive().ok()
 }
 
-/// Test helper: push a Host→Controller packet without going through `Transport::write`.
-#[cfg(test)]
+/// Push a Host→Controller packet without going through `Transport::write`.
+///
+/// For cooperative pumps and diagnostics that have no async Host; production
+/// Hosts use [`HciTransport`] through `bt-hci`.
 pub fn try_send_host_packet(packet: Packet) -> Result<(), Error> {
     HOST_TO_CONTROLLER
         .try_send(packet)
@@ -178,8 +180,7 @@ pub fn try_send_controller_packet(packet: Packet) -> Result<(), Error> {
         .map_err(|_| Error::PacketTooLarge)
 }
 
-/// Non-blocking Controller→Host poll (tests).
-#[cfg(test)]
+/// Non-blocking Controller→Host poll (cooperative pumps and diagnostics).
 pub fn try_receive_controller_packet() -> Option<Packet> {
     CONTROLLER_TO_HOST.try_receive().ok()
 }

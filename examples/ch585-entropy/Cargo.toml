@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "ch585-entropy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", features = [
+    "ch585",
+    "rt",
+    "memory-x",
+], default-features = false }
+wchble = { path = "../..", features = ["ch585", "controller"] }
+bt-hci = { version = "0.11", default-features = false }
+qingke-rt = "0.8.4"
+qingke = "0.8.4"
+panic-halt = "1.0"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+
+[profile.release]
+strip = false
+lto = true
+opt-level = "z"
