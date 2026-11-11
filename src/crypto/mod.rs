@@ -6,3 +6,8 @@
 
 pub mod aes;
 pub mod ccm;
+pub mod engine;
+
+pub use aes::Aes128;
+pub use ccm::{CcmError, BLE_MIC_LEN, BLE_NONCE_LEN};
+pub use engine::{AesEngine, AesEngineError};

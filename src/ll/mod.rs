@@ -5,6 +5,7 @@ pub mod adv;
 pub mod central;
 pub mod conn;
 pub mod ctrl;
+pub mod enc;
 pub mod scan;
 
 /// High-level LL role for the scaffold.

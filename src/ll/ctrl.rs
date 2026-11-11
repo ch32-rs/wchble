@@ -1,4 +1,9 @@
-//! Minimal unencrypted legacy peripheral LL control procedures.
+//! Minimal legacy peripheral LL control procedures.
+//!
+//! Encryption control PDUs are constructed and parsed here; the session key
+//! and data-PDU crypto live in [`super::enc`]. The control state machine in
+//! this module deliberately does not handle encryption: the Host (LTK) and the
+//! radio owner must sequence those exchanges, so they are driven explicitly.
 
 use super::conn::{le16, ConnError, ConnectionUpdate, LinkTiming};
 
@@ -17,9 +22,13 @@ pub enum LlCtrlOpcode {
     UnknownRsp = 0x07,
     FeatureReq = 0x08,
     FeatureRsp = 0x09,
+    PauseEncReq = 0x0a,
+    PauseEncRsp = 0x0b,
     VersionInd = 0x0c,
+    RejectInd = 0x0d,
     ConnectionParamReq = 0x0f,
     ConnectionParamRsp = 0x10,
+    RejectExtInd = 0x11,
 }
 
 /// Identity must be supplied by the application, not copied from a vendor
@@ -34,14 +43,15 @@ pub struct LocalVersion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(4))]
 pub struct ControlPdu {
-    bytes: [u8; 12],
+    bytes: [u8; 27],
     len: u8,
 }
 
 impl ControlPdu {
     fn new(payload: &[u8]) -> Self {
+        debug_assert!(payload.len() <= 27);
         let mut pdu = Self {
-            bytes: [0; 12],
+            bytes: [0; 27],
             len: payload.len() as u8,
         };
         pdu.bytes[..payload.len()].copy_from_slice(payload);
@@ -96,10 +106,110 @@ impl ControlPdu {
         Self::new(&bytes)
     }
 
+    /// `LL_ENC_REQ`, sent by the Central. All fields are in wire order.
+    pub fn enc_req(req: &EncReq) -> Self {
+        let mut bytes = [0; 23];
+        bytes[0] = LlCtrlOpcode::EncReq as u8;
+        bytes[1..9].copy_from_slice(&req.rand);
+        bytes[9..11].copy_from_slice(&req.ediv.to_le_bytes());
+        bytes[11..19].copy_from_slice(&req.skdm);
+        bytes[19..23].copy_from_slice(&req.ivm);
+        Self::new(&bytes)
+    }
+
+    /// `LL_ENC_RSP`, sent by the Peripheral.
+    pub fn enc_rsp(rsp: &EncRsp) -> Self {
+        let mut bytes = [0; 13];
+        bytes[0] = LlCtrlOpcode::EncRsp as u8;
+        bytes[1..9].copy_from_slice(&rsp.skds);
+        bytes[9..13].copy_from_slice(&rsp.ivs);
+        Self::new(&bytes)
+    }
+
+    pub fn start_enc_req() -> Self {
+        Self::new(&[LlCtrlOpcode::StartEncReq as u8])
+    }
+
+    pub fn start_enc_rsp() -> Self {
+        Self::new(&[LlCtrlOpcode::StartEncRsp as u8])
+    }
+
+    pub fn pause_enc_req() -> Self {
+        Self::new(&[LlCtrlOpcode::PauseEncReq as u8])
+    }
+
+    pub fn pause_enc_rsp() -> Self {
+        Self::new(&[LlCtrlOpcode::PauseEncRsp as u8])
+    }
+
+    pub fn reject_ind(reason: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::RejectInd as u8, reason])
+    }
+
+    pub fn reject_ext_ind(opcode: u8, reason: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::RejectExtInd as u8, opcode, reason])
+    }
+
     /// Payload only. Queue using `LinkSequence::queue(3, pdu.as_bytes())` so
     /// controls use exactly the same acknowledgment/retry path as ACL data.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
+    }
+}
+
+/// `LL_ENC_REQ` fields in wire order. `skdm` and `ivm` are the Central's
+/// session-key-diversifier and IV contributions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncReq {
+    pub rand: [u8; 8],
+    pub ediv: u16,
+    pub skdm: [u8; 8],
+    pub ivm: [u8; 4],
+}
+
+impl EncReq {
+    pub fn parse(payload: &[u8]) -> Result<Self, ConnError> {
+        if payload.len() != 23 {
+            return Err(ConnError::Length);
+        }
+        if payload[0] != LlCtrlOpcode::EncReq as u8 {
+            return Err(ConnError::Header);
+        }
+        let mut rand = [0; 8];
+        rand.copy_from_slice(&payload[1..9]);
+        let mut skdm = [0; 8];
+        skdm.copy_from_slice(&payload[11..19]);
+        let mut ivm = [0; 4];
+        ivm.copy_from_slice(&payload[19..23]);
+        Ok(Self {
+            rand,
+            ediv: le16(&payload[9..]),
+            skdm,
+            ivm,
+        })
+    }
+}
+
+/// `LL_ENC_RSP` fields in wire order: the Peripheral's contributions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncRsp {
+    pub skds: [u8; 8],
+    pub ivs: [u8; 4],
+}
+
+impl EncRsp {
+    pub fn parse(payload: &[u8]) -> Result<Self, ConnError> {
+        if payload.len() != 13 {
+            return Err(ConnError::Length);
+        }
+        if payload[0] != LlCtrlOpcode::EncRsp as u8 {
+            return Err(ConnError::Header);
+        }
+        let mut skds = [0; 8];
+        skds.copy_from_slice(&payload[1..9]);
+        let mut ivs = [0; 4];
+        ivs.copy_from_slice(&payload[9..13]);
+        Ok(Self { skds, ivs })
     }
 }
 
@@ -281,12 +391,12 @@ mod tests {
 
     #[test]
     fn control_pdu_is_word_aligned_without_exposing_padding() {
-        assert_eq!(core::mem::size_of::<ControlPdu>(), 16);
+        assert_eq!(core::mem::size_of::<ControlPdu>(), 28);
         assert_eq!(core::mem::align_of::<ControlPdu>(), 4);
         let pdu = ControlPdu::new(&[7, 0x14]);
         assert_eq!(pdu.as_bytes(), &[7, 0x14]);
-        let full = ControlPdu::new(&[0; 12]);
-        assert_eq!(full.as_bytes().len(), 12);
+        let full = ControlPdu::new(&[0; 27]);
+        assert_eq!(full.as_bytes().len(), 27);
     }
 
     fn reply(action: ControlAction) -> ControlPdu {

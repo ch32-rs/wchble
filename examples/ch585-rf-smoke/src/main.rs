@@ -511,6 +511,44 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
         dt,
         dt / iters
     );
+
+    // S1 engine wrapper: key/mode loaded once, then blocks. Verify the first
+    // block and a chained second block against known vectors.
+    use wchble::crypto::AesEngine as _;
+    let second = [
+        0x4f, 0x63, 0x8c, 0x73, 0x5f, 0x61, 0x43, 0x01, 0x56, 0x78, 0x24, 0xb1, 0xa2, 0x1a, 0x4f,
+        0x6a,
+    ];
+    let mut engine = wchble::rf::family::ch585::Ch585Aes::new(&key);
+    let mut first_block = pt;
+    let mut second_block = ct;
+    let first_ok = engine.encrypt_block(&mut first_block).is_ok() && first_block == ct;
+    let second_ok = engine.encrypt_block(&mut second_block).is_ok() && second_block == second;
+    let _ = writeln!(
+        out,
+        "aes engine kat first={} second={}",
+        first_ok, second_ok
+    );
+
+    let t0 = clock.now_us();
+    let mut engine_ok = true;
+    for i in 0..iters {
+        let mut block = pt;
+        block[0] ^= i as u8;
+        if engine.encrypt_block(&mut block).is_err() {
+            engine_ok = false;
+            break;
+        }
+    }
+    let dt = clock.now_us().wrapping_sub(t0);
+    let _ = writeln!(
+        out,
+        "aes engine loop n={} ok={} us={} us/block={}",
+        iters,
+        engine_ok,
+        dt,
+        dt / iters
+    );
 }
 
 #[entry]

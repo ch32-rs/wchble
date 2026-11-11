@@ -34,6 +34,8 @@ pub enum BridgeError {
     InvalidPacket,
     Full,
     AlreadyConnected,
+    /// The Host has not enabled the event required to continue.
+    Disabled,
 }
 
 /// An opaque identity for an actual Host ACL buffer, not an LL sequence number.
@@ -215,6 +217,67 @@ impl ConnectionBridge {
         parameters[8..10].copy_from_slice(&timeout.to_le_bytes());
         self.push_event(event_packet(0x3e, &parameters));
         Ok(())
+    }
+
+    /// Emit `Encryption Change` for the connected handle.
+    ///
+    /// `enabled` is the HCI Encryption_Enabled value (0x00 off, 0x01 on).
+    /// Returns `Full` when no event slot is free so the caller can retry on a
+    /// later pump rather than overwrite a lifecycle event.
+    pub fn encryption_change(
+        &mut self,
+        handle: u16,
+        status: u8,
+        enabled: u8,
+    ) -> Result<(), BridgeError> {
+        if self.handle() != Some(handle) || self.resetting {
+            return Err(BridgeError::NotConnected);
+        }
+        if !self.event_enabled(0x08) {
+            return Ok(());
+        }
+        if self.events.iter().all(Option::is_some) {
+            return Err(BridgeError::Full);
+        }
+        let [lo, hi] = handle.to_le_bytes();
+        self.push_event(event_packet(0x08, &[status, lo, hi, enabled]));
+        Ok(())
+    }
+
+    /// Emit `LE LTK Request` for the connected handle. The controller cannot
+    /// continue the start-encryption procedure until the Host answers, so a
+    /// disabled event mask or full queue is reported as an error.
+    pub fn ltk_request(
+        &mut self,
+        handle: u16,
+        rand: [u8; 8],
+        ediv: u16,
+    ) -> Result<(), BridgeError> {
+        if self.handle() != Some(handle) || self.resetting {
+            return Err(BridgeError::NotConnected);
+        }
+        if !self.le_event_enabled(5) {
+            return Err(BridgeError::Disabled);
+        }
+        if self.events.iter().all(Option::is_some) {
+            return Err(BridgeError::Full);
+        }
+        let [lo, hi] = handle.to_le_bytes();
+        let [elo, ehi] = ediv.to_le_bytes();
+        let mut parameters = [0u8; 13];
+        parameters[0] = 0x05; // LE LTK Request
+        parameters[1] = lo;
+        parameters[2] = hi;
+        parameters[3..11].copy_from_slice(&rand);
+        parameters[11] = elo;
+        parameters[12] = ehi;
+        self.push_event(event_packet(0x3e, &parameters));
+        Ok(())
+    }
+
+    /// True while a Host disconnect or Reset is in flight.
+    pub(crate) fn is_disconnecting(&self) -> bool {
+        self.disconnecting || self.resetting
     }
 
     /// Check this before advancing NESN for a new, CRC-valid data PDU. The

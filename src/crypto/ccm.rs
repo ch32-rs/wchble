@@ -7,7 +7,7 @@
 //!
 //! No allocations: callers provide the output slice and a fixed-size MIC.
 
-use super::aes::Aes128;
+use super::engine::AesEngine;
 
 /// BLE MIC length (Core Vol 6 Part E).
 pub const BLE_MIC_LEN: usize = 4;
@@ -28,13 +28,15 @@ pub enum CcmError {
     BufferTooSmall,
     /// Authentication failed on decrypt.
     AuthFailed,
+    /// The block engine did not complete.
+    Engine,
 }
 
 /// Encrypt `plaintext` under `nonce` and `aad`, writing the ciphertext to
 /// `out` and the MIC to `mic`. `out.len()` must be at least `plaintext.len()`.
 #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 pub fn encrypt<const M: usize>(
-    aes: &Aes128,
+    aes: &mut impl AesEngine,
     nonce: &[u8; BLE_NONCE_LEN],
     aad: &[u8],
     plaintext: &[u8],
@@ -43,7 +45,7 @@ pub fn encrypt<const M: usize>(
 ) -> Result<(), CcmError> {
     validate::<M>(aad, plaintext, out)?;
     let (mac, s0) = mac_and_s0::<M>(aes, nonce, aad, plaintext)?;
-    ctr(aes, nonce, plaintext, out);
+    ctr(aes, nonce, plaintext, out)?;
     for i in 0..M {
         mic[i] = mac[i] ^ s0[i];
     }
@@ -55,7 +57,7 @@ pub fn encrypt<const M: usize>(
 /// unauthenticated plaintext and must be discarded by the caller.
 #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 pub fn decrypt<const M: usize>(
-    aes: &Aes128,
+    aes: &mut impl AesEngine,
     nonce: &[u8; BLE_NONCE_LEN],
     aad: &[u8],
     ciphertext: &[u8],
@@ -64,7 +66,7 @@ pub fn decrypt<const M: usize>(
 ) -> Result<(), CcmError> {
     validate::<M>(aad, ciphertext, out)?;
     // CCM authenticates the plaintext, so decrypt first, then MAC.
-    ctr(aes, nonce, ciphertext, out);
+    ctr(aes, nonce, ciphertext, out)?;
     let (mut mac, s0) = mac_and_s0::<M>(aes, nonce, aad, &out[..ciphertext.len()])?;
     for i in 0..M {
         mac[i] ^= s0[i];
@@ -98,7 +100,7 @@ fn validate<const M: usize>(aad: &[u8], msg: &[u8], out: &[u8]) -> Result<(), Cc
 /// CTR block `S0` used to mask the MAC.
 #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
 fn mac_and_s0<const M: usize>(
-    aes: &Aes128,
+    aes: &mut impl AesEngine,
     nonce: &[u8; BLE_NONCE_LEN],
     aad: &[u8],
     msg: &[u8],
@@ -119,7 +121,7 @@ fn mac_and_s0<const M: usize>(
     b[14] = (msg_len >> 8) as u8;
     b[15] = msg_len as u8;
     xor_block(&mut mac, &b);
-    aes.encrypt_block(&mut mac);
+    aes.encrypt_block(&mut mac).map_err(|_| CcmError::Engine)?;
 
     // AAD: 2-octet length prefix, then the bytes, zero padded.
     if !aad.is_empty() {
@@ -129,14 +131,14 @@ fn mac_and_s0<const M: usize>(
         let first = core::cmp::min(14, aad.len());
         block[2..2 + first].copy_from_slice(&aad[..first]);
         xor_block(&mut mac, &block);
-        aes.encrypt_block(&mut mac);
+        aes.encrypt_block(&mut mac).map_err(|_| CcmError::Engine)?;
         let mut i = first;
         while i < aad.len() {
             let n = core::cmp::min(BLOCK, aad.len() - i);
             let mut block = [0u8; BLOCK];
             block[..n].copy_from_slice(&aad[i..i + n]);
             xor_block(&mut mac, &block);
-            aes.encrypt_block(&mut mac);
+            aes.encrypt_block(&mut mac).map_err(|_| CcmError::Engine)?;
             i += n;
         }
     }
@@ -148,7 +150,7 @@ fn mac_and_s0<const M: usize>(
         let mut block = [0u8; BLOCK];
         block[..n].copy_from_slice(&msg[i..i + n]);
         xor_block(&mut mac, &block);
-        aes.encrypt_block(&mut mac);
+        aes.encrypt_block(&mut mac).map_err(|_| CcmError::Engine)?;
         i += n;
     }
 
@@ -156,14 +158,19 @@ fn mac_and_s0<const M: usize>(
     let mut a = [0u8; BLOCK];
     a[0] = (BLE_L - 1) as u8;
     a[1..1 + BLE_NONCE_LEN].copy_from_slice(nonce);
-    aes.encrypt_block(&mut a);
+    aes.encrypt_block(&mut a).map_err(|_| CcmError::Engine)?;
 
     Ok((mac, a))
 }
 
 /// CTR mode starting at counter 1.
 #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
-fn ctr(aes: &Aes128, nonce: &[u8; BLE_NONCE_LEN], input: &[u8], out: &mut [u8]) {
+fn ctr(
+    aes: &mut impl AesEngine,
+    nonce: &[u8; BLE_NONCE_LEN],
+    input: &[u8],
+    out: &mut [u8],
+) -> Result<(), CcmError> {
     let mut a = [0u8; BLOCK];
     a[0] = (BLE_L - 1) as u8;
     a[1..1 + BLE_NONCE_LEN].copy_from_slice(nonce);
@@ -174,13 +181,14 @@ fn ctr(aes: &Aes128, nonce: &[u8; BLE_NONCE_LEN], input: &[u8], out: &mut [u8]) 
         a[14] = (counter >> 8) as u8;
         a[15] = counter as u8;
         let mut s = a;
-        aes.encrypt_block(&mut s);
+        aes.encrypt_block(&mut s).map_err(|_| CcmError::Engine)?;
         let n = core::cmp::min(BLOCK, input.len() - i);
         for j in 0..n {
             out[i + j] = input[i + j] ^ s[j];
         }
         i += n;
     }
+    Ok(())
 }
 
 #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
@@ -192,6 +200,7 @@ fn xor_block(dst: &mut [u8; BLOCK], src: &[u8; BLOCK]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::aes::Aes128;
     use super::*;
 
     fn key() -> Aes128 {
@@ -227,7 +236,15 @@ mod tests {
         let expected_mic = [0x17, 0xe8, 0xd1, 0x2c, 0xfd, 0xf9, 0x26, 0xe0];
         let mut out = [0u8; 23];
         let mut mic = [0u8; 8];
-        encrypt(&key(), &nonce(), &aad(), &plaintext(), &mut out, &mut mic).unwrap();
+        encrypt(
+            &mut key(),
+            &nonce(),
+            &aad(),
+            &plaintext(),
+            &mut out,
+            &mut mic,
+        )
+        .unwrap();
         assert_eq!(out, expected);
         assert_eq!(mic, expected_mic);
     }
@@ -240,7 +257,7 @@ mod tests {
         ];
         let mic = [0x17, 0xe8, 0xd1, 0x2c, 0xfd, 0xf9, 0x26, 0xe0];
         let mut out = [0u8; 23];
-        decrypt(&key(), &nonce(), &aad(), &ct, &mic, &mut out).unwrap();
+        decrypt(&mut key(), &nonce(), &aad(), &ct, &mic, &mut out).unwrap();
         assert_eq!(out, plaintext());
     }
 
@@ -251,7 +268,15 @@ mod tests {
     fn ble_mic_len_kat() {
         let mut out = [0u8; 23];
         let mut mic = [0u8; BLE_MIC_LEN];
-        encrypt::<BLE_MIC_LEN>(&key(), &nonce(), &aad(), &plaintext(), &mut out, &mut mic).unwrap();
+        encrypt::<BLE_MIC_LEN>(
+            &mut key(),
+            &nonce(),
+            &aad(),
+            &plaintext(),
+            &mut out,
+            &mut mic,
+        )
+        .unwrap();
         assert_eq!(
             out,
             [
@@ -265,7 +290,15 @@ mod tests {
     #[test]
     fn empty_message_kat() {
         let mut mic = [0u8; BLE_MIC_LEN];
-        encrypt::<BLE_MIC_LEN>(&key(), &[0u8; BLE_NONCE_LEN], &[], &[], &mut [], &mut mic).unwrap();
+        encrypt::<BLE_MIC_LEN>(
+            &mut key(),
+            &[0u8; BLE_NONCE_LEN],
+            &[],
+            &[],
+            &mut [],
+            &mut mic,
+        )
+        .unwrap();
         assert_eq!(mic, [0x5a, 0xaa, 0x6f, 0xc4]);
     }
 
@@ -279,23 +312,23 @@ mod tests {
         mic[3] ^= 0x80;
         let mut out = [0u8; 23];
         assert_eq!(
-            decrypt(&key(), &nonce(), &aad(), &ct, &mic, &mut out),
+            decrypt(&mut key(), &nonce(), &aad(), &ct, &mic, &mut out),
             Err(CcmError::AuthFailed)
         );
     }
 
     #[test]
     fn round_trip_ble_mic_len() {
-        let aes = Aes128::new(&[0x11; 16]);
+        let mut aes = Aes128::new(&[0x11; 16]);
         let nonce = [0x42; BLE_NONCE_LEN];
         let pt = [0xab; 37];
         let mut ct = [0u8; 37];
         let mut mic = [0u8; BLE_MIC_LEN];
-        emit_round_trip(&aes, &nonce, &pt, &mut ct, &mut mic);
+        emit_round_trip(&mut aes, &nonce, &pt, &mut ct, &mut mic);
     }
 
     fn emit_round_trip(
-        aes: &Aes128,
+        aes: &mut Aes128,
         nonce: &[u8; BLE_NONCE_LEN],
         pt: &[u8; 37],
         ct: &mut [u8; 37],
