@@ -1130,6 +1130,8 @@ fn main() -> ! {
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
     soft.set_le_features(LOCAL_FEATURES);
+    // Keep the pre-DLE Host framing until the segmentation path takes over.
+    let _ = soft.set_acl_packet_length(27);
     let app_stats = host::HostStats::new();
     let mut app = core::pin::pin!(host::run(controller, &app_stats));
     let started = clock.now_us();

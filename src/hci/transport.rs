@@ -14,11 +14,10 @@ use bt_hci::{FromHciBytesError, ReadHciError};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
-/// Bytes reserved for one HCI packet on this soft transport.
-///
-/// Trouble's legacy advertiser cmds fit in ≤35 B; ACL frames with header ≤31 B
-/// until DLE. Keep headroom for Command Complete return parameters.
-pub const HCI_PACKET_CAPACITY: usize = 64;
+/// Bytes reserved for one HCI packet on this soft transport: the four-octet
+/// ACL header plus the 251-octet DLE maximum. This is also the largest packet
+/// `Packet::from_bytes` accepts, so no ACL frame can silently truncate.
+pub const HCI_PACKET_CAPACITY: usize = 255;
 
 const HOST_TO_CONTROLLER_CAPACITY: usize = 1;
 const CONTROLLER_TO_HOST_CAPACITY: usize = 4;
@@ -262,4 +261,27 @@ pub(crate) fn command_status_packet(opcode: u16, status: u8) -> Packet {
 pub fn drain_channels_for_test() {
     while HOST_TO_CONTROLLER.try_receive().is_ok() {}
     while CONTROLLER_TO_HOST.try_receive().is_ok() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acl_maximum_packet_fits_without_truncation() {
+        // Four-octet ACL header plus the 251-octet DLE maximum is exactly one
+        // HCI packet, and one byte more must be rejected rather than clipped.
+        assert_eq!(HCI_PACKET_CAPACITY, 4 + 251);
+        assert_eq!(
+            HCI_PACKET_CAPACITY,
+            crate::hci::connection::ACL_DATA_PACKET_LENGTH + 4
+        );
+        let max = [0x5au8; HCI_PACKET_CAPACITY];
+        let packet = Packet::from_bytes(PacketKind::AclData, &max).unwrap();
+        assert_eq!(packet.payload(), &max);
+        assert_eq!(
+            Packet::from_bytes(PacketKind::AclData, &[0; HCI_PACKET_CAPACITY + 1]).err(),
+            Some(Error::PacketTooLarge)
+        );
+    }
 }

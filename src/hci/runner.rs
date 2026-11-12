@@ -7,6 +7,7 @@
 use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
+use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PAYLOAD, LL_MAX_TIME_US};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -24,7 +25,7 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 /// Unknown connection identifier.
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 
-/// Default ACL data packet length reported by `LE Read Buffer Size` (no DLE).
+/// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
 /// Number of ACL credits advertised to the Host.
 const ACL_CREDITS: u8 = super::connection::ACL_CREDITS as u8;
@@ -107,6 +108,9 @@ pub struct SoftRunner {
     ltk_reply: Option<LtkReply>,
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
+    /// Host's `LE Write Suggested Default Data Length` values.
+    suggested_tx_octets: u16,
+    suggested_tx_time: u16,
     /// Most recent command that answered with a non-success status:
     /// `(opcode << 8) | status`, for firmware-side diagnostics.
     last_command_failure: Option<u32>,
@@ -148,6 +152,8 @@ impl SoftRunner {
             pending_encryption: None,
             ltk_reply: None,
             le_features: [0; 8],
+            suggested_tx_octets: LL_LEGACY_PAYLOAD,
+            suggested_tx_time: LL_LEGACY_TIME_US,
             last_command_failure: None,
             command_log: [0; 8],
             command_log_len: 0,
@@ -263,6 +269,16 @@ impl SoftRunner {
 
     pub fn le_features(&self) -> [u8; 8] {
         self.le_features
+    }
+
+    /// Suggested default TX data length last written by the Host.
+    pub fn suggested_data_length(&self) -> (u16, u16) {
+        (self.suggested_tx_octets, self.suggested_tx_time)
+    }
+
+    /// Take a Host `LE Set Data Length` request (`TX_Octets`, `TX_Time`).
+    pub fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
+        self.bridge.take_data_length_request()
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -524,6 +540,8 @@ impl SoftRunner {
         self.scan = ScanState::default();
         self.pending_connect = None;
         self.clear_encryption();
+        self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
+        self.suggested_tx_time = LL_LEGACY_TIME_US;
         if self.random_addr.is_some() {
             self.sync_adv_addr();
         }
@@ -633,6 +651,76 @@ impl SoftRunner {
                     opcode,
                     HCI_SUCCESS,
                     &features,
+                ));
+                return;
+            }
+            // LE Set Data Length: the RF owner performs LL_LENGTH_REQ.
+            0x2022 if params.len() == 6 => {
+                let handle = u16::from_le_bytes([params[0], params[1]]);
+                let octets = u16::from_le_bytes([params[2], params[3]]);
+                let time = u16::from_le_bytes([params[4], params[5]]);
+                let status = if !(LL_LEGACY_PAYLOAD..=LL_MAX_PAYLOAD).contains(&octets)
+                    || !(LL_LEGACY_TIME_US..=LL_MAX_TIME_US).contains(&time)
+                {
+                    HCI_INVALID_PARAMETERS
+                } else {
+                    self.bridge.request_data_length(handle, octets, time)
+                };
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    status,
+                    &[params[0], params[1]],
+                ));
+                return;
+            }
+            // LE Read Suggested Default Data Length.
+            0x2023 if params.is_empty() => {
+                let octets = self.suggested_tx_octets.to_le_bytes();
+                let time = self.suggested_tx_time.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[octets[0], octets[1], time[0], time[1]],
+                ));
+                return;
+            }
+            // LE Write Suggested Default Data Length.
+            0x2024 if params.len() == 4 => {
+                let octets = u16::from_le_bytes([params[0], params[1]]);
+                let time = u16::from_le_bytes([params[2], params[3]]);
+                let status = if (LL_LEGACY_PAYLOAD..=LL_MAX_PAYLOAD).contains(&octets)
+                    && (LL_LEGACY_TIME_US..=LL_MAX_TIME_US).contains(&time)
+                {
+                    self.suggested_tx_octets = octets;
+                    self.suggested_tx_time = time;
+                    HCI_SUCCESS
+                } else {
+                    HCI_INVALID_PARAMETERS
+                };
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Read Maximum Data Length.
+            0x202f if params.is_empty() => {
+                let octets = LL_MAX_PAYLOAD.to_le_bytes();
+                let time = LL_MAX_TIME_US.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[
+                        octets[0], octets[1], time[0], time[1], octets[0], octets[1], time[0],
+                        time[1],
+                    ],
+                ));
+                return;
+            }
+            // LE Read Buffer Size v2: no ISO buffers.
+            0x2060 if params.is_empty() => {
+                let [lo, hi] = ACL_DATA_PACKET_LENGTH.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[lo, hi, ACL_CREDITS, 0, 0, 0, 0],
                 ));
                 return;
             }
@@ -1097,7 +1185,7 @@ mod tests {
             for n in 0..5 {
                 runner
                     .bridge
-                    .enqueue_tx(&acl(1, n % 2, &[cycle as u8; 27]))
+                    .enqueue_tx(&acl(1, n % 2, &[cycle as u8; 251]))
                     .unwrap();
             }
             assert_eq!(
@@ -1108,8 +1196,8 @@ mod tests {
             for (n, tag) in tags.iter_mut().enumerate() {
                 let tx = runner.bridge.take_tx_acl().unwrap();
                 assert_eq!(tx.llid, if n % 2 == 0 { 2 } else { 1 });
-                assert_eq!(tx.len, 27);
-                assert_eq!(&tx.bytes, &[cycle as u8; 27]);
+                assert_eq!(tx.len, 251);
+                assert_eq!(&tx.bytes[..tx.len], &[cycle as u8; 251]);
                 *tag = Some(tx.tag);
             }
             assert!(runner.bridge.take_tx_acl().is_none());
@@ -1134,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn acl_validates_handle_pb_bc_and_exact_27_byte_limit() {
+    fn acl_validates_handle_pb_bc_and_the_251_byte_limit() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
@@ -1148,34 +1236,39 @@ mod tests {
             acl(1, 2, &[1]),
             acl(1, 3, &[1]),
             acl(0x4001, 0, &[1]),
-            acl(1, 0, &[1; 28]),
         ] {
             assert_eq!(
                 runner.bridge.enqueue_tx(&packet),
                 Err(BridgeError::InvalidPacket)
             );
         }
+        // A claimed 252-octet payload cannot fit one HCI packet at all.
+        let mut oversized = acl(1, 0, &[1; 251]);
+        oversized.bytes[2..4].copy_from_slice(&252u16.to_le_bytes());
+        assert_eq!(
+            runner.bridge.enqueue_tx(&oversized),
+            Err(BridgeError::InvalidPacket)
+        );
         let mut truncated = acl(1, 0, &[1, 2]);
         truncated.len -= 1;
         assert_eq!(
             runner.bridge.enqueue_tx(&truncated),
             Err(BridgeError::InvalidPacket)
         );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 251])).is_ok());
     }
 
     #[test]
-    fn host_acl_fragments_stay_within_the_legacy_plaintext_limit() {
+    fn host_acl_fragments_fit_the_reported_251_octet_buffer() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
         open(&mut runner);
-        // 27 plaintext octets become 31 on air once the MIC is added.
         assert_eq!(
-            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 28])),
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 252])),
             Err(BridgeError::InvalidPacket)
         );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 251])).is_ok());
     }
 
     #[test]
@@ -1188,11 +1281,73 @@ mod tests {
         pollster::block_on(async {
             inject_cmd(0x2002, &[]);
             runner.serve_one().await;
-            expect_command_complete(0x2002, HCI_SUCCESS, &[27, 0, ACL_CREDITS]);
+            expect_command_complete(0x2002, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS]);
 
             inject_cmd(0x2003, &[]);
             runner.serve_one().await;
             expect_command_complete(0x2003, HCI_SUCCESS, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn dle_commands_report_the_maximum_and_store_the_suggestion() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x202f, &[]);
+            runner.serve_one().await;
+            expect_command_complete(
+                0x202f,
+                HCI_SUCCESS,
+                &[0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08],
+            );
+
+            inject_cmd(0x2060, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2060, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS, 0, 0, 0, 0]);
+
+            inject_cmd(0x2023, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2023, HCI_SUCCESS, &[27, 0, 0x48, 0x01]);
+
+            inject_cmd(0x2024, &[0xfb, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_SUCCESS, &[]);
+            assert_eq!(runner.suggested_data_length(), (251, 2120));
+
+            inject_cmd(0x2024, &[0x1a, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_INVALID_PARAMETERS, &[]);
+            assert_eq!(runner.suggested_data_length(), (251, 2120));
+        });
+    }
+
+    #[test]
+    fn le_set_data_length_queues_a_request_for_a_live_handle() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        pollster::block_on(async {
+            inject_cmd(0x2022, &[1, 0, 0xfb, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_SUCCESS, &[1, 0]);
+            assert_eq!(runner.take_data_length_request(), Some((251, 2120)));
+            assert_eq!(runner.take_data_length_request(), None);
+
+            // Unknown handle.
+            inject_cmd(0x2022, &[0xfe, 0x0f, 0xfb, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_UNKNOWN_CONNECTION, &[0xfe, 0x0f]);
+
+            // Out-of-range octets.
+            inject_cmd(0x2022, &[1, 0, 0x1a, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_INVALID_PARAMETERS, &[1, 0]);
+            assert_eq!(runner.take_data_length_request(), None);
         });
     }
 
@@ -1232,7 +1387,7 @@ mod tests {
         let mut runner = SoftRunner::new();
         runner.bridge.connected(connection_info()).unwrap();
         assert!(!runner.bridge.can_receive_acl(3, 1));
-        assert!(!runner.bridge.can_receive_acl(2, 28));
+        assert!(!runner.bridge.can_receive_acl(2, 252));
         assert_eq!(
             runner.bridge.receive_acl(3, &[0]),
             Err(BridgeError::InvalidPacket)
