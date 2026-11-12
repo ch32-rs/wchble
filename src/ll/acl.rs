@@ -17,12 +17,12 @@ pub struct AclFragment {
     pub len: u16,
 }
 
-/// Largest on-air data payload before DLE: 27 plaintext octets, or 31 when
-/// the 4-octet MIC is added by link-layer encryption.
+/// Largest on-air data-PDU payload this layer can store: the DLE maximum of
+/// 251 octets, MIC included. The effective per-link limit is smaller until
+/// DLE completes; [`LinkSequence::set_max_payloads`] applies it.
 pub const MAX_LEGACY_PAYLOAD: usize = crate::ll::enc::MAX_ENCRYPTED;
 
-/// Two-byte header plus the largest on-air legacy payload.
-const DATA_PDU_CAPACITY: usize = 2 + MAX_LEGACY_PAYLOAD;
+use super::dle::{LL_DEFAULT_RX_PAYLOAD, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxError {
@@ -35,7 +35,7 @@ pub enum TxError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(4))]
 pub struct DataPdu {
-    bytes: [u8; DATA_PDU_CAPACITY],
+    bytes: [u8; MAX_LEGACY_PAYLOAD + 2],
 }
 
 impl DataPdu {
@@ -47,7 +47,7 @@ impl DataPdu {
             return Err(TxError::Llid);
         }
         let mut pdu = Self {
-            bytes: [0; DATA_PDU_CAPACITY],
+            bytes: [0; MAX_LEGACY_PAYLOAD + 2],
         };
         pdu.bytes[0] = llid;
         pdu.bytes[1] = payload.len() as u8;
@@ -92,6 +92,8 @@ pub struct LinkSequence {
     tx_sn: bool,
     outstanding: Option<DataPdu>,
     transmitted: bool,
+    tx_max_payload: u16,
+    rx_max_payload: u16,
 }
 
 impl Default for LinkSequence {
@@ -107,7 +109,24 @@ impl LinkSequence {
             tx_sn: false,
             outstanding: None,
             transmitted: false,
+            tx_max_payload: LL_LEGACY_PAYLOAD,
+            rx_max_payload: LL_DEFAULT_RX_PAYLOAD,
         }
+    }
+
+    /// Apply the negotiated on-air limits (MIC included). Values are clamped
+    /// to the legacy minimum and the DLE maximum.
+    pub fn set_max_payloads(&mut self, tx: u16, rx: u16) {
+        self.tx_max_payload = tx.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+        self.rx_max_payload = rx.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+    }
+
+    pub fn tx_max_payload(&self) -> u16 {
+        self.tx_max_payload
+    }
+
+    pub fn rx_max_payload(&self) -> u16 {
+        self.rx_max_payload
     }
 
     pub fn expected_rx_sn(&self) -> bool {
@@ -124,6 +143,9 @@ impl LinkSequence {
         if self.outstanding.is_some() {
             return Err(TxError::Busy);
         }
+        if payload.len() > usize::from(self.tx_max_payload) {
+            return Err(TxError::Length);
+        }
         self.outstanding = Some(DataPdu::new(llid, payload)?);
         self.transmitted = false;
         Ok(())
@@ -135,7 +157,7 @@ impl LinkSequence {
     /// refreshed to acknowledge the newest accepted peer packet.
     pub fn tx_pdu(&mut self) -> DataPdu {
         let pdu = self.outstanding.get_or_insert(DataPdu {
-            bytes: [0; DATA_PDU_CAPACITY],
+            bytes: [0; MAX_LEGACY_PAYLOAD + 2],
         });
         if pdu.bytes[0] & 3 == 0 {
             pdu.bytes[0] = 1;
@@ -160,6 +182,7 @@ impl LinkSequence {
             || llid == 0
             || (llid != 1 && payload.is_empty())
             || payload.len() > MAX_LEGACY_PAYLOAD
+            || payload.len() > usize::from(self.rx_max_payload)
         {
             return RxOutcome {
                 status: RxStatus::Invalid,
@@ -191,16 +214,77 @@ mod tests {
 
     #[test]
     fn pdu_bounds_and_llid() {
-        assert_eq!(core::mem::size_of::<DataPdu>(), 36);
+        // One header + length octet and the largest payload, rounded up to
+        // the four-octet alignment the radio DMA expects.
+        assert_eq!(
+            core::mem::size_of::<DataPdu>(),
+            (MAX_LEGACY_PAYLOAD + 2 + 3) / 4 * 4
+        );
         assert_eq!(core::mem::align_of::<DataPdu>(), 4);
         assert_eq!(DataPdu::new(1, &[]).unwrap().as_bytes(), &[1, 0]);
-        assert_eq!(DataPdu::new(2, &[1; 27]).unwrap().as_bytes().len(), 29);
-        // Encrypted legacy payloads carry 27 plaintext + 4 MIC octets.
-        assert_eq!(DataPdu::new(2, &[1; 31]).unwrap().as_bytes().len(), 33);
-        assert_eq!(DataPdu::new(2, &[1; 32]), Err(TxError::Length));
+        assert_eq!(
+            DataPdu::new(2, &[1; MAX_LEGACY_PAYLOAD])
+                .unwrap()
+                .as_bytes()
+                .len(),
+            MAX_LEGACY_PAYLOAD + 2
+        );
+        assert_eq!(
+            DataPdu::new(2, &[1; MAX_LEGACY_PAYLOAD + 1]),
+            Err(TxError::Length)
+        );
         assert_eq!(DataPdu::new(0, &[1]), Err(TxError::Llid));
         assert_eq!(DataPdu::new(3, &[]), Err(TxError::Llid));
         assert_eq!(DataPdu::new(2, &[]), Err(TxError::Llid));
+    }
+
+    #[test]
+    fn one_acl_fragment_of_encrypted_plaintext_is_accepted() {
+        // 24 plaintext octets plus the MIC is the on-air size an Android
+        // Central uses for L2CAP fragments without DLE; refusing it stalls
+        // the link because the peer retransmits an unacknowledged PDU.
+        let encrypted = 24 + crate::crypto::BLE_MIC_LEN;
+        assert!(encrypted > 27, "the legacy limit would have refused this");
+        let mut link = LinkSequence::new();
+        assert_eq!(
+            link.on_rx(0x02, &[1; 24 + crate::crypto::BLE_MIC_LEN][..], true, true)
+                .status,
+            RxStatus::Accepted
+        );
+        let mut link = LinkSequence::new();
+        assert_eq!(
+            link.on_rx(0x02, &[1; MAX_LEGACY_PAYLOAD + 1][..], true, true).status,
+            RxStatus::Invalid
+        );
+    }
+
+    #[test]
+    fn negotiated_limits_gate_tx_storage_and_rx_acceptance() {
+        let mut link = LinkSequence::new();
+        assert_eq!(link.tx_max_payload(), 27);
+        assert_eq!(link.rx_max_payload(), 31);
+        assert_eq!(link.queue(2, &[1; 28]), Err(TxError::Length));
+        assert_eq!(
+            link.on_rx(2, &[1; 32], true, true).status,
+            RxStatus::Invalid
+        );
+
+        link.set_max_payloads(251, 251);
+        assert_eq!(link.tx_max_payload(), 251);
+        assert_eq!(
+            link.on_rx(2, &[1; 251], true, true).status,
+            RxStatus::Accepted
+        );
+        assert_eq!(
+            link.on_rx(2, &[1; 252], true, true).status,
+            RxStatus::Invalid
+        );
+        assert_eq!(link.queue(2, &[1; 252]), Err(TxError::Length));
+        assert!(link.queue(2, &[1; 251]).is_ok());
+        // Clamping protects the buffers from caller mistakes.
+        link.set_max_payloads(0, u16::MAX);
+        assert_eq!(link.tx_max_payload(), 27);
+        assert_eq!(link.rx_max_payload(), 251);
     }
 
     #[test]
@@ -316,7 +400,7 @@ mod tests {
             (4, &[1][..], true),
             (0x25, &[1][..], true),
             (7, &[][..], true),
-            (5, &[1; 32][..], true),
+            (5, &[1; MAX_LEGACY_PAYLOAD + 1][..], true),
         ] {
             assert_eq!(
                 link.on_rx(header, payload, crc, true),

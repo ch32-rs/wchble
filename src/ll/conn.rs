@@ -1,5 +1,7 @@
 //! Pure legacy LE 1M peripheral connection timing and channel selection.
 
+use super::dle::{LL_DEFAULT_RX_PAYLOAD, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD};
+
 /// Connection handle / timing placeholders retained for the HCI scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -461,6 +463,7 @@ pub struct PeripheralConnection {
     pub params: ConnectParams,
     csa: ChannelSelection,
     channel: u8,
+    rx_max_payload: u16,
     event_counter: u16,
     event_start_us: u32,
     window_width_us: u32,
@@ -490,6 +493,7 @@ impl PeripheralConnection {
             params,
             csa,
             channel,
+            rx_max_payload: LL_DEFAULT_RX_PAYLOAD,
             event_counter: 0,
             event_start_us: connect_end_us.wrapping_add(1250 + u32::from(params.win_offset) * 1250),
             window_width_us: u32::from(params.win_size) * 1250,
@@ -508,6 +512,18 @@ impl PeripheralConnection {
     pub fn channel_selection_algorithm(&self) -> ChannelSelectionAlgorithm {
         self.csa.algorithm()
     }
+
+    /// Largest on-air PDU payload accepted from the peer, MIC included.
+    pub fn rx_max_payload(&self) -> u16 {
+        self.rx_max_payload
+    }
+
+    /// Apply the negotiated receive limit. Call only after DLE completed;
+    /// the pre-negotiation value stays in place while a request is in flight.
+    pub fn set_rx_max_payload(&mut self, octets: u16) {
+        self.rx_max_payload = octets.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+    }
+
     pub fn event_counter(&self) -> u16 {
         self.event_counter
     }
@@ -541,15 +557,20 @@ impl PeripheralConnection {
             .wrapping_add(self.window_width_us + self.widening_us())
     }
 
-    /// Allow the latest-starting legacy LE 1M packet to finish: 80 us overhead
-    /// plus the largest on-air payload (31 octets with the 4-octet MIC).
-    /// Address match cannot occur before the 40 us preamble/AA reception; its
-    /// exact hardware flag latency is not assumed.
-    /// Use this for the initial hardware window and software no-capture timeout,
-    /// while still honoring earlier finite, supervision and event deadlines.
+    /// On-air time of the largest accepted PDU: 80 us preamble/AA/header/CRC
+    /// overhead plus 8 us per payload octet. Address match cannot occur before
+    /// the 40 us preamble/AA reception; its exact hardware flag latency is not
+    /// assumed.
+    pub fn rx_complete_allowance_us(&self) -> u32 {
+        80 + u32::from(self.rx_max_payload) * 8
+    }
+
+    /// Allow the latest-starting LE 1M packet to finish. Use this for the
+    /// initial hardware window and the software no-capture timeout, while
+    /// still honoring earlier finite, supervision and event deadlines.
     pub fn rx_complete_end_us(&self) -> u32 {
         self.rx_end_us()
-            .wrapping_add(80 + super::enc::MAX_ENCRYPTED as u32 * 8)
+            .wrapping_add(self.rx_complete_allowance_us())
     }
 
     /// Until the first valid data PDU, establishment is bounded by six
@@ -572,7 +593,7 @@ impl PeripheralConnection {
     /// A later packet in the same event refreshes supervision, not the anchor.
     /// Returns false for an invalid length or a link that already expired.
     pub fn on_rx_anchor(&mut self, rx_done_us: u32, payload_len: u8) -> bool {
-        if usize::from(payload_len) > super::enc::MAX_ENCRYPTED
+        if usize::from(payload_len) > usize::from(self.rx_max_payload)
             || self.supervision_expired(rx_done_us)
         {
             return false;

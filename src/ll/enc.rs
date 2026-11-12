@@ -33,11 +33,14 @@ use crate::crypto::{Aes128, AesEngine};
 
 use super::ctrl::{ControlPdu, EncReq, EncRsp};
 
-/// Largest plaintext payload of an encrypted legacy PDU (27 plaintext
-/// octets; the 4-octet MIC pushes the on-air payload to 31).
-pub const MAX_PLAINTEXT: usize = 27;
+/// Largest plaintext payload of an encrypted PDU. This is the DLE maximum
+/// (251 on air, MIC included) and also covers pre-DLE peers: an Android
+/// Central has been observed sending 28-octet encrypted PDUs without
+/// negotiating. The negotiated per-link limit is smaller until DLE completes;
+/// see [`super::dle::DataLength`].
+pub const MAX_PLAINTEXT: usize = crate::ll::dle::LL_MAX_PLAINTEXT as usize;
 /// Largest encrypted payload including the MIC.
-pub const MAX_ENCRYPTED: usize = MAX_PLAINTEXT + BLE_MIC_LEN;
+pub const MAX_ENCRYPTED: usize = crate::ll::dle::LL_MAX_PAYLOAD as usize;
 
 /// Header bits that are excluded from the authenticated data.
 const AAD_MASK: u8 = !0x1c; // ~(NESN | SN | MD)
@@ -684,6 +687,40 @@ mod tests {
         assert_eq!(rx.decrypt(0x02, &out[..len], &mut plain), Ok(5));
         assert_eq!(&plain[..5], &[1, 2, 3, 4, 5]);
         assert_eq!(rx.rx_counter(), 1);
+    }
+
+    #[test]
+    fn one_acl_fragment_of_plaintext_round_trips() {
+        // An Android Central fragments its L2CAP PDUs at 24 octets and sends
+        // them encrypted without DLE: 28 octets on air. Both directions must
+        // handle that size even though it exceeds the legacy 27-octet PDU.
+        let mut tx = central();
+        tx.enable_tx();
+        let mut wire = [0; MAX_ENCRYPTED];
+        let plaintext = [0xa5; 24];
+        let len = tx.encrypt(0x02, &plaintext, &mut wire).unwrap();
+        assert_eq!(len, 24 + BLE_MIC_LEN);
+        let mut rx = peripheral();
+        rx.enable_rx();
+        let mut plain = [0; MAX_PLAINTEXT];
+        assert_eq!(rx.decrypt(0x02, &wire[..len], &mut plain), Ok(24));
+        assert_eq!(&plain[..24], &plaintext);
+    }
+
+    #[test]
+    fn dle_maximum_plaintext_round_trips() {
+        let mut tx = central();
+        tx.enable_tx();
+        let mut wire = [0; MAX_ENCRYPTED];
+        let plaintext = [0x5a; MAX_PLAINTEXT];
+        let len = tx.encrypt(0x02, &plaintext, &mut wire).unwrap();
+        assert_eq!(len, MAX_ENCRYPTED);
+        assert_eq!(len, 251);
+        let mut rx = peripheral();
+        rx.enable_rx();
+        let mut plain = [0; MAX_PLAINTEXT];
+        assert_eq!(rx.decrypt(0x02, &wire[..len], &mut plain), Ok(247));
+        assert_eq!(&plain, &plaintext);
     }
 
     #[test]

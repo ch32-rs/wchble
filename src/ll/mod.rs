@@ -5,6 +5,7 @@ pub mod adv;
 pub mod central;
 pub mod conn;
 pub mod ctrl;
+pub mod dle;
 pub mod enc;
 pub mod scan;
 

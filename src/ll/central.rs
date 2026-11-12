@@ -5,11 +5,11 @@
 //! peripheral object, a received packet never moves the anchor; it only
 //! refreshes supervision and establishes the link.
 
-use super::acl::MAX_LEGACY_PAYLOAD;
 use super::conn::{
     time_reached, validate_instant, ChannelSelection, ChannelSelectionAlgorithm, ConnError,
     ConnectParams, ConnectionUpdate, LinkTiming,
 };
+use super::dle::{LL_DEFAULT_RX_PAYLOAD, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD};
 
 /// One central link, independent of radio registers and packet buffers.
 /// All timestamps are wrapping microseconds. Call `next_event` for every
@@ -19,6 +19,7 @@ pub struct CentralConnection {
     pub params: ConnectParams,
     csa: ChannelSelection,
     channel: u8,
+    rx_max_payload: u16,
     event_counter: u16,
     event_start_us: u32,
     connect_end_us: u32,
@@ -52,6 +53,7 @@ impl CentralConnection {
             params,
             csa,
             channel,
+            rx_max_payload: LL_DEFAULT_RX_PAYLOAD,
             event_counter: 0,
             event_start_us: connect_ind_end_us
                 .wrapping_add(1250 + u32::from(params.win_offset) * 1250),
@@ -77,6 +79,16 @@ impl CentralConnection {
 
     pub fn channel_selection_algorithm(&self) -> ChannelSelectionAlgorithm {
         self.csa.algorithm()
+    }
+
+    /// Largest on-air PDU payload accepted from the peer, MIC included.
+    pub fn rx_max_payload(&self) -> u16 {
+        self.rx_max_payload
+    }
+
+    /// Apply the negotiated receive limit after DLE completed.
+    pub fn set_rx_max_payload(&mut self, octets: u16) {
+        self.rx_max_payload = octets.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
     }
 
     pub fn event_counter(&self) -> u16 {
@@ -118,7 +130,7 @@ impl CentralConnection {
     /// unchanged; the central's own schedule defines it.
     pub fn on_rx(&mut self, rx_done_us: u32, payload_len: u8, crc_ok: bool) -> bool {
         if !crc_ok
-            || usize::from(payload_len) > MAX_LEGACY_PAYLOAD
+            || usize::from(payload_len) > usize::from(self.rx_max_payload)
             || self.supervision_expired(rx_done_us)
         {
             return false;

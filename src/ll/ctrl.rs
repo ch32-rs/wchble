@@ -6,6 +6,7 @@
 //! radio owner must sequence those exchanges, so they are driven explicitly.
 
 use super::conn::{le16, ConnError, ConnectionUpdate, LinkTiming};
+use super::dle::{DataLength, LengthParams};
 
 /// Subset of LL Control opcodes used during bring-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub enum LlCtrlOpcode {
     ConnectionParamReq = 0x0f,
     ConnectionParamRsp = 0x10,
     RejectExtInd = 0x11,
+    LengthReq = 0x14,
+    LengthRsp = 0x15,
 }
 
 /// Identity must be supplied by the application, not copied from a vendor
@@ -99,10 +102,28 @@ impl ControlPdu {
         ])
     }
 
+    pub fn feature_req() -> Self {
+        Self::new(&[LlCtrlOpcode::FeatureReq as u8])
+    }
+
     pub fn feature_rsp(features: [u8; 8]) -> Self {
         let mut bytes = [0; 9];
         bytes[0] = LlCtrlOpcode::FeatureRsp as u8;
         bytes[1..9].copy_from_slice(&features);
+        Self::new(&bytes)
+    }
+
+    pub fn length_req(params: LengthParams) -> Self {
+        let mut bytes = [0; 9];
+        bytes[0] = LlCtrlOpcode::LengthReq as u8;
+        bytes[1..9].copy_from_slice(&params.clamped().to_octets());
+        Self::new(&bytes)
+    }
+
+    pub fn length_rsp(params: LengthParams) -> Self {
+        let mut bytes = [0; 9];
+        bytes[0] = LlCtrlOpcode::LengthRsp as u8;
+        bytes[1..9].copy_from_slice(&params.clamped().to_octets());
         Self::new(&bytes)
     }
 
@@ -247,7 +268,10 @@ pub struct ControlState {
     /// Feature bits this controller build implements. Bit 0 (LE Encryption)
     /// must be set by an RF owner that drives the start-encryption procedure.
     pub local_features: [u8; 8],
+    /// DLE negotiation state for this link.
+    pub data_length: DataLength,
     version_sent: bool,
+    feature_req_sent: bool,
     termination_deadline_us: Option<u32>,
 }
 
@@ -257,9 +281,46 @@ impl ControlState {
             peer_version: None,
             peer_features: None,
             local_features: [0; 8],
+            data_length: DataLength::new(),
             version_sent: false,
+            feature_req_sent: false,
             termination_deadline_us: None,
         }
+    }
+
+    /// Queue `LL_FEATURE_REQ` once, but only while the peer's feature set is
+    /// still unknown. Terminal responses are recorded in `on_pdu`.
+    pub fn feature_request(&mut self) -> Option<ControlPdu> {
+        if self.peer_features.is_some() || self.feature_req_sent {
+            return None;
+        }
+        self.feature_req_sent = true;
+        Some(ControlPdu::feature_req())
+    }
+
+    /// Send one `LL_LENGTH_REQ` with the current local limits.
+    pub fn length_request(&mut self) -> ControlPdu {
+        self.data_length.mark_requested();
+        ControlPdu::length_req(self.data_length.local_params())
+    }
+
+    /// Start DLE when both sides advertise it and no request is outstanding.
+    /// The caller decides when the link is idle enough to send it.
+    pub fn request_length_if_supported(&mut self) -> Option<ControlPdu> {
+        if self.data_length.requested() {
+            return None;
+        }
+        let peer = self.peer_features?;
+        if self.local_features[0] & (1 << FEATURE_LE_DATA_LENGTH_EXTENSION) == 0
+            || peer[0] & (1 << FEATURE_LE_DATA_LENGTH_EXTENSION) == 0
+        {
+            return None;
+        }
+        Some(self.length_request())
+    }
+
+    fn dle_enabled(&self) -> bool {
+        self.local_features[0] & (1 << FEATURE_LE_DATA_LENGTH_EXTENSION) != 0
     }
 
     /// Start when local termination is requested, even if an older PDU is still
@@ -355,9 +416,28 @@ impl ControlState {
                 exact_len(payload, 3)?; // LL_REJECT_EXT_IND.
                 return Ok(ControlAction::None);
             }
-            // Unsupported encryption, connection parameter request, DLE, PHY,
-            // and future opcodes are explicitly reported as unknown. Never
-            // fake an encryption response or negotiate a larger data length.
+            0x14 => {
+                if !self.dle_enabled() {
+                    return Ok(ControlAction::Reply(ControlPdu::unknown(0x14)));
+                }
+                exact_len(payload, 9)?;
+                let peer = LengthParams::from_octets(&payload[1..9]).ok_or(ConnError::Length)?;
+                let rsp = self.data_length.on_peer_length(peer);
+                self.data_length.mark_requested();
+                ControlPdu::length_rsp(rsp)
+            }
+            0x15 => {
+                if !self.dle_enabled() {
+                    return Ok(ControlAction::Reply(ControlPdu::unknown(0x15)));
+                }
+                exact_len(payload, 9)?;
+                let peer = LengthParams::from_octets(&payload[1..9]).ok_or(ConnError::Length)?;
+                self.data_length.on_peer_length(peer);
+                return Ok(ControlAction::None);
+            }
+            // Unsupported encryption, connection parameter request, PHY and
+            // future opcodes are explicitly reported as unknown. Never fake an
+            // encryption response or acknowledge an unimplemented request.
             _ => ControlPdu::unknown(opcode),
         };
         Ok(ControlAction::Reply(reply))
@@ -533,10 +613,107 @@ mod tests {
     }
 
     #[test]
+    fn dle_requests_and_responses_round_trip() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
+        // Peer request: 251 octets / 2120 us in both directions.
+        let req = [0x14, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08];
+        let rsp = reply(ctrl.on_pdu(&mut c, &req, LOCAL).unwrap());
+        assert_eq!(rsp.as_bytes().len(), 9);
+        assert_eq!(
+            rsp.as_bytes(),
+            &[0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+        );
+        assert!(ctrl.data_length.negotiated());
+        assert!(ctrl.data_length.requested());
+        assert_eq!(ctrl.data_length.tx_octets(), 251);
+        assert_eq!(ctrl.data_length.rx_octets(), 251);
+        // A peer-initiated exchange is complete; do not send our own request.
+        assert_eq!(ctrl.request_length_if_supported(), None);
+
+        // A response to a request we sent applies the peer's limits.
+        ctrl.data_length = DataLength::new();
+        ctrl.data_length.mark_requested();
+        let rsp = [0x15, 0x41, 0, 0x50, 0x03, 0x41, 0, 0x50, 0x03];
+        assert_eq!(ctrl.on_pdu(&mut c, &rsp, LOCAL), Ok(ControlAction::None));
+        assert_eq!(ctrl.data_length.tx_octets(), 65);
+        assert_eq!(ctrl.data_length.rx_octets(), 65);
+    }
+
+    #[test]
+    fn dle_lengths_are_clamped_and_bad_lengths_rejected() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
+        let huge = [0x14, 0xe8, 0x03, 0x01, 0x00, 0xe8, 0x03, 0x01, 0x00];
+        let rsp = reply(ctrl.on_pdu(&mut c, &huge, LOCAL).unwrap());
+        // The response carries our own limits (251 octets, 2120 us); the
+        // peer's 1000 octets are clamped before they cap our TX/RX.
+        assert_eq!(
+            rsp.as_bytes(),
+            &[0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+        );
+        assert_eq!(ctrl.data_length.rx_octets(), 251);
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
+        assert_eq!(ctrl.on_pdu(&mut c, &[0x14], LOCAL), Err(ConnError::Length));
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x15, 0, 0, 0, 0, 0, 0, 0], LOCAL),
+            Err(ConnError::Length)
+        );
+    }
+
+    #[test]
+    fn dle_is_not_advertised_or_accepted_without_the_feature_bit() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = [0; 8];
+        let req = [0x14, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08];
+        assert_eq!(
+            reply(ctrl.on_pdu(&mut c, &req, LOCAL).unwrap()).as_bytes(),
+            &[0x07, 0x14]
+        );
+        let rsp = [0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08];
+        assert_eq!(
+            reply(ctrl.on_pdu(&mut c, &rsp, LOCAL).unwrap()).as_bytes(),
+            &[0x07, 0x15]
+        );
+        assert!(!ctrl.data_length.negotiated());
+    }
+
+    #[test]
+    fn dle_starts_only_after_the_peer_features_are_known() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
+        assert_eq!(ctrl.request_length_if_supported(), None);
+        let feature_req = ctrl.feature_request().unwrap();
+        assert_eq!(feature_req.as_bytes(), &[0x08]);
+        assert_eq!(ctrl.feature_request(), None);
+        // Peer answers without DLE.
+        ctrl.on_pdu(&mut c, &[9, 0, 0, 0, 0, 0, 0, 0, 0], LOCAL)
+            .unwrap();
+        assert_eq!(ctrl.request_length_if_supported(), None);
+        // Peer answers with DLE; the request now goes out exactly once.
+        let mut ctrl = ControlState::new();
+        ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
+        ctrl.on_pdu(&mut c, &[9, 0x20, 0, 0, 0, 0, 0, 0, 0], LOCAL)
+            .unwrap();
+        let req = ctrl.request_length_if_supported().unwrap();
+        assert_eq!(req.as_bytes()[0], 0x14);
+        assert_eq!(
+            &req.as_bytes()[1..],
+            &[0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+        );
+        assert_eq!(ctrl.request_length_if_supported(), None);
+    }
+
+    #[test]
     fn unsupported_features_receive_unknown_not_fake_success() {
         let mut c = connection();
         let mut ctrl = ControlState::new();
-        for opcode in [0x03, 0x0f, 0x12, 0x14, 0x16, 0xff] {
+        for opcode in [0x03, 0x0f, 0x12, 0x14, 0x15, 0x16, 0xff] {
             let response = reply(ctrl.on_pdu(&mut c, &[opcode], LOCAL).unwrap());
             assert_eq!(response.as_bytes(), &[0x07, opcode]);
         }

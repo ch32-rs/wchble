@@ -18,6 +18,7 @@ use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::conn::{ConnectParams, PeripheralConnection};
 use wchble::ll::ctrl::{
     feature_bits, ControlAction, ControlPdu, ControlState, LocalVersion, FEATURE_LE_CSA2,
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
 };
 #[cfg(feature = "secure")]
 use wchble::ll::ctrl::FEATURE_LE_ENCRYPTION;
@@ -93,9 +94,16 @@ const SEC_PREPARED: usize = 13;
 const SEC_LAST_ERROR: usize = 15;
 
 #[cfg(feature = "secure")]
-const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_ENCRYPTION, FEATURE_LE_CSA2]);
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[
+    FEATURE_LE_ENCRYPTION,
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
+    FEATURE_LE_CSA2,
+]);
 #[cfg(not(feature = "secure"))]
-const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_CSA2]);
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
+    FEATURE_LE_CSA2,
+]);
 
 fn put(i: usize, v: u32) {
     unsafe {

@@ -17,11 +17,17 @@ use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::central::CentralConnection;
 use wchble::ll::conn::ConnectParams;
-use wchble::ll::ctrl::{feature_bits, ControlAction, ControlState, LocalVersion, FEATURE_LE_CSA2};
+use wchble::ll::ctrl::{
+    feature_bits, ControlAction, ControlState, LocalVersion, FEATURE_LE_CSA2,
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
+};
 use wchble::ll::scan;
 
-/// CSA #2 only: this example does not drive encryption or the DLE procedure.
-const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_CSA2]);
+/// CSA #2 and DLE; this example does not drive encryption.
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
+    FEATURE_LE_CSA2,
+]);
 use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE};
 use wchble::rf::regs::{self, bb, bb_irq, lle};
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
