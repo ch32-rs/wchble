@@ -13,7 +13,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use probe_rs::flashing::{
-    download_file_with_options, DownloadOptions, ElfLoader, ElfOptions, HexLoader,
+    download_file_with_options, DownloadOptions, ElfLoader, ElfOptions, FlashProgress, Flasher,
+    HexLoader,
 };
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbeSelector, WireProtocol};
@@ -60,25 +61,75 @@ fn shut_down(core: &mut probe_rs::Core<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// What the single probe session does after the RF shutdown check.
+enum Action {
+    /// Download an image and start it.
+    Download(String),
+    /// Reset and start the image already in flash. This is a debug reset, not
+    /// a power cycle: RAM is cleared, DataFlash is retained either way.
+    Reset,
+    /// Read DataFlash through the target's `pc_read` algorithm. Direct bus
+    /// reads return the sentinel `0xF3F9BDA9`, so this must use the flasher.
+    Dump {
+        path: String,
+        address: u64,
+        length: usize,
+    },
+}
+
 fn run() -> Result<(), (u8, String)> {
     let mut args = std::env::args().skip(1);
     let mut selector = None;
     let mut target = None;
     let mut protocol = None;
-    let mut elf = None;
+    let mut image = None;
     let mut verify = false;
+    let mut reset = false;
+    let mut dump = None;
+    let mut dataflash_address = 0x0007_7E00u64;
+    let mut dataflash_length = 0x200usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--probe" => selector = args.next(),
             "--chip" => target = args.next(),
             "--protocol" => protocol = args.next(),
             "--verify" => verify = true,
-            other => elf = Some(other.to_owned()),
+            "--reset" => reset = true,
+            "--dump-dataflash" => dump = args.next(),
+            "--dataflash-addr" => {
+                let raw = args.next().ok_or((2, "missing --dataflash-addr".into()))?;
+                dataflash_address = u64::from_str_radix(
+                    raw.trim_start_matches("0x").trim_start_matches("0X"),
+                    16,
+                )
+                .map_err(|e| (2, format!("invalid --dataflash-addr: {e}")))?;
+            }
+            "--dataflash-len" => {
+                let raw = args.next().ok_or((2, "missing --dataflash-len".into()))?;
+                dataflash_length = raw
+                    .parse()
+                    .map_err(|e| (2, format!("invalid --dataflash-len: {e}")))?;
+            }
+            other => image = Some(other.to_owned()),
         }
     }
     let selector = selector.ok_or((2, "missing --probe".into()))?;
     let target = target.ok_or((2, "missing --chip".into()))?;
-    let image = elf.ok_or((2, "missing image path".into()))?;
+    let action = match (reset, dump, image) {
+        (true, None, None) => Action::Reset,
+        (false, Some(path), None) => Action::Dump {
+            path,
+            address: dataflash_address,
+            length: dataflash_length,
+        },
+        (false, None, Some(image)) => Action::Download(image),
+        _ => {
+            return Err((
+                2,
+                "use exactly one of an image, --reset or --dump-dataflash".into(),
+            ))
+        }
+    };
 
     let selector: DebugProbeSelector = selector
         .parse()
@@ -107,6 +158,51 @@ fn run() -> Result<(), (u8, String)> {
         shut_down(&mut core).map_err(|e| (3, e))?;
     }
 
+    if let Action::Dump {
+        path,
+        address,
+        length,
+    } = &action
+    {
+        let target = session.target().clone();
+        let raw = target
+            .flash_algorithms
+            .iter()
+            .find(|algorithm| algorithm.name == "ch5xx-data-flash")
+            .ok_or((4, "target has no ch5xx-data-flash algorithm".into()))?
+            .clone();
+        let mut flasher =
+            Flasher::new(&target, 0, &raw).map_err(|e| (4, format!("flasher: {e:?}")))?;
+        let mut progress = FlashProgress::empty();
+        let mut data = vec![0u8; *length];
+        flasher
+            .run_verify(&mut session, &mut progress, |active, _| {
+                active.read_flash(*address, &mut data)
+            })
+            .map_err(|e| (4, format!("read DataFlash: {e:?}")))?;
+        std::fs::write(path, &data).map_err(|e| (4, format!("write {path}: {e}")))?;
+        let non_empty = data
+            .iter()
+            .position(|&byte| byte != 0xFF)
+            .map_or("empty".to_owned(), |offset| format!("first used byte +{offset:#x}"));
+        println!(
+            "preflight: dumped {length} bytes at {address:#x} to {path} ({non_empty})"
+        );
+        return Ok(());
+    }
+
+    if matches!(action, Action::Reset) {
+        let mut core = session.core(0).map_err(|e| (5, format!("core0: {e}")))?;
+        core.reset_and_halt(Duration::from_secs(2))
+            .map_err(|e| (5, format!("reset: {e}")))?;
+        core.run().map_err(|e| (5, format!("start: {e}")))?;
+        println!("preflight: reset and started the image in flash (no download)");
+        return Ok(());
+    }
+
+    let Action::Download(image) = action else {
+        unreachable!("dump and reset returned above");
+    };
     let mut options = DownloadOptions::default();
     options.verify = verify;
     let download_started = Instant::now();

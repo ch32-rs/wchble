@@ -63,6 +63,8 @@ ch595 = []
 controller = ["dep:bt-hci", "dep:embassy-sync", "dep:embedded-io"]
 # PHY scheduler helpers (can be used without full controller).
 phy = []
+# Test-only: let the storage layer inject a truncated program.
+storage-fault = []
 defmt = ["dep:defmt", "bt-hci?/defmt"]
 
 [lib]

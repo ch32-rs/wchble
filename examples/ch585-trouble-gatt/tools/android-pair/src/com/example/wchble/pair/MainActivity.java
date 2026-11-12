@@ -42,14 +42,18 @@ public class MainActivity extends Activity {
     private String targetName = "wch585-p4";
     private static final UUID SERVICE = UUID.fromString("00001000-b0cd-11ec-871f-d45ddf138840");
     private static final UUID VALUE = UUID.fromString("00001001-b0cd-11ec-871f-d45ddf138840");
+    private static final UUID CONTROL = UUID.fromString("00001002-b0cd-11ec-871f-d45ddf138840");
     private static final int WRITE_VALUE = 0x2b;
     private static final int TIMEOUT_MS = 45_000;
+    // `--es mode` selects the S3 acceptance phase. `pair` is the S2 flow.
+    private String mode = "pair";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter;
     private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic valueCharacteristic;
+    private BluetoothGattCharacteristic controlCharacteristic;
     private String targetAddress;
     private boolean scanning;
     private boolean bonding;
@@ -58,6 +62,7 @@ public class MainActivity extends Activity {
     private boolean started;
     private boolean writeSent;
     private boolean verifyRead;
+    private boolean controlWrite;
     private boolean done;
     private int reads;
     private int scanReports;
@@ -172,15 +177,34 @@ public class MainActivity extends Activity {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 if (!bonding) {
                     bonding = true;
-                    // Differential runs reconnect to a device that is already
-                    // bonded; there is no BOND_BONDED broadcast then, but the
-                    // controller still runs the LL encryption procedure.
-                    if (g.getDevice().getBondState() == BluetoothDevice.BOND_BONDED) {
+                    boolean peerBonded =
+                            g.getDevice().getBondState() == BluetoothDevice.BOND_BONDED;
+                    if (peerBonded) {
                         bonded = true;
                         logEvent("\"event\":\"already_bonded\"");
                     }
-                    boolean requested = g.getDevice().createBond();
-                    logEvent("\"event\":\"bond_requested\",\"ok\":%s", requested);
+                    if ("wipe".equals(mode)) {
+                        // Setup phase: the control write needs no encryption,
+                        // so it works even when the Host still holds a stale
+                        // bond this phone cannot use.
+                        logEvent("\"event\":\"control_only\"");
+                    } else if ("reconnect".equals(mode)) {
+                        // The whole point of S3: the controller must resume
+                        // the stored keys, so never ask for a new bond here.
+                        if (!peerBonded) {
+                            finishRun(false, "reconnect_not_bonded");
+                            return;
+                        }
+                    } else if (!peerBonded) {
+                        if (!"pair".equals(mode)) {
+                            // delete/fault act on the bond this phone and the
+                            // Host already share.
+                            finishRun(false, "not_bonded");
+                            return;
+                        }
+                        boolean requested = g.getDevice().createBond();
+                        logEvent("\"event\":\"bond_requested\",\"ok\":%s", requested);
+                    }
                 }
                 if (!g.discoverServices()) {
                     finishRun(false, "discover_failed");
@@ -196,21 +220,22 @@ public class MainActivity extends Activity {
         public void onServicesDiscovered(BluetoothGatt g, int status) {
             BluetoothGattService service = g.getService(SERVICE);
             BluetoothGattCharacteristic characteristic = service == null ? null : service.getCharacteristic(VALUE);
-            logEvent("\"event\":\"services_discovered\",\"status\":%d,\"service\":%s,\"characteristic\":%s",
-                    status, service != null, characteristic != null);
-            if (status != BluetoothGatt.GATT_SUCCESS || characteristic == null) {
+            BluetoothGattCharacteristic control = service == null ? null : service.getCharacteristic(CONTROL);
+            logEvent("\"event\":\"services_discovered\",\"status\":%d,\"service\":%s,\"characteristic\":%s,"
+                            + "\"control\":%s",
+                    status, service != null, characteristic != null, control != null);
+            boolean controlOnly = "wipe".equals(mode);
+            if (status != BluetoothGatt.GATT_SUCCESS
+                    || (controlOnly ? control == null : characteristic == null)) {
                 // Differential mode: a vendor peripheral serves other GATT
                 // services, so this run only proves the pairing/encryption
                 // transcript. Wait for the bond, then pass on that alone.
                 serviceMissing = true;
-                if (bonded) {
-                    finishRun(true, "paired_no_service");
-                } else {
-                    maybeStartGatt();
-                }
+                maybeStartGatt();
                 return;
             }
             valueCharacteristic = characteristic;
+            controlCharacteristic = control;
             discovered = true;
             maybeStartGatt();
         }
@@ -235,13 +260,22 @@ public class MainActivity extends Activity {
             }
             if (verifyRead) {
                 if (value == WRITE_VALUE) {
-                    finishRun(true, "encrypted_read_write_ok");
+                    finishRun(true, reason());
                 } else {
                     finishRun(false, "verify_mismatch");
                 }
                 return;
             }
-            // First read proves encrypted access; then write and read back.
+            // First read proves encrypted access. Control modes then send the
+            // bond command; the S2 flow writes the value and reads it back.
+            if (isControlMode()) {
+                controlWrite = true;
+                logEvent("\"event\":\"control_write\",\"command\":\"%s\"", controlName());
+                if (!writeControl()) {
+                    finishRun(false, "write_start_failed");
+                }
+                return;
+            }
             characteristic.setValue(le32(WRITE_VALUE));
             characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
             writeSent = g.writeCharacteristic(characteristic);
@@ -259,6 +293,10 @@ public class MainActivity extends Activity {
                 finishRun(false, "write_failed");
                 return;
             }
+            if (controlWrite) {
+                finishRun(true, reason());
+                return;
+            }
             verifyRead = true;
             if (!g.readCharacteristic(characteristic)) {
                 finishRun(false, "verify_read_start_failed");
@@ -274,6 +312,15 @@ public class MainActivity extends Activity {
         if (requestedTarget != null && !requestedTarget.isEmpty()) {
             targetName = requestedTarget;
         }
+        String requestedMode = getIntent().getStringExtra("mode");
+        if (requestedMode != null) {
+            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault")) {
+                finishRun(false, "unknown_mode");
+                return;
+            }
+            mode = requestedMode;
+        }
+        logEvent("\"event\":\"mode\",\"mode\":\"%s\"", mode);
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             finishRun(false, "permissions_missing");
@@ -316,15 +363,35 @@ public class MainActivity extends Activity {
     }
 
     private void maybeStartGatt() {
-        if (done || started || !bonded) {
+        if (done || started) {
             return;
         }
         if (serviceMissing) {
-            started = true;
-            finishRun(true, "paired_no_service");
+            boolean s3Run = isControlMode() || "reconnect".equals(mode);
+            if (s3Run) {
+                started = true;
+                finishRun(false, "service_missing");
+            } else if (bonded) {
+                started = true;
+                finishRun(true, "paired_no_service");
+            }
             return;
         }
-        if (!discovered || valueCharacteristic == null) {
+        if ("wipe".equals(mode)) {
+            // Setup only: no encrypted access is possible yet, so go straight
+            // to the control write once discovery succeeded.
+            if (!discovered || controlCharacteristic == null) {
+                return;
+            }
+            started = true;
+            controlWrite = true;
+            logEvent("\"event\":\"control_start\",\"command\":\"%s\"", controlName());
+            if (!writeControl()) {
+                finishRun(false, "write_start_failed");
+            }
+            return;
+        }
+        if (!bonded || !discovered || valueCharacteristic == null) {
             return;
         }
         started = true;
@@ -332,6 +399,60 @@ public class MainActivity extends Activity {
         if (!gatt.readCharacteristic(valueCharacteristic)) {
             finishRun(false, "read_start_failed");
         }
+    }
+
+    /** delete/wipe/fault talk to the bond control characteristic. */
+    private boolean isControlMode() {
+        return "delete".equals(mode) || "wipe".equals(mode) || "fault".equals(mode);
+    }
+
+    /** Summary reason the runner matches for this mode. */
+    private String reason() {
+        switch (mode) {
+            case "reconnect":
+                return "reconnect_encrypted_read_write_ok";
+            case "delete":
+                return "bond_delete_ok";
+            case "wipe":
+                return "bond_wipe_ok";
+            case "fault":
+                return "fault_injected_ok";
+            default:
+                return "encrypted_read_write_ok";
+        }
+    }
+
+    private String controlName() {
+        switch (mode) {
+            case "wipe":
+                return "WIPE";
+            case "delete":
+                return "DEL!";
+            case "fault":
+                return "FALT";
+            default:
+                return "";
+        }
+    }
+
+    private int controlCommand() {
+        return le32Of(controlName());
+    }
+
+    private static int le32Of(String text) {
+        return (text.charAt(0) & 0xff) | ((text.charAt(1) & 0xff) << 8)
+                | ((text.charAt(2) & 0xff) << 16) | ((text.charAt(3) & 0xff) << 24);
+    }
+
+    private boolean writeControl() {
+        if (controlCharacteristic == null) {
+            return false;
+        }
+        controlCharacteristic.setValue(le32(controlCommand()));
+        controlCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        boolean sent = gatt.writeCharacteristic(controlCharacteristic);
+        logEvent("\"event\":\"write_requested\",\"ok\":%s,\"value\":%d", sent, controlCommand());
+        return sent;
     }
 
     private int valueOf(BluetoothGattCharacteristic characteristic) {

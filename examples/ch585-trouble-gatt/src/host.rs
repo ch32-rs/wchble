@@ -36,11 +36,29 @@ pub const UART_CHARACTERISTIC_UUID_TEXT: &str = "6e400002-b5a3-f393-e0a9-e50e24d
 // P5 changes the service database, so use a new static identity. iOS caches a
 // peer's GATT database by address and can otherwise keep the P4 layout.
 //
-// `main` rotates the least-significant octet from measured entropy before the
-// Host starts: a peer that bonded an earlier boot would otherwise insist on
-// its stored LTK, and this firmware deliberately has no bond store, so every
-// S2 acceptance run must present itself as a new device.
-pub const RANDOM_ADDRESS: [u8; 6] = [0x15, 0x00, 0x00, 0xee, 0xff, 0xc1];
+// S3 fixes the address instead of rotating it per boot: the bond store keeps
+// the peer's LTK, so a later boot has to present the same identity for the
+// phone to reuse its bond. A phone that still holds a bond from the rotation
+// era must forget it once.
+pub const RANDOM_ADDRESS: [u8; 6] = [0x16, 0x00, 0x00, 0xee, 0xff, 0xc1];
+
+/// Bond capacity of the Host. Matches `storage::bond::MAX_BONDS` so the stored
+/// list always fits the Host's in-memory table.
+#[cfg(feature = "secure")]
+const BOND_CAPACITY: usize = crate::bond::MAX_BONDS;
+#[cfg(not(feature = "secure"))]
+const BOND_CAPACITY: usize = 10;
+
+/// Access level for the value characteristic.
+#[cfg(feature = "secure")]
+const VALUE_PERMISSION: PermissionLevel = PermissionLevel::EncryptionRequired;
+#[cfg(not(feature = "secure"))]
+const VALUE_PERMISSION: PermissionLevel = PermissionLevel::Allowed;
+
+/// Test-only delete/wipe/fault command characteristic (secure build only).
+#[cfg(feature = "secure")]
+pub const BOND_CONTROL_UUID: Uuid =
+    Uuid::new_long(0x00001002_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
 
 pub const HOST_STATS_WORDS: usize = 16;
 pub const STAT_PHASE: usize = 0;
@@ -165,15 +183,45 @@ pub async fn run(
 ) -> ! {
     stats.phase(PHASE_STARTING);
     // One connection; ATT and the LE signaling channel, with no dynamic channels.
-    let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
+    let mut resources: HostResources<DefaultPacketPool, 1, 2, 1, BOND_CAPACITY> =
+        HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(Address::random(address))
         .build();
+    // Restore bonds before advertising: the stack answers a peer's LTK request
+    // from this table, so a rebooted device can resume encryption instead of
+    // pairing again.
+    #[cfg(feature = "secure")]
+    for record in crate::bond::boot_bonds() {
+        match stack.add_bond_information(crate::bond::to_bond(record)) {
+            Ok(()) => crate::bond::bump(crate::bond::STAT_ADD_BOND_OK),
+            Err(_) => crate::bond::bump(crate::bond::STAT_ADD_BOND_FAIL),
+        }
+    }
+    // Remove every in-memory bond; the RF owner erases the flash copy after
+    // the Host has dropped them.
+    #[cfg(feature = "secure")]
+    let remove_all_bonds = || {
+        let identities = stack.with_bond_information(|bonds| {
+            let mut list = heapless::Vec::<Identity, BOND_CAPACITY>::new();
+            for bond in bonds {
+                let _ = list.push(bond.identity);
+            }
+            list
+        });
+        for identity in identities {
+            if stack.remove_bond_information(identity).is_ok() {
+                crate::bond::bump(crate::bond::STAT_IN_MEMORY_REMOVED);
+            }
+        }
+    };
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
     let appearance = [0u8, 0];
     let mut storage = [0u8; 4];
+    #[cfg(feature = "secure")]
+    let mut control_storage = [0u8; 4];
     let mut uart_rx_storage = [0u8; 64];
     let mut uart_tx_storage = [0u8; 64];
     let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
@@ -191,8 +239,10 @@ pub async fn run(
     info.add_characteristic_ro(0x2a26u16, "p5-0.1");
     info.build();
 
-    let value: Characteristic<u32> = table
-        .add_service(Service::new(SERVICE_UUID))
+    let mut vendor = table.add_service(Service::new(SERVICE_UUID));
+    // S3: the secure build refuses unencrypted reads and writes instead of
+    // trusting the peer to pair first.
+    let value: Characteristic<u32> = vendor
         .add_characteristic(
             VALUE_UUID,
             &[
@@ -203,7 +253,24 @@ pub async fn run(
             0u32,
             &mut storage,
         )
+        .read_permission(VALUE_PERMISSION)
+        .write_permission(VALUE_PERMISSION)
         .build();
+
+    // S3 acceptance commands: `DEL!` removes the bond and writes a tombstone,
+    // `WIPE` erases both slots, `FALT` truncates the next save. This is a test
+    // control, not part of a product profile; it is deliberately unauthenticated
+    // because the phone has to be able to erase a stale bond it cannot use.
+    #[cfg(feature = "secure")]
+    let control: Characteristic<[u8; 4]> = vendor
+        .add_characteristic(
+            BOND_CONTROL_UUID,
+            &[CharacteristicProp::Write],
+            [0u8; 4],
+            &mut control_storage,
+        )
+        .build();
+    vendor.build();
 
     // UART pipe: writes to RX are echoed as notifications on TX.
     let mut uart = table.add_service(Service::new(UART_SERVICE_UUID));
@@ -350,6 +417,8 @@ pub async fn run(
                     GattConnectionEvent::Gatt { event } => {
                         let mut wrote_value = false;
                         let mut wrote_uart = false;
+                        #[cfg(feature = "secure")]
+                        let mut wrote_control = false;
                         #[cfg(any(feature = "conn-params-30", feature = "conn-params-48"))]
                         let is_write = matches!(&event, GattEvent::Write(_));
                         match &event {
@@ -362,12 +431,37 @@ pub async fn run(
                             GattEvent::Write(event) if event.handle() == uart_rx.handle => {
                                 wrote_uart = true;
                             }
+                            #[cfg(feature = "secure")]
+                            GattEvent::Write(event) if event.handle() == control.handle => {
+                                wrote_control = true;
+                            }
                             _ => stats.inc(STAT_OTHER),
                         }
                         // Discovery, MTU exchange and CCCD events also need replies.
                         match event.accept() {
                             Ok(reply) => reply.send().await,
                             Err(_) => fatal(stats, 7).await,
+                        }
+                        #[cfg(feature = "secure")]
+                        if wrote_control {
+                            let command = match connection.get(&control) {
+                                Ok(command) => command,
+                                Err(_) => fatal(stats, 17).await,
+                            };
+                            crate::bond::bump(crate::bond::STAT_CONTROL_WRITES);
+                            match &command {
+                                b"DEL!" => {
+                                    crate::bond::bump(crate::bond::STAT_CLEAR_REQUESTS);
+                                    remove_all_bonds();
+                                    crate::bond::signals().delete.set(true);
+                                }
+                                b"WIPE" => {
+                                    remove_all_bonds();
+                                    crate::bond::signals().wipe.set(true);
+                                }
+                                b"FALT" => crate::bond::signals().fault.set(true),
+                                _ => crate::bond::bump(crate::bond::STAT_MALFORMED_CONTROL_WRITES),
+                            }
                         }
                         // Test-only: after discovery settles, ask for one fixed
                         // interval over the LE signaling channel (L2CAP 0x12).
@@ -434,11 +528,26 @@ pub async fn run(
                         }
                     }
                     #[cfg(feature = "secure")]
-                    GattConnectionEvent::PairingComplete { .. } => {
+                    GattConnectionEvent::PairingComplete { bond, .. } => {
                         // Pairing Complete can arrive after Encryption Change;
                         // the encrypted state is the stronger fact.
                         if stats.word(STAT_SECURITY) != SECURITY_ENCRYPTED {
                             stats.set(STAT_SECURITY, SECURITY_PAIRED);
+                        }
+                        if let Some(bond) = bond {
+                            // Trouble already inserted it; hand the full list to
+                            // the RF owner, which persists it between events.
+                            crate::bond::echo(&bond);
+                            let snapshot = stack.with_bond_information(|bonds| {
+                                let mut list = crate::bond::BondSnapshot::new();
+                                for entry in bonds {
+                                    let _ = list.push(entry.clone());
+                                }
+                                list
+                            });
+                            crate::bond::signals().set_pending(snapshot);
+                        } else {
+                            crate::bond::bump(crate::bond::STAT_PAIRS_WITHOUT_BOND);
                         }
                     }
                     #[cfg(feature = "secure")]

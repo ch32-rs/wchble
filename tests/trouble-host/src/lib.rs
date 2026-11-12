@@ -273,11 +273,7 @@ mod tests {
     fn real_host_discovery_read_write_notify_and_reconnect() {
         // The transport is process-global: keep the whole lifecycle in one test.
         let stats = host::HostStats::new();
-        let mut future = pin!(host::run(
-            wchble::hci::new(),
-            &stats,
-            host::RANDOM_ADDRESS
-        ));
+        let mut future = pin!(host::run(wchble::hci::new(), &stats, host::RANDOM_ADDRESS));
         let mut fixture = Fixture {
             host: future.as_mut(),
             stats: &stats,

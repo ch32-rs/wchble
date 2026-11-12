@@ -35,6 +35,7 @@ use crate::rf::regs::{self, bb, bb_irq, lle, rfend};
 use crate::rf::timing::{v208_rx_capture_reload_half_us, v208_tx_window_half_us};
 use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
+use crate::storage::FlashError;
 use crate::time::InstantUs;
 use crate::{Error, Result};
 
@@ -827,6 +828,302 @@ mod aes_block {
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// DataFlash (EEPROM) backend for the serial flash engine.
+///
+/// The 32 KiB region at [`DATAFLASH_START`] is separate from the 448 KiB code
+/// flash and survives image downloads, which is what makes it usable for bond
+/// storage. It is *not* memory-mapped for reads: direct bus reads return the
+/// sentinel `0xF3F9BDA9`, so every access goes through the engine commands
+/// (`0x81` erase, `0x02` program, `0x0B` read). See
+/// `/Users/mono/Repos/research/ch585-flash-algorithm-re.md` for the reverse
+/// engineering and `flash-algorithms/algos-ch5xx/ch5xx/src/data_flash.rs` for
+/// the board-tested RAM algorithm this follows.
+///
+/// The safe-access window is only a few system clocks wide, so the whole
+/// unlock → command → lock sequence runs from `.highcode` RAM with interrupts
+/// masked.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Ch585DataFlash;
+
+/// First DataFlash byte in the code address space.
+pub const DATAFLASH_START: u32 = 0x0007_0000;
+/// One past the last DataFlash byte.
+pub const DATAFLASH_END: u32 = 0x0007_8000;
+
+mod dataflash {
+    use super::{DATAFLASH_END, DATAFLASH_START};
+
+    pub(super) const PAGE_SIZE: usize = 256;
+    const FLASH_DATA: usize = 0x4000_1804;
+    const FLASH_CTRL: usize = 0x4000_1806;
+    const SAFE_ACCESS_SIG: usize = 0x4000_1040;
+    const GLOB_ROM_CFG: usize = 0x4000_1044;
+    /// `0x81` erases one DataFlash sector, `0x02` programs byte-wise and
+    /// `0x0B` reads through the engine.
+    pub(super) const CMD_ERASE_SECTOR: u8 = 0x81;
+    pub(super) const CMD_PROGRAM: u8 = 0x02;
+    pub(super) const CMD_READ: u8 = 0x0B;
+    const WAIT_SPINS: u32 = 0x80000;
+    /// Interrupt-enable bit in `mstatus`.
+    #[cfg(target_arch = "riscv32")]
+    const MSTATUS_MIE: usize = 1 << 3;
+
+    #[inline(always)]
+    unsafe fn r8(addr: usize) -> u8 {
+        unsafe { core::ptr::read_volatile(addr as *const u8) }
+    }
+
+    #[inline(always)]
+    unsafe fn w8(addr: usize, value: u8) {
+        unsafe { core::ptr::write_volatile(addr as *mut u8, value) }
+    }
+
+    #[inline(always)]
+    unsafe fn beg(command: u8) {
+        unsafe {
+            w8(FLASH_CTRL, 0);
+            w8(FLASH_CTRL, 5);
+            core::arch::asm!("nop; nop");
+            w8(FLASH_DATA, command);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn end() {
+        unsafe {
+            while (r8(FLASH_CTRL) as i8) < 0 {}
+            w8(FLASH_CTRL, 0);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn read_byte() -> u8 {
+        unsafe {
+            while (r8(FLASH_CTRL) as i8) < 0 {}
+            r8(FLASH_DATA)
+        }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn out(value: u8) {
+        unsafe {
+            while (r8(FLASH_CTRL) as i8) < 0 {}
+            w8(FLASH_DATA, value);
+        }
+    }
+
+    /// Start a non-read command at absolute address `addr`.
+    #[inline(always)]
+    pub(super) unsafe fn addr(command: u8, addr: u32) {
+        unsafe {
+            beg(6);
+            end();
+            beg(command);
+            out((addr >> 16) as u8);
+            out((addr >> 8) as u8);
+            out(addr as u8);
+        }
+    }
+
+    /// Start a read command; the engine expects the five-byte frame.
+    #[inline(always)]
+    pub(super) unsafe fn read_addr(command: u8, addr: u32) {
+        unsafe {
+            beg(command);
+            out((addr >> 16) as u8);
+            out((addr >> 8) as u8);
+            out(addr as u8);
+            out(0);
+            out(0);
+        }
+    }
+
+    /// Poll the engine until it reports completion; `false` on timeout.
+    #[inline(always)]
+    pub(super) unsafe fn wait() -> bool {
+        unsafe {
+            let mut spins = WAIT_SPINS;
+            loop {
+                end();
+                beg(5);
+                let _ = read_byte();
+                let status = read_byte();
+                end();
+                if status & 1 == 0 {
+                    return true;
+                }
+                spins -= 1;
+                if spins == 0 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Mask interrupts and report whether they were enabled. The engine
+    /// window must not be interrupted, and the sequence is short enough that
+    /// disabling them for its duration is harmless.
+    #[cfg(target_arch = "riscv32")]
+    #[inline(always)]
+    unsafe fn disable_interrupts() -> usize {
+        let mstatus: usize;
+        unsafe {
+            core::arch::asm!("csrrci {}, mstatus, 8", out(reg) mstatus);
+        }
+        mstatus & MSTATUS_MIE
+    }
+
+    #[cfg(not(target_arch = "riscv32"))]
+    #[inline(always)]
+    unsafe fn disable_interrupts() -> usize {
+        0
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    #[inline(always)]
+    unsafe fn restore_interrupts(saved: usize) {
+        if saved != 0 {
+            unsafe { core::arch::asm!("csrsi mstatus, 8") };
+        }
+    }
+
+    #[cfg(not(target_arch = "riscv32"))]
+    #[inline(always)]
+    unsafe fn restore_interrupts(_saved: usize) {}
+
+    #[inline(always)]
+    unsafe fn unlock_and_reset() {
+        unsafe {
+            w8(SAFE_ACCESS_SIG, 0x57);
+            w8(SAFE_ACCESS_SIG, 0xA8);
+            // Unconditional: this address reads back as the reset status with
+            // 0xE0 set even while the write direction is locked.
+            w8(GLOB_ROM_CFG, r8(GLOB_ROM_CFG) | 0xE0);
+            w8(SAFE_ACCESS_SIG, 0x00);
+            w8(FLASH_CTRL, 0x04);
+            beg(0xFF);
+            end();
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn lock() {
+        unsafe {
+            w8(SAFE_ACCESS_SIG, 0x57);
+            w8(SAFE_ACCESS_SIG, 0xA8);
+            w8(GLOB_ROM_CFG, r8(GLOB_ROM_CFG) & 0x10);
+            w8(SAFE_ACCESS_SIG, 0x00);
+        }
+    }
+
+    /// Run `body` inside one unlock window with interrupts masked.
+    #[inline(always)]
+    pub(super) unsafe fn unlocked<T>(body: impl FnOnce() -> T) -> T {
+        unsafe {
+            let saved = disable_interrupts();
+            unlock_and_reset();
+            let result = body();
+            lock();
+            restore_interrupts(saved);
+            result
+        }
+    }
+
+    pub(super) fn in_range(offset: u32, len: usize) -> bool {
+        let len = len as u32;
+        offset <= DATAFLASH_END - DATAFLASH_START && len <= DATAFLASH_END - DATAFLASH_START - offset
+    }
+}
+
+impl Ch585DataFlash {
+    /// Offset of the two bond slots: the last two DataFlash pages, away from
+    /// the vendor bond block at offset `0x7000`.
+    pub const BOND_SLOTS: [u32; 2] = [0x7E00, 0x7F00];
+}
+
+impl crate::storage::FlashRegion for Ch585DataFlash {
+    fn page_size(&self) -> usize {
+        dataflash::PAGE_SIZE
+    }
+
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
+    fn read(&mut self, offset: u32, out: &mut [u8]) -> core::result::Result<(), FlashError> {
+        if !dataflash::in_range(offset, out.len()) {
+            return Err(FlashError::OutOfRange);
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            dataflash::unlocked(|| {
+                dataflash::read_addr(dataflash::CMD_READ, DATAFLASH_START + offset);
+                for byte in out.iter_mut() {
+                    *byte = dataflash::read_byte();
+                }
+                dataflash::end();
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
+    fn erase(&mut self, offset: u32) -> core::result::Result<(), FlashError> {
+        let aligned = offset & !(dataflash::PAGE_SIZE as u32 - 1);
+        if !dataflash::in_range(aligned, dataflash::PAGE_SIZE) {
+            return Err(FlashError::OutOfRange);
+        }
+        let done = unsafe {
+            dataflash::unlocked(|| {
+                dataflash::addr(dataflash::CMD_ERASE_SECTOR, DATAFLASH_START + aligned);
+                dataflash::wait()
+            })
+        };
+        if done {
+            Ok(())
+        } else {
+            Err(FlashError::Timeout)
+        }
+    }
+
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
+    fn program(&mut self, offset: u32, data: &[u8]) -> core::result::Result<(), FlashError> {
+        if !dataflash::in_range(offset, data.len()) {
+            return Err(FlashError::OutOfRange);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let done = unsafe {
+            dataflash::unlocked(|| {
+                let mut written = 0usize;
+                while written < data.len() {
+                    let absolute = DATAFLASH_START + offset + written as u32;
+                    let to_boundary =
+                        dataflash::PAGE_SIZE - (absolute as usize & (dataflash::PAGE_SIZE - 1));
+                    let chunk = core::cmp::min(data.len() - written, to_boundary);
+                    dataflash::addr(dataflash::CMD_PROGRAM, absolute);
+                    for &byte in &data[written..written + chunk] {
+                        dataflash::out(byte);
+                    }
+                    if !dataflash::wait() {
+                        return false;
+                    }
+                    written += chunk;
+                }
+                true
+            })
+        };
+        if done {
+            Ok(())
+        } else {
+            Err(FlashError::Timeout)
         }
     }
 }

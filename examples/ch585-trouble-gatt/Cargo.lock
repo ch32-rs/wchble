@@ -140,7 +140,7 @@ dependencies = [
 [[package]]
 name = "ch5xx-metapac"
 version = "0.1.2"
-source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=28acb57#28acb571d29cc1ce6cc6f68ac2a695224db68dbe"
+source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=ee136f4#ee136f4b9f0a80c8ac0aa43958da009ab04b406f"
 dependencies = [
  "cortex-m",
  "riscv",

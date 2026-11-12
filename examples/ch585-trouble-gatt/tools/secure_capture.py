@@ -43,13 +43,14 @@ FIELDS = ['frame.number', 'nordic_ble.crcok', 'nordic_ble.direction',
           'btsmp.authreq', 'btsmp.bonding_flags', 'btsmp.mitm_flag',
           'btsmp.sc_flag', 'btsmp.max_enc_key_size',
           'btsmp.initiator_key_distribution', 'btsmp.responder_key_distribution']
-# host.rs RANDOM_ADDRESS = [0x15, 0x00, 0x00, 0xee, 0xff, 0xc1], printed in
-# Bluetooth (most-significant-first) order.
-TARGET = 'c1:ff:ee:00:00:15'
+# host.rs RANDOM_ADDRESS is fixed since S3 so a bonded peer can find the key it
+# stored on an earlier boot. Printed in Bluetooth (most-significant-first) order.
+TARGET = 'c1:ff:ee:00:00:16'
 SMP_NAMES = dict(secure.SMP_OPCODES)
 LL_CONTROL = {0x02: 'TERMINATE_IND', 0x03: 'ENC_REQ', 0x04: 'ENC_RSP',
               0x05: 'START_ENC_REQ', 0x06: 'START_ENC_RSP',
-              0x0d: 'PAUSE_ENC_REQ', 0x0e: 'PAUSE_ENC_RSP'}
+              0x0a: 'PAUSE_ENC_REQ', 0x0b: 'PAUSE_ENC_RSP',
+              0x0c: 'VERSION_IND', 0x0d: 'REJECT_IND'}
 
 
 def run_target(out):
@@ -135,18 +136,38 @@ def analyze(rows, out, target):
     return assessed
 
 
-def evaluate(assessed):
+def evaluate(assessed, mode='pair'):
+    """Mode-specific capture gates.
+
+    `pair` is the S2 matrix. `reconnect` and `fault` must show encryption
+    resumed without any new SMP pairing. `delete` must show the controller
+    rejecting the peer's LTK with LL_REJECT_IND and never starting encryption.
+    """
     errors = []
     if assessed.get('access_address') is None:
         errors.append(f'capture saw no CRC-valid CONNECT_IND to {assessed.get("target")}')
-    if not assessed['smp']:
+    if mode == 'delete':
+        if not any(entry['name'] == 'REJECT_IND' for entry in assessed['ll_control']):
+            errors.append('capture saw no LL_REJECT_IND after the delete command')
+        if any(entry['name'] in ('START_ENC_REQ', 'START_ENC_RSP')
+               for entry in assessed['ll_control']):
+            errors.append('capture showed encryption starting after the bond was deleted')
+        return errors
+    if not assessed['smp'] and mode == 'pair':
         errors.append('capture saw no SMP traffic')
-    if assessed.get('pairing_request') is None:
-        errors.append('capture saw no central Pairing Request')
-    if assessed.get('pairing_response') is None:
-        errors.append('capture saw no peripheral Pairing Response')
-    if 'PairingDHKeyCheck' not in assessed['smp_opcodes_captured']:
-        errors.append('capture saw no DHKey Check in either direction')
+    if mode == 'pair':
+        if assessed.get('pairing_request') is None:
+            errors.append('capture saw no central Pairing Request')
+        if assessed.get('pairing_response') is None:
+            errors.append('capture saw no peripheral Pairing Response')
+        if 'PairingDHKeyCheck' not in assessed['smp_opcodes_captured']:
+            errors.append('capture saw no DHKey Check in either direction')
+    else:
+        pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
+                   'PairingDHKeyCheck', 'PairingPublicKey'}
+        seen = pairing & set(assessed['smp_opcodes_captured'])
+        if seen:
+            errors.append(f'capture showed a new pairing during {mode}: {sorted(seen)}')
     if 'encryption_start' not in assessed:
         errors.append('capture saw no LL encryption start')
     elif assessed.get('att_after_encryption_start'):
@@ -270,6 +291,7 @@ def execute(capture, args):
                 'sniffer_serial': capture.sniffer_serial,
                 'sniffer_port': capture.sniffer_port,
                 'serial_timeout_ms': capture.serial_timeout_ms,
+                'capture_mode': capture.mode,
                 'follow_mode': 'name->address' if capture.follow_by_name else 'address',
                 'errors': []}
     hook = SnifferHook(capture, out, metadata, out / 'capture.log')
@@ -297,7 +319,7 @@ def execute(capture, args):
         metadata.setdefault('shutdown', hook.stop())
         try:
             cap.validate_pcap(out / 'capture.pcap')
-            metadata['capture'] = assess_pcap(out, capture.tshark)
+            metadata['capture'] = assess_pcap(out, capture.tshark, capture.mode)
         except (*secure.FAILURES, subprocess.CalledProcessError) as error:
             metadata['capture'] = {'errors': [f'{type(error).__name__}: {error}']}
         metadata['runner_exit'] = runner_exit
@@ -317,11 +339,12 @@ def time_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
 
 
-def assess_pcap(out, tshark):
+def assess_pcap(out, tshark, mode='pair'):
     structure = cap.validate_pcap(out / 'capture.pcap')
     assessed = decode(out / 'capture.pcap', out, tshark, run_target(out))
     assessed['structure'] = structure
-    assessed['errors'] = evaluate(assessed)
+    assessed['mode'] = mode
+    assessed['errors'] = evaluate(assessed, mode)
     return assessed
 
 
@@ -335,12 +358,16 @@ def options(argv=None):
     parser.add_argument('--follow-by-name', action='store_true')
     parser.add_argument('--nrfutil-home', type=Path, required=True)
     parser.add_argument('--tshark', default='tshark')
+    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'fault'),
+                        default='pair')
     parser.add_argument('--serial-timeout-ms', type=int, default=100)
     parser.add_argument('--startup-timeout', type=float, default=10)
     capture, remaining = parser.parse_known_args(argv)
     if not 1 <= capture.serial_timeout_ms <= 1000 or not 0 < capture.startup_timeout <= 30:
         parser.error('require serial timeout 1..1000ms and startup timeout 0..30s')
     args = secure.options(remaining)
+    # One mode drives both the phone flow and the capture gates.
+    args.mode = capture.mode
     capture.sniffer = capture.sniffer.resolve()
     capture.nrfutil_home = capture.nrfutil_home.resolve()
     return capture, args
