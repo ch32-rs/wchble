@@ -265,11 +265,17 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 ## X4b HID (encrypted-link keyboard)
 
-- [ ] **Android system-HID round not yet executed.** This is the only host
-  round that exercises the real `0x1812` subscription and reports; it needs one
-  Just Works confirmation tap and a focused text field. Firmware counters,
-  `dumpsys input` and a screenshot are the evidence. The 60 s macOS runs do not
-  replace it.
+- [x] **Android system-HID round executed (2026-11-12).** With the 360 s
+  image, the pair helper plus the system HID host produced `reports_sent=354`,
+  `subscription_edges=1`, `HOST security=3`, `SECURE active=1` and a
+  `wch585-hid` keyboard in `dumpsys input` (`local-docs/results/x4b-android-1/`).
+  Human-visible typing was not observed; the helper app's own summary is
+  `timeout` because it targets the P5 vendor service.
+- [ ] **Bond store is keyed by peer address only.** Reusing the store from an
+  image with a different local identity makes SMP fail: the phone has no bond
+  for the new address while the Host still returns the old LTK. Pairing only
+  worked after `DEL!`. Key the record by local identity too, or clear the store
+  when the identity changes.
 - [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
   third-party discovery (Apple Accessory Design Guidelines, GATT Server
   section) and bluetoothd checks an unsigned CLI in with

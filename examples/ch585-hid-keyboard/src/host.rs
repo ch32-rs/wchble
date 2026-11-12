@@ -526,11 +526,11 @@ pub async fn run(
             hid_put(HID_PROTOCOL_MODE, u32::from(PROTOCOL_REPORT));
             // The peripheral Security Request is what makes macOS show its
             // pairing prompt before the app touches an encrypted attribute.
-            // It must not be the first SMP traffic (Android stalls waiting for
-            // an app callback), so delay it until the central's own flow had
-            // its turn.
+            // It must not race an app-initiated pairing: Android aborts SMP
+            // when a Security Request arrives while it is already pairing, so
+            // only send it once the central's own flow had ample time.
             #[cfg(feature = "secure")]
-            let mut security_deadline = Some(Instant::now() + Duration::from_millis(1_500));
+            let mut security_deadline = Some(Instant::now() + Duration::from_millis(10_000));
             let mut hid_state = HidState::new();
             let mut next_report_at = Instant::now();
 

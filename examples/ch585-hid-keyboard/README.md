@@ -145,20 +145,32 @@ swiftc -typecheck examples/ch585-hid-keyboard/tools/hid_host.swift
 
 `hidutil list` shows the new keyboard device while it is connected.
 
-### Android manual check
+### Android system-HID round
 
-1. Flash the `secure,long-run` image through the preflight helper (360 s).
-2. Advanced Bluetooth settings → pair with `wch585-hid`; the Just Works dialog
-   on this ROM needs one user tap.
-3. Open a text field and watch `abcd…` typed once per second.
-4. Evidence: `adb shell dumpsys input` shows a new HID keyboard input device,
-   `adb exec-out screencap -p` captures the typed text, and the firmware
-   counters are read after the run. `getevent` may be restricted on retail
-   builds; that is recorded, not treated as a failure.
+The encrypted report path is validated on Android, where the system HID host
+claims `0x1812`:
+
+1. Clear any bond the firmware still holds for the phone (a new local identity
+   with an old peer key makes SMP fail). With the 60 s secure image running,
+   write `DEL!` to the vendor bond control characteristic from a macOS client,
+   then let the finite run finish.
+2. Flash the `secure,long-run` image through the preflight helper (360 s).
+3. Start the pair helper with `--es mode pair --es target_name wch585-hid`;
+   confirm the Just Works dialog (adb can tap it). The phone bonds, its system
+   HID host subscribes over the same link, and the one-second report cycle
+   flows encrypted.
+4. Evidence: `dumpsys input` lists `wch585-hid` as a keyboard input device, the
+   firmware shows `reports_sent=354`, `subscription_edges=1`, `security=3`,
+   `SECURE active=1`, and `encrypted_tx>0` with no notify errors.
 5. Wait out the 360 s budget, then restore the smoke image.
 
-Android system HOGP cannot be scripted; it does not replace the macOS
-byte-level assertions.
+Result: `local-docs/results/x4b-android-1/`. The helper app's own summary can be
+`timeout` because it only looks for the P5 vendor service; the HOGP evidence is
+the system input device plus the firmware counters. The on-screen typing was
+not observed by a human in the automated round.
+
+For the macOS gate run, disable other bonded peers (for example the phone's
+Bluetooth) so their automatic reconnect cannot join the same finite window.
 
 ## Known gaps
 
