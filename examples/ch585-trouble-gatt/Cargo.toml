@@ -30,7 +30,11 @@ panic-halt = "1.0"
 static_cell = "2.1"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
 # Local Trouble checkout: 3aa6fd27b89cd5fc35f5c9b4f0c7f66795a14f70 (bt-hci 0.11).
-trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-27"] }
+# A 27-byte pool cannot hold SMP's 65-byte P-256 public key: reassembly fails
+# and the drop-out continuation makes the Host close the link as if the peer
+# had disconnected. Every packet in this example is <= 65 L2CAP bytes, so 128
+# is the smallest pool with room for LESC.
+trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-128"] }
 embassy-sync = { version = "0.8", default-features = false }
 embassy-futures = "0.1"
 embassy-time = { version = "0.5", default-features = false, features = ["tick-hz-1_000_000"] }

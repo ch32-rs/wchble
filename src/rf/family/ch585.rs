@@ -772,20 +772,28 @@ mod aes_block {
 
     #[derive(Debug)]
     pub struct Ch585Aes {
-        _private: (),
+        key: [u8; 16],
     }
 
     impl Ch585Aes {
         /// Load a session key. Call `Ch585Radio::init` first.
         pub fn new(key: &[u8; 16]) -> Self {
+            let mut engine = Self { key: *key };
+            engine.load();
+            engine
+        }
+
+        /// Rewrite the key/mode registers. The RF IP shares this block and
+        /// leaves it unkeyed after an event, so every CCM operation reloads.
+        #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+        fn load(&mut self) {
             unsafe {
                 regs::write(AES_BASE, CFG, RESET);
                 regs::write(AES_BASE, CFG, MODE_ENCRYPT);
                 for i in 0..4 {
-                    regs::write(AES_BASE, KEY + 4 * i, le_word(&key[4 * i..]));
+                    regs::write(AES_BASE, KEY + 4 * i, le_word(&self.key[4 * i..]));
                 }
             }
-            Self { _private: () }
         }
     }
 
@@ -794,6 +802,10 @@ mod aes_block {
     }
 
     impl AesEngine for Ch585Aes {
+        fn reload(&mut self) {
+            self.load();
+        }
+
         #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
         fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), AesEngineError> {
             unsafe {

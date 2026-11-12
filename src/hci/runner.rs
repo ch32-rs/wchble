@@ -109,6 +109,19 @@ pub struct SoftRunner {
     le_features: [u8; 8],
     /// ACL payload length advertised through `LE Read Buffer Size`.
     acl_packet_length: u16,
+    /// Most recent command that answered with a non-success status:
+    /// `(opcode << 8) | status`, for firmware-side diagnostics.
+    last_command_failure: Option<u32>,
+    /// Newest eight commands, each `(opcode << 8) | status`; the firmware
+    /// dumps this to explain a Host that stopped on an HCI error.
+    command_log: [u32; 8],
+    command_log_len: u32,
+    /// Newest eight command responses actually handed to the Host, packed as
+    /// `0xE0_0000 | opcode << 8 | status` (Complete) or
+    /// `0xF0_0000 | opcode << 8 | status` (Status), with a separate counter so
+    /// a dropped or overwritten reply can be told apart from a logged one.
+    sent_log: [u32; 8],
+    sent_log_len: u32,
 }
 
 impl Default for SoftRunner {
@@ -138,6 +151,87 @@ impl SoftRunner {
             ltk_reply: None,
             le_features: [0; 8],
             acl_packet_length: ACL_DATA_PACKET_LENGTH,
+            last_command_failure: None,
+            command_log: [0; 8],
+            command_log_len: 0,
+            sent_log: [0; 8],
+            sent_log_len: 0,
+        }
+    }
+
+    /// Opcode and status of the most recent failed HCI command, packed as
+    /// `(opcode << 8) | status`.
+    pub fn last_command_failure(&self) -> Option<u32> {
+        self.last_command_failure
+    }
+
+    /// The newest eight commands as `(opcode << 8) | status`, oldest first.
+    pub fn command_log(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        if self.command_log_len < 8 {
+            out[..self.command_log_len as usize]
+                .copy_from_slice(&self.command_log[..self.command_log_len as usize]);
+        } else {
+            let start = (self.command_log_len % 8) as usize;
+            for i in 0..8 {
+                out[i] = self.command_log[(start + i) % 8];
+            }
+        }
+        out
+    }
+
+    /// The newest eight command responses handed to the Host, oldest first.
+    /// Each is `0xE000_0000 | opcode << 8 | status` for Command Complete and
+    /// `0xF000_0000 | opcode << 8 | status` for Command Status.
+    pub fn sent_log(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        if self.sent_log_len < 8 {
+            out[..self.sent_log_len as usize]
+                .copy_from_slice(&self.sent_log[..self.sent_log_len as usize]);
+        } else {
+            let start = (self.sent_log_len % 8) as usize;
+            for i in 0..8 {
+                out[i] = self.sent_log[(start + i) % 8];
+            }
+        }
+        out
+    }
+
+    /// Number of commands the runner has answered so far.
+    pub fn command_log_len(&self) -> u32 {
+        self.command_log_len
+    }
+
+    /// Number of command responses handed to the Host so far.
+    pub fn sent_log_len(&self) -> u32 {
+        self.sent_log_len
+    }
+
+    fn log_sent(&mut self, packet: &transport::Packet) {
+        let (tag, opcode, status) = match packet.bytes[0] {
+            0x0e if packet.len >= 6 => (
+                0xE000_0000,
+                u16::from_le_bytes([packet.bytes[3], packet.bytes[4]]),
+                packet.bytes[5],
+            ),
+            0x0f if packet.len >= 5 => (
+                0xF000_0000,
+                u16::from_le_bytes([packet.bytes[3], packet.bytes[4]]),
+                packet.bytes[2],
+            ),
+            _ => return,
+        };
+        let index = (self.sent_log_len % 8) as usize;
+        self.sent_log[index] = tag | (u32::from(opcode) << 8) | u32::from(status);
+        self.sent_log_len = self.sent_log_len.wrapping_add(1);
+    }
+
+    fn log_command(&mut self, opcode: u16, status: u8) {
+        let index = (self.command_log_len % 8) as usize;
+        self.command_log[index] = (u32::from(opcode) << 8) | u32::from(status);
+        self.command_log_len = self.command_log_len.wrapping_add(1);
+        if status != HCI_SUCCESS {
+            self.last_command_failure = Some(self.command_log[index]);
         }
     }
 
@@ -375,6 +469,7 @@ impl SoftRunner {
             if transport::try_send_controller_packet(reply).is_err() {
                 return progressed;
             }
+            self.log_sent(&reply);
             self.pending_reply = None;
             return true;
         }
@@ -406,6 +501,7 @@ impl SoftRunner {
         }
         if let Some(reply) = self.pending_reply {
             if transport::try_send_controller_packet(reply).is_ok() {
+                self.log_sent(&reply);
                 self.pending_reply = None;
             }
         }
@@ -472,15 +568,18 @@ impl SoftRunner {
                     self.bridge
                         .request_disconnect(u16::from_le_bytes([params[0], params[1]]), params[2])
                 };
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x200d => {
                 let status = self.create_connection(params);
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x2013 => {
+                self.log_command(opcode, HCI_COMMAND_DISALLOWED);
                 self.pending_reply = Some(transport::command_status_packet(
                     opcode,
                     HCI_COMMAND_DISALLOWED,
@@ -489,6 +588,7 @@ impl SoftRunner {
             }
             0x2019 => {
                 let status = self.enable_encryption(params);
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
@@ -658,7 +758,10 @@ impl SoftRunner {
                 return;
             }
             0x2017 => Err(HCI_INVALID_PARAMETERS),
-            // LE LTK Request Reply / Negative Reply (Peripheral role).
+            // LE LTK Request Reply / Negative Reply (Peripheral role). Both
+            // return the connection handle in the Command Complete parameters
+            // (Core 5.4 Vol 4 Part E §7.8.25/26); a Host that cannot decode it
+            // reports `Invalid HCI Command Parameters` even on success.
             0x201a if params.len() == 18 => {
                 if self.bridge.handle() != Some(le16_from(params)) {
                     Err(HCI_UNKNOWN_CONNECTION)
@@ -666,7 +769,7 @@ impl SoftRunner {
                     let mut ltk = [0u8; 16];
                     ltk.copy_from_slice(&params[2..18]);
                     self.ltk_reply = Some(LtkReply::Key(ltk));
-                    Ok(&[][..])
+                    Ok(&params[..2])
                 }
             }
             0x201a => Err(HCI_INVALID_PARAMETERS),
@@ -675,7 +778,7 @@ impl SoftRunner {
                     Err(HCI_UNKNOWN_CONNECTION)
                 } else {
                     self.ltk_reply = Some(LtkReply::Rejected);
-                    Ok(&[][..])
+                    Ok(&params[..2])
                 }
             }
             0x201b => Err(HCI_INVALID_PARAMETERS),
@@ -695,6 +798,11 @@ impl SoftRunner {
             _ => Err(HCI_UNKNOWN_COMMAND),
         };
 
+        let status = match &result {
+            Ok(_) => HCI_SUCCESS,
+            Err(status) => *status,
+        };
+        self.log_command(opcode, status);
         self.pending_reply = Some(match result {
             Ok(return_data) => transport::command_complete_packet(opcode, HCI_SUCCESS, return_data),
             Err(status) => transport::command_complete_packet(opcode, status, &[]),
@@ -1619,12 +1727,21 @@ mod tests {
         pollster::block_on(async {
             inject_cmd(0x201a, &params);
             runner.serve_one().await;
-            expect_command_complete(0x201a, HCI_SUCCESS, &[]);
+            // bt-hci parses the Command Complete return parameters as a
+            // `ConnHandle`; empty parameters become
+            // `Error::INVALID_HCI_PARAMETERS` even though the status is 0.
+            let echoed = [1u8, 0];
+            expect_command_complete(0x201a, HCI_SUCCESS, &echoed);
+            use bt_hci::FromHciBytes as _;
+            let (handle, rest) =
+                bt_hci::param::ConnHandle::from_hci_bytes(&echoed).expect("conn handle");
+            assert_eq!(handle.raw(), 1);
+            assert!(rest.is_empty());
             assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
 
             inject_cmd(0x201b, &[1, 0]);
             runner.serve_one().await;
-            expect_command_complete(0x201b, HCI_SUCCESS, &[]);
+            expect_command_complete(0x201b, HCI_SUCCESS, &echoed);
             assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Rejected));
 
             let mut bad = params;

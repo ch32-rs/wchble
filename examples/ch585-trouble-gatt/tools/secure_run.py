@@ -12,10 +12,12 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import time
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location(
@@ -41,6 +43,7 @@ STAT_NAMES = p4.STAT_NAMES
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
 SECURITY_ENCRYPTED = 3
+ui_path = '/sdcard/wchble-ui.xml'
 
 
 def symbols_from(text):
@@ -52,10 +55,101 @@ def symbols_from(text):
     return symbols
 
 
+DIAG_RX_BASE, DIAG_TX_BASE, DIAG_ENTRIES = 2, 18, 16
+DIAG_DISCONNECT_REASON, DIAG_DISCONNECT_COUNT = 34, 35
+DIAG_NAMES = {4: 'ATT', 5: 'LE-signaling', 6: 'SMP'}
+SMP_OPCODES = {
+    0x01: 'PairingRequest', 0x02: 'PairingResponse', 0x03: 'PairingConfirm', 0x04: 'PairingRandom',
+    0x05: 'PairingFailed', 0x06: 'EncryptionInformation', 0x07: 'MasterIdentification',
+    0x08: 'IdentityInformation', 0x09: 'IdentityAddressInformation', 0x0a: 'SigningInformation',
+    0x0b: 'SecurityRequest', 0x0c: 'PairingPublicKey', 0x0d: 'PairingDHKeyCheck',
+    0x0e: 'KeypressNotification',
+}
+ATT_OPCODES = {
+    0x01: 'ErrorRsp', 0x02: 'MtuReq', 0x03: 'MtuRsp', 0x04: 'FindInfoReq', 0x05: 'FindInfoRsp',
+    0x06: 'FindByTypeValueReq', 0x07: 'FindByTypeValueRsp', 0x08: 'ReadByTypeReq', 0x09: 'ReadByTypeRsp',
+    0x0a: 'ReadReq', 0x0b: 'ReadRsp', 0x0c: 'ReadBlobReq', 0x0d: 'ReadBlobRsp', 0x0e: 'ReadMultiReq',
+    0x0f: 'ReadMultiRsp', 0x10: 'ReadByGroupReq', 0x11: 'ReadByGroupRsp', 0x12: 'WriteReq',
+    0x13: 'WriteRsp', 0x1b: 'Notification', 0x1d: 'Indication', 0x1e: 'Confirm', 0x52: 'WriteCmd',
+}
+
+
+def decode_opcodes(words):
+    """Per-opcode start-fragment counts; no ring wrap, unlike SEC_DIAG."""
+    smp = {'rx': {SMP_OPCODES.get(i, f'0x{i:02x}'): words[i] for i in range(16) if words[i]},
+           'tx': {SMP_OPCODES.get(i, f'0x{i:02x}'): words[16 + i] for i in range(16) if words[16 + i]}}
+    att = {'rx': {ATT_OPCODES.get(i, f'0x{i:02x}'): words[32 + i] for i in range(32) if words[32 + i]},
+           'tx': {ATT_OPCODES.get(i, f'0x{i:02x}'): words[64 + i] for i in range(32) if words[64 + i]}}
+    return {'smp': smp, 'att': att}
+
+
+TRACE_KINDS = {1: 'advertise', 2: 'advertise_done', 3: 'event', 4: 'connect',
+               5: 'terminate', 8: 'first_exchange', 9: 'bridge'}
+
+
+def decode_trace(words, count):
+    """Decode the 8-word TRACE rows; `count` is STATS[39].
+
+    Rows 0..127 are filled in order; past that the firmware keeps a 64-row
+    ring in rows 64..127, so only the latest 64 survive.
+    """
+    rows = []
+    if count <= 128:
+        order = range(count)
+    else:
+        start = (count - 64) % 64
+        order = [64 + (start + i) % 64 for i in range(64)]
+    for row in order:
+        base = row * 8
+        entry = words[base:base + 8]
+        if not entry or not any(entry):
+            continue
+        rows.append({
+            'us': entry[0],
+            'kind': TRACE_KINDS.get(entry[1], str(entry[1])),
+            'event': entry[2] & 0xFFFF,
+            'channel': entry[3],
+            'header': entry[4] & 0xFF,
+            'len': entry[5] & 0xFF,
+            'a': entry[6],
+            'b': entry[7],
+        })
+    return rows
+
+
+def decode_diag(words):
+    """Turn the packed diagnostic rings into an ordered transcript."""
+    rows = []
+    for direction, seq_index, base in (('rx', 0, DIAG_RX_BASE), ('tx', 1, DIAG_TX_BASE)):
+        for offset in range(DIAG_ENTRIES):
+            entry = words[base + offset]
+            if entry == 0:
+                continue
+            rows.append({
+                'dir': direction,
+                'seq': (entry >> 24) & 0xff,
+                'llid': (entry >> 16) & 0xff,
+                'cid': (entry >> 8) & 0xff,
+                'opcode': entry & 0xff,
+                'channel': DIAG_NAMES.get((entry >> 8) & 0xff, 'continuation'
+                                          if (entry >> 8) & 0xff == 0xff else 'other'),
+            })
+    rows.sort(key=lambda row: (row['dir'] != 'rx', row['seq']))
+    return {
+        'rx_total': words[0],
+        'tx_total': words[1],
+        'host_disconnect_requests': words[DIAG_DISCONNECT_COUNT],
+        'last_host_disconnect_reason': words[DIAG_DISCONNECT_REASON],
+        'entries': rows,
+    }
+
+
 def validate_observation_buffers(image, symbols):
     sections = p4.p3.elf_sections(image)
     ranges = []
     for name, count in (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
+                        ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
+                        ('PERIPHERAL_ADDRESS', 2),
                         ('TRACE', 128 * 8)):
         address, size = symbols[name], count * 4
         if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
@@ -69,9 +163,50 @@ def validate_observation_buffers(image, symbols):
     return symbols
 
 
-def adb(serial, *args, timeout=30):
+def flash(elf, out, prefix, timeout=240):
+    """Single retained preflight session. The secure image is ~280 KiB of
+    text, so program+verify needs well over the helper's 40 s default."""
+    io.command([str(io.PREFLIGHT), '--probe', '1a86:8010:F93D8F067E10', '--chip', 'CH585',
+                '--protocol', 'jtag', '--verify', str(elf)],
+               out / f'{prefix}-flash.log', timeout=timeout)
+
+
+def adb(serial, *args, timeout=30, check=True):
     return subprocess.run(['adb', '-s', serial, *args], capture_output=True, text=True,
-                          timeout=timeout, check=True).stdout
+                          timeout=timeout, check=check).stdout
+
+
+def confirm_pairing_dialog(serial):
+    """Confirm the system Just Works dialog on behalf of the user.
+
+    This ROM rejects `BluetoothDevice.setPairingConfirmation` from an
+    unprivileged app (BLUETOOTH_PRIVILEGED), so the only path is the system
+    dialog. Tap it only when that dialog owns the focus; returns a record of
+    the tap, or None when there is nothing to confirm.
+    """
+    try:
+        focus = adb(serial, 'shell', 'dumpsys', 'window', timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if 'BluetoothPairingDialog' not in focus:
+        return None
+    try:
+        adb(serial, 'shell', 'uiautomator', 'dump', ui_path, timeout=25)
+        dump = adb(serial, 'shell', 'cat', ui_path, timeout=20)
+        root = ElementTree.fromstring(dump)
+    except (OSError, subprocess.SubprocessError, ElementTree.ParseError):
+        return None
+    for node in root.iter('node'):
+        if node.get('resource-id') != 'android:id/button1' or not node.get('bounds'):
+            continue
+        x1, y1, x2, y2 = (int(value) for value in re.findall(r'\d+', node.get('bounds')))
+        tap = [x // 2 for x in (x1 + x2, y1 + y2)]
+        try:
+            adb(serial, 'shell', 'input', 'tap', str(tap[0]), str(tap[1]), timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return {'action': 'confirm', 'button': node.get('text', ''), 'tap': tap}
+    return None
 
 
 def read_log(lines):
@@ -182,7 +317,20 @@ def execute(args):
         metadata['elf_sha256'] = hashlib.sha256(image).hexdigest()
         metadata['smoke_sha256'] = hashlib.sha256(smoke.read_bytes()).hexdigest()
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
-        symbols = validate_observation_buffers(image, symbols_from(nm_text))
+        symbols = p4.symbols_from(nm_text)
+        for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
+                     'PERIPHERAL_ADDRESS'):
+            matches = [parts for line in nm_text.splitlines()
+                       if len(parts := line.split()) == 3 and parts[2] == name]
+            if len(matches) != 1:
+                raise ValueError(f'missing or ambiguous {name} symbol')
+            symbols[name] = int(matches[0][0], 16)
+        symbols = validate_observation_buffers(image, symbols)
+        # Both feature sets write the same output path, so a plain `cargo
+        # build` right after a secure build silently replaces this image.
+        # Refuse to spend a probe session on a Host without the crypto backend.
+        if '_embassy_crypto_aes128ecb_encrypt_blocks' not in nm_text:
+            raise ValueError('ELF was not built with --features secure (no crypto backend)')
         metadata['symbols'] = symbols
         metadata['ram_layout'] = p4.validate_ram_layout(image, symbols)
         embedded_seconds = p4.embedded_u32(image, symbols['RUN_SECONDS'])
@@ -203,23 +351,47 @@ def execute(args):
         try:
             # One retained probe session: halt, engine shutdown, idle checks,
             # verified download.
-            io.flash(archived, args.out, 'test', check_idle=False)
+            flash(archived, args.out, 'test')
         finally:
             safe_read_at = time.monotonic() + embedded_seconds + 3
 
         adb(args.serial, 'logcat', '-c')
+        # Android 15 blocks BLE scans for a backgrounded/dozing app; keep the
+        # activity foregrounded and the screen on for the whole finite run.
+        adb(args.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP')
+        adb(args.serial, 'shell', 'wm', 'dismiss-keyguard')
+        adb(args.serial, 'shell', 'svc', 'power', 'stayon', 'true')
         adb(args.serial, 'shell', 'am', 'force-stop', PACKAGE)
+        # The sniffer follows by advertised name, so it can only attach once the
+        # firmware is up: the finite image advertises from boot, which is
+        # already true here (flash completed above). The capture wrapper uses
+        # this hook to start listening before the phone connects.
+        hook = getattr(args, 'capture_hook', None)
+        if hook is not None:
+            hook.before_app(args)
         adb(args.serial, 'shell', 'am', 'start', '-W', '-n', ACTIVITY)
         deadline = time.monotonic() + args.timeout
+        metadata['pairing_consent'] = []
         while time.monotonic() < deadline:
-            pid = adb(args.serial, 'shell', 'pidof', PACKAGE).strip()
+            # `pidof` exits 1 once the app is gone; that is the success signal,
+            # so this call must not be checked.
+            pid = adb(args.serial, 'shell', 'pidof', PACKAGE, check=False).strip()
             if not pid:
                 break
+            confirmed = confirm_pairing_dialog(args.serial)
+            if confirmed is not None:
+                metadata['pairing_consent'].append(confirmed)
+                print('CONSENT', json.dumps(confirmed), flush=True)
             time.sleep(0.5)
         else:
             errors.append('phone app did not finish within its timeout')
         log_path = args.out / 'logcat.txt'
         log_path.write_text(adb(args.serial, 'logcat', '-d', '-s', 'WCHBLE:I', timeout=60))
+        if args.full_logcat:
+            # The Bluetooth stack's own SMP/encryption diagnostics are the only
+            # view of the phone's side; they are not on the WCHBLE tag.
+            (args.out / 'logcat-all.txt').write_text(
+                adb(args.serial, 'logcat', '-d', '-b', 'all', timeout=120))
         rows = read_log(log_path.read_text().splitlines())
         (args.out / 'transcript.jsonl').write_text(
             '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
@@ -227,7 +399,7 @@ def execute(args):
             (row for row in reversed(rows) if row.get('event') == 'summary'), None)
         errors.extend(evaluate_transcript(rows))
 
-        io.wait_until(safe_read_at)
+        p4.wait_until(safe_read_at)
         observations = {}
         for name, count, names in (('STATS', 64, STAT_NAMES),
                                    ('HOST_STATS', 16, HOST_NAMES),
@@ -240,9 +412,57 @@ def execute(args):
         errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
                                         observations.get('HOST_STATS', []),
                                         observations.get('STATS', []), args.run_seconds))
+        diag_words = io.read32(symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
+        metadata['sec_diag'] = decode_diag(diag_words)
+        if diag_words[40]:
+            metadata['sec_diag']['last_hci_failure'] = {
+                'opcode': f'0x{diag_words[40] >> 8:04x}',
+                'status': f'0x{diag_words[40] & 0xFF:02x}',
+            }
+        metadata['sec_diag']['hci_log_len'] = diag_words[49]
+        metadata['sec_diag']['hci_log'] = [
+            {'opcode': f'0x{word >> 8:04x}', 'status': f'0x{word & 0xFF:02x}'}
+            for word in diag_words[41:49] if word]
+        metadata['sec_diag']['hci_sent_len'] = diag_words[58]
+        metadata['sec_diag']['hci_sent'] = [
+            {'kind': 'complete' if word >> 28 == 0xE else 'status',
+             'opcode': f'0x{(word >> 8) & 0xFFFF:04x}',
+             'status': f'0x{word & 0xFF:02x}'}
+            for word in diag_words[50:58] if word]
+        (args.out / 'sec_diag.json').write_text(
+            json.dumps(metadata['sec_diag'], indent=2) + '\n')
+        opcode_words = io.read32(symbols['SEC_OPCODES'], 96, args.out / 'sec_opcodes.txt')
+        metadata['sec_opcodes'] = decode_opcodes(opcode_words)
+        metadata['sec_opcodes']['slow_polls_over_100ms'] = diag_words[36]
+        metadata['sec_opcodes']['skipped_events'] = diag_words[37]
+        metadata['sec_opcodes']['start_req_queued'] = diag_words[38]
+        metadata['sec_opcodes']['start_rsp_queued'] = diag_words[39]
+        # LSO-first static random address; the secure build rotates octet 0
+        # from measured entropy so each run is a fresh device for a bonded peer.
+        address_words = io.read32(symbols['PERIPHERAL_ADDRESS'], 2,
+                                  args.out / 'address.txt')
+        address = bytes(byte for word in address_words
+                        for byte in word.to_bytes(4, 'little'))[:6]
+        metadata['peripheral_address'] = ':'.join(f'{byte:02x}' for byte in reversed(address))
+        error_words = io.read32(symbols['HOST_ERROR'], 32, args.out / 'host_error.txt')
+        length = min(error_words[0], (len(error_words) - 1) * 4)
+        metadata['host_error'] = bytes(
+            byte for word in error_words[1:] for byte in word.to_bytes(4, 'little')
+        )[:length].decode('utf-8', 'replace')
+        if metadata['host_error']:
+            errors.append(f'Host runner stopped: {metadata["host_error"]}')
+        (args.out / 'sec_opcodes.json').write_text(
+            json.dumps(metadata['sec_opcodes'], indent=2) + '\n')
+        trace_rows = decode_trace(
+            io.read32(symbols['TRACE'], 128 * 8, args.out / 'trace.txt'),
+            observations.get('STATS', [0] * 64)[39] if observations.get('STATS') else 0)
+        metadata['trace'] = trace_rows
+        (args.out / 'trace.json').write_text(json.dumps(trace_rows, indent=2) + '\n')
+        print('SMP', json.dumps(metadata['sec_opcodes']['smp'], sort_keys=True))
+        print('ATT', json.dumps(metadata['sec_opcodes']['att'], sort_keys=True))
 
         try:
-            io.flash(smoke, args.out, 'restore', check_idle=False)
+            flash(smoke, args.out, 'restore')
             io.command(['swift', str(io.SCANNER), 'wch585', '8'],
                        args.out / 'restore-scan.log', 20)
             metadata['smoke_recovery'] = 'flash verify and exact-name macOS discovery PASS'
@@ -273,6 +493,7 @@ def options(argv=None):
     parser.add_argument('--run-seconds', type=int, default=25)
     parser.add_argument('--timeout', type=float, default=45)
     parser.add_argument('--build-apk', action='store_true')
+    parser.add_argument('--full-logcat', action='store_true')
     args = parser.parse_args(argv)
     if not (math.isfinite(args.timeout) and 0 < args.timeout <= args.run_seconds):
         parser.error('require finite timeout <= run-seconds')

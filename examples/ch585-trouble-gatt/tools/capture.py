@@ -135,7 +135,10 @@ def stop_capture(process):
     if process.poll() is not None:
         return {'clean': False, 'exit': process.returncode, 'actions': actions,
                 'reason': 'capture exited before requested stop'}
-    for signum, budget in ((signal.SIGINT, 5), (signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+    # The dongle side occasionally needs more than 5 s to flush its pcap and
+    # stop scanning; a longer SIGINT budget keeps the clean-stop criterion
+    # instead of falling through to SIGTERM.
+    for signum, budget in ((signal.SIGINT, 12), (signal.SIGTERM, 2), (signal.SIGKILL, 2)):
         actions.append(signum.name)
         try:
             os.killpg(process.pid, signum)

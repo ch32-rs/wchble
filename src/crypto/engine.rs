@@ -20,6 +20,14 @@ pub enum AesEngineError {
 }
 
 pub trait AesEngine {
+    /// Re-establish the loaded key before a CCM operation.
+    ///
+    /// Engines whose key lives in registers shared with another owner must
+    /// reload it here: the CH585 AES block sits in the RF IP, and every
+    /// connection event leaves it without the session key. Software engines
+    /// keep their round keys and leave the default no-op.
+    fn reload(&mut self) {}
+
     /// Encrypt one 16-byte block in place with the engine's loaded key.
     fn encrypt_block(&mut self, block: &mut [u8; 16]) -> Result<(), AesEngineError>;
 }

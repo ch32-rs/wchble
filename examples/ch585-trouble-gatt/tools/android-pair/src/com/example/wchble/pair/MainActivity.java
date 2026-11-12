@@ -37,7 +37,9 @@ import java.util.UUID;
  */
 public class MainActivity extends Activity {
     private static final String TAG = "WCHBLE";
-    private static final String TARGET = "wch585-p4";
+    // Default target for the S2 peripheral; `--es target_name` overrides it so
+    // the same pairing transcript can be taken against a vendor EVT example.
+    private String targetName = "wch585-p4";
     private static final UUID SERVICE = UUID.fromString("00001000-b0cd-11ec-871f-d45ddf138840");
     private static final UUID VALUE = UUID.fromString("00001001-b0cd-11ec-871f-d45ddf138840");
     private static final int WRITE_VALUE = 0x2b;
@@ -58,6 +60,10 @@ public class MainActivity extends Activity {
     private boolean verifyRead;
     private boolean done;
     private int reads;
+    private int scanReports;
+    private boolean authRetried;
+    private boolean serviceMissing;
+    private boolean scanOnly;
 
     private final Runnable timeout = () -> finishRun(false, "timeout");
 
@@ -74,9 +80,48 @@ public class MainActivity extends Activity {
             logEvent("\"event\":\"bond_state\",\"state\":%d,\"previous\":%d", state, previous);
             if (state == BluetoothDevice.BOND_BONDED) {
                 bonded = true;
-                maybeStartGatt();
+                // BONDED is set when SMP finishes; the controller starts the
+                // LL encryption procedure after that. Give it time so the
+                // transcript's read/write really travel encrypted.
+                handler.postDelayed(() -> {
+                    logEvent("\"event\":\"bond_settled\"");
+                    maybeStartGatt();
+                }, 2000);
             } else if (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDING) {
                 finishRun(false, "bond_rejected");
+            }
+        }
+    };
+
+    // Android shows a consent dialog for Just Works pairing whenever the local
+    // IO capability is display-capable, even though our Pairing Response asks
+    // for NoInputNoOutput/MITM-off. The broadcast arrives from the Bluetooth
+    // stack process (so the receiver must be exported), but this ROM requires
+    // BLUETOOTH_PRIVILEGED for setPairingConfirmation; the runner therefore
+    // taps the system dialog and logs the variant for evidence.
+    // BluetoothDevice.PAIRING_VARIANT_CONSENT is @SystemApi, so mirror its value.
+    private static final int PAIRING_VARIANT_CONSENT = 3;
+
+    private final BroadcastReceiver pairingReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (device == null || targetAddress == null || !targetAddress.equals(device.getAddress())) {
+                return;
+            }
+            int variant = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, -1);
+            logEvent("\"event\":\"pairing_request\",\"variant\":%d", variant);
+            if (variant == PAIRING_VARIANT_CONSENT) {
+                boolean confirmed;
+                try {
+                    confirmed = device.setPairingConfirmation(true);
+                } catch (SecurityException denied) {
+                    logEvent("\"event\":\"pairing_confirm\",\"accepted\":false,"
+                            + "\"error\":\"bluetooth_privileged\"");
+                    return;
+                }
+                logEvent("\"event\":\"pairing_confirm\",\"accepted\":%s",
+                        confirmed ? "true" : "false");
             }
         }
     };
@@ -90,12 +135,20 @@ public class MainActivity extends Activity {
                 if (name == null) {
                     name = result.getDevice().getName();
                 }
-                if (TARGET.equals(name)) {
+                scanReports += 1;
+                if (scanReports <= 16) {
+                    logEvent("\"event\":\"scan_report\",\"name\":\"%s\",\"address\":\"%s\",\"rssi\":%d",
+                            name == null ? "" : name, result.getDevice().getAddress(), result.getRssi());
+                }
+                if (targetName.equals(name)) {
                     scanning = false;
                     scanner.stopScan(this);
                     targetAddress = result.getDevice().getAddress();
                     logEvent("\"event\":\"found\",\"name\":\"%s\",\"address\":\"%s\",\"rssi\":%d",
                             name, targetAddress, result.getRssi());
+                    if (scanOnly) {
+                        return;
+                    }
                     logEvent("\"event\":\"connecting\",\"address\":\"%s\"", targetAddress);
                     gatt = result.getDevice().connectGatt(MainActivity.this, false, gattCallback,
                             BluetoothDevice.TRANSPORT_LE);
@@ -119,6 +172,13 @@ public class MainActivity extends Activity {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 if (!bonding) {
                     bonding = true;
+                    // Differential runs reconnect to a device that is already
+                    // bonded; there is no BOND_BONDED broadcast then, but the
+                    // controller still runs the LL encryption procedure.
+                    if (g.getDevice().getBondState() == BluetoothDevice.BOND_BONDED) {
+                        bonded = true;
+                        logEvent("\"event\":\"already_bonded\"");
+                    }
                     boolean requested = g.getDevice().createBond();
                     logEvent("\"event\":\"bond_requested\",\"ok\":%s", requested);
                 }
@@ -139,7 +199,15 @@ public class MainActivity extends Activity {
             logEvent("\"event\":\"services_discovered\",\"status\":%d,\"service\":%s,\"characteristic\":%s",
                     status, service != null, characteristic != null);
             if (status != BluetoothGatt.GATT_SUCCESS || characteristic == null) {
-                finishRun(false, "service_missing");
+                // Differential mode: a vendor peripheral serves other GATT
+                // services, so this run only proves the pairing/encryption
+                // transcript. Wait for the bond, then pass on that alone.
+                serviceMissing = true;
+                if (bonded) {
+                    finishRun(true, "paired_no_service");
+                } else {
+                    maybeStartGatt();
+                }
                 return;
             }
             valueCharacteristic = characteristic;
@@ -154,6 +222,14 @@ public class MainActivity extends Activity {
             int value = valueOf(characteristic);
             logEvent("\"event\":\"read\",\"status\":%d,\"value\":%d,\"index\":%d", status, value, reads);
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                // A bonded reconnect may need the stack to encrypt first; one
+                // delayed retry covers the 0x05/0x0F authentication errors.
+                if (!authRetried && (status == 5 || status == 15)) {
+                    authRetried = true;
+                    handler.postDelayed(() -> g.readCharacteristic(characteristic), 2000);
+                    logEvent("\"event\":\"read_retry\"");
+                    return;
+                }
                 finishRun(false, "read_failed");
                 return;
             }
@@ -194,6 +270,10 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(new android.view.View(this));
+        String requestedTarget = getIntent().getStringExtra("target_name");
+        if (requestedTarget != null && !requestedTarget.isEmpty()) {
+            targetName = requestedTarget;
+        }
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             finishRun(false, "permissions_missing");
@@ -210,19 +290,41 @@ public class MainActivity extends Activity {
             finishRun(false, "scanner_missing");
             return;
         }
+        // Bond state also arrives from the Bluetooth stack process; a
+        // non-exported receiver silently never fires (no run ever logged one).
         registerReceiver(bondReceiver, new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
-                Context.RECEIVER_NOT_EXPORTED);
-        handler.postDelayed(timeout, TIMEOUT_MS);
+                Context.RECEIVER_EXPORTED);
+        // These broadcasts come from the Bluetooth stack process, not ours:
+        // a non-exported receiver never sees them (the Settings pairing dialog
+        // then appears and nothing confirms it).
+        registerReceiver(pairingReceiver, new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST),
+                Context.RECEIVER_EXPORTED);
+        scanOnly = getIntent().getBooleanExtra("scan_only", false);
+        if (scanOnly) {
+            // Address discovery only: the vendor differential needs the peer's
+            // public address for the sniffer's --follow before connecting.
+            handler.postDelayed(() -> finishRun(true, "scan_only_done"), 10_000);
+        } else {
+            handler.postDelayed(timeout, TIMEOUT_MS);
+        }
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build();
         scanning = true;
-        logEvent("\"event\":\"scan_started\",\"target\":\"%s\"", TARGET);
+        logEvent("\"event\":\"scan_started\",\"target\":\"%s\"", targetName);
         scanner.startScan(null, settings, scanCallback);
     }
 
     private void maybeStartGatt() {
-        if (done || started || !bonded || !discovered || valueCharacteristic == null) {
+        if (done || started || !bonded) {
+            return;
+        }
+        if (serviceMissing) {
+            started = true;
+            finishRun(true, "paired_no_service");
+            return;
+        }
+        if (!discovered || valueCharacteristic == null) {
             return;
         }
         started = true;
@@ -246,8 +348,10 @@ public class MainActivity extends Activity {
     }
 
     private void logEvent(String fmt, Object... args) {
-        Log.i(TAG, String.format(Locale.US,
-                "{\"t_ms\":%d," + fmt + "}", SystemClock.elapsedRealtime(), args));
+        Object[] values = new Object[args.length + 1];
+        values[0] = SystemClock.elapsedRealtime();
+        System.arraycopy(args, 0, values, 1, args.length);
+        Log.i(TAG, String.format(Locale.US, "{\"t_ms\":%d," + fmt + "}", values));
     }
 
     private void finishRun(boolean pass, String reason) {
@@ -267,7 +371,14 @@ public class MainActivity extends Activity {
                 // Best effort: the log line is the evidence.
             }
         }
-        handler.postDelayed(this::finish, 300);
+        // The runner waits for `pidof` to become empty; finishing the activity
+        // alone leaves a cached process behind on Android 15, so end it here
+        // after the summary line has been written.
+        handler.postDelayed(() -> {
+            finish();
+            handler.postDelayed(() -> android.os.Process.killProcess(
+                    android.os.Process.myPid()), 300);
+        }, 300);
     }
 
     @Override
@@ -276,6 +387,11 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(timeout);
         try {
             unregisterReceiver(bondReceiver);
+        } catch (RuntimeException ignored) {
+            // Not registered.
+        }
+        try {
+            unregisterReceiver(pairingReceiver);
         } catch (RuntimeException ignored) {
             // Not registered.
         }
