@@ -49,6 +49,14 @@ pub const CONTROL_SERVICE_UUID: Uuid =
 #[cfg(feature = "secure")]
 pub const BOND_CONTROL_UUID: Uuid =
     Uuid::new_long(0x00001a01_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
+/// Diagnostic mirror of the HID input report. Apple's Accessory Design
+/// Guidelines (GATT Server section) filter the BLE HID service out of
+/// CoreBluetooth discovery, so no macOS app can subscribe to 0x2A4D. This
+/// characteristic carries the same bytes on the same encrypted link for the
+/// automated harness; it is not part of HOGP and HOGP hosts ignore it.
+#[cfg(feature = "secure")]
+pub const MIRROR_UUID: Uuid =
+    Uuid::new_long(0x00001a02_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
 
 // HID Information: bcdHID 0x0111, country code 0, remote wake supported.
 const HID_INFORMATION: [u8; 4] = [0x11, 0x01, 0x00, 0x01];
@@ -307,6 +315,8 @@ pub async fn run(
     let mut boot_output_storage = [0u8; 1];
     #[cfg(feature = "secure")]
     let mut bond_control_storage = [0u8; 4];
+    #[cfg(feature = "secure")]
+    let mut mirror_storage = [0u8; 8];
     // GAP + GATT + DIS + HID + vendor control. `AttributeTable::push` panics
     // on overflow at the first poll, so the capacity is stated once here and
     // mirrored by the server's const generic below.
@@ -329,13 +339,16 @@ pub async fn run(
     // report and boot protocols; the two 0x2A4D characteristics are told apart
     // by their Report Reference descriptors.
     let mut hid = table.add_service(Service::new(0x1812u16));
+    // HID Information and the Report Map carry no secret: HOGP hosts read
+    // them while bonding, and a host that claims the HID service internally
+    // (Apple) otherwise stalls its discovery on Insufficient Authentication.
     let hid_info: Characteristic<[u8; 4]> = hid
         .add_characteristic_ro(0x2a4au16, &HID_INFORMATION)
-        .read_permission(HID_PERMISSION)
+        .read_permission(PermissionLevel::Allowed)
         .build();
     let report_map: Characteristic<[u8; 63]> = hid
         .add_characteristic_ro(0x2a4bu16, &REPORT_MAP)
-        .read_permission(HID_PERMISSION)
+        .read_permission(PermissionLevel::Allowed)
         .build();
     let control_point: Characteristic<u8> = hid
         .add_characteristic(
@@ -413,7 +426,7 @@ pub async fn run(
     // `WIPE` erases both slots, `FALT` truncates the next save. Deliberately
     // unauthenticated: the peer has to be able to erase a bond it cannot use.
     #[cfg(feature = "secure")]
-    let bond_control: Characteristic<[u8; 4]> = {
+    let (bond_control, mirror): (Characteristic<[u8; 4]>, Characteristic<[u8; 8]>) = {
         let mut control = table.add_service(Service::new(CONTROL_SERVICE_UUID));
         let characteristic = control
             .add_characteristic(
@@ -423,8 +436,18 @@ pub async fn run(
                 &mut bond_control_storage,
             )
             .build();
+        let channel = control
+            .add_characteristic(
+                MIRROR_UUID,
+                &[CharacteristicProp::Read, CharacteristicProp::Notify],
+                [0u8; 8],
+                &mut mirror_storage,
+            )
+            .read_permission(HID_PERMISSION)
+            .cccd_permission(HID_PERMISSION)
+            .build();
         control.build();
-        characteristic
+        (characteristic, channel)
     };
     let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 64, 1>::new(table);
 
@@ -501,35 +524,17 @@ pub async fn run(
                 fatal(stats, 18).await;
             }
             hid_put(HID_PROTOCOL_MODE, u32::from(PROTOCOL_REPORT));
-            // S2: a peripheral Security Request is what makes a macOS central
-            // start pairing without a protected attribute, but it must not be
-            // the first SMP traffic (Android stalls waiting for an app
-            // callback). Delay it until the central's own flow had its turn.
+            // The peripheral Security Request is what makes macOS show its
+            // pairing prompt before the app touches an encrypted attribute.
+            // It must not be the first SMP traffic (Android stalls waiting for
+            // an app callback), so delay it until the central's own flow had
+            // its turn.
             #[cfg(feature = "secure")]
-            let mut security_deadline =
-                Some(Instant::now() + Duration::from_millis(2_000));
+            let mut security_deadline = Some(Instant::now() + Duration::from_millis(1_500));
             let mut hid_state = HidState::new();
             let mut next_report_at = Instant::now();
 
             loop {
-                #[cfg(feature = "secure")]
-                if security_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    security_deadline = None;
-                    let unencrypted = matches!(
-                        connection.raw().security_level(),
-                        Ok(SecurityLevel::NoEncryption)
-                    );
-                    if unencrypted {
-                        match connection.raw().request_security() {
-                            Ok(()) => stats.set(STAT_SECURITY, SECURITY_REQUESTED),
-                            Err(_) => {
-                                stats.error(14);
-                                stats.set(STAT_SECURITY, SECURITY_FAILED);
-                            }
-                        }
-                    }
-                }
-
                 // Report tick. It runs between connection events: the Host
                 // task is polled cooperatively by the RF pump, so awaiting the
                 // notification here never touches a radio deadline.
@@ -549,11 +554,18 @@ pub async fn run(
                         hid_inc(HID_BLOCKED_UNENCRYPTED);
                     }
                     let boot = hid_state.protocol_mode == 0;
-                    let subscribed = if boot {
+                    let hid_subscribed = if boot {
                         boot_input.should_notify(&connection)
                     } else {
                         input_report.should_notify(&connection)
                     };
+                    // The diagnostic mirror is subscribed by the macOS harness,
+                    // which cannot see the HID service through CoreBluetooth.
+                    #[cfg(feature = "secure")]
+                    let mirror_subscribed = mirror.should_notify(&connection);
+                    #[cfg(not(feature = "secure"))]
+                    let mirror_subscribed = false;
+                    let subscribed = hid_subscribed || mirror_subscribed;
                     if subscribed && !hid_state.subscribed {
                         hid_state.seq = 0;
                         hid_inc(HID_SUBSCRIPTION_EDGES);
@@ -561,33 +573,69 @@ pub async fn run(
                     hid_state.subscribed = subscribed;
                     if subscribed && encrypted {
                         let bytes = REPORT_CYCLE[hid_state.seq % REPORT_CYCLE.len()];
-                        // `try_` keeps the Host poll non-blocking: a full
-                        // queue is counted and the same report is retried on
-                        // the next tick.
-                        let sent = if boot {
-                            boot_input.try_notify_raw(&connection, &bytes, false)
-                        } else {
-                            input_report.try_notify_raw(&connection, &bytes, false)
-                        };
-                        match sent {
-                            Ok(()) => {
-                                if boot {
-                                    hid_inc(HID_BOOT_INPUT_SENT);
-                                } else {
-                                    hid_inc(HID_REPORTS_SENT);
+                        let mut sent_any = false;
+                        if hid_subscribed {
+                            // `try_` keeps the Host poll non-blocking: a full
+                            // queue is counted and the same report is retried
+                            // on the next tick.
+                            let sent = if boot {
+                                boot_input.try_notify_raw(&connection, &bytes, false)
+                            } else {
+                                input_report.try_notify_raw(&connection, &bytes, false)
+                            };
+                            match sent {
+                                Ok(()) => {
+                                    if boot {
+                                        hid_inc(HID_BOOT_INPUT_SENT);
+                                    } else {
+                                        hid_inc(HID_REPORTS_SENT);
+                                    }
+                                    sent_any = true;
                                 }
-                                hid_state.seq = (hid_state.seq + 1) % REPORT_CYCLE.len();
+                                Err(_) => {
+                                    hid_inc(HID_NOTIFY_ERRORS);
+                                    hid_put(HID_LAST_ERROR, 1);
+                                }
                             }
-                            Err(_) => {
-                                hid_inc(HID_NOTIFY_ERRORS);
-                                hid_put(HID_LAST_ERROR, 1);
+                        }
+                        #[cfg(feature = "secure")]
+                        if mirror_subscribed {
+                            match mirror.try_notify_raw(&connection, &bytes, false) {
+                                Ok(()) => sent_any = true,
+                                Err(_) => {
+                                    hid_inc(HID_NOTIFY_ERRORS);
+                                    hid_put(HID_LAST_ERROR, 2);
+                                }
                             }
+                        }
+                        if sent_any {
+                            hid_state.seq = (hid_state.seq + 1) % REPORT_CYCLE.len();
                         }
                     } else {
                         hid_state.seq = 0;
                     }
                 }
 
+                #[cfg(feature = "secure")]
+                if security_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    security_deadline = None;
+                    let unencrypted = matches!(
+                        connection.raw().security_level(),
+                        Ok(SecurityLevel::NoEncryption)
+                    );
+                    if unencrypted {
+                        match connection.raw().request_security() {
+                            Ok(()) => stats.set(STAT_SECURITY, SECURITY_REQUESTED),
+                            Err(_) => {
+                                stats.error(14);
+                                stats.set(STAT_SECURITY, SECURITY_FAILED);
+                            }
+                        }
+                    }
+                }
+
+                // The deadline also bounds the report timer, so the tick above
+                // is never delayed past its interval by a long select.
                 #[cfg(feature = "secure")]
                 let deadline = match security_deadline {
                     Some(deadline) if deadline < next_report_at => deadline,

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """X4b HID keyboard acceptance: flash the secure HID firmware, drive the macOS
-CoreBluetooth client, collect HID/secure/Host counters, then restore smoke.
+CoreBluetooth client over the vendor report mirror (Apple filters 0x1812 from
+app discovery), collect HID/secure/Host counters, then restore smoke.
 
 The script never probes while RF may be running: it flashes through the
 single-session preflight helper, runs the client first, and reads RAM only once
@@ -50,6 +51,7 @@ REQUIRED_SYMBOLS = ('STATS', 'HOST_STATS', 'HID_STATS', 'SECURE_STATS', 'SEC_DIA
                     'SEC_OPCODES', 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO',
                     'PERIPHERAL_ADDRESS', 'TRACE')
 RUN_SECONDS_CHOICES = (60, 360)
+SECURITY_REQUESTED = 1
 SECURITY_ENCRYPTED = 3
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
@@ -85,8 +87,16 @@ def client_rows(path):
     return rows
 
 
-def evaluate_client(rows, returncode, discover_only=False):
-    """Byte-level evidence from the macOS client's JSONL transcript."""
+def evaluate_client(rows, returncode):
+    """Discovery and security evidence from the macOS client's JSONL transcript.
+
+    Apple filters the HID service out of CoreBluetooth discovery (Accessory
+    Design Guidelines, GATT Server section), and bluetoothd checks an unsigned
+    CLI in with fProgrammaticPairing 0, so macOS cannot start BLE pairing from
+    this tool. A protected access therefore ends in Insufficient Authentication
+    (the security gate). If the Mac already holds a bond, the same client
+    verifies the mirrored report bytes instead.
+    """
     errors = []
     events = [row.get('event') for row in rows]
     summaries = [row for row in rows if row.get('event') == 'summary']
@@ -96,67 +106,70 @@ def evaluate_client(rows, returncode, discover_only=False):
         errors.append(f'expected one client summary, found {len(summaries)}')
         return errors
     summary = summaries[0]
-    reason = 'hid_discovery_ok' if discover_only else 'hid_reports_ok'
-    if summary.get('exit_code') != 0 or summary.get('reason') != reason:
-        errors.append(f'client summary is not {reason}: {summary.get("reason")}')
+    reason = summary.get('reason')
+    if summary.get('exit_code') != 0 or reason not in ('hid_mirror_ok', 'hid_security_gate_ok'):
+        errors.append(f'client summary is not a passing reason: {reason}')
     if events.count('services_discovered') != 1:
-        errors.append('HID service discovery did not complete exactly once')
+        errors.append('vendor service discovery did not complete exactly once')
     if events.count('characteristics_discovered') != 1:
-        errors.append('HID characteristic discovery did not complete exactly once')
-    if events.count('descriptor_read') != 2:
-        errors.append(f'expected two Report Reference reads, got {events.count("descriptor_read")}')
-    if events.count('read_result') < 3:
-        errors.append('client did not read HID Information, Report Map and Protocol Mode')
+        errors.append('vendor characteristic discovery did not complete exactly once')
+    if summary.get('hid_service_visible'):
+        errors.append('HID service was visible to CoreBluetooth; Apple filters it')
     if events.count('error'):
         errors.append('client reported an error event')
-    if discover_only:
-        if summary.get('reports') != 0 or summary.get('writes') != 0:
-            errors.append('discovery-only run produced reports or writes')
+    if reason == 'hid_security_gate_ok':
+        if not summary.get('security_gate'):
+            errors.append('security-gate summary lacks the gate marker')
+        if events.count('security_gate') != 1:
+            errors.append(f'expected one security gate event, got {events.count("security_gate")}')
+        if summary.get('reports') != 0 or events.count('notification'):
+            errors.append('unencrypted run delivered report notifications')
+        if summary.get('gate_code') != 5:
+            errors.append(f'security gate code={summary.get("gate_code")}, expected 5 '
+                          '(Insufficient Authentication)')
         return errors
+    if events.count('read_result') < 1:
+        errors.append('client did not read the mirror value')
+    if events.count('notify_state') != 2:
+        errors.append('client did not observe both mirror subscription state changes')
     if summary.get('reports') != 8:
         errors.append(f'client verified {summary.get("reports")} reports, expected 8')
-    if summary.get('boot_reports') != 2:
-        errors.append(f'client verified {summary.get("boot_reports")} boot reports, expected 2')
-    if (summary.get('writes') or 0) < 1:
-        errors.append('client did not acknowledge the LED output write')
     if events.count('notification') != 8:
-        errors.append(f'expected 8 report notifications, got {events.count("notification")}')
-    if events.count('boot_notification') != 2:
-        errors.append(f'expected 2 boot notifications, got {events.count("boot_notification")}')
-    if events.count('notify_state') != 2:
-        errors.append('client did not observe both subscription state changes')
-    if events.count('write_sent') != 3:
-        errors.append(f'expected 3 response-less writes, got {events.count("write_sent")}')
+        errors.append(f'expected 8 mirror notifications, got {events.count("notification")}')
     return errors
 
 
-def evaluate_firmware(hid, host, sec, stats, run_seconds, discover_only=False):
-    """Firmware-side counters; gates are fixed, never relaxed after a failure."""
+def evaluate_firmware(hid, host, sec, stats, run_seconds, mirror_mode):
+    """Firmware-side counters; gates are fixed, never relaxed after a failure.
+
+    mirror_mode is the bonded-host path (protected access succeeded, reports
+    verified). Without a bond the macOS run must show the security gate: the
+    peripheral requested security, no SMP/encryption completed, and no report
+    left the device on the unencrypted link.
+    """
     errors = []
     if len(hid) != 16:
         return ['invalid HID_STATS size']
     if hid[0] != HID_MAGIC or hid[1] != 1:
         return [f'HID_STATS magic/version wrong: {hid[:2]}']
     index = HID_NAMES.index
-    minimum = {'report_map_reads': 1, 'hid_info_reads': 1}
-    if not discover_only:
-        minimum.update({'reports_sent': 8, 'boot_input_sent': 2,
-                        'subscription_edges': 2, 'led_writes': 1,
-                        'control_point_writes': 2, 'protocol_mode_writes': 2})
-    for name, count in minimum.items():
-        if hid[index(name)] < count:
-            errors.append(f'HID {name}={hid[index(name)]} < {count}')
     if hid[index('notify_errors')]:
         errors.append(f'HID notify_errors={hid[index("notify_errors")]}')
     if hid[index('last_error')]:
         errors.append(f'HID last_error={hid[index("last_error")]}')
-    if not discover_only:
-        if hid[index('led_value')] != 0x07:
-            errors.append(f'HID led_value={hid[index("led_value")]}, expected 0x07')
-        if hid[index('control_point_last')] != 1:
-            errors.append(f'HID control_point_last={hid[index("control_point_last")]}, expected 1')
     if hid[index('protocol_mode')] != 1:
         errors.append(f'HID protocol_mode={hid[index("protocol_mode")]}, expected 1')
+    if mirror_mode:
+        if hid[index('subscription_edges')] < 1:
+            errors.append(f'HID subscription_edges={hid[index("subscription_edges")]} < 1')
+    else:
+        if hid[index('subscription_edges')]:
+            errors.append(f'HID subscription_edges={hid[index("subscription_edges")]} on a gated link')
+        for name in ('reports_sent', 'boot_input_sent'):
+            if hid[index(name)]:
+                errors.append(f'HID {name}={hid[index(name)]} on an unencrypted link')
+        if hid[index('blocked_unencrypted')] < 1:
+            errors.append('HID blocked_unencrypted=0; the report tick never observed a plain link')
 
     if len(sec) != 16:
         errors.append('invalid SECURE_STATS size')
@@ -170,13 +183,19 @@ def evaluate_firmware(hid, host, sec, stats, run_seconds, discover_only=False):
             errors.append('Host crypto RNG was not seeded')
         if not flags & (1 << 10):
             errors.append('controller DRBG was not seeded')
-        for name, count in (('enc_req', 1), ('enc_rsp', 1), ('ltk_request', 1),
-                            ('ltk_reply', 1), ('start_req', 1), ('start_rsp', 1),
-                            ('encrypted_tx', 2), ('encrypted_rx', 2)):
-            if sec[SEC_NAMES.index(name)] < count:
-                errors.append(f'SECURE {name}={sec[SEC_NAMES.index(name)]} < {count}')
-        if sec[SEC_NAMES.index('active')] != 1:
-            errors.append(f'SECURE active={sec[SEC_NAMES.index("active")]}, expected 1')
+        if mirror_mode:
+            for name, count in (('enc_req', 1), ('enc_rsp', 1), ('ltk_request', 1),
+                                ('ltk_reply', 1), ('start_req', 1), ('start_rsp', 1),
+                                ('encrypted_tx', 2), ('encrypted_rx', 2)):
+                if sec[SEC_NAMES.index(name)] < count:
+                    errors.append(f'SECURE {name}={sec[SEC_NAMES.index(name)]} < {count}')
+            if sec[SEC_NAMES.index('active')] != 1:
+                errors.append(f'SECURE active={sec[SEC_NAMES.index("active")]}, expected 1')
+        else:
+            for name in ('enc_req', 'enc_rsp', 'start_req', 'start_rsp', 'active',
+                         'encrypted_tx', 'encrypted_rx'):
+                if sec[SEC_NAMES.index(name)]:
+                    errors.append(f'SECURE {name}={sec[SEC_NAMES.index(name)]} without a bond')
         for name in ('mic_failure', 'errors', 'plaintext_start_retry'):
             if sec[SEC_NAMES.index(name)]:
                 errors.append(f'SECURE {name}={sec[SEC_NAMES.index(name)]}')
@@ -188,9 +207,10 @@ def evaluate_firmware(hid, host, sec, stats, run_seconds, discover_only=False):
             errors.append('Host did not accept a connection')
         if host[HOST_NAMES.index('disconnects')] < 1:
             errors.append('Host did not observe the disconnect')
-        if host[HOST_NAMES.index('security')] != SECURITY_ENCRYPTED:
+        expected_security = SECURITY_ENCRYPTED if mirror_mode else SECURITY_REQUESTED
+        if host[HOST_NAMES.index('security')] != expected_security:
             errors.append(f'Host security state={host[HOST_NAMES.index("security")]}, '
-                          f'expected {SECURITY_ENCRYPTED}')
+                          f'expected {expected_security}')
         for name in ('errors', 'last_error'):
             if host[HOST_NAMES.index(name)]:
                 errors.append(f'Host {name}={host[HOST_NAMES.index(name)]}')
@@ -223,9 +243,9 @@ def execute(args):
     args.out.mkdir(parents=True, exist_ok=False)
     errors, metadata = [], {
         'probe': PROBE,
-        'scope': 'X4b HOGP keyboard on a Just Works encrypted link',
+        'scope': 'X4b HOGP keyboard report bytes through the vendor mirror on '
+                 'a Just Works encrypted link (Apple filters 0x1812)',
         'run_seconds': args.run_seconds, 'timeout': args.timeout,
-        'discover_only': args.discover_only,
         'pair_click': args.pair_click,
         'air_ifs': 'UNMEASURED', 'mitm': 'not protected (Just Works)',
     }
@@ -282,8 +302,6 @@ def execute(args):
                 stdout=(args.out / 'pair_click.log').open('w'),
                 stderr=subprocess.STDOUT, text=True)
         client_args = [str(binary), '--timeout', str(args.timeout), '--hold', str(args.hold)]
-        if args.discover_only:
-            client_args.append('--discover-only')
         (args.out / 'client.command.json').write_text(json.dumps(client_args) + '\n')
         client_log = (args.out / 'hid_host.jsonl').open('w')
         client_err = (args.out / 'hid_host.stderr.log').open('w')
@@ -300,7 +318,9 @@ def execute(args):
         rows = client_rows(args.out / 'hid_host.jsonl')
         metadata['client_summary'] = next(
             (row for row in reversed(rows) if row.get('event') == 'summary'), None)
-        errors.extend(evaluate_client(rows, client.returncode, args.discover_only))
+        mirror_mode = (metadata['client_summary'] or {}).get('reason') == 'hid_mirror_ok'
+        metadata['mirror_mode'] = mirror_mode
+        errors.extend(evaluate_client(rows, client.returncode))
     except FAILURES as error:
         errors.append(f'{type(error).__name__}: {error}')
     finally:
@@ -338,7 +358,7 @@ def execute(args):
                     errors.extend(evaluate_firmware(
                         observations['HID_STATS'], observations['HOST_STATS'],
                         observations['SECURE_STATS'], observations['STATS'],
-                        args.run_seconds, args.discover_only))
+                        args.run_seconds, mirror_mode))
             try:
                 io.flash(args.out / 'smoke.elf', args.out, 'restore')
                 io.command(['swift', str(io.SCANNER), 'wch585', '8'],
@@ -363,10 +383,8 @@ def options(argv=None):
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)
     parser.add_argument('--run-seconds', type=int, choices=RUN_SECONDS_CHOICES, default=60)
-    parser.add_argument('--timeout', type=float, default=45)
-    parser.add_argument('--hold', type=float, default=6)
-    parser.add_argument('--discover-only', action='store_true',
-                        help='stop after service/characteristic/descriptor reads')
+    parser.add_argument('--timeout', type=float, default=50)
+    parser.add_argument('--hold', type=float, default=0.5)
     parser.add_argument('--no-pair-click', dest='pair_click', action='store_false',
                         help='do not auto-click the macOS pairing dialog')
     return parser.parse_args(argv)

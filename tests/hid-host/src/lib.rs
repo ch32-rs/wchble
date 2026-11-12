@@ -50,9 +50,6 @@ mod tests {
 
     const PUMP_LIMIT: usize = 4096;
     const HANDLE: u16 = 1;
-    /// Default ATT MTU: every read response carries at most MTU-1 bytes.
-    const READ_CHUNK: usize = 22;
-
     /// The vendor boot-keyboard report map, duplicated here as an independent
     /// expectation: the test must fail if the firmware constant drifts.
     const EXPECTED_MAP: [u8; 63] = [
@@ -78,6 +75,8 @@ mod tests {
         host: Pin<&'a mut F>,
         stats: &'a host::HostStats,
         controller: SoftRunner,
+        /// Negotiated ATT MTU; 23 until an Exchange MTU Request succeeds.
+        mtu: usize,
     }
 
     impl<F: Future> Fixture<'_, F> {
@@ -242,7 +241,7 @@ mod tests {
                 let chunk = &replies[0][1..];
                 let len = chunk.len();
                 out.extend_from_slice(chunk);
-                if len < READ_CHUNK {
+                if len < self.mtu - 1 {
                     break;
                 }
             }
@@ -256,6 +255,49 @@ mod tests {
             let replies = self.exchange(&request, 1 + notifications);
             assert_eq!(replies.iter().filter(|r| r.as_slice() == [0x13]).count(), 1);
             replies.into_iter().filter(|r| r[0] == 0x1b).collect()
+        }
+
+        /// Exchange MTU the way a desktop host does before discovering.
+        fn exchange_mtu(&mut self, mtu: u16) -> u16 {
+            let [lo, hi] = mtu.to_le_bytes();
+            let replies = self.exchange(&[0x02, lo, hi], 1);
+            assert_eq!(replies[0][0], 0x03);
+            assert_eq!(replies[0].len(), 3);
+            let negotiated = u16::from_le_bytes([replies[0][1], replies[0][2]]);
+            self.mtu = usize::from(negotiated);
+            negotiated
+        }
+
+        /// Read By Group Type 0x2800, the walk CoreBluetooth uses to list
+        /// primary services. Entries are (start, end, uuid16).
+        fn discover_groups(&mut self) -> Vec<(u16, u16, u16)> {
+            let mut at = 1u16;
+            let mut found = Vec::new();
+            loop {
+                let [sl, sh] = at.to_le_bytes();
+                let replies = self.exchange(&[0x10, sl, sh, 0xff, 0xff, 0x00, 0x28], 1);
+                if replies[0][0] == 0x01 {
+                    break;
+                }
+                assert_eq!(replies[0][0], 0x11);
+                let stride = replies[0][1] as usize;
+                assert_eq!(stride, 6, "16-bit primary services only");
+                let mut last = None;
+                for entry in replies[0][2..].chunks_exact(stride) {
+                    let start = u16::from_le_bytes([entry[0], entry[1]]);
+                    let end = u16::from_le_bytes([entry[2], entry[3]]);
+                    let uuid = u16::from_le_bytes([entry[4], entry[5]]);
+                    found.push((start, end, uuid));
+                    last = Some(end);
+                }
+                let Some(last_end) = last else { break };
+                // The final service group uses 0xFFFF as "end of database".
+                if last_end == u16::MAX || last_end <= at {
+                    break;
+                }
+                at = last_end + 1;
+            }
+            found
         }
 
         fn find_service(&mut self, uuid: u16) -> (u16, u16) {
@@ -373,14 +415,37 @@ mod tests {
             host: future.as_mut(),
             stats: &stats,
             controller: SoftRunner::new(),
+            mtu: 23,
         };
         fixture.until("Host initializes and advertises", |f| {
             f.controller.adv_enabled()
         });
         fixture.connect(1);
 
+        // Desktop hosts discover primary services with Read By Group Type
+        // after an MTU exchange, not with Find By Type Value. Replay that walk
+        // first: a wrong group end handle makes macOS skip the HID service.
+        let mtu = fixture.exchange_mtu(247);
+        assert!(mtu >= 23 && mtu <= 128, "negotiated ATT MTU {mtu}");
+        // This fixture compiles host.rs without `secure`, so the vendor bond
+        // control service (0x1A00) does not exist here. The HID service is the
+        // last 16-bit group, and Trouble reports the end of the database as
+        // 0xFFFF for it; a walk must stop there without overflowing.
+        let groups = fixture.discover_groups();
+        let uuids: Vec<u16> = groups.iter().map(|(_, _, uuid)| *uuid).collect();
+        assert_eq!(uuids, vec![0x1800, 0x1801, 0x180a, 0x1812]);
+        assert_eq!(groups[0].0, 1, "first service starts at handle 1");
+        for window in groups.windows(2) {
+            assert_eq!(window[1].0, window[0].1 + 1, "service groups must be contiguous");
+            assert!(window[0].0 <= window[0].1);
+        }
+        assert_eq!(groups.last().unwrap().1, u16::MAX, "last group ends the database");
+        let hid_group = groups.iter().find(|(_, _, uuid)| *uuid == 0x1812).unwrap();
+        assert!(hid_group.0 < hid_group.1);
+
         // HID service: nine characteristics, two of them 0x2A4D.
         let (start, end) = fixture.find_service(0x1812);
+        assert_eq!((start, end), (hid_group.0, hid_group.1));
         assert!(start < end);
         let chars = fixture.declarations(start, end);
         let mut uuids: Vec<u16> = chars.iter().map(|(uuid, _, _)| *uuid).collect();

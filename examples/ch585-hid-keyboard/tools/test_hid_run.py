@@ -17,22 +17,19 @@ def load(name, path):
 hid = load('x4b_hid_run_test', HERE / 'hid_run.py')
 
 
-def client_rows(discover_only=False, **overrides):
+def client_rows(gate=False, **overrides):
     events = ['start', 'bluetooth_state', 'scan_started', 'connecting', 'connected',
-              'hold_complete', 'services_discovered', 'characteristics_discovered',
-              'descriptor_read', 'descriptor_read', 'read_result', 'read_result',
-              'read_result']
-    summary = {'event': 'summary', 'exit_code': 0,
-               'reason': 'hid_discovery_ok' if discover_only else 'hid_reports_ok',
-               'reports': 0 if discover_only else 8,
-               'boot_reports': 0 if discover_only else 2,
-               'writes': 0 if discover_only else 1,
-               'notifications': 0 if discover_only else 10}
-    if not discover_only:
-        events += ['notify_state', 'notification'] + ['notification'] * 7
-        events += ['write_ack', 'write_sent', 'write_sent', 'write_sent',
-                   'notify_state', 'boot_notification', 'boot_notification']
-    events += ['cancel_requested', 'disconnected']
+              'hold_complete', 'services_discovered', 'characteristics_discovered']
+    summary = {'event': 'summary', 'exit_code': 0, 'hid_service_visible': False}
+    if gate:
+        events += ['notify_requested', 'security_gate', 'cancel_requested', 'disconnected']
+        summary.update({'reason': 'hid_security_gate_ok', 'reports': 0,
+                        'security_gate': True, 'gate_code': 5})
+    else:
+        events += ['notify_requested', 'notify_state', 'read_requested', 'read_result']
+        events += ['notification'] * 8
+        events += ['notify_state', 'cancel_requested', 'disconnected']
+        summary.update({'reason': 'hid_mirror_ok', 'reports': 8, 'security_gate': False})
     rows = [{'event': name} for name in events]
     rows.append(dict(summary, **overrides))
     return rows
@@ -84,41 +81,60 @@ def run_stats(run_seconds=60):
     return words
 
 
-def firmware_errors(discover_only=False, **overrides):
+def gated_secure_stats():
+    """No bond: entropy/DRBG flags set, every encryption counter zero."""
+    return secure_stats(enc_req=0, enc_rsp=0, ltk_request=0, ltk_reply=0,
+                        start_req=0, start_rsp=0, encrypted_tx=0, encrypted_rx=0,
+                        active=0)
+
+
+def firmware_errors(mirror_mode=True, **overrides):
+    host = overrides.get('host')
+    if host is None:
+        host = host_stats(**({} if mirror_mode else {'security': 1}))
+    sec = overrides.get('sec')
+    if sec is None:
+        sec = secure_stats() if mirror_mode else gated_secure_stats()
+    hid_words = overrides.get('hid')
+    if hid_words is None:
+        hid_words = hid_stats(**({} if mirror_mode else {
+            'subscription_edges': 0, 'reports_sent': 0, 'boot_input_sent': 0}))
     return hid.evaluate_firmware(
-        overrides.get('hid', hid_stats()), overrides.get('host', host_stats()),
-        overrides.get('sec', secure_stats()), overrides.get('stats', run_stats()),
-        overrides.get('run_seconds', 60), discover_only)
+        hid_words, host, sec, overrides.get('stats', run_stats()),
+        overrides.get('run_seconds', 60), mirror_mode)
 
 
 class ClientTests(unittest.TestCase):
-    def test_full_transcript_passes(self):
-        rows = client_rows()
-        self.assertEqual(hid.evaluate_client(rows, 0), [])
+    def test_mirror_transcript_passes(self):
+        self.assertEqual(hid.evaluate_client(client_rows(), 0), [])
 
-    def test_discovery_transcript_passes(self):
-        rows = client_rows(discover_only=True)
-        self.assertEqual(hid.evaluate_client(rows, 0, True), [])
+    def test_security_gate_transcript_passes(self):
+        self.assertEqual(hid.evaluate_client(client_rows(gate=True), 0), [])
 
     def test_failures_are_reported(self):
         cases = [
-            (client_rows(), 1, False),
-            (client_rows()[:-1], 0, False),
-            (client_rows(**{'reason': 'hid_discovery_ok'}), 0, False),
-            (client_rows(**{'reports': 7}), 0, False),
-            (client_rows(**{'boot_reports': 1}), 0, False),
-            (client_rows(**{'writes': 0}), 0, False),
-            (client_rows(discover_only=True, reports=1), 0, True),
+            (client_rows(), 1),
+            (client_rows()[:-1], 0),
+            (client_rows(**{'reason': 'hid_reports_ok'}), 0),
+            (client_rows(**{'reports': 7}), 0),
+            (client_rows(**{'hid_service_visible': True}), 0),
+            (client_rows(gate=True, **{'gate_code': 15}), 0),
+            (client_rows(gate=True, reports=1), 0),
         ]
-        for rows, code, discover in cases:
-            with self.subTest(code=code, discover=discover):
-                self.assertTrue(hid.evaluate_client(rows, code, discover))
+        for rows, code in cases:
+            with self.subTest(code=code):
+                self.assertTrue(hid.evaluate_client(rows, code))
 
     def test_event_counts_are_checked(self):
         rows = client_rows()
-        rows = [row for row in rows if row.get('event') != 'descriptor_read']
-        self.assertTrue(any('Report Reference' in error
-                            for error in hid.evaluate_client(rows, 0)))
+        rows = [row for row in rows if row.get('event') != 'read_result']
+        self.assertTrue(any('mirror' in error for error in hid.evaluate_client(rows, 0)))
+        rows = client_rows()
+        rows = [row for row in rows if row.get('event') != 'notify_state']
+        self.assertTrue(hid.evaluate_client(rows, 0))
+        rows = client_rows(gate=True)
+        rows = [row for row in rows if row.get('event') != 'security_gate']
+        self.assertTrue(hid.evaluate_client(rows, 0))
         rows = client_rows()
         rows.insert(5, {'event': 'error', 'reason': 'x'})
         self.assertTrue(hid.evaluate_client(rows, 0))
@@ -138,25 +154,26 @@ class ClientTests(unittest.TestCase):
 class FirmwareTests(unittest.TestCase):
     def test_clean_counters_pass(self):
         self.assertEqual(firmware_errors(), [])
-        self.assertEqual(firmware_errors(discover_only=True), [])
+        self.assertEqual(firmware_errors(mirror_mode=False), [])
 
-    def test_report_gates(self):
-        for name, value in (('reports_sent', 7), ('boot_input_sent', 1),
-                            ('notify_errors', 1), ('led_value', 0),
-                            ('control_point_last', 0), ('protocol_mode', 0),
-                            ('report_map_reads', 0), ('hid_info_reads', 0),
-                            ('last_error', 1)):
+    def test_mirror_gates(self):
+        for name, value in (('notify_errors', 1), ('protocol_mode', 0),
+                            ('subscription_edges', 0), ('last_error', 1)):
             with self.subTest(name=name):
                 errors = firmware_errors(hid=hid_stats(**{name: value}))
                 self.assertTrue(errors)
 
-    def test_discovery_gates_do_not_require_reports(self):
-        errors = firmware_errors(discover_only=True,
-                                 hid=hid_stats(reports_sent=0, boot_input_sent=0,
-                                               led_writes=0, control_point_writes=0,
-                                               protocol_mode_writes=0,
-                                               subscription_edges=0))
-        self.assertEqual(errors, [])
+    def test_gate_mode_rejects_plaintext_and_absent_encryption(self):
+        self.assertTrue(firmware_errors(mirror_mode=False,
+                                        hid=hid_stats(subscription_edges=0, reports_sent=1,
+                                                      boot_input_sent=0)))
+        self.assertTrue(any('blocked_unencrypted' in error for error in
+                            firmware_errors(mirror_mode=False,
+                                            hid=hid_stats(subscription_edges=0, reports_sent=0,
+                                                          boot_input_sent=0,
+                                                          blocked_unencrypted=0))))
+        self.assertTrue(firmware_errors(mirror_mode=False, sec=secure_stats()))
+        self.assertTrue(firmware_errors(mirror_mode=False, host=host_stats(security=3)))
 
     def test_security_and_host_gates(self):
         self.assertTrue(firmware_errors(sec=secure_stats(encrypted_tx=1)))
@@ -188,9 +205,10 @@ class OptionTests(unittest.TestCase):
             hid.options(['--out', '/tmp/x', '--run-seconds', '25'])
 
     def test_switches(self):
-        parsed = hid.options(['--out', '/tmp/x', '--discover-only', '--no-pair-click'])
-        self.assertTrue(parsed.discover_only)
+        parsed = hid.options(['--out', '/tmp/x', '--no-pair-click'])
         self.assertFalse(parsed.pair_click)
+        parsed = hid.options(['--out', '/tmp/x', '--hold', '0'])
+        self.assertEqual(parsed.hold, 0)
 
     def test_unique_stat_names(self):
         self.assertEqual(len(hid.HID_NAMES), 16)

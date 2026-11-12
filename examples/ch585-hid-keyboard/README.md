@@ -35,8 +35,8 @@ dependency.
 | --- | --- | --- | --- | --- |
 | GAP | Device Name / Appearance | `2A00` / `2A01` | Read | `wch585-hid` / `0x03C1` |
 | DIS | Manufacturer / Model / FW | `2A29` / `2A24` / `2A26` | Read | `wchble` / `ch585-hid-keyboard` / `x4b-0.1` |
-| HID | HID Information | `2A4A` | Read | `11 01 00 01` |
-| HID | Report Map | `2A4B` | Read | 63-byte boot keyboard map |
+| HID | HID Information | `2A4A` | Read (no encryption) | `11 01 00 01` |
+| HID | Report Map | `2A4B` | Read (no encryption) | 63-byte boot keyboard map |
 | HID | HID Control Point | `2A4C` | Write Without Response | `0x00`/`0x01` recorded |
 | HID | Protocol Mode | `2A4E` | Read + Write Without Response | `1` report, `0` boot |
 | HID | Report (keyboard input) | `2A4D` | Read + Notify, `2908=[0,1]` | 8 bytes |
@@ -44,15 +44,25 @@ dependency.
 | HID | Boot Keyboard Input | `2A22` | Read + Notify | 8 bytes |
 | HID | Boot Keyboard Output | `2A32` | Read + Write | 1 byte |
 | vendor | Bond control | `00001a01-…` | Write | `DEL!` / `WIPE` / `FALT` |
+| vendor | Report mirror | `00001a02-…` | Read + Notify | diagnostic copy of the 8-byte HID input report |
 
 The 63-byte report map is the vendor `HID_Keyboard` map
 (`CH585EVT/EXAM/BLE/HID_Keyboard/Profile/hidkbdservice.c`): 8 modifier bits, one
 reserved byte, five LED bits plus padding, six key bytes. There is no boot
 keyboard control point: `0x2A34` is Glucose Measurement Context, not HID.
 
-Under `secure`, every HID value/CCCD write requires encryption. The two
-`0x2908` Report Reference descriptors stay `Allowed`: they carry no secret and
-a HOGP host may read them while bonding. The attribute table capacity is 64
+Under `secure`, every report value and CCCD write requires encryption. HID
+Information, the Report Map and the two `0x2908` Report Reference descriptors
+stay readable without one: they carry no secret, a HOGP host reads them while
+bonding, and a host that claims the HID service internally (Apple) otherwise
+stalls its discovery on Insufficient Authentication. Reports never leave the
+device before encryption is active.
+
+The report mirror exists because Apple's Accessory Design Guidelines filter the
+BLE HID service out of CoreBluetooth discovery: a macOS app never sees
+`0x1812`, even when it asks for that UUID explicitly (verified on hardware).
+The mirror is not part of HOGP; it carries the same bytes over the same
+encrypted link and is ignored by every HID host. The attribute table capacity is 64
 (`AttributeTable` and `AttributeServer` const generics must match; `push`
 panics at the first poll on overflow).
 
@@ -69,7 +79,8 @@ Once the input report CCCD is written, a one-second tick sends the fixed cycle
 at every subscription rising edge, so a client always sees the cycle from its
 first report. In boot protocol the same eight-byte reports go to `0x2A22`;
 values written to either LED output characteristic are recorded. Reports are
-never sent while the link is unencrypted.
+never sent while the link is unencrypted. A subscribed mirror receives the
+same bytes regardless of protocol mode.
 
 `HID_STATS[16]` (symbol, read over SWD) carries: `magic`, `version`,
 `reports_sent` (report protocol), `notify_errors`, `subscription_edges`,
@@ -90,20 +101,30 @@ cleanup margin, reads the counters, and always restores the smoke image.
 It never probes while RF may be running.
 
 ```sh
-# First hardware step: discovery only (no pairing, no reports).
-python3 examples/ch585-hid-keyboard/tools/hid_run.py \
-  --out local-docs/results/x4b-discover-<unique> --discover-only
-
-# Full macOS acceptance.
 python3 examples/ch585-hid-keyboard/tools/hid_run.py \
   --out local-docs/results/x4b-macos-<unique>
 ```
 
-The macOS client asserts the HID Information, the exact 63-byte Report Map,
-Protocol Mode `1`, the two `0x2908` values, the first eight report bytes, the
-LED write, both Control Point values, boot protocol reports and the return to
-report protocol. The pairing dialog must be accepted; the runner starts
-`tools/hid_pair_click.py`, which clicks only the affirmative Bluetooth button.
+Two Apple platform constraints shape this run:
+
+- CoreBluetooth filters `0x1812` out of third-party app discovery, so the
+  client cannot read HID values or subscribe to `0x2A4D`, even when asking for
+  the UUID explicitly (Apple Accessory Design Guidelines, GATT Server
+  section).
+- bluetoothd checks an unsigned CLI in with `fProgrammaticPairing 0`, so macOS
+  never starts BLE pairing for this tool and every protected access ends in
+  Insufficient Authentication (0x05) after the 30 s ATT timeout. No pairing
+  dialog appears; the entitlements needed are not available to a test tool.
+
+The automated macOS run therefore asserts: the vendor service is visible,
+`0x1812` is hidden (a run where it becomes visible fails on purpose), the
+firmware read HID Information and the Report Map for the system HID stack, and
+the encrypted mirror access was refused. Firmware counters must show no report
+on the plain link (`reports_sent == 0`, `blocked_unencrypted > 0`), the
+peripheral Security Request (`Host security == 1`) and no SMP. The exact byte
+contract is covered by `tests/hid-host`; a bonded host (for example after the
+Android check) exercises the mirror path instead, and the same client then
+verifies the eight mirrored report bytes byte-for-byte.
 
 Offline gates before any hardware session:
 
@@ -112,6 +133,17 @@ cargo test --manifest-path tests/hid-host/Cargo.toml --locked
 python3 -m unittest discover -s examples/ch585-hid-keyboard/tools -p 'test_*.py'
 swiftc -typecheck examples/ch585-hid-keyboard/tools/hid_host.swift
 ```
+
+### macOS system-HID check (manual)
+
+1. Flash the `secure,long-run` image through the preflight helper (360 s).
+2. System Settings → Bluetooth → connect/pair `wch585-hid` (Just Works).
+3. Focus a text field; macOS types `abcd…` once per second.
+4. Evidence: a screenshot of the typed text and the firmware counters read
+   after the run (`reports_sent` and `subscription_edges` must be non-zero).
+5. Wait out the 360 s budget, then restore the smoke image.
+
+`hidutil list` shows the new keyboard device while it is connected.
 
 ### Android manual check
 
@@ -139,3 +171,9 @@ byte-level assertions.
 - Encryption-required HID Information/Report Map reads may need to be relaxed
   to `Allowed` if a specific Android HID host fails before bonding; reports
   themselves stay encrypted.
+- Apple's CoreBluetooth filters `0x1812` (Accessory Design Guidelines, GATT
+  Server section) and macOS refuses programmatic BLE pairing to unsigned
+  tools, so macOS cannot be an automated byte-level HOGP host. The HID
+  contract is validated offline and on the Android system HID stack.
+- `tools/hid_pair_click.py` is kept for the bonded-host case but no dialog
+  appears for an unsigned client; macOS pairs only from System Settings.

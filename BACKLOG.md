@@ -263,6 +263,28 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).
 
+## X4b HID (encrypted-link keyboard)
+
+- [ ] **Android system-HID round not yet executed.** This is the only host
+  round that exercises the real `0x1812` subscription and reports; it needs one
+  Just Works confirmation tap and a focused text field. Firmware counters,
+  `dumpsys input` and a screenshot are the evidence. The 60 s macOS runs do not
+  replace it.
+- [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
+  third-party discovery (Apple Accessory Design Guidelines, GATT Server
+  section) and bluetoothd checks an unsigned CLI in with
+  `fProgrammaticPairing 0`, so no pairing dialog or encrypted access is
+  possible. The diagnostic mirror and client support a bonded host, but that
+  path was never exercised on macOS.
+- [ ] **Only a keyboard Report Map is implemented.** Consumer-control and mouse
+  collections, output reports beyond the LED byte, and multiple Report IDs are
+  absent.
+- [ ] **Encrypted ATT is not decodable in captures.** The sniffer sees SMP and
+  LL encryption but cannot read reports without the stored LTK; the
+  `--sc-ltk-key` path was not wired into the runner.
+- [ ] **The example duplicates the ~2100-line P4/P5 pump.** Extraction belongs
+  to L0; the copied example is a validation artefact, not a second driver.
+
 ## Explicitly outside this milestone
 
 Pairing/encryption, multiple connections, DLE, 2M, CSA2, long attributes and
