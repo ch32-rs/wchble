@@ -570,7 +570,7 @@ impl Session {
         enc_rsp_payload[0] = 0x04;
         enc_rsp_payload[1..].copy_from_slice(&enc_rsp_random);
         Self {
-            conn: PeripheralConnection::new(params, end),
+            conn: PeripheralConnection::new(params, end, false),
             link: LinkSequence::new(),
             control,
             pending_control: None,

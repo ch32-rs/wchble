@@ -478,6 +478,7 @@ fn prepare_initiator(
     let params = ConnectParams {
         peer_addr: request.peer_addr,
         peer_random: request.peer_random,
+        chsel: false,
         access_addr: CONNECT_AA,
         crc_init: CONNECT_CRC_INIT,
         win_size: WIN_SIZE,
@@ -989,6 +990,7 @@ fn tx_probe(radio: &mut Ch585Radio, clock: &Clock) {
     let params = ConnectParams {
         peer_addr: [0x34, 0x12, 0x00, 0xee, 0xff, 0xc2],
         peer_random: true,
+        chsel: false,
         access_addr: 0x1a2b_3c4d,
         crc_init: 0x0065_4321,
         win_size: 3,

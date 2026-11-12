@@ -7,7 +7,8 @@
 
 use super::acl::MAX_LEGACY_PAYLOAD;
 use super::conn::{
-    time_reached, validate_instant, ConnError, ConnectParams, ConnectionUpdate, Csa1, LinkTiming,
+    time_reached, validate_instant, ChannelSelection, ChannelSelectionAlgorithm, ConnError,
+    ConnectParams, ConnectionUpdate, LinkTiming,
 };
 
 /// One central link, independent of radio registers and packet buffers.
@@ -16,7 +17,7 @@ use super::conn::{
 #[derive(Debug, Clone)]
 pub struct CentralConnection {
     pub params: ConnectParams,
-    csa: Csa1,
+    csa: ChannelSelection,
     channel: u8,
     event_counter: u16,
     event_start_us: u32,
@@ -32,8 +33,21 @@ impl CentralConnection {
     /// software estimate of the CONNECT_IND on-air end; the first event starts
     /// at `connect_ind_end_us + 1.25 ms + WinOffset * 1.25 ms`.
     pub fn new(params: ConnectParams, connect_ind_end_us: u32) -> Self {
-        let mut csa = Csa1::new(params.channel_map, params.hop).expect("validated CONNECT_IND");
-        let channel = csa.next_channel();
+        // `params.chsel` was already gated on the peer ADV's ChSel when the
+        // CONNECT_IND was built, so it alone decides the algorithm here.
+        let algorithm = if params.chsel {
+            ChannelSelectionAlgorithm::Csa2
+        } else {
+            ChannelSelectionAlgorithm::Csa1
+        };
+        let mut csa = ChannelSelection::new(
+            algorithm,
+            params.channel_map,
+            params.access_addr,
+            params.hop,
+        )
+        .expect("validated CONNECT_IND");
+        let channel = csa.next_channel(0);
         Self {
             params,
             csa,
@@ -59,6 +73,10 @@ impl CentralConnection {
 
     pub fn channel(&self) -> u8 {
         self.channel
+    }
+
+    pub fn channel_selection_algorithm(&self) -> ChannelSelectionAlgorithm {
+        self.csa.algorithm()
     }
 
     pub fn event_counter(&self) -> u16 {
@@ -156,7 +174,7 @@ impl CentralConnection {
                 self.pending_update = None;
             }
         }
-        self.channel = self.csa.next_channel();
+        self.channel = self.csa.next_channel(self.event_counter);
         Ok(())
     }
 
@@ -198,6 +216,7 @@ mod tests {
         ConnectParams {
             peer_addr: [1, 2, 3, 4, 5, 6],
             peer_random: true,
+            chsel: false,
             access_addr: 0x1234_5678,
             crc_init: 0x0055_5555,
             win_size: 2,
@@ -217,6 +236,28 @@ mod tests {
         assert_eq!(conn.event_start_us(), 1000 + 1250 + 1250);
         assert_eq!(conn.channel(), 5);
         assert_eq!(conn.event_counter(), 0);
+        assert_eq!(
+            conn.channel_selection_algorithm(),
+            ChannelSelectionAlgorithm::Csa1
+        );
+    }
+
+    #[test]
+    fn csa2_first_event_matches_the_peripheral() {
+        let mut p = params();
+        p.chsel = true;
+        let mut central = CentralConnection::new(p, 1000);
+        let mut peripheral = crate::ll::conn::PeripheralConnection::new(p, 1000, true);
+        assert_eq!(
+            central.channel_selection_algorithm(),
+            ChannelSelectionAlgorithm::Csa2
+        );
+        assert_eq!(central.channel(), peripheral.channel());
+        for _ in 0..8 {
+            central.next_event().unwrap();
+            peripheral.next_event().unwrap();
+            assert_eq!(central.channel(), peripheral.channel());
+        }
     }
 
     #[test]

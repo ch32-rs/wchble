@@ -378,6 +378,7 @@ mod tests {
             ConnectParams {
                 peer_addr: [1; 6],
                 peer_random: false,
+                chsel: false,
                 access_addr: 0x1234_5678,
                 crc_init: 0,
                 win_size: 1,
@@ -390,6 +391,7 @@ mod tests {
                 sca: 0,
             },
             1000,
+            false,
         )
     }
 
@@ -417,7 +419,7 @@ mod tests {
         let mut ctrl = ControlState::new();
         let mut link = LinkSequence::new();
         let start = u32::MAX - 50_000;
-        conn = PeripheralConnection::new(conn.params, start.wrapping_sub(1000));
+        conn = PeripheralConnection::new(conn.params, start.wrapping_sub(1000), false);
         assert!(conn.on_rx_anchor(start, 0));
         ctrl.start_termination(start, 10);
         link.queue(3, &[2, 0x13]).unwrap();
