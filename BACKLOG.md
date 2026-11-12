@@ -99,9 +99,32 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [x] **Device Information + UART echo v1:** standard DIS reads and a Nordic
   UART-style write/notify echo run in the Host/application layer. Native fixture
   and a three-cycle macOS run pass.
-- [ ] **ATT MTU negotiation and long data:** the image still fixes MTU 23 and a
-  27-byte packet pool. MTU exchange, longer writes, L2CAP fragmentation and
-  reads across multiple ACL packets are unimplemented/unvalidated.
+- [x] **ATT MTU negotiation and long data (2026-11-13).** The 60 s secure
+  image now negotiates MTU 124 (128-byte packet pool), answers a 200-byte read
+  with Read + Read Blob and a 200-byte write with Prepare/Execute; the Android
+  app read back the identical pattern and the air opcode counters prove both
+  paths. The same round exercised notification-queue pressure (12 attempts, 7
+  queued, 5 queue-full). Evidence:
+  `local-docs/results/x4-att-5-rx31/`, summary in
+  [X4 results](local-docs/research/ch585-x4-att-results.md).
+- [x] **Encrypted PDUs above the legacy 27 octets (2026-11-13).** An Android
+  Central without DLE sent 28-octet encrypted data PDUs (24 plaintext + MIC);
+  the LL refused them at four hardcoded 27-byte limits and, because the refusal
+  happened before any TX, never acknowledged them. The peer retransmitted until
+  the 5 s supervision timeout killed the link. The ceiling is now
+  `ll::enc::MAX_ENCRYPTED` (27 plaintext + MIC) everywhere, and a refused PDU
+  is recorded in `SEC_DIAG[63]`; the X4 runner fails on any such sample.
+  Evidence: `local-docs/results/x4-att-3-badpdu/` (`0x001c1201` = header
+  `0x12`, length 28), `x4-att-4-rx31/`, `x4-att-5-rx31/`.
+- [ ] **Burst drops are silent by design.** `try_notify_raw` returns
+  `OutOfMemory` when the 8-deep notification queue is full; the X4 fixture
+  counts it and moves on rather than waiting or retrying. This proves the
+  pressure path but is not a flow-control policy; a profile needing lossless
+  notification must add credit/backpressure semantics at the application layer.
+- [ ] **Long writes depend on the peer's queued-write implementation.** The
+  Android result relies on AOSP splitting a `WRITE_TYPE_DEFAULT` value larger
+  than MTU-3 into Prepare/Execute writes. Other stacks may truncate or fail
+  instead; the acceptance evidence is for CPH2411/AOSP only.
 - [ ] **UART flow and throughput stress:** bursts beyond the Host credit window,
   backpressure with large payloads, and sustained bidirectional throughput are
   not tested. The current echo accepts at most 20 bytes per write at MTU 23.
@@ -314,6 +337,8 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 ## Explicitly outside this milestone
 
-Pairing/encryption, multiple connections, DLE, 2M, CSA2, long attributes and
-product profiles are not implemented or accepted by the current peripheral or
-central examples. They are future scope decisions, not compatibility claims.
+Multiple connections, DLE, 2M, CSA2 and product profiles beyond HOGP are not
+implemented or accepted by the current peripheral or central examples. They are
+future scope decisions, not compatibility claims. Pairing/encryption (S2/S3)
+and long attributes (X4a) have since moved out of this list with the evidence
+above.
