@@ -16,6 +16,7 @@ use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::conn::{ConnectParams, PeripheralConnection};
 use wchble::ll::ctrl::{ControlAction, ControlPdu, ControlState, LocalVersion};
+use wchble::crypto::BLE_MIC_LEN;
 use wchble::ll::enc::{
     EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
 };
@@ -167,6 +168,11 @@ const DIAG_HCI_LOG_LEN: usize = 49;
 /// `0xE000_0000 | opcode << 8 | status` (Complete), `0xF000_0000 | ...` (Status).
 const DIAG_HCI_SENT: usize = 50;
 const DIAG_HCI_SENT_LEN: usize = 58;
+/// First connection PDU the link layer refused this run, packed as
+/// `1 | header << 8 | length << 16` (zero when every PDU was accepted).
+/// A refused PDU is never acknowledged, so the peer retransmits it until
+/// supervision fails; this word names the frame that starts the stall.
+const DIAG_BAD_PDU: usize = 63;
 const DIAG_WORDS: usize = 64;
 
 /// Static random address advertised this boot as two little-endian words
@@ -226,6 +232,16 @@ fn diag_put(i: usize, v: u32) {
             .cast::<u32>()
             .add(i)
             .write_volatile(v)
+    }
+}
+
+/// Record the first connection PDU this run refused.
+fn note_bad_pdu(header: u8, len: usize) {
+    if diag_get(DIAG_BAD_PDU) == 0 {
+        diag_put(
+            DIAG_BAD_PDU,
+            1 | (u32::from(header) << 8) | ((len as u32) << 16),
+        );
     }
 }
 
@@ -633,19 +649,23 @@ fn connection_event(
         };
         let header = rx.0[0];
         let payload = &rx.0[2..packet.len];
-        if payload.len() > 27 {
+        let llid = header & 3;
+        if payload.len() > MAX_ENCRYPTED {
+            note_bad_pdu(header, payload.len());
             inc(9);
             break;
         }
-        let llid = header & 3;
         // After our plaintext LL_START_ENC_REQ, the Central's next non-empty
         // PDU is its encrypted LL_START_ENC_RSP (the link's first encrypted
         // PDU); empty PDUs stay plaintext.
         let ciphertext = s.rx_encrypted && !(llid == 1 && payload.is_empty());
         let capacity = if ciphertext {
+            // The bridge stores plaintext, so reserve room for the fragment
+            // without the MIC, not for the on-air ciphertext.
+            let plain_len = payload.len().saturating_sub(BLE_MIC_LEN);
             s.deferred_rx.is_none()
                 && match llid {
-                    1 | 2 => soft.bridge.can_receive_acl(llid, payload.len()),
+                    1 | 2 => soft.bridge.can_receive_acl(llid, plain_len),
                     3 => true,
                     _ => false,
                 }
@@ -663,6 +683,7 @@ fn connection_event(
         };
         let outcome = s.link.on_rx(header, payload, true, capacity);
         if outcome.status == RxStatus::Invalid {
+            note_bad_pdu(header, payload.len());
             inc(9);
             break;
         }

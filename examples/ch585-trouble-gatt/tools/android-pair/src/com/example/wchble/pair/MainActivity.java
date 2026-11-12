@@ -54,6 +54,14 @@ public class MainActivity extends Activity {
     private static final UUID HID_REPORT = UUID.fromString("00002a4d-0000-1000-8000-00805f9b34fb");
     private static final UUID HID_PROTOCOL = UUID.fromString("00002a4e-0000-1000-8000-00805f9b34fb");
     private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+    // X4: ATT MTU, long read/write and notification-queue pressure.
+    private static final UUID BULK = UUID.fromString("00001005-b0cd-11ec-871f-d45ddf138840");
+    private static final UUID BURST = UUID.fromString("00001006-b0cd-11ec-871f-d45ddf138840");
+    private static final UUID X4_CONTROL = UUID.fromString("00001007-b0cd-11ec-871f-d45ddf138840");
+    private static final int BULK_LEN = 200;
+    private static final int BURST_LEN = 121;
+    private static final int BURST_ATTEMPTS = 12;
+    private static final int BURST_WINDOW_MS = 6_000;
     private static final byte[] EXPECTED_INFO = {0x11, 0x01, 0x00, 0x01};
     private static final byte[] EXPECTED_PROTOCOL = {0x01};
     // Same fixed cycle as the firmware fixtures: 'a'..'d' press, release.
@@ -101,6 +109,16 @@ public class MainActivity extends Activity {
     private boolean hidInfoRead;
     private boolean hidStarted;
     private boolean hidInputWatch;
+    private BluetoothGattCharacteristic bulkCharacteristic;
+    private BluetoothGattCharacteristic burstCharacteristic;
+    private BluetoothGattCharacteristic x4Control;
+    private boolean mtuRequested;
+    private boolean mtuReady;
+    private boolean attStarted;
+    private boolean bulkWritten;
+    private int attMtu;
+    private int attNotifications;
+    private byte[] attWritePattern;
 
     private final Runnable timeout = () -> finishRun(false, "timeout");
 
@@ -228,7 +246,7 @@ public class MainActivity extends Activity {
                             return;
                         }
                     } else if (!peerBonded) {
-                        if (!"pair".equals(mode) && !"hid".equals(mode)) {
+                        if (!"pair".equals(mode) && !"hid".equals(mode) && !"att".equals(mode)) {
                             // delete/fault act on the bond this phone and the
                             // Host already share.
                             finishRun(false, "not_bonded");
@@ -237,6 +255,12 @@ public class MainActivity extends Activity {
                         boolean requested = g.getDevice().createBond();
                         logEvent("\"event\":\"bond_requested\",\"ok\":%s", requested);
                     }
+                }
+                if ("att".equals(mode)) {
+                    // The MTU has to be negotiated before discovery so the
+                    // long read/write really run at the new ATT MTU.
+                    maybeStartGatt();
+                    return;
                 }
                 if (!g.discoverServices()) {
                     finishRun(false, "discover_failed");
@@ -251,7 +275,30 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onMtuChanged(BluetoothGatt g, int mtu, int status) {
+            logEvent("\"event\":\"mtu\",\"status\":%d,\"mtu\":%d", status, mtu);
+            if (!"att".equals(mode)) {
+                return;
+            }
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                finishRun(false, "mtu_failed");
+                return;
+            }
+            attMtu = mtu;
+            mtuReady = true;
+            // Discovery follows the exchange, so every later read/write runs
+            // at the negotiated ATT MTU.
+            if (g == null || !g.discoverServices()) {
+                finishRun(false, "discover_failed");
+            }
+        }
+
+        @Override
         public void onServicesDiscovered(BluetoothGatt g, int status) {
+            if ("att".equals(mode)) {
+                onAttServices(g, status);
+                return;
+            }
             if ("hid".equals(mode)) {
                 discovered = true;
                 if (!bonded) {
@@ -288,6 +335,10 @@ public class MainActivity extends Activity {
         @Override
         public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
                                          int status) {
+            if ("att".equals(mode)) {
+                onAttRead(characteristic, status);
+                return;
+            }
             if ("hid".equals(mode)) {
                 try {
                     onHidRead(g, characteristic, status);
@@ -341,6 +392,10 @@ public class MainActivity extends Activity {
         @Override
         public void onDescriptorWrite(BluetoothGatt g, android.bluetooth.BluetoothGattDescriptor descriptor,
                                       int status) {
+            if ("att".equals(mode)) {
+                onAttDescriptorWrite(descriptor, status);
+                return;
+            }
             if (!"hid".equals(mode) || descriptor.getCharacteristic() != hidReport) {
                 return;
             }
@@ -357,18 +412,24 @@ public class MainActivity extends Activity {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic characteristic) {
+            handleAttNotification(characteristic, characteristic.getValue());
             handleHidNotification(characteristic, characteristic.getValue());
         }
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
                                             byte[] value) {
+            handleAttNotification(characteristic, value);
             handleHidNotification(characteristic, value);
         }
 
         @Override
         public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
                                           int status) {
+            if ("att".equals(mode)) {
+                onAttWrite(characteristic, status);
+                return;
+            }
             logEvent("\"event\":\"write_ack\",\"status\":%d", status);
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 finishRun(false, "write_failed");
@@ -395,7 +456,7 @@ public class MainActivity extends Activity {
         }
         String requestedMode = getIntent().getStringExtra("mode");
         if (requestedMode != null) {
-            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid")) {
+            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid|att")) {
                 finishRun(false, "unknown_mode");
                 return;
             }
@@ -476,6 +537,25 @@ public class MainActivity extends Activity {
 
     private void maybeStartGatt() {
         if (done || started) {
+            return;
+        }
+        if ("att".equals(mode)) {
+            if (!bonded || gatt == null) {
+                return;
+            }
+            if (!mtuRequested) {
+                mtuRequested = true;
+                boolean requested = gatt.requestMtu(247);
+                logEvent("\"event\":\"mtu_requested\",\"ok\":%s", requested);
+                return;
+            }
+            if (mtuReady && discovered && bulkCharacteristic != null) {
+                started = true;
+                logEvent("\"event\":\"att_start\",\"mtu\":%d", attMtu);
+                if (!gatt.readCharacteristic(bulkCharacteristic)) {
+                    finishRun(false, "bulk_read_start_failed");
+                }
+            }
             return;
         }
         if ("hid".equals(mode)) {
@@ -816,6 +896,188 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void onAttServices(BluetoothGatt g, int status) {
+        BluetoothGattService service = g.getService(SERVICE);
+        bulkCharacteristic = service == null ? null : service.getCharacteristic(BULK);
+        burstCharacteristic = service == null ? null : service.getCharacteristic(BURST);
+        x4Control = service == null ? null : service.getCharacteristic(X4_CONTROL);
+        logEvent("\"event\":\"services_discovered\",\"status\":%d,\"service\":%s,\"bulk\":%s,"
+                        + "\"burst\":%s,\"control\":%s",
+                status, service != null, bulkCharacteristic != null,
+                burstCharacteristic != null, x4Control != null);
+        if (status != BluetoothGatt.GATT_SUCCESS || service == null || bulkCharacteristic == null
+                || burstCharacteristic == null || x4Control == null) {
+            finishRun(false, "att_layout_missing");
+            return;
+        }
+        discovered = true;
+        maybeStartGatt();
+    }
+
+    private void onAttRead(BluetoothGattCharacteristic characteristic, int status) {
+        if (characteristic != bulkCharacteristic) {
+            logEvent("\"event\":\"att_unexpected_read\",\"status\":%d", status);
+            finishRun(false, "att_unexpected_read");
+            return;
+        }
+        byte[] value = characteristic.getValue();
+        int length = value == null ? 0 : value.length;
+        if (!bulkWritten) {
+            boolean patternOk = matches(value, bulkReadPattern(), BULK_LEN);
+            logEvent("\"event\":\"bulk_read\",\"status\":%d,\"length\":%d,\"pattern_ok\":%s,"
+                            + "\"head\":\"%s\"",
+                    status, length, patternOk, hexHead(value, 8));
+            if (status != BluetoothGatt.GATT_SUCCESS || !patternOk) {
+                finishRun(false, "bulk_read_failed");
+                return;
+            }
+            attWritePattern = bulkWritePattern();
+            // WRITE_TYPE_DEFAULT is the reliable-write path: longer than MTU-3
+            // makes the stack use Prepare Write + Execute Write.
+            bulkCharacteristic.setValue(attWritePattern);
+            bulkCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            boolean started = gatt.writeCharacteristic(bulkCharacteristic);
+            logEvent("\"event\":\"bulk_write_requested\",\"ok\":%s,\"length\":%d",
+                    started, BULK_LEN);
+            if (!started) {
+                finishRun(false, "bulk_write_start_failed");
+            }
+            return;
+        }
+        boolean verified = matches(value, attWritePattern, BULK_LEN);
+        logEvent("\"event\":\"bulk_verify\",\"status\":%d,\"length\":%d,\"match\":%s",
+                status, length, verified);
+        if (status != BluetoothGatt.GATT_SUCCESS || !verified) {
+            finishRun(false, "bulk_verify_failed");
+            return;
+        }
+        subscribeBurst();
+    }
+
+    private void onAttWrite(BluetoothGattCharacteristic characteristic, int status) {
+        if (characteristic == bulkCharacteristic) {
+            logEvent("\"event\":\"bulk_write_ack\",\"status\":%d", status);
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                finishRun(false, "bulk_write_failed");
+                return;
+            }
+            bulkWritten = true;
+            if (!gatt.readCharacteristic(bulkCharacteristic)) {
+                finishRun(false, "bulk_verify_start_failed");
+            }
+            return;
+        }
+        if (characteristic == x4Control) {
+            logEvent("\"event\":\"burst_command_ack\",\"status\":%d", status);
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                finishRun(false, "burst_command_failed");
+                return;
+            }
+            // Notifications start arriving as soon as the Host queues them;
+            // close the window here so a shorter burst is not a timeout.
+            handler.postDelayed(this::finishBurstWindow, BURST_WINDOW_MS);
+            return;
+        }
+        logEvent("\"event\":\"att_unexpected_write\",\"status\":%d", status);
+        finishRun(false, "att_unexpected_write");
+    }
+
+    private void subscribeBurst() {
+        if (!gatt.setCharacteristicNotification(burstCharacteristic, true)) {
+            finishRun(false, "burst_notify_enable_failed");
+            return;
+        }
+        android.bluetooth.BluetoothGattDescriptor cccd = burstCharacteristic.getDescriptor(CCCD);
+        if (cccd == null) {
+            finishRun(false, "burst_cccd_missing");
+            return;
+        }
+        cccd.setValue(android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        logEvent("\"event\":\"burst_cccd_requested\"");
+        if (!gatt.writeDescriptor(cccd)) {
+            finishRun(false, "burst_cccd_write_start_failed");
+        }
+    }
+
+    private void onAttDescriptorWrite(android.bluetooth.BluetoothGattDescriptor descriptor, int status) {
+        if (descriptor.getCharacteristic() != burstCharacteristic) {
+            return;
+        }
+        logEvent("\"event\":\"burst_cccd\",\"status\":%d", status);
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            finishRun(false, "burst_cccd_failed");
+            return;
+        }
+        x4Control.setValue(new byte[]{'B', 'S', 'T', '!'});
+        x4Control.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+        boolean started = gatt.writeCharacteristic(x4Control);
+        logEvent("\"event\":\"burst_requested\",\"ok\":%s,\"attempts\":%d", started, BURST_ATTEMPTS);
+        if (!started) {
+            finishRun(false, "burst_command_start_failed");
+        }
+    }
+
+    private void handleAttNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
+        if (!"att".equals(mode) || characteristic != burstCharacteristic || value == null) {
+            return;
+        }
+        boolean patternOk = matches(value, burstPattern(), BURST_LEN);
+        attNotifications += 1;
+        logEvent("\"event\":\"burst_notification\",\"index\":%d,\"length\":%d,\"pattern_ok\":%s",
+                attNotifications, value.length, patternOk);
+    }
+
+    private void finishBurstWindow() {
+        if (done) {
+            return;
+        }
+        logEvent("\"event\":\"burst_window\",\"notifications\":%d", attNotifications);
+        finishRun(attNotifications > 0, "att_mtu_long_burst_ok");
+    }
+
+    private static byte[] bulkReadPattern() {
+        byte[] value = new byte[BULK_LEN];
+        for (int index = 0; index < value.length; index++) {
+            value[index] = (byte) ((index * 7 + 3) & 0xff);
+        }
+        return value;
+    }
+
+    private static byte[] bulkWritePattern() {
+        byte[] value = new byte[BULK_LEN];
+        for (int index = 0; index < value.length; index++) {
+            value[index] = (byte) (255 - index);
+        }
+        return value;
+    }
+
+    private static byte[] burstPattern() {
+        byte[] value = new byte[BURST_LEN];
+        for (int index = 0; index < value.length; index++) {
+            value[index] = (byte) ((index * 3 + 1) & 0xff);
+        }
+        return value;
+    }
+
+    private static boolean matches(byte[] value, byte[] expected, int length) {
+        if (value == null || value.length != length || expected == null) {
+            return false;
+        }
+        for (int index = 0; index < length; index++) {
+            if (value[index] != expected[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String hexHead(byte[] value, int count) {
+        if (value == null) {
+            return "";
+        }
+        return hex(java.util.Arrays.copyOf(value, Math.min(count, value.length)));
+    }
+
     private void finishRun(boolean pass, String reason) {
         if (done) {
             return;
@@ -824,8 +1086,9 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(timeout);
         logInputDevices();
         logEvent("\"event\":\"summary\",\"pass\":%s,\"reason\":\"%s\",\"bonder\":%s,"
-                        + "\"bonded\":%s,\"reads\":%d,\"wrote\":%s",
-                pass, reason, bonding, bonded, reads, writeSent);
+                        + "\"bonded\":%s,\"reads\":%d,\"wrote\":%s,\"mtu\":%d,"
+                        + "\"notifications\":%d",
+                pass, reason, bonding, bonded, reads, writeSent, attMtu, attNotifications);
         if (gatt != null) {
             try {
                 gatt.disconnect();

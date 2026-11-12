@@ -45,7 +45,7 @@ FIELDS = ['frame.number', 'nordic_ble.crcok', 'nordic_ble.direction',
           'btsmp.initiator_key_distribution', 'btsmp.responder_key_distribution']
 # host.rs RANDOM_ADDRESS is fixed since S3 so a bonded peer can find the key it
 # stored on an earlier boot. Printed in Bluetooth (most-significant-first) order.
-TARGET = 'c1:ff:ee:00:00:16'
+TARGET = 'c1:ff:ee:00:00:18'
 SMP_NAMES = dict(secure.SMP_OPCODES)
 LL_CONTROL = {0x02: 'TERMINATE_IND', 0x03: 'ENC_REQ', 0x04: 'ENC_RSP',
               0x05: 'START_ENC_REQ', 0x06: 'START_ENC_RSP',
@@ -163,6 +163,15 @@ def evaluate(assessed, mode='pair'):
             errors.append('capture saw no peripheral Pairing Response')
         if 'PairingDHKeyCheck' not in assessed['smp_opcodes_captured']:
             errors.append('capture saw no DHKey Check in either direction')
+    elif mode == 'att':
+        # A reused bond skips SMP; a fresh one must show the whole exchange.
+        if assessed['smp']:
+            if assessed.get('pairing_request') is None:
+                errors.append('capture saw no central Pairing Request')
+            if assessed.get('pairing_response') is None:
+                errors.append('capture saw no peripheral Pairing Response')
+            if 'PairingDHKeyCheck' not in assessed['smp_opcodes_captured']:
+                errors.append('capture saw no DHKey Check in either direction')
     else:
         pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
                    'PairingDHKeyCheck', 'PairingPublicKey'}
@@ -359,7 +368,7 @@ def options(argv=None):
     parser.add_argument('--follow-by-name', action='store_true')
     parser.add_argument('--nrfutil-home', type=Path, required=True)
     parser.add_argument('--tshark', default='tshark')
-    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject', 'fault'),
+    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject', 'fault', 'att'),
                         default='pair')
     parser.add_argument('--serial-timeout-ms', type=int, default=100)
     parser.add_argument('--startup-timeout', type=float, default=10)
