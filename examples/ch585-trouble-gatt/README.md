@@ -294,8 +294,12 @@ advertising), scans for the rotated address and follows it; `--follow-by-name`
 alone races the sniffer's one-shot name lookup. Both runners flash with the
 single-session preflight helper and restore the smoke image in a `finally`.
 
-Android 15 (CPH2411) passed this matrix on 2026-11-12. iOS is still blocked:
-the paired iPhone is offline, so S2 is not complete.
+Android 15 (CPH2411) passed this matrix on 2026-11-12. The iOS round has not
+been attempted yet: this repository has no iOS client, and the test iPhone
+(registered with the Mac as `mono@iphone`, not bonded to this firmware) is
+currently offline. The iOS acceptance client is nRF Connect, already installed
+on that phone and used for the P5 manual checks; no part of S2 has run on iOS,
+so S2 is not complete.
 
 ## Build and validate
 
