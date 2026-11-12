@@ -204,6 +204,25 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   any future Android-based acceptance source does the same instead of treating
   the first failure as a controller defect.
 
+## S2 security gaps
+
+- [ ] **iOS round never started (backlogged 2026-11-12 by project decision).**
+  No iOS client exists in this repository and none was ever installed on the
+  phone; the devicectl entry `mono@iphone` is a Mac development registration,
+  not a bond. The intended client is the nRF Connect install already used for
+  the P5 manual checks. Requires, on a live iPhone: Just Works pairing
+  (system dialog), `dumpsys`-equivalent bond evidence or app-level bond state,
+  an encrypted read/write, and a capture with no plaintext ATT. Do not claim
+  cross-platform LESC support until this closes.
+- [ ] **Android evidence is one green run.** Run53 (2026-11-12) is the only
+  clean end-to-end record: bonded, encrypted read/write with every ATT status
+  0, `SECURE_STATS` encryption counters, and a capture with ciphertext after
+  `START_ENC_RSP`. It does not establish repeatability across boots, per-model
+  behaviour, MTU above 23, or an encrypted notification path.
+- [ ] **No bond store.** Every boot rotates the static random address, so an
+  existing bond can never be reused and the phone sees a new device each time.
+  This is the S3 entry condition, not a property of a finished design.
+
 ## Explicitly outside this milestone
 
 Pairing/encryption, multiple connections, DLE, 2M, CSA2, long attributes and
