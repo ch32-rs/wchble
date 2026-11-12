@@ -19,12 +19,16 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.hardware.input.InputManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.InputDevice;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
@@ -44,6 +48,25 @@ public class MainActivity extends Activity {
     private static final UUID VALUE = UUID.fromString("00001001-b0cd-11ec-871f-d45ddf138840");
     private static final UUID CONTROL = UUID.fromString("00001002-b0cd-11ec-871f-d45ddf138840");
     private static final int WRITE_VALUE = 0x2b;
+    private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
+    private static final UUID HID_INFO = UUID.fromString("00002a4a-0000-1000-8000-00805f9b34fb");
+    private static final UUID HID_MAP = UUID.fromString("00002a4b-0000-1000-8000-00805f9b34fb");
+    private static final UUID HID_REPORT = UUID.fromString("00002a4d-0000-1000-8000-00805f9b34fb");
+    private static final UUID HID_PROTOCOL = UUID.fromString("00002a4e-0000-1000-8000-00805f9b34fb");
+    private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+    private static final byte[] EXPECTED_INFO = {0x11, 0x01, 0x00, 0x01};
+    private static final byte[] EXPECTED_PROTOCOL = {0x01};
+    // Same fixed cycle as the firmware fixtures: 'a'..'d' press, release.
+    private static final byte[][] EXPECTED_CYCLE = {
+            {0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    };
     private static final int TIMEOUT_MS = 45_000;
     // `--es mode` selects the S3 acceptance phase. `pair` is the S2 flow.
     private String mode = "pair";
@@ -69,6 +92,15 @@ public class MainActivity extends Activity {
     private boolean authRetried;
     private boolean serviceMissing;
     private boolean scanOnly;
+    private BluetoothGattCharacteristic hidReport;
+    private int hidCycleIndex;
+    private int hidNotifications;
+    private int hidReportsMatched;
+    private boolean hidSubscribed;
+    private boolean hidMapRead;
+    private boolean hidInfoRead;
+    private boolean hidStarted;
+    private boolean hidInputWatch;
 
     private final Runnable timeout = () -> finishRun(false, "timeout");
 
@@ -196,7 +228,7 @@ public class MainActivity extends Activity {
                             return;
                         }
                     } else if (!peerBonded) {
-                        if (!"pair".equals(mode)) {
+                        if (!"pair".equals(mode) && !"hid".equals(mode)) {
                             // delete/fault act on the bond this phone and the
                             // Host already share.
                             finishRun(false, "not_bonded");
@@ -210,7 +242,9 @@ public class MainActivity extends Activity {
                     finishRun(false, "discover_failed");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (!done) {
+                // In the HID hand-off path the disconnect is ours: the link is
+                // released so the system HID host can own it.
+                if (!done && !hidInputWatch) {
                     finishRun(false, "disconnected");
                 }
             }
@@ -218,6 +252,17 @@ public class MainActivity extends Activity {
 
         @Override
         public void onServicesDiscovered(BluetoothGatt g, int status) {
+            if ("hid".equals(mode)) {
+                discovered = true;
+                if (!bonded) {
+                    // The encrypted reads have to follow the bond; the bond
+                    // receiver restarts this once BOND_BONDED settles.
+                    logEvent("\"event\":\"hid_waiting_for_bond\"");
+                    return;
+                }
+                startHid(g, status);
+                return;
+            }
             BluetoothGattService service = g.getService(SERVICE);
             BluetoothGattCharacteristic characteristic = service == null ? null : service.getCharacteristic(VALUE);
             BluetoothGattCharacteristic control = service == null ? null : service.getCharacteristic(CONTROL);
@@ -243,6 +288,14 @@ public class MainActivity extends Activity {
         @Override
         public void onCharacteristicRead(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
                                          int status) {
+            if ("hid".equals(mode)) {
+                try {
+                    onHidRead(g, characteristic, status);
+                } catch (SecurityException denied) {
+                    onHidAccessDenied(g, denied);
+                }
+                return;
+            }
             reads += 1;
             int value = valueOf(characteristic);
             logEvent("\"event\":\"read\",\"status\":%d,\"value\":%d,\"index\":%d", status, value, reads);
@@ -286,6 +339,34 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onDescriptorWrite(BluetoothGatt g, android.bluetooth.BluetoothGattDescriptor descriptor,
+                                      int status) {
+            if (!"hid".equals(mode) || descriptor.getCharacteristic() != hidReport) {
+                return;
+            }
+            logEvent("\"event\":\"cccd_write\",\"status\":%d", status);
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                finishRun(false, "cccd_write_failed");
+                return;
+            }
+            hidSubscribed = true;
+            logEvent("\"event\":\"report_subscribed\"");
+            // The system HID host may register the input device a moment later.
+            handler.postDelayed(MainActivity.this::logInputDevices, 3000);
+        }
+
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic characteristic) {
+            handleHidNotification(characteristic, characteristic.getValue());
+        }
+
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
+                                            byte[] value) {
+            handleHidNotification(characteristic, value);
+        }
+
+        @Override
         public void onCharacteristicWrite(BluetoothGatt g, BluetoothGattCharacteristic characteristic,
                                           int status) {
             logEvent("\"event\":\"write_ack\",\"status\":%d", status);
@@ -314,7 +395,7 @@ public class MainActivity extends Activity {
         }
         String requestedMode = getIntent().getStringExtra("mode");
         if (requestedMode != null) {
-            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault")) {
+            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid")) {
                 finishRun(false, "unknown_mode");
                 return;
             }
@@ -354,6 +435,24 @@ public class MainActivity extends Activity {
         } else {
             handler.postDelayed(timeout, TIMEOUT_MS);
         }
+        // Some ROMs rebuild this activity when the system pairing dialog
+        // closes. Rescanning then loses the only window: the peer is bonded,
+        // may have stopped advertising, and the system HID host can take the
+        // single connection slot first. Connect to the bonded peer directly so
+        // a rebuilt activity still completes the HID run.
+        if ("hid".equals(mode)) {
+            BluetoothDevice bondedPeer = findBondedPeer(adapter, targetName);
+            if (bondedPeer != null) {
+                targetAddress = bondedPeer.getAddress();
+                logEvent("\"event\":\"bonded_peer_connect\",\"address\":\"%s\"", targetAddress);
+                gatt = bondedPeer.connectGatt(MainActivity.this, false, gattCallback,
+                        BluetoothDevice.TRANSPORT_LE);
+                if (gatt == null) {
+                    finishRun(false, "connect_gatt_null");
+                }
+                return;
+            }
+        }
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build();
@@ -362,8 +461,27 @@ public class MainActivity extends Activity {
         scanner.startScan(null, settings, scanCallback);
     }
 
+    private BluetoothDevice findBondedPeer(BluetoothAdapter bluetooth, String name) {
+        try {
+            for (BluetoothDevice device : bluetooth.getBondedDevices()) {
+                if (name.equals(device.getName())) {
+                    return device;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Adapter state can change under us; fall back to scanning.
+        }
+        return null;
+    }
+
     private void maybeStartGatt() {
         if (done || started) {
+            return;
+        }
+        if ("hid".equals(mode)) {
+            if (bonded && discovered && !hidStarted) {
+                startHid(gatt, BluetoothGatt.GATT_SUCCESS);
+            }
             return;
         }
         if (serviceMissing) {
@@ -470,10 +588,232 @@ public class MainActivity extends Activity {
     }
 
     private void logEvent(String fmt, Object... args) {
-        Object[] values = new Object[args.length + 1];
+        // pid distinguishes a rebuilt activity from the original process when
+        // a system pairing dialog outlives this activity on some ROMs.
+        Object[] values = new Object[args.length + 2];
         values[0] = SystemClock.elapsedRealtime();
-        System.arraycopy(args, 0, values, 1, args.length);
-        Log.i(TAG, String.format(Locale.US, "{\"t_ms\":%d," + fmt + "}", values));
+        values[1] = android.os.Process.myPid();
+        System.arraycopy(args, 0, values, 2, args.length);
+        Log.i(TAG, String.format(Locale.US, "{\"t_ms\":%d,\"pid\":%d," + fmt + "}", values));
+    }
+
+    private void startHid(BluetoothGatt g, int status) {
+        if (done || hidStarted || g == null) {
+            return;
+        }
+        hidStarted = true;
+        BluetoothGattService service = g.getService(HID_SERVICE);
+        List<BluetoothGattCharacteristic> characteristics =
+                service == null ? new ArrayList<>() : service.getCharacteristics();
+        int reports = 0;
+        for (BluetoothGattCharacteristic candidate : characteristics) {
+            if (candidate.getUuid().equals(HID_REPORT)) {
+                reports += 1;
+                if ((candidate.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                    hidReport = candidate;
+                }
+            }
+        }
+        logEvent("\"event\":\"hid_service\",\"status\":%d,\"service\":%s,\"characteristics\":%d,"
+                + "\"reports\":%d,\"notify_report\":%s",
+                status, service != null, characteristics.size(), reports, hidReport != null);
+        if (status != BluetoothGatt.GATT_SUCCESS || service == null) {
+            finishRun(false, "hid_service_missing");
+            return;
+        }
+        BluetoothGattCharacteristic info = service.getCharacteristic(HID_INFO);
+        BluetoothGattCharacteristic map = service.getCharacteristic(HID_MAP);
+        BluetoothGattCharacteristic protocol = service.getCharacteristic(HID_PROTOCOL);
+        if (info == null || map == null || protocol == null || hidReport == null) {
+            finishRun(false, "hid_characteristic_missing");
+            return;
+        }
+        try {
+            if (!g.readCharacteristic(info)) {
+                finishRun(false, "hid_info_read_start_failed");
+            }
+        } catch (SecurityException denied) {
+            // Android only lets a privileged process talk to the HID service;
+            // a third-party GATT client gets BLUETOOTH PRIVILEGED enforcement
+            // on the first read. The system HID host owns the same ACL, so
+            // hand the link over and verify its input device instead.
+            onHidAccessDenied(g, denied);
+        }
+    }
+
+    private void onHidAccessDenied(BluetoothGatt g, SecurityException denied) {
+        if (hidInputWatch || done) {
+            return;
+        }
+        hidInputWatch = true;
+        logEvent("\"event\":\"hid_access_denied\",\"error\":\"%s\"", escape(denied.getMessage()));
+        // Release our client so the system HID host can run its own
+        // discovery and subscription; an unprivileged app cannot.
+        try {
+            g.disconnect();
+        } catch (RuntimeException ignored) {
+            // Already gone.
+        }
+        watchForInputDevice(0);
+    }
+
+    private void watchForInputDevice(int attempt) {
+        if (done) {
+            return;
+        }
+        if (findTargetInputDevice() != null) {
+            logInputDevices();
+            finishRun(true, "hid_system_input_ok");
+            return;
+        }
+        if (attempt >= 60) {
+            finishRun(false, "input_device_missing");
+            return;
+        }
+        handler.postDelayed(() -> watchForInputDevice(attempt + 1), 500);
+    }
+
+    private InputDevice findTargetInputDevice() {
+        try {
+            InputManager manager = getSystemService(InputManager.class);
+            if (manager == null) {
+                return null;
+            }
+            String needle = targetName.toLowerCase(Locale.ROOT);
+            for (int id : manager.getInputDeviceIds()) {
+                InputDevice device = manager.getInputDevice(id);
+                String name = device == null ? null : device.getName();
+                if (name != null && name.toLowerCase(Locale.ROOT).contains(needle)) {
+                    return device;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Evidence is best effort; dumpsys input is the independent view.
+        }
+        return null;
+    }
+
+    private void onHidRead(BluetoothGatt g, BluetoothGattCharacteristic characteristic, int status) {
+        byte[] value = characteristic.getValue();
+        UUID uuid = characteristic.getUuid();
+        String field = uuid.equals(HID_INFO) ? "hid_info"
+                : uuid.equals(HID_MAP) ? "report_map"
+                : uuid.equals(HID_PROTOCOL) ? "protocol_mode" : "other";
+        logEvent("\"event\":\"hid_read\",\"field\":\"%s\",\"status\":%d,\"length\":%d,"
+                        + "\"bytes\":\"%s\"",
+                field, status, value == null ? 0 : value.length, hex(value));
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            finishRun(false, "hid_read_failed_" + status);
+            return;
+        }
+        BluetoothGattService service = g.getService(HID_SERVICE);
+        if (uuid.equals(HID_INFO)) {
+            hidInfoRead = true;
+            if (!java.util.Arrays.equals(value, EXPECTED_INFO)) {
+                finishRun(false, "hid_info_mismatch");
+                return;
+            }
+            if (service == null || !g.readCharacteristic(service.getCharacteristic(HID_MAP))) {
+                finishRun(false, "report_map_read_start_failed");
+            }
+            return;
+        }
+        if (uuid.equals(HID_MAP)) {
+            hidMapRead = true;
+            if (value == null || value.length != 63) {
+                finishRun(false, "report_map_length_" + (value == null ? -1 : value.length));
+                return;
+            }
+            if (service == null || !g.readCharacteristic(service.getCharacteristic(HID_PROTOCOL))) {
+                finishRun(false, "protocol_mode_read_start_failed");
+            }
+            return;
+        }
+        if (uuid.equals(HID_PROTOCOL)) {
+            if (!java.util.Arrays.equals(value, EXPECTED_PROTOCOL)) {
+                finishRun(false, "protocol_mode_mismatch");
+                return;
+            }
+            if (!g.setCharacteristicNotification(hidReport, true)) {
+                finishRun(false, "notify_enable_failed");
+                return;
+            }
+            android.bluetooth.BluetoothGattDescriptor cccd = hidReport.getDescriptor(CCCD);
+            if (cccd == null) {
+                finishRun(false, "cccd_missing");
+                return;
+            }
+            cccd.setValue(android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            logEvent("\"event\":\"cccd_write_requested\"");
+            if (!g.writeDescriptor(cccd)) {
+                finishRun(false, "cccd_write_start_failed");
+            }
+        }
+    }
+
+    private void handleHidNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
+        if (!"hid".equals(mode) || characteristic.getUuid() != HID_REPORT || value == null) {
+            return;
+        }
+        hidNotifications += 1;
+        logEvent("\"event\":\"notification\",\"bytes\":\"%s\",\"length\":%d",
+                hex(value), value.length);
+        if (java.util.Arrays.equals(value, EXPECTED_CYCLE[hidCycleIndex])) {
+            hidCycleIndex += 1;
+            if (hidCycleIndex > hidReportsMatched) {
+                hidReportsMatched = hidCycleIndex;
+            }
+        } else if (java.util.Arrays.equals(value, EXPECTED_CYCLE[0])) {
+            hidCycleIndex = 1;
+        } else {
+            hidCycleIndex = 0;
+        }
+        if (hidCycleIndex == EXPECTED_CYCLE.length) {
+            logInputDevices();
+            finishRun(true, "hid_reports_ok");
+        }
+    }
+
+    private static String hex(byte[] value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder text = new StringBuilder(value.length * 2);
+        for (byte single : value) {
+            text.append(String.format(Locale.ROOT, "%02x", single & 0xff));
+        }
+        return text.toString();
+    }
+
+    private String escape(String value) {
+        return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private void logInputDevices() {
+        try {
+            InputManager manager = getSystemService(InputManager.class);
+            if (manager == null) {
+                return;
+            }
+            String needle = targetName.toLowerCase(Locale.ROOT);
+            for (int id : manager.getInputDeviceIds()) {
+                InputDevice device = manager.getInputDevice(id);
+                if (device == null) {
+                    continue;
+                }
+                String name = device.getName();
+                String descriptor = device.getDescriptor();
+                if ((name != null && name.toLowerCase(Locale.ROOT).contains(needle))
+                        || (descriptor != null && descriptor.toLowerCase(Locale.ROOT).contains(needle))) {
+                    logEvent("\"event\":\"input_device\",\"id\":%d,\"name\":\"%s\","
+                                    + "\"descriptor\":\"%s\",\"sources\":%d,\"keyboard_type\":%d",
+                            id, escape(name), escape(descriptor), device.getSources(),
+                            device.getKeyboardType());
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Evidence is best effort; dumpsys input is the independent view.
+        }
     }
 
     private void finishRun(boolean pass, String reason) {
@@ -482,6 +822,7 @@ public class MainActivity extends Activity {
         }
         done = true;
         handler.removeCallbacks(timeout);
+        logInputDevices();
         logEvent("\"event\":\"summary\",\"pass\":%s,\"reason\":\"%s\",\"bonder\":%s,"
                         + "\"bonded\":%s,\"reads\":%d,\"wrote\":%s",
                 pass, reason, bonding, bonded, reads, writeSent);
@@ -507,6 +848,14 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         done = true;
         handler.removeCallbacks(timeout);
+        if (gatt != null) {
+            try {
+                gatt.close();
+            } catch (RuntimeException ignored) {
+                // Already closed.
+            }
+            gatt = null;
+        }
         try {
             unregisterReceiver(bondReceiver);
         } catch (RuntimeException ignored) {

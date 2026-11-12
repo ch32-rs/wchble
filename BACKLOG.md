@@ -271,6 +271,23 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   `wch585-hid` keyboard in `dumpsys input` (`local-docs/results/x4b-android-1/`).
   Human-visible typing was not observed; the helper app's own summary is
   `timeout` because it targets the P5 vendor service.
+- [x] **App-level HID recognition on Android (2026-11-12).** The helper app's
+  `hid` mode discovers `0x1812` (8 characteristics, two `0x2A4D` reports),
+  records the platform gate (`SecurityException: Need BLUETOOTH PRIVILEGED
+  permission` on the first read) and then observes the OS input device
+  (`input_device`: sources `0x101`, keyboard type 2) in `InputManager` and
+  `dumpsys input` (`local-docs/results/x4b-android-5/`). Driven by
+  `tools/android_hid_run.py --expect app`.
+- [ ] **Stock Android blocks third-party HID-service GATT access.** Unprivileged
+  clients cannot read or subscribe to `0x1812`; byte-level HOGP assertions must
+  come from the system HID host (or a privileged/system app). Recorded, not
+  worked around.
+- [ ] **A bonded Android host with a cached layout does not resubscribe.** After
+  a first discovery, the system HID host keeps the cached service layout and
+  never writes the report CCCD again, so a same-bond run shows
+  `subscription_edges=0`. The payload evidence needs a fresh bond (or a full
+  link/client reset); cycling the adapter (`--bt-reset`) did not bring the HID
+  host back on the CPH2411.
 - [ ] **Bond store is keyed by peer address only.** Reusing the store from an
   image with a different local identity makes SMP fail: the phone has no bond
   for the new address while the Host still returns the old LTK. Pairing only

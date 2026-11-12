@@ -9,7 +9,8 @@ across reboots.
 
 This example has passed only what is recorded in
 `local-docs/research/ch585-hid-results.md`. iOS is not a HOGP host and is out of
-scope; Android is a manual system-HID check.
+scope. Android is driven automatically through the shared `android-pair` helper
+(see the Android round below).
 
 ## Build
 
@@ -147,27 +148,50 @@ swiftc -typecheck examples/ch585-hid-keyboard/tools/hid_host.swift
 
 ### Android system-HID round
 
-The encrypted report path is validated on Android, where the system HID host
-claims `0x1812`:
+The encrypted report path and the OS-level input device are validated on
+Android in two complementary runs, driven by
+`tools/android_hid_run.py`:
 
-1. Clear any bond the firmware still holds for the phone (a new local identity
-   with an old peer key makes SMP fail). With the 60 s secure image running,
-   write `DEL!` to the vendor bond control characteristic from a macOS client,
-   then let the finite run finish.
-2. Flash the `secure,long-run` image through the preflight helper (360 s).
-3. Start the pair helper with `--es mode pair --es target_name wch585-hid`;
-   confirm the Just Works dialog (adb can tap it). The phone bonds, its system
-   HID host subscribes over the same link, and the one-second report cycle
-   flows encrypted.
-4. Evidence: `dumpsys input` lists `wch585-hid` as a keyboard input device, the
-   firmware shows `reports_sent=354`, `subscription_edges=1`, `security=3`,
-   `SECURE active=1`, and `encrypted_tx>0` with no notify errors.
-5. Wait out the 360 s budget, then restore the smoke image.
+```
+# app round (bonded peer): the helper app proves what a third-party app can see
+python3 tools/android_hid_run.py --out local-docs/results/x4b-android-app \
+    --expect app --pair-tap 786,2121
 
-Result: `local-docs/results/x4b-android-1/`. The helper app's own summary can be
-`timeout` because it only looks for the P5 vendor service; the HOGP evidence is
-the system input device plus the firmware counters. The on-screen typing was
-not observed by a human in the automated round.
+# payload round (fresh bond): the system HID host subscribes to the report CCCD
+python3 tools/android_hid_run.py --out local-docs/results/x4b-android-payload \
+    --expect payload --wipe-bond --pair-tap 786,2121
+```
+
+Both runs flash the 60 s secure image through the preflight helper, install the
+shared `android-pair` APK, start it with `--es mode hid`, tap the Just Works
+dialog when it appears, and always restore and re-scan the smoke image.
+
+**App round** (this is the "app sees HID input" evidence):
+
+- The app discovers service `0x1812` with 8 characteristics and two `0x2A4D`
+  reports, one notify-capable. It then records the platform gate: the first
+  `readCharacteristic` throws `SecurityException: Need BLUETOOTH PRIVILEGED
+  permission` — Android does not let an unprivileged GATT client touch the HID
+  service. That is why byte-level report assertions must come from the system
+  HID host, exactly as on macOS.
+- The app then enumerates `InputManager` and logs the OS input device:
+  `wch585-hid`, sources `0x101` (SOURCE_KEYBOARD), keyboard type 2
+  (alphabetic), with its descriptor. `dumpsys input` shows the same
+  `Device …: wch585-hid`.
+- Firmware: the link is encrypted (`security=3`, `SECURE active=1`,
+  `enc_req/enc_rsp/start_req/start_rsp=1`), no errors, clean finite stop.
+
+**Payload round** (fresh bond, no cached GATT layout): the phone bonds, the
+system HID host performs its own discovery and subscribes, and the firmware
+counts `reports_sent>=8`, `subscription_edges>=1`, `security=3`, with no
+notify errors. The earlier full run of this path reached `reports_sent=354`.
+A bonded peer whose GATT layout is cached does not re-subscribe, which is why
+the payload round belongs on a fresh bond.
+
+Result of the app round: `local-docs/results/x4b-android-5/` (the final
+attempt in this window, `x4b-android-7`, failed after an adapter reset left the
+system HID host inert and is preserved). Payload evidence:
+`local-docs/results/x4b-android-1/`.
 
 For the macOS gate run, disable other bonded peers (for example the phone's
 Bluetooth) so their automatic reconnect cannot join the same finite window.
@@ -189,3 +213,12 @@ Bluetooth) so their automatic reconnect cannot join the same finite window.
   contract is validated offline and on the Android system HID stack.
 - `tools/hid_pair_click.py` is kept for the bonded-host case but no dialog
   appears for an unsigned client; macOS pairs only from System Settings.
+- Stock Android refuses HID-service access to third-party apps
+  (`BLUETOOTH_PRIVILEGED`), so the app can discover `0x1812` and observe the OS
+  input device but cannot read or subscribe to it. Byte-level reports are the
+  system HID host's job.
+- A bonded Android host with a cached GATT layout does not re-subscribe to the
+  report CCCD; the payload round therefore starts from a fresh bond.
+- `tools/android_hid_run.py --bt-reset` (adapter cycle to force a fresh host
+  connection) did not restore the HID host on the CPH2411 and is kept only as a
+  documented experiment.
