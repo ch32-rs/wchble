@@ -221,6 +221,25 @@ pub enum ControlAction {
     Terminate(u8),
 }
 
+/// Feature bit indices (Core 5.4, Vol 6, Part B, 4.6). Bit numbering is
+/// LSB-first across the eight response octets, so index 14 is octet 1 bit 6.
+pub const FEATURE_LE_ENCRYPTION: u8 = 0;
+pub const FEATURE_LE_DATA_LENGTH_EXTENSION: u8 = 5;
+pub const FEATURE_LE_CSA2: u8 = 14;
+
+/// Build a feature bitmap with exactly `bits` set. Bit 37 (LE Coded PHY) and
+/// the 2M bit stay clear until those PHYs are actually implemented.
+pub const fn feature_bits(bits: &[u8]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    let mut i = 0;
+    while i < bits.len() {
+        let bit = bits[i];
+        out[(bit / 8) as usize] |= 1 << (bit % 8);
+        i += 1;
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ControlState {
     pub peer_version: Option<LocalVersion>,
@@ -309,9 +328,10 @@ impl ControlState {
                 if opcode == 0x09 {
                     return Ok(ControlAction::None);
                 }
-                // Only the features the owner explicitly enabled. DLE, PHY
-                // update, CSA #2 and optional control procedures remain
-                // unadvertised. Mandatory legacy procedures need no bit.
+                // Only the features the owner explicitly enabled in
+                // `local_features`. PHY update and the remaining optional
+                // procedures stay unadvertised until implemented.
+                // Mandatory legacy procedures need no bit.
                 ControlPdu::feature_rsp(self.local_features)
             }
             0x0c => {
@@ -492,6 +512,23 @@ mod tests {
             )
             .as_bytes(),
             &[9, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn feature_bit_helpers_map_to_the_wire_layout() {
+        assert_eq!(feature_bits(&[]), [0; 8]);
+        assert_eq!(
+            feature_bits(&[
+                FEATURE_LE_ENCRYPTION,
+                FEATURE_LE_DATA_LENGTH_EXTENSION,
+                FEATURE_LE_CSA2
+            ]),
+            [0x21, 0x40, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            feature_bits(&[FEATURE_LE_ENCRYPTION]),
+            [1, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 

@@ -17,8 +17,11 @@ use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::central::CentralConnection;
 use wchble::ll::conn::ConnectParams;
-use wchble::ll::ctrl::{ControlAction, ControlState, LocalVersion};
+use wchble::ll::ctrl::{feature_bits, ControlAction, ControlState, LocalVersion, FEATURE_LE_CSA2};
 use wchble::ll::scan;
+
+/// CSA #2 only: this example does not drive encryption or the DLE procedure.
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_CSA2]);
 use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE};
 use wchble::rf::regs::{self, bb, bb_irq, lle};
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
@@ -31,9 +34,11 @@ mod host;
 static SCRATCH: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 /// The LLE fetch appears to read 32-byte blocks; keep CONNECT_IND on a
-/// 32-byte boundary so the block containing its tail is unambiguous.
+/// 32-byte boundary so the block containing its tail is unambiguous. Two
+/// variants are prebuilt: offset 0 has ChSel=0, offset 64 has ChSel=1.
 #[repr(align(32))]
-struct ConnIndBuf(DmaBuf<64>);
+struct ConnIndBuf(DmaBuf<128>);
+const CONN_IND_CSEL_OFFSET: usize = 64;
 static CONN_IND: StaticCell<ConnIndBuf> = StaticCell::new();
 static DATA: StaticCell<DmaBuf<64>> = StaticCell::new();
 
@@ -258,6 +263,8 @@ struct Received {
     crc_ok: bool,
     /// This advertisement carried the address the initiator is waiting for.
     target_matched: bool,
+    /// ChSel bit of the target advertisement (CSA #2 support).
+    peer_chsel: bool,
     /// Completion time of an armed CONNECT_IND, present when this RX event was
     /// the target advertisement and the LLE accepted the TX arm.
     connect_done: Option<u32>,
@@ -325,6 +332,7 @@ fn receive_scan(
             end,
             crc_ok: false,
             target_matched: false,
+            peer_chsel: false,
             connect_done: None,
         });
     }
@@ -337,6 +345,7 @@ fn receive_scan(
             end,
             crc_ok: false,
             target_matched: false,
+            peer_chsel: false,
             connect_done: None,
         });
     }
@@ -346,6 +355,7 @@ fn receive_scan(
     // and lets the engine start the packet at hardware T_IFS. Nothing slow may
     // run between RX_DONE and this arm.
     let mut target_matched = false;
+    let mut peer_chsel = false;
     let mut connect_done = None;
     if let Some(init) = initiator {
         let header = rx.0[0];
@@ -355,9 +365,11 @@ fn receive_scan(
             && rx.0[2..8] == init.request.peer_addr
         {
             target_matched = true;
+            peer_chsel = header & 0x20 != 0;
             inc(14);
             let arm_at = clock.now_us();
-            match radio.initiate_tx(clock, &conn_buf.0 .0[..init.ind_len]) {
+            let ind = if peer_chsel { CONN_IND_CSEL_OFFSET } else { 0 };
+            match radio.initiate_tx(clock, &conn_buf.0 .0[ind..ind + init.ind_len]) {
                 Ok(done) => {
                     inc(15);
                     connect_done = Some(done);
@@ -380,6 +392,7 @@ fn receive_scan(
         end,
         crc_ok: true,
         target_matched,
+        peer_chsel,
         connect_done,
     })
 }
@@ -438,6 +451,7 @@ fn receive_response(
             end,
             crc_ok: false,
             target_matched: false,
+            peer_chsel: false,
             connect_done: None,
         });
     }
@@ -448,6 +462,7 @@ fn receive_response(
             end,
             crc_ok: false,
             target_matched: false,
+            peer_chsel: false,
             connect_done: None,
         });
     }
@@ -456,6 +471,7 @@ fn receive_response(
         end,
         crc_ok: true,
         target_matched: false,
+        peer_chsel: false,
         connect_done: None,
     })
 }
@@ -475,7 +491,7 @@ fn prepare_initiator(
     conn_buf: &mut ConnIndBuf,
     request: wchble::hci::runner::CreateConnRequest,
 ) -> Option<Initiator> {
-    let params = ConnectParams {
+    let mut params = ConnectParams {
         peer_addr: request.peer_addr,
         peer_random: request.peer_random,
         chsel: false,
@@ -497,6 +513,21 @@ fn prepare_initiator(
         soft.clear_pending_connect();
         return None;
     };
+    // Second variant with ChSel=1; picked in the receive window based on the
+    // target advertisement's own ChSel bit.
+    params.chsel = true;
+    if params.build_connect_ind(
+        &mut conn_buf.0 .0[CONN_IND_CSEL_OFFSET..],
+        own_addr,
+        own_random,
+    ) != Some(ind_len)
+    {
+        inc(17);
+        let _ = soft.bridge.connection_failed(0x12);
+        soft.clear_pending_connect();
+        return None;
+    }
+    params.chsel = false;
     unsafe {
         let debug = core::ptr::addr_of_mut!(IND_DEBUG).cast::<u32>();
         debug.add(0).write_volatile(u32::from(params.channel_map[0]));
@@ -531,7 +562,11 @@ impl Session {
         Self {
             conn,
             link: LinkSequence::new(),
-            control: ControlState::new(),
+            control: {
+                let mut control = ControlState::new();
+                control.local_features = LOCAL_FEATURES;
+                control
+            },
             pending_control: None,
             acl_tag: None,
             terminating: None,
@@ -908,6 +943,7 @@ fn start_connection(
     clock: &Clock,
     soft: &mut SoftRunner,
     initiator: &Initiator,
+    peer_chsel: bool,
     adv_end_us: u32,
     connect_done_us: u32,
 ) -> Session {
@@ -923,7 +959,8 @@ fn start_connection(
     );
     stop(radio, clock);
     soft.clear_pending_connect();
-    let params = initiator.params;
+    let mut params = initiator.params;
+    params.chsel = peer_chsel;
     radio.set_aa_crc(params.access_addr, params.crc_init);
     put(51, u32::from(params.interval));
     put(
@@ -1086,6 +1123,7 @@ fn main() -> ! {
     tx_probe(&mut radio, &clock);
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
+    soft.set_le_features(LOCAL_FEATURES);
     let app_stats = host::HostStats::new();
     let mut app = core::pin::pin!(host::run(controller, &app_stats));
     let started = clock.now_us();
@@ -1252,6 +1290,7 @@ fn main() -> ! {
                         &clock,
                         &mut soft,
                         init,
+                        packet.peer_chsel,
                         packet.end,
                         connect_done,
                     );

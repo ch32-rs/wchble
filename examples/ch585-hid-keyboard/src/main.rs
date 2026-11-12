@@ -15,7 +15,11 @@ use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::conn::{ConnectParams, PeripheralConnection};
-use wchble::ll::ctrl::{ControlAction, ControlPdu, ControlState, LocalVersion};
+use wchble::ll::ctrl::{
+    feature_bits, ControlAction, ControlPdu, ControlState, LocalVersion, FEATURE_LE_CSA2,
+};
+#[cfg(feature = "secure")]
+use wchble::ll::ctrl::FEATURE_LE_ENCRYPTION;
 use wchble::crypto::BLE_MIC_LEN;
 use wchble::ll::enc::{
     EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
@@ -90,9 +94,9 @@ const SEC_PREPARED: usize = 13;
 const SEC_LAST_ERROR: usize = 15;
 
 #[cfg(feature = "secure")]
-const LOCAL_FEATURES: [u8; 8] = [0x01, 0, 0, 0, 0, 0, 0, 0];
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_ENCRYPTION, FEATURE_LE_CSA2]);
 #[cfg(not(feature = "secure"))]
-const LOCAL_FEATURES: [u8; 8] = [0; 8];
+const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_CSA2]);
 
 fn put(i: usize, v: u32) {
     unsafe {
@@ -536,14 +540,20 @@ struct Session {
     pending_ltk: Option<([u8; 8], u16)>,
 }
 impl Session {
-    fn new(params: ConnectParams, end: u32, now: u32, enc_rsp_random: [u8; 12]) -> Self {
+    fn new(
+        params: ConnectParams,
+        advertiser_chsel: bool,
+        end: u32,
+        now: u32,
+        enc_rsp_random: [u8; 12],
+    ) -> Self {
         let mut control = ControlState::new();
         control.local_features = LOCAL_FEATURES;
         let mut enc_rsp_payload = [0u8; 13];
         enc_rsp_payload[0] = 0x04;
         enc_rsp_payload[1..].copy_from_slice(&enc_rsp_random);
         Self {
-            conn: PeripheralConnection::new(params, end, false),
+            conn: PeripheralConnection::new(params, end, advertiser_chsel),
             link: LinkSequence::new(),
             control,
             pending_control: None,
@@ -1445,6 +1455,9 @@ fn main() -> ! {
         );
     }
     soft.set_le_features(LOCAL_FEATURES);
+    // CSA #2 is negotiated only when both ADV_IND ChSel (here) and the
+    // initiator's CONNECT_IND ChSel are set.
+    soft.ll.adv.chsel = true;
     // S3: restore bonds before the Host advertises. The read is a flash-engine
     // command, so it happens here with the radio stopped.
     #[cfg(feature = "secure")]
@@ -1720,6 +1733,7 @@ fn main() -> ! {
                         soft.fill_random(&mut enc_rsp_random);
                         let s = Session::new(
                             params,
+                            soft.ll.adv.chsel,
                             packet.end,
                             clock.now_us(),
                             enc_rsp_random,
