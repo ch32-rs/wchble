@@ -1243,12 +1243,17 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
             let mut payload = [0u8; MAX_PAYLOAD];
             let started = clock.now_us();
             match store.load(&mut payload) {
-                Ok(Some(len)) => match store.save_with_fault(&payload[..len], 96) {
-                    Err(wchble::storage::StoreError::Injected) => {
-                        bond::bump(bond::STAT_FAULT_INJECTED)
+                Ok(Some(len)) => {
+                    // Half the record reaches flash; the header still claims
+                    // the full length, so its payload CRC must fail. A fixed
+                    // prefix longer than the record would write it complete.
+                    match store.save_with_fault(&payload[..len], len / 2) {
+                        Err(wchble::storage::StoreError::Injected) => {
+                            bond::bump(bond::STAT_FAULT_INJECTED)
+                        }
+                        _ => bond::bump(bond::STAT_SAVE_FAIL),
                     }
-                    _ => bond::bump(bond::STAT_SAVE_FAIL),
-                },
+                }
                 _ => bond::bump(bond::STAT_SAVE_FAIL),
             }
             record_save_time(clock, started);

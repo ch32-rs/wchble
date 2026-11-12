@@ -450,9 +450,10 @@ public class MainActivity extends Activity {
         }
         controlCharacteristic.setValue(le32(controlCommand()));
         controlCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-        boolean sent = gatt.writeCharacteristic(controlCharacteristic);
-        logEvent("\"event\":\"write_requested\",\"ok\":%s,\"value\":%d", sent, controlCommand());
-        return sent;
+        writeSent = gatt.writeCharacteristic(controlCharacteristic);
+        logEvent("\"event\":\"write_requested\",\"ok\":%s,\"value\":%d", writeSent,
+                controlCommand());
+        return writeSent;
     }
 
     private int valueOf(BluetoothGattCharacteristic characteristic) {

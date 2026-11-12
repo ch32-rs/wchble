@@ -89,6 +89,9 @@ def valid_slots(slots):
 
 
 def start_app(args, mode):
+    # One phase can start the app twice (delete, then the rejection run); the
+    # transcript must only contain the new run's lines.
+    secure.adb(args.serial, 'logcat', '-c')
     secure.adb(args.serial, 'shell', 'am', 'force-stop', secure.PACKAGE)
     secure.adb(args.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP')
     secure.adb(args.serial, 'shell', 'wm', 'dismiss-keyguard')
@@ -113,10 +116,16 @@ def wait_for_app(args, out, mode, consent=False):
     log_path = out / f'logcat-{mode}.txt'
     log_path.write_text(secure.adb(args.serial, 'logcat', '-d', '-s', 'WCHBLE:I',
                                    timeout=60))
-    rows = secure.read_log(log_path.read_text().splitlines())
+    rows = after_last_mode(secure.read_log(log_path.read_text().splitlines()))
     (out / f'transcript-{mode}.jsonl').write_text(
         '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
     return rows
+
+
+def after_last_mode(rows):
+    """Drop lines from an earlier app launch in the same log buffer."""
+    starts = [index for index, row in enumerate(rows) if row.get('event') == 'mode']
+    return rows[starts[-1]:] if starts else rows
 
 
 def summary(rows):
@@ -188,8 +197,6 @@ def checks_pair(named, raw, echo, rows, slots, seconds):
         errors.append('the new bond was never saved')
     if bonds['save_fail']:
         errors.append(f'{bonds["save_fail"]} bond saves failed')
-    if bonds['add_bond_ok'] < 1:
-        errors.append('the Host never accepted the bond')
     errors += dump_matches_echo(slots, echo)
     return errors
 
@@ -207,6 +214,8 @@ def checks_reconnect(named, raw, rows, seconds):
         errors.append('the resumed session paired again instead of reusing the bond')
     if bonds['save_attempts'] != 0:
         errors.append(f'{bonds["save_attempts"]} bond writes on a resumed session')
+    if bonds['add_bond_ok'] < bonds['records_loaded']:
+        errors.append('the boot restore did not hand every record to the Host')
     if sec['ltk_request'] < 1 or sec['ltk_reply'] < 1:
         errors.append(f'controller did not use the stored LTK: '
                       f'request={sec["ltk_request"]} reply={sec["ltk_reply"]}')
@@ -272,9 +281,7 @@ def checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
 
 
 def phase_pair(args, out, symbols, image, seconds):
-    fresh = out / 'firmware.elf'
-    shutil.copyfile(image, fresh)
-    secure.flash(fresh, out, 'test')
+    secure.flash(image, out, 'test')
     started = time.monotonic()
     start_app(args, 'pair')
     rows = wait_for_app(args, out, 'pair', consent=True)
@@ -286,9 +293,7 @@ def phase_pair(args, out, symbols, image, seconds):
 
 
 def phase_wipe(args, out, symbols, image, seconds):
-    fresh = out / 'firmware.elf'
-    shutil.copyfile(image, fresh)
-    secure.flash(fresh, out, 'test')
+    secure.flash(image, out, 'test')
     started = time.monotonic()
     start_app(args, 'wipe')
     rows = wait_for_app(args, out, 'wipe')
@@ -322,9 +327,7 @@ def phase_powercycle(args, out, symbols, seconds):
 
 
 def phase_delete(args, out, symbols, image, seconds):
-    fresh = out / 'firmware.elf'
-    shutil.copyfile(image, fresh)
-    secure.flash(fresh, out, 'test')
+    secure.flash(image, out, 'test')
     started = time.monotonic()
     start_app(args, 'delete')
     rows = wait_for_app(args, out, 'delete')
@@ -350,9 +353,7 @@ def phase_delete(args, out, symbols, image, seconds):
 def phase_fault(args, out, symbols, image, seconds, nm_text):
     if 'BOND_FAULT_BUILD' not in nm_text:
         raise ValueError('the fault phase needs an image built with --features bond-fault')
-    fresh = out / 'firmware.elf'
-    shutil.copyfile(image, fresh)
-    secure.flash(fresh, out, 'test')
+    secure.flash(image, out, 'test')
     started = time.monotonic()
     start_app(args, 'fault')
     rows = wait_for_app(args, out, 'fault')
@@ -377,8 +378,9 @@ def phase_fault(args, out, symbols, image, seconds, nm_text):
 def load_symbols(image):
     nm_text = io.command([p4.NM, str(image)], Path(f'{image}.nm.txt'))
     symbols = p4.symbols_from(nm_text)
-    for name in ('HOST_STATS', 'SECURE_STATS', 'BOND_STATS', 'BOND_ECHO',
-                 'PERIPHERAL_ADDRESS', 'RUN_SECONDS'):
+    for name in ('STATS', 'HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES',
+                 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO', 'PERIPHERAL_ADDRESS',
+                 'TRACE', 'RUN_SECONDS'):
         matches = [parts for line in nm_text.splitlines()
                    if len(parts := line.split()) == 3 and parts[2] == name]
         if len(matches) != 1:

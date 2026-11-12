@@ -172,12 +172,16 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60))
 
     def test_reconnect_requires_the_stored_key_and_no_new_save(self):
-        named, raw = observations({'load_result': 1, 'records_loaded': 1})
+        named, raw = observations({'load_result': 1, 'records_loaded': 1,
+                                   'add_bond_ok': 1})
         rows = summary('reconnect_encrypted_read_write_ok')
         self.assertEqual(bond.checks_reconnect(named, raw, rows, 60), [])
-        for bonds in ({'load_result': 0, 'records_loaded': 1},
-                      {'load_result': 1, 'pairs_complete': 1},
-                      {'load_result': 1, 'save_attempts': 1}):
+        for bonds in ({'load_result': 0, 'records_loaded': 1, 'add_bond_ok': 1},
+                      {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1,
+                       'pairs_complete': 1},
+                      {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1,
+                       'save_attempts': 1},
+                      {'load_result': 1, 'records_loaded': 1}):
             named, raw = observations(bonds)
             with self.subTest(bonds=bonds):
                 self.assertTrue(bond.checks_reconnect(named, raw, rows, 60))
@@ -229,7 +233,8 @@ class CheckTests(unittest.TestCase):
         truncated[24 + 20] ^= 0x01  # damage the payload, keep the header
         slots = dumped(page(1, payload()), bytes(truncated))
         reconnect_named, reconnect_raw = observations({'load_result': 1,
-                                                       'records_loaded': 1})
+                                                       'records_loaded': 1,
+                                                       'add_bond_ok': 1})
         errors = bond.checks_fault(
             named, summary('fault_injected_ok'), slots, reconnect_named, reconnect_raw,
             summary('reconnect_encrypted_read_write_ok'), 60)
@@ -238,6 +243,16 @@ class CheckTests(unittest.TestCase):
             named, summary('fault_injected_ok'), dumped(erased(), erased()),
             reconnect_named, reconnect_raw,
             summary('reconnect_encrypted_read_write_ok'), 60))
+
+
+class TranscriptTests(unittest.TestCase):
+    def test_only_the_last_app_launch_is_kept(self):
+        rows = [{'event': 'mode', 'mode': 'delete'}, {'event': 'summary', 'pass': True},
+                {'event': 'mode', 'mode': 'reconnect'}, {'event': 'read'},
+                {'event': 'summary', 'pass': False}]
+        kept = bond.after_last_mode(rows)
+        self.assertEqual([row.get('event') for row in kept], ['mode', 'read', 'summary'])
+        self.assertEqual(bond.after_last_mode([]), [])
 
 
 class ArgumentTests(unittest.TestCase):

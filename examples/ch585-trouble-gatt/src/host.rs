@@ -224,7 +224,10 @@ pub async fn run(
     let mut control_storage = [0u8; 4];
     let mut uart_rx_storage = [0u8; 64];
     let mut uart_tx_storage = [0u8; 64];
-    let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
+    // GAP + GATT + DIS + vendor (value, control, two CCCDs) + UART. The S3
+    // control characteristic needed two more slots than the S2 table had;
+    // `AttributeTable::push` panics on overflow at the first poll.
+    let mut table: AttributeTable<'_, NoopRawMutex, 32> = AttributeTable::new();
     let mut gap = table.add_service(Service::new(0x1800u16));
     gap.add_characteristic_ro(0x2a00u16, LOCAL_NAME);
     gap.add_characteristic_ro(0x2a01u16, &appearance);
@@ -291,7 +294,7 @@ pub async fn run(
         )
         .build();
     uart.build();
-    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 24, 1>::new(table);
+    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 32, 1>::new(table);
 
     let runner_task = async {
         use core::fmt::Write;

@@ -288,6 +288,40 @@ def evaluate_transcript(rows, mode='pair'):
     return errors
 
 
+def evaluate_rejection(rows):
+    """Same app flow as `reconnect`, but the board no longer holds the key."""
+    errors = []
+    summaries = [row for row in rows if row.get('event') == 'summary']
+    if len(summaries) != 1:
+        return [f'expected exactly one app summary, saw {len(summaries)}']
+    app = summaries[0]
+    if app.get('pass') is not False:
+        errors.append(f'the reconnect unexpectedly succeeded: {app}')
+    if app.get('reason') not in ('read_failed', 'disconnected', 'reconnect_not_bonded'):
+        errors.append(f'unexpected rejection reason: {app.get("reason")}')
+    return errors
+
+
+def evaluate_rejected_link(sec, host):
+    """Firmware-side proof that the controller refused the deleted key."""
+    errors = []
+    if len(sec) != 16 or sec[0] != SEC_MAGIC:
+        return ['invalid SECURE_STATS']
+    ltk, start, active = (SEC_NAMES.index(name) for name in
+                          ('ltk_request', 'start_req', 'active'))
+    if sec[ltk] < 1:
+        errors.append('the controller never asked for the deleted LTK')
+    if sec[start] != 0:
+        errors.append(f'encryption started after deletion: start_req={sec[start]}')
+    if sec[SEC_NAMES.index("last_error")] != 0x06:
+        errors.append(f'expected LL_REJECT_IND 0x06, last_error={sec[SEC_NAMES.index("last_error")]}')
+    if sec[active] != 0:
+        errors.append('the run reports an active encrypted link')
+    if len(host) == 16 and host[15] == SECURITY_ENCRYPTED:
+        errors.append('the Host still reports an encrypted link')
+    return errors
+
+
 def decode_bond_echo(words):
     """Key material the Host last stored, for comparison with the flash dump."""
     if not words or words[0] != 0x4F48_4345:
@@ -449,7 +483,10 @@ def execute(args):
             '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
         metadata['client_summary'] = next(
             (row for row in reversed(rows) if row.get('event') == 'summary'), None)
-        errors.extend(evaluate_transcript(rows, args.mode))
+        if args.reject:
+            errors.extend(evaluate_rejection(rows))
+        else:
+            errors.extend(evaluate_transcript(rows, args.mode))
 
         p4.wait_until(safe_read_at)
         observations = {}
@@ -461,9 +498,14 @@ def execute(args):
             metadata[name.lower()] = dict(zip(names, words))
             (args.out / f'{name.lower()}.json').write_text(
                 json.dumps(metadata[name.lower()], indent=2) + '\n')
-        errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
-                                        observations.get('HOST_STATS', []),
-                                        observations.get('STATS', []), args.run_seconds))
+        if args.reject:
+            errors.extend(evaluate_rejected_link(observations.get('SECURE_STATS', []),
+                                                 observations.get('HOST_STATS', [])))
+        else:
+            errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
+                                            observations.get('HOST_STATS', []),
+                                            observations.get('STATS', []),
+                                            args.run_seconds))
         bond_words = io.read32(symbols['BOND_STATS'], 32, args.out / 'bond_stats.txt')
         metadata['bond_stats'] = dict(zip(BOND_NAMES, bond_words))
         echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
@@ -553,6 +595,8 @@ def options(argv=None):
     parser.add_argument('--timeout', type=float, default=45)
     parser.add_argument('--mode', choices=tuple(SUMMARY_REASONS), default='pair',
                         help='app phase: pair, reconnect, delete, wipe or fault')
+    parser.add_argument('--reject', action='store_true',
+                        help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')
     parser.add_argument('--full-logcat', action='store_true')
     args = parser.parse_args(argv)

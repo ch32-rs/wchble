@@ -140,13 +140,14 @@ def evaluate(assessed, mode='pair'):
     """Mode-specific capture gates.
 
     `pair` is the S2 matrix. `reconnect` and `fault` must show encryption
-    resumed without any new SMP pairing. `delete` must show the controller
-    rejecting the peer's LTK with LL_REJECT_IND and never starting encryption.
+    resumed without any new SMP pairing. `delete`/`reject` must show the
+    controller rejecting the peer's LTK with LL_REJECT_IND and never starting
+    encryption; `reject` is the run where the board's bond is already gone.
     """
     errors = []
     if assessed.get('access_address') is None:
         errors.append(f'capture saw no CRC-valid CONNECT_IND to {assessed.get("target")}')
-    if mode == 'delete':
+    if mode in ('delete', 'reject'):
         if not any(entry['name'] == 'REJECT_IND' for entry in assessed['ll_control']):
             errors.append('capture saw no LL_REJECT_IND after the delete command')
         if any(entry['name'] in ('START_ENC_REQ', 'START_ENC_RSP')
@@ -358,7 +359,7 @@ def options(argv=None):
     parser.add_argument('--follow-by-name', action='store_true')
     parser.add_argument('--nrfutil-home', type=Path, required=True)
     parser.add_argument('--tshark', default='tshark')
-    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'fault'),
+    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject', 'fault'),
                         default='pair')
     parser.add_argument('--serial-timeout-ms', type=int, default=100)
     parser.add_argument('--startup-timeout', type=float, default=10)
@@ -366,8 +367,10 @@ def options(argv=None):
     if not 1 <= capture.serial_timeout_ms <= 1000 or not 0 < capture.startup_timeout <= 30:
         parser.error('require serial timeout 1..1000ms and startup timeout 0..30s')
     args = secure.options(remaining)
-    # One mode drives both the phone flow and the capture gates.
-    args.mode = capture.mode
+    # One mode drives both the phone flow and the capture gates. `reject`
+    # reuses the reconnect app flow but expects the board to refuse the key.
+    args.mode = 'reconnect' if capture.mode == 'reject' else capture.mode
+    args.reject = capture.mode == 'reject'
     capture.sniffer = capture.sniffer.resolve()
     capture.nrfutil_home = capture.nrfutil_home.resolve()
     return capture, args
