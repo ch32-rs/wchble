@@ -1,6 +1,6 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-10. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-12. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
 failures or retroactively change archived results.
@@ -204,7 +204,7 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   any future Android-based acceptance source does the same instead of treating
   the first failure as a controller defect.
 
-## S2 security gaps
+## Security gaps (S2/S3)
 
 - [ ] **iOS round never started (backlogged 2026-11-12 by project decision).**
   No iOS client exists in this repository and none was ever installed on the
@@ -219,9 +219,28 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   0, `SECURE_STATS` encryption counters, and a capture with ciphertext after
   `START_ENC_RSP`. It does not establish repeatability across boots, per-model
   behaviour, MTU above 23, or an encrypted notification path.
-- [ ] **No bond store.** Every boot rotates the static random address, so an
-  existing bond can never be reused and the phone sees a new device each time.
-  This is the S3 entry condition, not a property of a finished design.
+- [x] **Bond store (S3, 2026-11-12).** Two DataFlash pages, 24-byte header with
+  payload/header CRC32 and a wrap-safe sequence, a zero-length tombstone for
+  deletion, and the whole engine sequence in `.highcode` RAM with interrupts
+  masked. The address is now fixed (`C1:FF:EE:00:00:16`) so a peer can find the
+  key it stored on an earlier boot. Hardware evidence: probe reset and a real
+  USB unplug/replug reconnect encrypted with `pairs_complete=0` and
+  `save_attempts=0`; deletion produced `LL_REJECT_IND(0x06)` with
+  `start_req=0`, then a fresh pairing wrote a new record; a truncated save left
+  the older copy valid and the reboot loaded it (`winner_seq` unchanged). See
+  [S3 results](local-docs/research/ch585-s3-results.md).
+- [ ] **Air capture of the post-delete rejection.** Android re-pairs within the
+  same app run after the peripheral rejects the stale key (`BONDED→BONDING→
+  BONDED`), so the sniffer's first followed link shows the new pairing, not the
+  `REJECT_IND`. The rejection is proven by firmware counters
+  (`last_error=0x06`, `start_req=0`) and the phone's ATT 0x85, not on air.
+- [ ] **Multi-bond and resolving list.** The store holds up to four records per
+  slot and keeps the IRK field, but only one peer, one record and no RPA
+  resolution were exercised on hardware. Capacity and IRK round-trip are
+  host-tested only.
+- [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
+  SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
+  (security spec §2).
 
 ## Explicitly outside this milestone
 
