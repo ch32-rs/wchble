@@ -153,14 +153,20 @@ Android in two complementary runs, driven by
 `tools/android_hid_run.py`:
 
 ```
-# app round (bonded peer): the helper app proves what a third-party app can see
+# app round (bonded peer): what a third-party app can see, plus the OS device
 python3 tools/android_hid_run.py --out local-docs/results/x4b-android-app \
-    --expect app --pair-tap 786,2121
+    --expect app --settings-connect --pair-tap 786,2121
 
 # payload round (fresh bond): the system HID host subscribes to the report CCCD
 python3 tools/android_hid_run.py --out local-docs/results/x4b-android-payload \
     --expect payload --wipe-bond --pair-tap 786,2121
 ```
+
+`--settings-connect` opens Bluetooth Settings and taps the paired keyboard
+once: Android's HID host only opens its own GATT client when Settings (or a
+prior HID session) asks it to, and a bonded peer gets no background connection
+after a reboot. The first attach after a reboot performs a full discovery and
+subscribes; later attaches reuse the cached layout and do not re-subscribe.
 
 Both runs flash the 60 s secure image through the preflight helper, install the
 shared `android-pair` APK, start it with `--es mode hid`, tap the Just Works
@@ -188,10 +194,14 @@ notify errors. The earlier full run of this path reached `reports_sent=354`.
 A bonded peer whose GATT layout is cached does not re-subscribe, which is why
 the payload round belongs on a fresh bond.
 
-Result of the app round: `local-docs/results/x4b-android-5/` (the final
-attempt in this window, `x4b-android-7`, failed after an adapter reset left the
-system HID host inert and is preserved). Payload evidence:
-`local-docs/results/x4b-android-1/`.
+Results of the app round: `local-docs/results/x4b-android-10/` is the clean
+PASS (app summary `hid_system_input_ok`, input device id 7, `security=3`,
+smoke restored). `x4b-android-9/` is the same flow with the system HID host's
+first post-reboot attach: full discovery (`report_map_reads=3`), report CCCD
+subscription, `reports_sent=49`, two encryption activations (app + host). It
+was marked failed only by the runner's then-strict `active==1` gate, which is
+now `active>=1` because the app round intentionally has two clients.
+Payload evidence: `local-docs/results/x4b-android-1/` (354 reports).
 
 For the macOS gate run, disable other bonded peers (for example the phone's
 Bluetooth) so their automatic reconnect cannot join the same finite window.

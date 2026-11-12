@@ -13,6 +13,7 @@ window is short, pass `--pair-tap X,Y` with the Pair button coordinates
 import argparse
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import time
@@ -51,6 +52,40 @@ def adb(*args, check=True, timeout=30):
     return subprocess.run(['adb', '-s', SERIAL, *args], capture_output=True, text=True,
                           encoding='utf-8', errors='replace',
                           timeout=timeout, check=check).stdout
+
+
+def tap_settings_connect(out):
+    """Open Bluetooth Settings and tap the paired keyboard once.
+
+    Android's HID host only opens its own GATT client when Settings (or a
+    previous HID session) asks it to; a bonded peer does not get an automatic
+    background connection after a reboot. Settings is the deterministic
+    trigger, so the runner drives it through the uiautomator dump.
+    """
+    adb('shell', 'input', 'keyevent', 'KEYCODE_WAKEUP')
+    adb('shell', 'wm', 'dismiss-keyguard')
+    adb('shell', 'am', 'force-stop', 'com.android.settings')
+    time.sleep(1)
+    adb('shell', 'am', 'start', '-W', '-a', 'android.settings.BLUETOOTH_SETTINGS',
+        timeout=60)
+    pattern = re.compile(r'text="' + re.escape(TARGET)
+                         + r'"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+    for _ in range(12):
+        try:
+            adb('shell', 'uiautomator', 'dump', '/sdcard/wchble-bt-ui.xml',
+                timeout=30)
+            dump = adb('shell', 'cat', '/sdcard/wchble-bt-ui.xml', timeout=30)
+        except subprocess.CalledProcessError:
+            time.sleep(1)
+            continue
+        match = pattern.search(dump)
+        if match:
+            x1, y1, x2, y2 = (int(part) for part in match.groups())
+            adb('shell', 'input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
+            print('SETTINGS tap', (x1 + x2) // 2, (y1 + y2) // 2, flush=True)
+            return True
+        time.sleep(1)
+    return False
 
 
 def parse_rows(logcat):
@@ -147,8 +182,11 @@ def evaluate_firmware(stats_words, host, sec, stats, run_seconds, expect):
         for bit, label in ((8, 'entropy health'), (9, 'Host RNG seed'), (10, 'DRBG seed')):
             if not sec[1] & (1 << bit):
                 errors.append(f'SECURE flags missing {label}')
-        if sec[hidex('active')] != ACTIVE:
-            errors.append(f'SECURE active={sec[hidex("active")]}, expected 1')
+        # The app round intentionally has two clients (the helper app and the
+        # system HID host), so encryption can become active once per connection.
+        # The single-client S2/S3 fixture keeps its exact-one rule separately.
+        if sec[hidex('active')] < ACTIVE:
+            errors.append(f'SECURE active={sec[hidex("active")]}, expected at least 1')
         for name in ('enc_req', 'enc_rsp', 'start_req', 'start_rsp'):
             if sec[hidex(name)] < 1:
                 errors.append(f'SECURE {name}={sec[hidex(name)]} < 1')
@@ -204,6 +242,9 @@ def options(argv=None):
     parser.add_argument('--bt-reset', action='store_true',
                         help='cycle the adapter after the app so the HID host '
                              'reconnects with a fresh client and subscribes')
+    parser.add_argument('--settings-connect', action='store_true',
+                        help='tap the paired keyboard in Bluetooth Settings so '
+                             'the system HID host opens its own GATT client')
     parser.add_argument('--expect', choices=('app', 'payload'), default='app',
                         help='app: OS input-device recognition (bonded peer); '
                              'payload: encrypted report flow on a fresh bond')
@@ -280,6 +321,11 @@ def execute(args):
         adb('shell', 'am', 'force-stop', PACKAGE)
         adb('shell', 'am', 'start', '-W', '-n', ACTIVITY,
             '--es', 'mode', 'hid', '--es', 'target_name', TARGET, timeout=60)
+        if args.settings_connect:
+            time.sleep(2)
+            metadata['settings_connect'] = tap_settings_connect(args.out)
+            if not metadata['settings_connect']:
+                errors.append('could not find the paired keyboard in Bluetooth settings')
         tap = tuple(int(part) for part in args.pair_tap.split(',')) if args.pair_tap else None
         consents = []
         deadline = time.monotonic() + args.timeout

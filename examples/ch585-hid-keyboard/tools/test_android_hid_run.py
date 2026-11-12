@@ -109,6 +109,15 @@ class FirmwareTests(unittest.TestCase):
             firmware_words(), host_words(), secure_words(), stats_words(), 60, 'app')
         self.assertEqual(errors, [], errors)
 
+    def test_app_mode_allows_two_encryptions(self):
+        # App and system HID host each bring the link up once.
+        errors = runner.evaluate_firmware(
+            firmware_words(), host_words(connections=2),
+            secure_words(enc_req=2, enc_rsp=2, ltk_request=2, ltk_reply=2,
+                         start_req=2, start_rsp=2, encrypted_tx=63, active=2),
+            stats_words(), 60, 'app')
+        self.assertEqual(errors, [], errors)
+
     def test_app_mode_requires_encryption(self):
         errors = runner.evaluate_firmware(
             firmware_words(), host_words(security=1), secure_words(), stats_words(), 60, 'app')

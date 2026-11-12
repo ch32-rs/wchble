@@ -285,9 +285,13 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [ ] **A bonded Android host with a cached layout does not resubscribe.** After
   a first discovery, the system HID host keeps the cached service layout and
   never writes the report CCCD again, so a same-bond run shows
-  `subscription_edges=0`. The payload evidence needs a fresh bond (or a full
-  link/client reset); cycling the adapter (`--bt-reset`) did not bring the HID
-  host back on the CPH2411.
+  `subscription_edges=0`. The first attach after a reboot does a full
+  discovery and subscribes (`x4b-android-9`: `reports_sent=49`).
+- [ ] **The Android HID host needs an explicit connect trigger.** A bonded peer
+  gets no background connection after a reboot, and an adapter cycle did not
+  bring the HID host back. Tapping the paired keyboard in Bluetooth Settings
+  is deterministic; the runner automates it with `--settings-connect`
+  (`uiautomator` bounds, ROM-localised labels avoided).
 - [ ] **Bond store is keyed by peer address only.** Reusing the store from an
   image with a different local identity makes SMP fail: the phone has no bond
   for the new address while the Host still returns the old LTK. Pairing only
