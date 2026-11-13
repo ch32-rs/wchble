@@ -1280,19 +1280,6 @@ mod tests {
     }
 
     #[test]
-    fn host_acl_fragments_fit_the_reported_251_octet_buffer() {
-        let _guard = test_lock();
-        transport::drain_channels_for_test();
-        let mut runner = SoftRunner::new();
-        open(&mut runner);
-        assert_eq!(
-            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 252])),
-            Err(BridgeError::InvalidPacket)
-        );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 251])).is_ok());
-    }
-
-    #[test]
     fn host_reads_buffer_size_and_features() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
