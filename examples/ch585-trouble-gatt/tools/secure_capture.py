@@ -50,7 +50,8 @@ SMP_NAMES = dict(secure.SMP_OPCODES)
 LL_CONTROL = {0x02: 'TERMINATE_IND', 0x03: 'ENC_REQ', 0x04: 'ENC_RSP',
               0x05: 'START_ENC_REQ', 0x06: 'START_ENC_RSP',
               0x0a: 'PAUSE_ENC_REQ', 0x0b: 'PAUSE_ENC_RSP',
-              0x0c: 'VERSION_IND', 0x0d: 'REJECT_IND'}
+              0x0c: 'VERSION_IND', 0x0d: 'REJECT_IND',
+              0x14: 'LENGTH_REQ', 0x15: 'LENGTH_RSP'}
 
 
 def run_target(out):

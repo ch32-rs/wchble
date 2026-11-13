@@ -103,7 +103,9 @@ pub struct DataLength {
     local_octets: u16,
     local_time: u16,
     peer_rx_octets: Option<u16>,
+    peer_rx_time: Option<u16>,
     peer_tx_octets: Option<u16>,
+    peer_tx_time: Option<u16>,
     requested: bool,
 }
 
@@ -119,7 +121,9 @@ impl DataLength {
             local_octets: LL_MAX_PAYLOAD,
             local_time: LL_MAX_TIME_US,
             peer_rx_octets: None,
+            peer_rx_time: None,
             peer_tx_octets: None,
+            peer_tx_time: None,
             requested: false,
         }
     }
@@ -157,7 +161,9 @@ impl DataLength {
     pub fn on_peer_length(&mut self, peer: LengthParams) -> LengthParams {
         let peer = peer.clamped();
         self.peer_rx_octets = Some(peer.max_rx_octets);
+        self.peer_rx_time = Some(peer.max_rx_time);
         self.peer_tx_octets = Some(peer.max_tx_octets);
+        self.peer_tx_time = Some(peer.max_tx_time);
         self.local_params()
     }
 
@@ -176,6 +182,24 @@ impl DataLength {
         match self.peer_tx_octets {
             Some(peer) => self.local_octets.min(peer),
             None => LL_DEFAULT_RX_PAYLOAD,
+        }
+    }
+
+    /// Effective on-air TX time, MIC included. The peer's `MaxRxTime` caps
+    /// our `MaxTxTime`; 328 µs is the legacy default.
+    pub fn tx_time_us(&self) -> u16 {
+        match self.peer_rx_time {
+            Some(peer) => self.local_time.min(peer),
+            None => LL_LEGACY_TIME_US,
+        }
+    }
+
+    /// Effective on-air RX time. The peer's `MaxTxTime` caps our `MaxRxTime`;
+    /// the default covers the 31-octet pre-negotiation receive window.
+    pub fn rx_time_us(&self) -> u16 {
+        match self.peer_tx_time {
+            Some(peer) => self.local_time.min(peer),
+            None => air_time_us(LL_DEFAULT_RX_PAYLOAD),
         }
     }
 
@@ -302,9 +326,13 @@ mod tests {
         });
         assert_eq!(dle.tx_octets(), 65);
         assert_eq!(dle.rx_octets(), 100);
+        assert_eq!(dle.tx_time_us(), 848);
+        assert_eq!(dle.rx_time_us(), 1120);
         dle.set_local(27, 328);
         assert_eq!(dle.tx_octets(), 27);
         assert_eq!(dle.rx_octets(), 27);
+        assert_eq!(dle.tx_time_us(), 328);
+        assert_eq!(dle.rx_time_us(), 328);
     }
 
     #[test]

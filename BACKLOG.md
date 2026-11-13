@@ -1,6 +1,6 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-12. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-13. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
 failures or retroactively change archived results.
@@ -116,6 +116,20 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   is recorded in `SEC_DIAG[63]`; the X4 runner fails on any such sample.
   Evidence: `local-docs/results/x4-att-3-badpdu/` (`0x001c1201` = header
   `0x12`, length 28), `x4-att-4-rx31/`, `x4-att-5-rx31/`.
+- [ ] **X1 acceptance: CSA #2 and bidirectional DLE (implementation 2026-11-13).**
+  The controller negotiates CSA #2 from the ADV/CONNECT_IND ChSel bits (Core
+  sample vectors in unit tests). DLE advertises 251-octet buffers from startup,
+  segments every Host ACL packet at the negotiated on-air size, keeps the HCI
+  tag only on the final fragment, and scales receive windows with
+  `rx_complete_allowance_us()`. Effective limits stay 27 TX / 31 RX until the
+  peer answers, then min(local, peer), with 247 plaintext under the MIC.
+  Offline: 166 library tests, both Host fixtures, all examples build. Still to
+  record: the `att --require-dle` hardware round, S2/X4b regressions, and a
+  capture showing `LL_LENGTH_REQ/RSP` plus a 251-octet PDU. 2M/Coded remain
+  unadvertised.
+- [ ] **X1b: 2M/Coded PHY.** Both feature bits stay 0 because the PHY switch and
+  its timing are not implemented. Claim either only after a measured air
+  comparison against a controlled peer.
 - [ ] **Burst drops are silent by design.** `try_notify_raw` returns
   `OutOfMemory` when the 8-deep notification queue is full; the X4 fixture
   counts it and moves on rather than waiting or retrying. This proves the
@@ -337,8 +351,9 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 ## Explicitly outside this milestone
 
-Multiple connections, DLE, 2M, CSA2 and product profiles beyond HOGP are not
-implemented or accepted by the current peripheral or central examples. They are
-future scope decisions, not compatibility claims. Pairing/encryption (S2/S3)
-and long attributes (X4a) have since moved out of this list with the evidence
-above.
+Multiple connections, 2M/Coded PHY and product profiles beyond HOGP are not
+implemented or accepted by the current peripheral or central examples. DLE and
+CSA #2 have since moved out of this list (X1 implementation above; its hardware
+round is still open). They are future scope decisions, not compatibility
+claims. Pairing/encryption (S2/S3) and long attributes (X4a) moved out earlier
+with the evidence above.

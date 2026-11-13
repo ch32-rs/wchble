@@ -28,6 +28,52 @@ def sec(**values):
     return words
 
 
+def x1(**values):
+    words = [0] * 24
+    words[0] = secure.X1_MAGIC
+    words[1] = 1
+    words[2], words[4], words[5] = 2, 1, 1
+    words[10] = words[11] = 251
+    words[12] = words[13] = 2120
+    words[14] = words[15] = 251
+    for name, value in values.items():
+        words[secure.X1_NAMES.index(name)] = value
+    return words
+
+
+class X1Tests(unittest.TestCase):
+    def test_csa2_and_dle_stats_pass(self):
+        words = x1(feature_exchange=1, tx_over_27=4, rx_over_27=6,
+                   host_packets_segmented=2)
+        self.assertEqual(secure.evaluate_x1(words), [])
+        self.assertEqual(secure.evaluate_x1(words, require_dle=True), [])
+
+    def test_selection_bits_must_agree_with_the_algorithm(self):
+        errors = secure.evaluate_x1(x1(adv_chsel=0))
+        self.assertTrue(any('CSA#2 selected' in error for error in errors))
+        errors = secure.evaluate_x1(x1(algorithm=1))
+        self.assertTrue(any('CSA#1 selected' in error for error in errors))
+
+    def test_limits_must_stay_inside_the_spec_window(self):
+        errors = secure.evaluate_x1(x1(tx_octets=20))
+        self.assertTrue(any('tx_octets=20' in error for error in errors))
+        errors = secure.evaluate_x1(x1(max_rx_pdu=252))
+        self.assertTrue(any('251 octets' in error for error in errors))
+        errors = secure.evaluate_x1(x1(rx_time=300))
+        self.assertTrue(any('rx_time=300' in error for error in errors))
+
+    def test_require_dle_demands_observed_widening(self):
+        errors = secure.evaluate_x1(x1(), require_dle=True)
+        self.assertTrue(any('feature set' in error for error in errors))
+        self.assertTrue(any('transmitted PDU' in error for error in errors))
+        self.assertTrue(any('received PDU' in error for error in errors))
+        self.assertTrue(any('Host ACL packet' in error for error in errors))
+
+    def test_bad_magic_is_rejected(self):
+        self.assertTrue(secure.evaluate_x1([0] * 24))
+        self.assertTrue(secure.evaluate_x1([0] * 16))
+
+
 class RejectionTests(unittest.TestCase):
     def test_app_side_rejection(self):
         rows = [{'event': 'summary', 'pass': False, 'reason': 'read_failed'}]

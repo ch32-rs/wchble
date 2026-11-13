@@ -135,6 +135,18 @@ python3 -m unittest discover -s examples/ch585-hid-keyboard/tools -p 'test_*.py'
 swiftc -typecheck examples/ch585-hid-keyboard/tools/hid_host.swift
 ```
 
+### X1 counters
+
+The image exports the same `X1_STATS[24]` block as the P4/P5 examples:
+negotiated channel-selection algorithm and event counter, both ChSel bits,
+`LL_LENGTH_REQ/RSP` counts, effective TX/RX octets and times, largest PDUs,
+>27-octet counters, Host fragments/segmented packets, PDUs, feature-exchange
+state and `last_error`. `hid_run.py` reads it after every run and applies the
+same limits/consistency checks; `--require-dle` additionally demands evidence
+of a PDU above 27 octets in each direction and a fragmented Host packet. HID
+reports themselves are small, so large PDUs appear only when the peer exercises
+DLE; leave the flag off for a report-only run.
+
 ### macOS system-HID check (manual)
 
 1. Flash the `secure,long-run` image through the preflight helper (360 s).

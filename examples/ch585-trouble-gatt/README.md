@@ -228,6 +228,32 @@ also stores the first refused PDU header/length in `SEC_DIAG[63]`
 (`1 | header << 8 | len << 16`); the `att` gate fails the run if any sample
 appears.
 
+## X1: CSA #2 and bidirectional DLE
+
+The controller advertises `LE Data Length Extension` and `CSA #2` (and
+`Encryption` in the `secure` build) from startup; 2M/Coded stay unset because
+the PHY switch is not implemented. Advertising PDUs and CONNECT_IND carry
+ChSel, and the link uses CSA #2 only when both sides set it. The same
+algorithm runs in the central example; both are checked against the Core
+sample vectors in `src/ll/conn.rs`.
+
+DLE is fully bidirectional: `LE Read Buffer Size` reports 251 octets and five
+credits, the LL splits each Host ACL packet at the negotiated on-air size
+(27 octets until the peer answers), and only the last fragment returns the HCI
+credit. Encryption runs per fragment, so the negotiated 251 includes the MIC
+(247 plaintext). Receive windows and the software no-capture timeout scale
+with `rx_complete_allowance_us()`, and the pre-negotiation receive limit stays
+31 octets so the observed 28-octet Android PDU is still valid.
+
+`X1_STATS[24]` (exported symbol, magic `0x58310001`) records the negotiated
+algorithm, event counter, both ChSel bits, `LL_LENGTH_REQ/RSP` counts in both
+directions, effective TX/RX octets and times, largest TX/RX PDU, >27 counts,
+Host fragments and segmented Host packets, PDUs sent/received, whether the
+peer feature set is known, and `last_error`. `secure_run.py` validates it on
+every run; `--require-dle` additionally demands a feature exchange, at least
+one PDU above 27 octets in each direction, and at least one segmented Host
+packet. Host buffer credits are still 5 per direction.
+
 ## GATT contract
 
 - Complete local name: `wch585-p4`.

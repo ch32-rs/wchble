@@ -49,7 +49,8 @@ HOST_NAMES = '''phase connections disconnects security errors last_error
     reserved_12 reserved_13 reserved_14 reserved_15'''.split()
 REQUIRED_SYMBOLS = ('STATS', 'HOST_STATS', 'HID_STATS', 'SECURE_STATS', 'SEC_DIAG',
                     'SEC_OPCODES', 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO',
-                    'PERIPHERAL_ADDRESS', 'TRACE')
+                    'PERIPHERAL_ADDRESS', 'TRACE', 'X1_STATS')
+X1_NAMES = secure.X1_NAMES
 RUN_SECONDS_CHOICES = (60, 360)
 SECURITY_REQUESTED = 1
 SECURITY_ENCRYPTED = 3
@@ -58,7 +59,8 @@ FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, Keyboa
 
 def validate_hid_buffers(image, symbols):
     """Shared observation-buffer checks plus the HID evidence buffer."""
-    symbols = secure.validate_observation_buffers(image, symbols)
+    symbols = secure.validate_observation_buffers(
+        image, symbols, extra=(('X1_STATS', 24),))
     sections = p4.p3.elf_sections(image)
     address, size = symbols['HID_STATS'], 16 * 4
     if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
@@ -344,7 +346,8 @@ def execute(args):
                 for name, count, names in (('STATS', 64, STAT_NAMES),
                                            ('HOST_STATS', 16, HOST_NAMES),
                                            ('HID_STATS', 16, HID_NAMES),
-                                           ('SECURE_STATS', 16, SEC_NAMES)):
+                                           ('SECURE_STATS', 16, SEC_NAMES),
+                                           ('X1_STATS', 24, X1_NAMES)):
                     try:
                         words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
                         observations[name] = words
@@ -354,11 +357,14 @@ def execute(args):
                     except FAILURES as error:
                         errors.append(f'{name} observations: {error}')
                 if all(name in observations for name in ('HID_STATS', 'HOST_STATS',
-                                                        'SECURE_STATS', 'STATS')):
+                                                        'SECURE_STATS', 'STATS',
+                                                        'X1_STATS')):
                     errors.extend(evaluate_firmware(
                         observations['HID_STATS'], observations['HOST_STATS'],
                         observations['SECURE_STATS'], observations['STATS'],
                         args.run_seconds, mirror_mode))
+                    errors.extend(secure.evaluate_x1(observations['X1_STATS'],
+                                                     args.require_dle))
             try:
                 io.flash(args.out / 'smoke.elf', args.out, 'restore')
                 io.command(['swift', str(io.SCANNER), 'wch585', '8'],
@@ -382,6 +388,8 @@ def options(argv=None):
     parser.add_argument('--elf', type=Path, default=DEFAULT_ELF)
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)
+    parser.add_argument('--require-dle', action='store_true',
+                        help='require observed >27-byte PDUs and a fragmented Host packet')
     parser.add_argument('--run-seconds', type=int, choices=RUN_SECONDS_CHOICES, default=60)
     parser.add_argument('--timeout', type=float, default=50)
     parser.add_argument('--hold', type=float, default=0.5)

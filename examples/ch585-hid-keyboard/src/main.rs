@@ -22,6 +22,7 @@ use wchble::ll::ctrl::{
 #[cfg(feature = "secure")]
 use wchble::ll::ctrl::FEATURE_LE_ENCRYPTION;
 use wchble::crypto::BLE_MIC_LEN;
+use wchble::ll::dle::LL_LEGACY_PAYLOAD;
 use wchble::ll::enc::{
     EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
 };
@@ -486,6 +487,8 @@ struct EncTx {
 struct PendingHost {
     acl: TxAcl,
     offset: usize,
+    /// LL fragments queued for this Host packet; only the last owns the tag.
+    fragments: u32,
 }
 
 /// A received encrypted PDU held until after the event, when AES-CCM can run
@@ -534,6 +537,20 @@ struct Session {
     pending_enc_control: Option<EncTx>,
     pending_enc_acl: Option<EncTx>,
     pending_host: Option<PendingHost>,
+    /// X1 telemetry: (our ADV ChSel, the CONNECT_IND ChSel).
+    chsel: (bool, bool),
+    max_tx_pdu: u16,
+    max_rx_pdu: u16,
+    tx_over_27: u32,
+    rx_over_27: u32,
+    tx_pdus: u32,
+    rx_pdus: u32,
+    host_fragments: u32,
+    host_packets_segmented: u32,
+    length_req_tx: u32,
+    length_rsp_tx: u32,
+    length_req_rx: u32,
+    length_rsp_rx: u32,
     deferred_rx: Option<DeferredRx>,
     /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
     /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
@@ -565,6 +582,7 @@ impl Session {
         now: u32,
         enc_rsp_random: [u8; 12],
     ) -> Self {
+        let initiator_chsel = params.chsel;
         let mut control = ControlState::new();
         control.local_features = LOCAL_FEATURES;
         let mut enc_rsp_payload = [0u8; 13];
@@ -593,6 +611,19 @@ impl Session {
             pending_enc_control: None,
             pending_enc_acl: None,
             pending_host: None,
+            chsel: (advertiser_chsel, initiator_chsel),
+            max_tx_pdu: 0,
+            max_rx_pdu: 0,
+            tx_over_27: 0,
+            rx_over_27: 0,
+            tx_pdus: 0,
+            rx_pdus: 0,
+            host_fragments: 0,
+            host_packets_segmented: 0,
+            length_req_tx: 0,
+            length_rsp_tx: 0,
+            length_req_rx: 0,
+            length_rsp_rx: 0,
             deferred_rx: None,
             enc_rsp_random,
             enc_rsp_payload,
@@ -714,6 +745,7 @@ fn connection_event(
             inc(9);
             break;
         }
+        note_rx_pdu(s, payload.len());
         // After our plaintext LL_START_ENC_REQ, the Central's next non-empty
         // PDU is its encrypted LL_START_ENC_RSP (the link's first encrypted
         // PDU); empty PDUs stay plaintext.
@@ -830,6 +862,7 @@ fn connection_event(
                                 company_id: 0xffff,
                                 subversion: 1,
                             };
+                            note_control_rx(s, payload[0]);
                             match s.control.on_pdu(&mut s.conn, payload, local) {
                                 Ok(action) => {
                                     // DLE takes effect once the request or
@@ -839,6 +872,9 @@ fn connection_event(
                                         ControlAction::Reply(pdu) => {
                                             if pdu.as_bytes().first() == Some(&7) {
                                                 inc(27);
+                                            }
+                                            if pdu.as_bytes().first() == Some(&0x15) {
+                                                s.length_rsp_tx += 1;
                                             }
                                             s.pending_control =
                                                 Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
@@ -968,6 +1004,9 @@ fn connection_event(
         let frame = pdu.as_bytes();
         tx.0[..frame.len()].copy_from_slice(frame);
         let sent = transmit(radio, clock, &tx.0[..frame.len()], packet.end);
+        if sent {
+            note_tx_pdu(s, frame.len() - 2);
+        }
         put(58, sequence_us);
         put(59, handled_us);
         if retry {
@@ -1120,7 +1159,11 @@ fn queue_next_host_fragment(soft: &mut SoftRunner, s: &mut Session) {
             return;
         }
         diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
-        s.pending_host = Some(PendingHost { acl, offset: 0 });
+        s.pending_host = Some(PendingHost {
+            acl,
+            offset: 0,
+            fragments: 0,
+        });
     }
     let max = usize::from(s.link.tx_max_payload());
     let done = {
@@ -1132,16 +1175,93 @@ fn queue_next_host_fragment(soft: &mut SoftRunner, s: &mut Session) {
         let end = start + n;
         s.link.queue(llid, &host.acl.bytes[start..end]).unwrap();
         host.offset = end;
+        host.fragments += 1;
+        s.host_fragments += 1;
         if end == host.acl.len {
-            Some(host.acl.tag)
+            Some((host.acl.tag, host.fragments))
         } else {
             None
         }
     };
-    if let Some(tag) = done {
+    if let Some((tag, fragments)) = done {
+        if fragments > 1 {
+            s.host_packets_segmented += 1;
+        }
         s.pending_host = None;
         s.acl_tag = Some(tag);
     }
+}
+
+/// Count DLE opcodes seen in a received LL control PDU.
+fn note_control_rx(s: &mut Session, opcode: u8) {
+    match opcode {
+        0x14 => s.length_req_rx += 1,
+        0x15 => s.length_rsp_rx += 1,
+        _ => {}
+    }
+}
+
+fn note_tx_pdu(s: &mut Session, len: usize) {
+    let len = len as u16;
+    s.tx_pdus += 1;
+    s.max_tx_pdu = s.max_tx_pdu.max(len);
+    if len > LL_LEGACY_PAYLOAD {
+        s.tx_over_27 += 1;
+    }
+}
+
+fn note_rx_pdu(s: &mut Session, len: usize) {
+    let len = len as u16;
+    s.rx_pdus += 1;
+    s.max_rx_pdu = s.max_rx_pdu.max(len);
+    if len > LL_LEGACY_PAYLOAD {
+        s.rx_over_27 += 1;
+    }
+}
+
+/// Publish the CSA #2 / DLE observations for the HID runner's checks. Called
+/// once per connection event, outside the RF window.
+fn publish_x1(s: &Session) {
+    use host::{
+        x1_put, X1_ADV_CHSEL, X1_ALGORITHM, X1_EVENT_COUNTER, X1_FEATURE_EXCHANGE,
+        X1_HOST_FRAGMENTS, X1_HOST_PACKETS_SEGMENTED, X1_INIT_CHSEL, X1_LENGTH_REQ_RX,
+        X1_LENGTH_REQ_TX, X1_LENGTH_RSP_RX, X1_LENGTH_RSP_TX, X1_MAGIC, X1_MAGIC_INDEX,
+        X1_MAX_RX_PDU, X1_MAX_TX_PDU, X1_RX_OCTETS, X1_RX_OVER_27, X1_RX_PDUS, X1_RX_TIME,
+        X1_TX_OCTETS, X1_TX_OVER_27, X1_TX_PDUS, X1_TX_TIME, X1_VERSION, X1_VERSION_INDEX,
+    };
+    let data_length = &s.control.data_length;
+    x1_put(X1_MAGIC_INDEX, X1_MAGIC);
+    x1_put(X1_VERSION_INDEX, X1_VERSION);
+    x1_put(
+        X1_ALGORITHM,
+        match s.conn.channel_selection_algorithm() {
+            wchble::ll::conn::ChannelSelectionAlgorithm::Csa2 => 2,
+            _ => 1,
+        },
+    );
+    x1_put(X1_EVENT_COUNTER, u32::from(s.conn.event_counter()));
+    x1_put(X1_ADV_CHSEL, u32::from(s.chsel.0));
+    x1_put(X1_INIT_CHSEL, u32::from(s.chsel.1));
+    x1_put(X1_LENGTH_REQ_RX, s.length_req_rx);
+    x1_put(X1_LENGTH_RSP_RX, s.length_rsp_rx);
+    x1_put(X1_LENGTH_REQ_TX, s.length_req_tx);
+    x1_put(X1_LENGTH_RSP_TX, s.length_rsp_tx);
+    x1_put(X1_TX_OCTETS, u32::from(data_length.tx_octets()));
+    x1_put(X1_RX_OCTETS, u32::from(data_length.rx_octets()));
+    x1_put(X1_TX_TIME, u32::from(data_length.tx_time_us()));
+    x1_put(X1_RX_TIME, u32::from(data_length.rx_time_us()));
+    x1_put(X1_MAX_TX_PDU, u32::from(s.max_tx_pdu));
+    x1_put(X1_MAX_RX_PDU, u32::from(s.max_rx_pdu));
+    x1_put(X1_RX_OVER_27, s.rx_over_27);
+    x1_put(X1_TX_OVER_27, s.tx_over_27);
+    x1_put(X1_HOST_PACKETS_SEGMENTED, s.host_packets_segmented);
+    x1_put(X1_HOST_FRAGMENTS, s.host_fragments);
+    x1_put(X1_TX_PDUS, s.tx_pdus);
+    x1_put(X1_RX_PDUS, s.rx_pdus);
+    x1_put(
+        X1_FEATURE_EXCHANGE,
+        u32::from(s.control.peer_features.is_some() || data_length.negotiated()),
+    );
 }
 
 /// Start DLE from the peripheral side. Android Centrals have been observed
@@ -1156,11 +1276,13 @@ fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
         s.control.data_length.set_local(octets, time);
         let pdu = s.control.length_request();
         s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+        s.length_req_tx += 1;
         return None;
     }
     if !s.control.data_length.requested() {
         if let Some(pdu) = s.control.request_length_if_supported() {
             s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+            s.length_req_tx += 1;
             return None;
         }
         if let Some(pdu) = s.control.feature_request() {
@@ -1217,7 +1339,11 @@ fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                     let _ = soft.bridge.ack_tx(acl.tag);
                 } else {
                     diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
-                    s.pending_host = Some(PendingHost { acl, offset: 0 });
+                    s.pending_host = Some(PendingHost {
+                        acl,
+                        offset: 0,
+                        fragments: 0,
+                    });
                 }
             }
         }
@@ -1241,6 +1367,7 @@ fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                         None
                     },
                     end,
+                    host.fragments + 1,
                 )),
                 Err(_) => {
                     sec_error(0x1e);
@@ -1250,7 +1377,7 @@ fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
         } else {
             None
         };
-        if let Some((llid, out, len, tag, offset)) = prepared {
+        if let Some((llid, out, len, tag, offset, fragments)) = prepared {
             s.pending_enc_acl = Some(EncTx {
                 llid,
                 bytes: out,
@@ -1260,8 +1387,13 @@ fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
             });
             if let Some(host) = s.pending_host.as_mut() {
                 host.offset = offset;
+                host.fragments = fragments;
             }
+            s.host_fragments += 1;
             if tag.is_some() {
+                if fragments > 1 {
+                    s.host_packets_segmented += 1;
+                }
                 s.pending_host = None;
             }
         }
@@ -1326,6 +1458,7 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                 company_id: 0xffff,
                 subversion: 1,
             };
+            note_control_rx(s, plain[0]);
             match s.control.on_pdu(&mut s.conn, &plain[..len], local) {
                 Ok(action) => {
                     // DLE takes effect once the request or response has been
@@ -1335,6 +1468,9 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                         ControlAction::Reply(pdu) => {
                             if pdu.as_bytes().first() == Some(&7) {
                                 inc(27);
+                            }
+                            if pdu.as_bytes().first() == Some(&0x15) {
+                                s.length_rsp_tx += 1;
                             }
                             s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
                         }
@@ -1787,6 +1923,7 @@ fn main() -> ! {
                 if reason.is_none() {
                     reason = finish_deferred(&mut soft, s);
                 }
+                publish_x1(s);
                 if s.enc_change_pending {
                     // Our encrypted START_ENC_RSP is on air: tell the Host the
                     // link is encrypted. HCI work stays outside the event.

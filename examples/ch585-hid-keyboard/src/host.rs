@@ -172,6 +172,76 @@ pub fn hid_word(index: usize) -> u32 {
     hid_get(index)
 }
 
+// X1 telemetry: CSA #2 selection and the bidirectional DLE negotiation. The
+// RF owner writes these words; the HID runner reads them after a finite run.
+pub const X1_STATS_WORDS: usize = 24;
+pub const X1_MAGIC_INDEX: usize = 0;
+pub const X1_VERSION_INDEX: usize = 1;
+pub const X1_MAGIC: u32 = 0x5831_0001;
+pub const X1_VERSION: u32 = 1;
+/// 1 = CSA #1, 2 = CSA #2.
+pub const X1_ALGORITHM: usize = 2;
+pub const X1_EVENT_COUNTER: usize = 3;
+/// ChSel bit this peripheral put in its own ADV_IND/ADV_SCAN_IND.
+pub const X1_ADV_CHSEL: usize = 4;
+/// ChSel bit the central put in CONNECT_IND.
+pub const X1_INIT_CHSEL: usize = 5;
+pub const X1_LENGTH_REQ_RX: usize = 6;
+pub const X1_LENGTH_RSP_RX: usize = 7;
+pub const X1_LENGTH_REQ_TX: usize = 8;
+pub const X1_LENGTH_RSP_TX: usize = 9;
+/// Effective on-air limits; 27/31 until the peer answers an `LL_LENGTH_REQ`.
+pub const X1_TX_OCTETS: usize = 10;
+pub const X1_RX_OCTETS: usize = 11;
+pub const X1_TX_TIME: usize = 12;
+pub const X1_RX_TIME: usize = 13;
+pub const X1_MAX_TX_PDU: usize = 14;
+pub const X1_MAX_RX_PDU: usize = 15;
+pub const X1_RX_OVER_27: usize = 16;
+pub const X1_TX_OVER_27: usize = 17;
+/// Host ACL packets that needed more than one LL fragment.
+pub const X1_HOST_PACKETS_SEGMENTED: usize = 18;
+pub const X1_HOST_FRAGMENTS: usize = 19;
+pub const X1_TX_PDUS: usize = 20;
+pub const X1_RX_PDUS: usize = 21;
+/// 1 once the peer feature set is known (0 = still unknown).
+pub const X1_FEATURE_EXCHANGE: usize = 22;
+pub const X1_LAST_ERROR: usize = 23;
+
+#[no_mangle]
+static mut X1_STATS: [u32; X1_STATS_WORDS] = [0; X1_STATS_WORDS];
+
+pub fn x1_put(index: usize, value: u32) {
+    // SAFETY: single-threaded example; only the RF owner writes X1_STATS.
+    unsafe {
+        core::ptr::addr_of_mut!(X1_STATS)
+            .cast::<u32>()
+            .add(index)
+            .write_volatile(value)
+    }
+}
+
+pub fn x1_get(index: usize) -> u32 {
+    // SAFETY: single-threaded example; only the RF owner reads X1_STATS.
+    unsafe {
+        core::ptr::addr_of!(X1_STATS)
+            .cast::<u32>()
+            .add(index)
+            .read_volatile()
+    }
+}
+
+pub fn x1_inc(index: usize) {
+    x1_put(index, x1_get(index).wrapping_add(1));
+}
+
+/// Read an X1 counter. The firmware runner uses the exported symbol; the
+/// native host fixture uses this hook.
+#[allow(dead_code)]
+pub fn x1_word(index: usize) -> u32 {
+    x1_get(index)
+}
+
 /// Debug text of the error that ended the Host runner. Word 0 is the byte
 /// count; words 1.. carry the UTF-8 bytes little-endian, so the runner can
 /// read the reason back over SWD without an allocator.
