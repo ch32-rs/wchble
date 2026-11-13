@@ -136,6 +136,10 @@ impl ConnectionBridge {
         self.info.map(|info| info.handle)
     }
 
+    pub fn role(&self) -> Option<Role> {
+        self.info.map(|info| info.role)
+    }
+
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch
     }

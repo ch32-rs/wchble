@@ -914,12 +914,19 @@ impl SoftRunner {
     }
 
     fn enable_encryption(&mut self, params: &[u8]) -> u8 {
-        if params.len() != 29 {
+        // Connection_Handle 2 + Random_Number 8 + Encrypted_Diversifier 2 +
+        // Long_Term_Key 16 = 28 octets (Core 5.4 Vol 4 Part E §7.8.24).
+        if params.len() != 28 {
             return HCI_INVALID_PARAMETERS;
         }
         let handle = le16_from(params);
         if self.bridge.handle() != Some(handle) || self.bridge.is_disconnecting() {
             return HCI_UNKNOWN_CONNECTION;
+        }
+        // Only the Central starts encryption; a Peripheral waits for
+        // LL_ENC_REQ and raises LE LTK Request instead.
+        if self.bridge.role() != Some(crate::ll::Role::Central) {
+            return HCI_COMMAND_DISALLOWED;
         }
         if self.pending_encryption.is_some() {
             return HCI_COMMAND_DISALLOWED;
@@ -1674,9 +1681,15 @@ mod tests {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
-        open(&mut runner);
 
-        let mut params = [0u8; 29];
+        // Encryption is a Central procedure; the Peripheral path is LTK Request.
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        assert!(runner.pump_once());
+        transport::try_receive_controller_packet().unwrap();
+
+        let mut params = [0u8; 28];
         params[0..2].copy_from_slice(&1u16.to_le_bytes());
         params[2..10].copy_from_slice(&[0xa0; 8]);
         params[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
@@ -1699,8 +1712,13 @@ mod tests {
             runner.serve_one().await;
             expect_command_status(0x2019, HCI_UNKNOWN_CONNECTION);
 
-            // Short parameters.
-            inject_cmd(0x2019, &params[..28]);
+            // Short and long parameters are rejected before any state changes.
+            inject_cmd(0x2019, &params[..27]);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_INVALID_PARAMETERS);
+            let mut long = [0u8; 29];
+            long[..28].copy_from_slice(&params);
+            inject_cmd(0x2019, &long);
             runner.serve_one().await;
             expect_command_status(0x2019, HCI_INVALID_PARAMETERS);
         });
@@ -1710,6 +1728,24 @@ mod tests {
         assert_eq!(request.rand, [0xa0; 8]);
         assert_eq!(request.ediv, 0x1234);
         assert_eq!(request.ltk, [0x5a; 16]);
+        assert!(runner.take_encryption_request().is_none());
+    }
+
+    #[test]
+    fn enable_encryption_is_disallowed_in_the_peripheral_role() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 28];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_COMMAND_DISALLOWED);
+        });
         assert!(runner.take_encryption_request().is_none());
     }
 
