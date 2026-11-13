@@ -10,6 +10,7 @@ use core::task::{Context, Waker};
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
+use wchble::crypto::BLE_MIC_LEN;
 use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
