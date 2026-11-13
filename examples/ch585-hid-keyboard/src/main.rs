@@ -1038,58 +1038,60 @@ fn service_encryption(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
     None
 }
 
-/// Produce at most one encrypted control PDU and one encrypted ACL fragment
-/// before the next event. The event only queues the prepared ciphertext.
+/// Produce at most one prepared ciphertext PDU before the next event. The
+/// event only queues what is already encrypted.
+///
+/// Encryption assigns the CCM counter, so exactly one slot may be occupied at
+/// a time: a control PDU prepared later would otherwise be sent ahead of an
+/// older ACL PDU whose counter was already handed out, and the peer would
+/// reject it as a MIC failure. Control still wins, but only while both slots
+/// are empty; the event's priority check then never reorders two ciphertexts.
 fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
-    if !s.enc_active {
+    if !s.enc_active || s.pending_enc_control.is_some() || s.pending_enc_acl.is_some() {
         return None;
     }
     let enc = s.enc.as_mut()?;
-    if s.pending_enc_control.is_none() {
-        let mut out = [0u8; MAX_ENCRYPTED];
-        let prepared = if let Some(reason) = s.terminate_requested.take() {
-            Some((enc.encrypt(3, &[2, reason], &mut out), Some(reason)))
-        } else if let Some(pdu) = s.pending_control.take() {
-            Some((enc.encrypt(3, pdu.payload(), &mut out), None))
-        } else {
-            None
-        };
-        if let Some((result, terminate)) = prepared {
-            match result {
-                Ok(len) => {
-                    s.pending_enc_control = Some(EncTx {
-                        llid: 3,
-                        bytes: out,
-                        len: len as u8,
-                        tag: None,
-                        terminate,
-                    });
-                }
-                Err(_) => {
-                    sec_error(0x1e);
-                    return Some(0x1e);
-                }
+    let mut out = [0u8; MAX_ENCRYPTED];
+    let prepared = if let Some(reason) = s.terminate_requested.take() {
+        Some((enc.encrypt(3, &[2, reason], &mut out), Some(reason)))
+    } else if let Some(pdu) = s.pending_control.take() {
+        Some((enc.encrypt(3, pdu.payload(), &mut out), None))
+    } else {
+        None
+    };
+    if let Some((result, terminate)) = prepared {
+        match result {
+            Ok(len) => {
+                s.pending_enc_control = Some(EncTx {
+                    llid: 3,
+                    bytes: out,
+                    len: len as u8,
+                    tag: None,
+                    terminate,
+                });
+            }
+            Err(_) => {
+                sec_error(0x1e);
+                return Some(0x1e);
             }
         }
+        return None;
     }
-    if s.pending_enc_control.is_none() && s.pending_enc_acl.is_none() {
-        if let Some(acl) = soft.bridge.take_tx_acl() {
-            diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
-            let mut out = [0u8; MAX_ENCRYPTED];
-            match enc.encrypt(acl.llid, &acl.bytes[..acl.len], &mut out) {
-                Ok(len) => {
-                    s.pending_enc_acl = Some(EncTx {
-                        llid: acl.llid,
-                        bytes: out,
-                        len: len as u8,
-                        tag: Some(acl.tag),
-                        terminate: None,
-                    });
-                }
-                Err(_) => {
-                    sec_error(0x1e);
-                    return Some(0x1e);
-                }
+    if let Some(acl) = soft.bridge.take_tx_acl() {
+        diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
+        match enc.encrypt(acl.llid, &acl.bytes[..acl.len], &mut out) {
+            Ok(len) => {
+                s.pending_enc_acl = Some(EncTx {
+                    llid: acl.llid,
+                    bytes: out,
+                    len: len as u8,
+                    tag: Some(acl.tag),
+                    terminate: None,
+                });
+            }
+            Err(_) => {
+                sec_error(0x1e);
+                return Some(0x1e);
             }
         }
     }
@@ -1443,12 +1445,6 @@ fn main() -> ! {
         );
     }
     soft.set_le_features(LOCAL_FEATURES);
-    #[cfg(feature = "secure")]
-    {
-        // The Host fragments ACL data at this length, so every fragment fits
-        // a 27-octet encrypted on-air payload (23 + 4-octet MIC).
-        let _ = soft.set_acl_packet_length(23);
-    }
     // S3: restore bonds before the Host advertises. The read is a flash-engine
     // command, so it happens here with the radio stopped.
     #[cfg(feature = "secure")]
