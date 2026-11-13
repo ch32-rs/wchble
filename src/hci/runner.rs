@@ -24,7 +24,7 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 /// Unknown connection identifier.
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 
-/// ACL data packet length reported by `LE Read Buffer Size` (no DLE yet).
+/// Default ACL data packet length reported by `LE Read Buffer Size` (no DLE).
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
 /// Number of ACL credits advertised to the Host.
 const ACL_CREDITS: u8 = super::connection::ACL_CREDITS as u8;
@@ -105,6 +105,21 @@ pub struct SoftRunner {
     pending_encryption: Option<EnableEncryption>,
     /// Host answer waiting for the RF owner (Peripheral role).
     ltk_reply: Option<LtkReply>,
+    /// LE features advertised both through HCI and LL_FEATURE_RSP.
+    le_features: [u8; 8],
+    /// Most recent command that answered with a non-success status:
+    /// `(opcode << 8) | status`, for firmware-side diagnostics.
+    last_command_failure: Option<u32>,
+    /// Newest eight commands, each `(opcode << 8) | status`; the firmware
+    /// dumps this to explain a Host that stopped on an HCI error.
+    command_log: [u32; 8],
+    command_log_len: u32,
+    /// Newest eight command responses actually handed to the Host, packed as
+    /// `0xE0_0000 | opcode << 8 | status` (Complete) or
+    /// `0xF0_0000 | opcode << 8 | status` (Status), with a separate counter so
+    /// a dropped or overwritten reply can be told apart from a logged one.
+    sent_log: [u32; 8],
+    sent_log_len: u32,
 }
 
 impl Default for SoftRunner {
@@ -132,6 +147,88 @@ impl SoftRunner {
             entropy_seeded: false,
             pending_encryption: None,
             ltk_reply: None,
+            le_features: [0; 8],
+            last_command_failure: None,
+            command_log: [0; 8],
+            command_log_len: 0,
+            sent_log: [0; 8],
+            sent_log_len: 0,
+        }
+    }
+
+    /// Opcode and status of the most recent failed HCI command, packed as
+    /// `(opcode << 8) | status`.
+    pub fn last_command_failure(&self) -> Option<u32> {
+        self.last_command_failure
+    }
+
+    /// The newest eight commands as `(opcode << 8) | status`, oldest first.
+    pub fn command_log(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        if self.command_log_len < 8 {
+            out[..self.command_log_len as usize]
+                .copy_from_slice(&self.command_log[..self.command_log_len as usize]);
+        } else {
+            let start = (self.command_log_len % 8) as usize;
+            for i in 0..8 {
+                out[i] = self.command_log[(start + i) % 8];
+            }
+        }
+        out
+    }
+
+    /// The newest eight command responses handed to the Host, oldest first.
+    /// Each is `0xE000_0000 | opcode << 8 | status` for Command Complete and
+    /// `0xF000_0000 | opcode << 8 | status` for Command Status.
+    pub fn sent_log(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        if self.sent_log_len < 8 {
+            out[..self.sent_log_len as usize]
+                .copy_from_slice(&self.sent_log[..self.sent_log_len as usize]);
+        } else {
+            let start = (self.sent_log_len % 8) as usize;
+            for i in 0..8 {
+                out[i] = self.sent_log[(start + i) % 8];
+            }
+        }
+        out
+    }
+
+    /// Number of commands the runner has answered so far.
+    pub fn command_log_len(&self) -> u32 {
+        self.command_log_len
+    }
+
+    /// Number of command responses handed to the Host so far.
+    pub fn sent_log_len(&self) -> u32 {
+        self.sent_log_len
+    }
+
+    fn log_sent(&mut self, packet: &transport::Packet) {
+        let (tag, opcode, status) = match packet.bytes[0] {
+            0x0e if packet.len >= 6 => (
+                0xE000_0000,
+                u16::from_le_bytes([packet.bytes[3], packet.bytes[4]]),
+                packet.bytes[5],
+            ),
+            0x0f if packet.len >= 5 => (
+                0xF000_0000,
+                u16::from_le_bytes([packet.bytes[3], packet.bytes[4]]),
+                packet.bytes[2],
+            ),
+            _ => return,
+        };
+        let index = (self.sent_log_len % 8) as usize;
+        self.sent_log[index] = tag | (u32::from(opcode) << 8) | u32::from(status);
+        self.sent_log_len = self.sent_log_len.wrapping_add(1);
+    }
+
+    fn log_command(&mut self, opcode: u16, status: u8) {
+        let index = (self.command_log_len % 8) as usize;
+        self.command_log[index] = (u32::from(opcode) << 8) | u32::from(status);
+        self.command_log_len = self.command_log_len.wrapping_add(1);
+        if status != HCI_SUCCESS {
+            self.last_command_failure = Some(self.command_log[index]);
         }
     }
 
@@ -153,6 +250,19 @@ impl SoftRunner {
     /// Whether a measured entropy seed has been installed.
     pub fn entropy_seeded(&self) -> bool {
         self.entropy_seeded
+    }
+
+    /// Advertise the LE feature set implemented by this controller build.
+    ///
+    /// Both `LE Read Local Supported Features` and the LL feature response use
+    /// this value. The default is all zero (P3/P4); a build that drives the
+    /// start-encryption procedure must set bit 0.
+    pub fn set_le_features(&mut self, features: [u8; 8]) {
+        self.le_features = features;
+    }
+
+    pub fn le_features(&self) -> [u8; 8] {
+        self.le_features
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -339,6 +449,7 @@ impl SoftRunner {
             if transport::try_send_controller_packet(reply).is_err() {
                 return progressed;
             }
+            self.log_sent(&reply);
             self.pending_reply = None;
             return true;
         }
@@ -370,6 +481,7 @@ impl SoftRunner {
         }
         if let Some(reply) = self.pending_reply {
             if transport::try_send_controller_packet(reply).is_ok() {
+                self.log_sent(&reply);
                 self.pending_reply = None;
             }
         }
@@ -436,15 +548,18 @@ impl SoftRunner {
                     self.bridge
                         .request_disconnect(u16::from_le_bytes([params[0], params[1]]), params[2])
                 };
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x200d => {
                 let status = self.create_connection(params);
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x2013 => {
+                self.log_command(opcode, HCI_COMMAND_DISALLOWED);
                 self.pending_reply = Some(transport::command_status_packet(
                     opcode,
                     HCI_COMMAND_DISALLOWED,
@@ -453,6 +568,7 @@ impl SoftRunner {
             }
             0x2019 => {
                 let status = self.enable_encryption(params);
+                self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
@@ -501,17 +617,24 @@ impl SoftRunner {
             0x1405 => Err(HCI_COMMAND_DISALLOWED),
             // LE Read Buffer Size (v1)
             0x2002 if params.is_empty() => {
-                static BUFFER_SIZE: [u8; 3] = [
-                    ACL_DATA_PACKET_LENGTH as u8,
-                    (ACL_DATA_PACKET_LENGTH >> 8) as u8,
-                    ACL_CREDITS,
-                ];
-                Ok(&BUFFER_SIZE)
+                let [lo, hi] = ACL_DATA_PACKET_LENGTH.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[lo, hi, ACL_CREDITS],
+                ));
+                return;
             }
-            // Match the implemented, unencrypted LE 1M air-interface features.
+            // Features implemented by this controller build (bit 0 = LE
+            // Encryption when the RF owner drives the start procedure).
             0x2003 if params.is_empty() => {
-                static FEATURES: [u8; 8] = [0; 8];
-                Ok(&FEATURES)
+                let features = self.le_features;
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &features,
+                ));
+                return;
             }
             // LE Set Random Address
             0x2005 if params.len() == 6 => {
@@ -584,12 +707,36 @@ impl SoftRunner {
             0x200f if params.is_empty() => Ok(&[0][..]),
             0x2010 if params.is_empty() => Ok(&[][..]),
             0x2011 => Err(HCI_COMMAND_DISALLOWED),
+            // Resolving list and privacy: accepted but not implemented.
+            //
+            // The controller never generates or resolves RPAs yet (S4), and
+            // the examples use a static random address. Trouble's `security`
+            // feature still issues the full startup sync, so answer success
+            // while keeping the list logically empty. HCI commands:
+            // 0x2027 add, 0x2028 remove, 0x2029 clear, 0x202A read size,
+            // 0x202D address resolution enable, 0x202E RPA timeout,
+            // 0x204E privacy mode.
+            0x2027 if params.len() == 39 => Ok(&[][..]),
+            0x2028 if params.len() == 7 => Ok(&[][..]),
+            0x2029 if params.is_empty() => Ok(&[][..]),
+            0x202a if params.is_empty() => Ok(&[0][..]),
+            0x202d if params.len() == 1 && params[0] <= 1 => Ok(&[][..]),
+            0x202e if params.len() == 2 => Ok(&[][..]),
+            0x204e if params.len() == 8 => Ok(&[][..]),
+            0x2027 | 0x2028 | 0x202d | 0x202e | 0x204e => Err(HCI_INVALID_PARAMETERS),
             // LE Encrypt — one AES-128 block, software engine (Host utility;
             // not on the connection timing path).
             0x2017 if params.len() == 32 => {
+                // HCI carries 128-bit values least-significant-octet first,
+                // while the AES block is big-endian: reverse in, reverse out.
+                let mut key = [0u8; 16];
+                key.copy_from_slice(&params[..16]);
+                key.reverse();
                 let mut block = [0u8; 16];
                 block.copy_from_slice(&params[16..32]);
-                Aes128::new(params[..16].try_into().unwrap()).encrypt_block(&mut block);
+                block.reverse();
+                Aes128::new(&key).encrypt_block(&mut block);
+                block.reverse();
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
@@ -598,7 +745,10 @@ impl SoftRunner {
                 return;
             }
             0x2017 => Err(HCI_INVALID_PARAMETERS),
-            // LE LTK Request Reply / Negative Reply (Peripheral role).
+            // LE LTK Request Reply / Negative Reply (Peripheral role). Both
+            // return the connection handle in the Command Complete parameters
+            // (Core 5.4 Vol 4 Part E §7.8.25/26); a Host that cannot decode it
+            // reports `Invalid HCI Command Parameters` even on success.
             0x201a if params.len() == 18 => {
                 if self.bridge.handle() != Some(le16_from(params)) {
                     Err(HCI_UNKNOWN_CONNECTION)
@@ -606,7 +756,7 @@ impl SoftRunner {
                     let mut ltk = [0u8; 16];
                     ltk.copy_from_slice(&params[2..18]);
                     self.ltk_reply = Some(LtkReply::Key(ltk));
-                    Ok(&[][..])
+                    Ok(&params[..2])
                 }
             }
             0x201a => Err(HCI_INVALID_PARAMETERS),
@@ -615,7 +765,7 @@ impl SoftRunner {
                     Err(HCI_UNKNOWN_CONNECTION)
                 } else {
                     self.ltk_reply = Some(LtkReply::Rejected);
-                    Ok(&[][..])
+                    Ok(&params[..2])
                 }
             }
             0x201b => Err(HCI_INVALID_PARAMETERS),
@@ -635,6 +785,11 @@ impl SoftRunner {
             _ => Err(HCI_UNKNOWN_COMMAND),
         };
 
+        let status = match &result {
+            Ok(_) => HCI_SUCCESS,
+            Err(status) => *status,
+        };
+        self.log_command(opcode, status);
         self.pending_reply = Some(match result {
             Ok(return_data) => transport::command_complete_packet(opcode, HCI_SUCCESS, return_data),
             Err(status) => transport::command_complete_packet(opcode, status, &[]),
@@ -746,12 +901,19 @@ impl SoftRunner {
     }
 
     fn enable_encryption(&mut self, params: &[u8]) -> u8 {
-        if params.len() != 29 {
+        // Connection_Handle 2 + Random_Number 8 + Encrypted_Diversifier 2 +
+        // Long_Term_Key 16 = 28 octets (Core 5.4 Vol 4 Part E §7.8.24).
+        if params.len() != 28 {
             return HCI_INVALID_PARAMETERS;
         }
         let handle = le16_from(params);
         if self.bridge.handle() != Some(handle) || self.bridge.is_disconnecting() {
             return HCI_UNKNOWN_CONNECTION;
+        }
+        // Only the Central starts encryption; a Peripheral waits for
+        // LL_ENC_REQ and raises LE LTK Request instead.
+        if self.bridge.role() != Some(crate::ll::Role::Central) {
+            return HCI_COMMAND_DISALLOWED;
         }
         if self.pending_encryption.is_some() {
             return HCI_COMMAND_DISALLOWED;
@@ -1000,6 +1162,67 @@ mod tests {
             Err(BridgeError::InvalidPacket)
         );
         assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+    }
+
+    #[test]
+    fn host_acl_fragments_stay_within_the_legacy_plaintext_limit() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        // 27 plaintext octets become 31 on air once the MIC is added.
+        assert_eq!(
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 28])),
+            Err(BridgeError::InvalidPacket)
+        );
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+    }
+
+    #[test]
+    fn host_reads_buffer_size_and_features() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_le_features([1, 0, 0, 0, 0, 0, 0, 0]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2002, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2002, HCI_SUCCESS, &[27, 0, ACL_CREDITS]);
+
+            inject_cmd(0x2003, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2003, HCI_SUCCESS, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn privacy_commands_are_accepted_without_a_resolving_list() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            for (opcode, params) in [
+                (0x202d, &[1u8][..]),
+                (0x2029, &[][..]),
+                (0x2027, &[0u8; 39][..]),
+                (0x2028, &[0u8; 7][..]),
+                (0x202e, &[0x10, 0x00][..]),
+                (0x204e, &[0u8; 8][..]),
+            ] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_SUCCESS, &[]);
+            }
+            inject_cmd(0x202a, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x202a, HCI_SUCCESS, &[0]);
+
+            inject_cmd(0x202d, &[2]);
+            runner.serve_one().await;
+            expect_command_complete(0x202d, HCI_INVALID_PARAMETERS, &[]);
+        });
     }
 
     #[test]
@@ -1417,11 +1640,45 @@ mod tests {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
+        // HCI sends 128-bit values least-significant-octet first, so the FIPS
+        // key 000102..0f and plaintext 001122..ff travel reversed.
         let mut params = [0u8; 32];
         for i in 0..16 {
-            params[i] = i as u8; // key 000102..0f
-            params[16 + i] = (i as u8) * 0x11; // plaintext 001122..ff
+            params[i] = 15 - i as u8;
+            params[16 + i] = 0xff - (i as u8) * 0x11;
         }
+
+        pollster::block_on(async {
+            inject_cmd(0x2017, &params);
+            runner.serve_one().await;
+            // AES(000102..0f, 001122..ff) = 69c4e0d8..b4c55a, returned reversed.
+            expect_command_complete(
+                0x2017,
+                HCI_SUCCESS,
+                &[
+                    0x5a, 0xc5, 0xb4, 0x70, 0x80, 0xb7, 0xcd, 0xd8, 0x30, 0x04, 0x7b, 0x6a, 0xd8,
+                    0xe0, 0xc4, 0x69,
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn le_encrypt_matches_the_core_session_key_sample() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        // Core 5.4 Vol 6 Part C: SK = AES(LTK, SKD) with SKD = r ||
+        // (diversifier || 0). Both inputs and the result are in HCI wire order.
+        let mut params = [0u8; 32];
+        params[..16].copy_from_slice(&[
+            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
+            0x68, 0x4c,
+        ]);
+        params[16..].copy_from_slice(&[
+            0x13, 0x02, 0xf1, 0xe0, 0xdf, 0xce, 0xbd, 0xac, 0x79, 0x68, 0x57, 0x46, 0x35, 0x24,
+            0x13, 0x02,
+        ]);
 
         pollster::block_on(async {
             inject_cmd(0x2017, &params);
@@ -1430,10 +1687,26 @@ mod tests {
                 0x2017,
                 HCI_SUCCESS,
                 &[
-                    0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
-                    0xb4, 0xc5, 0x5a,
+                    0x66, 0xc6, 0xc2, 0x27, 0x8e, 0x3b, 0x8e, 0x05, 0x3e, 0x7e, 0xa3, 0x26, 0x52,
+                    0x1b, 0xad, 0x99,
                 ],
             );
+        });
+    }
+
+    #[test]
+    fn le_encrypt_rejects_a_wrong_parameter_length() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x2017, &[0u8; 31]);
+            runner.serve_one().await;
+            expect_command_complete(0x2017, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2017, &[0u8; 33]);
+            runner.serve_one().await;
+            expect_command_complete(0x2017, HCI_INVALID_PARAMETERS, &[]);
         });
     }
 
@@ -1442,9 +1715,15 @@ mod tests {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
-        open(&mut runner);
 
-        let mut params = [0u8; 29];
+        // Encryption is a Central procedure; the Peripheral path is LTK Request.
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        assert!(runner.pump_once());
+        transport::try_receive_controller_packet().unwrap();
+
+        let mut params = [0u8; 28];
         params[0..2].copy_from_slice(&1u16.to_le_bytes());
         params[2..10].copy_from_slice(&[0xa0; 8]);
         params[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
@@ -1467,8 +1746,13 @@ mod tests {
             runner.serve_one().await;
             expect_command_status(0x2019, HCI_UNKNOWN_CONNECTION);
 
-            // Short parameters.
-            inject_cmd(0x2019, &params[..28]);
+            // Short and long parameters are rejected before any state changes.
+            inject_cmd(0x2019, &params[..27]);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_INVALID_PARAMETERS);
+            let mut long = [0u8; 29];
+            long[..28].copy_from_slice(&params);
+            inject_cmd(0x2019, &long);
             runner.serve_one().await;
             expect_command_status(0x2019, HCI_INVALID_PARAMETERS);
         });
@@ -1478,6 +1762,24 @@ mod tests {
         assert_eq!(request.rand, [0xa0; 8]);
         assert_eq!(request.ediv, 0x1234);
         assert_eq!(request.ltk, [0x5a; 16]);
+        assert!(runner.take_encryption_request().is_none());
+    }
+
+    #[test]
+    fn enable_encryption_is_disallowed_in_the_peripheral_role() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 28];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_COMMAND_DISALLOWED);
+        });
         assert!(runner.take_encryption_request().is_none());
     }
 
@@ -1495,12 +1797,21 @@ mod tests {
         pollster::block_on(async {
             inject_cmd(0x201a, &params);
             runner.serve_one().await;
-            expect_command_complete(0x201a, HCI_SUCCESS, &[]);
+            // bt-hci parses the Command Complete return parameters as a
+            // `ConnHandle`; empty parameters become
+            // `Error::INVALID_HCI_PARAMETERS` even though the status is 0.
+            let echoed = [1u8, 0];
+            expect_command_complete(0x201a, HCI_SUCCESS, &echoed);
+            use bt_hci::FromHciBytes as _;
+            let (handle, rest) =
+                bt_hci::param::ConnHandle::from_hci_bytes(&echoed).expect("conn handle");
+            assert_eq!(handle.raw(), 1);
+            assert!(rest.is_empty());
             assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
 
             inject_cmd(0x201b, &[1, 0]);
             runner.serve_one().await;
-            expect_command_complete(0x201b, HCI_SUCCESS, &[]);
+            expect_command_complete(0x201b, HCI_SUCCESS, &echoed);
             assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Rejected));
 
             let mut bad = params;

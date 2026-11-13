@@ -273,7 +273,11 @@ mod tests {
     fn real_host_discovery_read_write_notify_and_reconnect() {
         // The transport is process-global: keep the whole lifecycle in one test.
         let stats = host::HostStats::new();
-        let mut future = pin!(host::run(wchble::hci::new(), &stats));
+        let mut future = pin!(host::run(
+            wchble::hci::new(),
+            &stats,
+            host::RANDOM_ADDRESS
+        ));
         let mut fixture = Fixture {
             host: future.as_mut(),
             stats: &stats,
@@ -377,6 +381,19 @@ mod tests {
         assert_eq!(stats.word(host::STAT_UART_NOTIFICATIONS), 2);
         assert_eq!(stats.word(host::STAT_UART_LEN), 6);
 
+        // A full MTU-23 write: 20 value octets plus the 3-octet ATT header.
+        // The resulting 27-octet ACL fragment is the largest plaintext packet;
+        // encryption adds the 4-octet MIC on top.
+        let full = [0x5a; 20];
+        let notifications = fixture.write(uart_rx, &full, 1);
+        let mut expected = vec![0x1b];
+        expected.extend_from_slice(&uart_tx.to_le_bytes());
+        expected.extend_from_slice(&full);
+        assert_eq!(notifications, [expected]);
+        assert_eq!(stats.word(host::STAT_UART_WRITES), 3);
+        assert_eq!(stats.word(host::STAT_UART_NOTIFICATIONS), 3);
+        assert_eq!(stats.word(host::STAT_UART_LEN), 20);
+
         // Leave a real Host ACL in flight. Disconnect must invalidate its credit/tag.
         let old_tag = fixture.hold_read_response(value_handle);
         fixture.disconnect(1);
@@ -411,7 +428,7 @@ mod tests {
         assert_eq!(stats.word(host::STAT_LAST_ERROR), 0);
         assert_eq!(stats.word(host::STAT_PHASE), host::PHASE_ADVERTISING);
         assert_eq!(stats.word(host::STAT_ADVERTISE_ATTEMPTS), 3);
-        // Includes DIS/NUS discovery and both UART echo notifications.
-        assert_eq!(fixture.acknowledged, 88);
+        // Includes DIS/NUS discovery and the three UART echo notifications.
+        assert_eq!(fixture.acknowledged, 90);
     }
 }

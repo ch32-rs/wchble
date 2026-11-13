@@ -23,6 +23,9 @@ struct CLIError: Error, CustomStringConvertible {
 struct Options {
     var cycles = 1
     var timeout = 20.0
+    // Delay between connecting and starting GATT discovery, so a peripheral
+    // Security Request can start pairing first (the S2 differential).
+    var hold = 0.0
 
     init(_ arguments: [String]) throws {
         var index = 0
@@ -43,6 +46,11 @@ struct Options {
                     throw CLIError("--timeout must be finite and in (0, 3600]")
                 }
                 timeout = seconds
+            case "--hold":
+                guard let seconds = Double(value), seconds.isFinite, seconds >= 0, seconds <= 600 else {
+                    throw CLIError("--hold must be finite and in [0, 600]")
+                }
+                hold = seconds
             case "--name":
                 guard value == targetName else { throw CLIError("--name must be \(targetName)") }
             default: throw CLIError("unknown option \(flag)")
@@ -100,7 +108,8 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func start() {
         emit("start", ["name": targetName, "cycles": options.cycles,
-                       "timeout_seconds": options.timeout, "service": serviceID.uuidString.lowercased(),
+                       "timeout_seconds": options.timeout, "hold_seconds": options.hold,
+                       "service": serviceID.uuidString.lowercased(),
                        "characteristic": characteristicID.uuidString.lowercased()])
         for number in [SIGINT, SIGTERM] {
             signal(number, SIG_IGN)
@@ -215,8 +224,17 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         peripheral.delegate = self
         phase = "services"
         step("connected")
-        step("services_requested", ["service": serviceID.uuidString.lowercased()])
-        peripheral.discoverServices([serviceID])
+        if options.hold > 0 {
+            step("holding", ["seconds": options.hold])
+            DispatchQueue.main.asyncAfter(deadline: .now() + options.hold) { [weak self] in
+                guard let self = self, self.phase == "services" else { return }
+                self.step("services_requested", ["service": serviceID.uuidString.lowercased()])
+                peripheral.discoverServices([serviceID])
+            }
+        } else {
+            step("services_requested", ["service": serviceID.uuidString.lowercased()])
+            peripheral.discoverServices([serviceID])
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,

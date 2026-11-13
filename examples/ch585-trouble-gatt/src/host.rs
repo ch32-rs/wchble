@@ -5,6 +5,10 @@ use core::convert::Infallible;
 use core::future::pending;
 
 use embassy_futures::join::join;
+#[cfg(feature = "secure")]
+use embassy_futures::select::{select, Either};
+#[cfg(feature = "secure")]
+use embassy_time::{Duration, Instant, Timer};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use heapless::Vec;
 use trouble_host::prelude::*;
@@ -31,6 +35,11 @@ pub const UART_TX_UUID: Uuid =
 pub const UART_CHARACTERISTIC_UUID_TEXT: &str = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 // P5 changes the service database, so use a new static identity. iOS caches a
 // peer's GATT database by address and can otherwise keep the P4 layout.
+//
+// `main` rotates the least-significant octet from measured entropy before the
+// Host starts: a peer that bonded an earlier boot would otherwise insist on
+// its stored LTK, and this firmware deliberately has no bond store, so every
+// S2 acceptance run must present itself as a new device.
 pub const RANDOM_ADDRESS: [u8; 6] = [0x15, 0x00, 0x00, 0xee, 0xff, 0xc1];
 
 pub const HOST_STATS_WORDS: usize = 16;
@@ -50,7 +59,23 @@ pub const STAT_UART_WRITES: usize = 12;
 pub const STAT_UART_NOTIFICATIONS: usize = 13;
 pub const STAT_UART_LEN: usize = 14;
 // 0 = not requested, 1 = L2CAP request sent, 2 = send failed (test feature).
+#[allow(dead_code)]
 pub const STAT_CONN_PARAMS: usize = 15;
+
+#[cfg(feature = "secure")]
+pub const STAT_SECURITY: usize = 15;
+#[cfg(feature = "secure")]
+pub const SECURITY_REQUESTED: u32 = 1;
+#[cfg(feature = "secure")]
+pub const SECURITY_PAIRED: u32 = 2;
+#[cfg(feature = "secure")]
+pub const SECURITY_ENCRYPTED: u32 = 3;
+#[cfg(feature = "secure")]
+pub const SECURITY_FAILED: u32 = 4;
+
+/// See the comment on `security_deadline`: Android must get the first word.
+#[cfg(feature = "secure")]
+const SECURITY_REQUEST_DELAY_MS: u64 = 2_000;
 
 #[cfg(feature = "conn-params-30")]
 const CONN_INTERVAL_US: u64 = 30_000;
@@ -61,6 +86,33 @@ pub const PHASE_STARTING: u32 = 1;
 pub const PHASE_ADVERTISING: u32 = 2;
 pub const PHASE_CONNECTED: u32 = 3;
 pub const PHASE_FATAL: u32 = 0xff;
+
+/// Debug text of the error that ended the Host runner. Word 0 is the byte
+/// count; words 1.. carry the UTF-8 bytes little-endian, so the runner can
+/// read the reason back over SWD without an allocator.
+pub const HOST_ERROR_WORDS: usize = 32;
+#[no_mangle]
+pub static mut HOST_ERROR: [u32; HOST_ERROR_WORDS] = [0; HOST_ERROR_WORDS];
+
+struct ErrorSink;
+
+impl core::fmt::Write for ErrorSink {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        // SAFETY: signal-free single-threaded example; only the Host poll writes here.
+        let words = unsafe { &mut *core::ptr::addr_of_mut!(HOST_ERROR) };
+        let capacity = (HOST_ERROR_WORDS - 1) * 4;
+        let mut length = words[0] as usize;
+        for &byte in text.as_bytes() {
+            if length == capacity {
+                break;
+            }
+            words[1 + length / 4] |= u32::from(byte) << ((length % 4) * 8);
+            length += 1;
+        }
+        words[0] = length as u32;
+        Ok(())
+    }
+}
 
 /// Main owns this value next to the pinned future; only that thread accesses it.
 pub struct HostStats {
@@ -106,12 +158,16 @@ async fn fatal(stats: &HostStats, stage: u32) -> ! {
 
 /// Run persistently; main must retain and pin this future across idle polls.
 /// Fatal errors park on `Pending`, never in a blocking spin loop.
-pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> ! {
+pub async fn run(
+    controller: wchble::hci::SoftController,
+    stats: &HostStats,
+    address: [u8; 6],
+) -> ! {
     stats.phase(PHASE_STARTING);
     // One connection; ATT and the LE signaling channel, with no dynamic channels.
     let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(RANDOM_ADDRESS))
+        .set_random_address(Address::random(address))
         .build();
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
@@ -171,17 +227,27 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
     let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 24, 1>::new(table);
 
     let runner_task = async {
-        let _ = runner.run().await;
+        use core::fmt::Write;
+        if let Err(error) = runner.run().await {
+            let _ = write!(ErrorSink, "{error:?}");
+        }
         fatal(stats, 1).await;
     };
     let app_task = async {
         let mut adv_data = [0u8; 31];
-        let adv_len = match AdStructure::encode_slice(
-            &[AdStructure::Flags(
-                LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED,
-            )],
-            &mut adv_data,
-        ) {
+        // Android scanners commonly receive only ADV_IND (no SCAN_REQ/RSP),
+        // so the secure build carries the name in the advertising data as
+        // well. The non-secure P4 build keeps its original layout.
+        #[cfg(feature = "secure")]
+        let adv_structures = [
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName(LOCAL_NAME),
+        ];
+        #[cfg(not(feature = "secure"))]
+        let adv_structures = [AdStructure::Flags(
+            LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED,
+        )];
+        let adv_len = match AdStructure::encode_slice(&adv_structures, &mut adv_data) {
             Ok(len) => len,
             Err(_) => fatal(stats, 2).await,
         };
@@ -214,6 +280,13 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                 Ok(connection) => connection,
                 Err(_) => fatal(stats, 5).await,
             };
+            // Bonding, like the reference macOS peripheral: without the bonding
+            // bit Android's SMP takes its non-bonding path, and this phone never
+            // follows LL_ENC_RSP with LL_START_ENC_REQ.
+            #[cfg(feature = "secure")]
+            if connection.set_bondable(true).is_err() {
+                fatal(stats, 16).await;
+            }
             let connection = match connection.with_attribute_server(&server) {
                 Ok(connection) => connection,
                 Err(_) => fatal(stats, 6).await,
@@ -221,9 +294,54 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             stats.inc(STAT_CONNECTIONS);
             stats.phase(PHASE_CONNECTED);
             stats.set(STAT_SUBSCRIBED, 0);
+            // S2: a peripheral Security Request is what makes a macOS central
+            // start pairing without a protected attribute. It must not be the
+            // first SMP traffic, though: when Android receives one in SMP IDLE
+            // before `createBond()` has issued its Pairing Request, its stack
+            // moves to WAIT_APP_RSP waiting for an app callback that a plain
+            // GATT client never registers, and pairing stalls until the link
+            // drops. Delay it so the central's own flow always goes first.
+            #[cfg(feature = "secure")]
+            let mut security_deadline =
+                Some(Instant::now() + Duration::from_millis(SECURITY_REQUEST_DELAY_MS));
 
             loop {
-                match connection.next().await {
+                #[cfg(feature = "secure")]
+                if security_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    security_deadline = None;
+                    let unencrypted = matches!(
+                        connection.raw().security_level(),
+                        Ok(SecurityLevel::NoEncryption)
+                    );
+                    if unencrypted {
+                        match connection.raw().request_security() {
+                            Ok(()) => stats.set(STAT_SECURITY, SECURITY_REQUESTED),
+                            Err(_) => {
+                                stats.error(14);
+                                stats.set(STAT_SECURITY, SECURITY_FAILED);
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "secure")]
+                let event = {
+                    let timer = async {
+                        match security_deadline {
+                            Some(deadline) => Timer::at(deadline).await,
+                            None => pending::<()>().await,
+                        }
+                    };
+                    match select(connection.next(), timer).await {
+                        Either::First(event) => Some(event),
+                        Either::Second(()) => None,
+                    }
+                };
+                #[cfg(not(feature = "secure"))]
+                let event = Some(connection.next().await);
+                let Some(event) = event else {
+                    continue;
+                };
+                match event {
                     GattConnectionEvent::Disconnected { .. } => {
                         stats.inc(STAT_DISCONNECTS);
                         stats.set(STAT_SUBSCRIBED, 0);
@@ -314,6 +432,23 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         if request.reject(&stack).await.is_err() {
                             stats.error(10);
                         }
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::PairingComplete { .. } => {
+                        // Pairing Complete can arrive after Encryption Change;
+                        // the encrypted state is the stronger fact.
+                        if stats.word(STAT_SECURITY) != SECURITY_ENCRYPTED {
+                            stats.set(STAT_SECURITY, SECURITY_PAIRED);
+                        }
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::Encrypted { .. } => {
+                        stats.set(STAT_SECURITY, SECURITY_ENCRYPTED);
+                    }
+                    #[cfg(feature = "secure")]
+                    GattConnectionEvent::PairingFailed(_) => {
+                        stats.error(15);
+                        stats.set(STAT_SECURITY, SECURITY_FAILED);
                     }
                     _ => {}
                 }

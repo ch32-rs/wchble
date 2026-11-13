@@ -5,6 +5,7 @@
 //! peripheral object, a received packet never moves the anchor; it only
 //! refreshes supervision and establishes the link.
 
+use super::acl::MAX_LEGACY_PAYLOAD;
 use super::conn::{
     time_reached, validate_instant, ConnError, ConnectParams, ConnectionUpdate, Csa1, LinkTiming,
 };
@@ -98,7 +99,10 @@ impl CentralConnection {
     /// packet cannot establish or refresh the link. The anchor is deliberately
     /// unchanged; the central's own schedule defines it.
     pub fn on_rx(&mut self, rx_done_us: u32, payload_len: u8, crc_ok: bool) -> bool {
-        if !crc_ok || payload_len > 27 || self.supervision_expired(rx_done_us) {
+        if !crc_ok
+            || usize::from(payload_len) > MAX_LEGACY_PAYLOAD
+            || self.supervision_expired(rx_done_us)
+        {
             return false;
         }
         self.supervision_base_us = rx_done_us;
@@ -244,6 +248,15 @@ mod tests {
         assert!(conn.supervision_expired(deadline));
         assert!(conn.on_rx(deadline - 10, 0, true));
         assert_eq!(conn.supervision_deadline_us(), deadline - 10 + 200 * 10_000);
+    }
+
+    #[test]
+    fn receive_ceiling_covers_the_encrypted_legacy_payload() {
+        // 27 plaintext octets plus the 4-octet MIC is the largest legacy PDU.
+        let mut conn = CentralConnection::new(params(), 0);
+        assert!(conn.on_rx(2_500, 31, true));
+        let mut conn = CentralConnection::new(params(), 0);
+        assert!(!conn.on_rx(2_500, 32, true));
     }
 
     #[test]

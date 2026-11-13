@@ -10,9 +10,11 @@ compliance. Open defects and acceptance gaps are tracked in the repository
 The local Trouble checkout at `../../../trouble/host` must be at
 `3aa6fd27b89cd5fc35f5c9b4f0c7f66795a14f70` (the `bt-hci` 0.11 revision).
 Only `peripheral`, `gatt`, `default-packet-pool` and
-`default-packet-pool-mtu-27` are enabled. No derive macros, executor, or HAL
-Embassy/SysTick time driver are enabled. The build and RAM-copy linker fragment
-are inherited from the P3 peripheral example.
+`default-packet-pool-mtu-128` are enabled. A 27-byte pool cannot reassemble the
+65-byte P-256 public key that LE Secure Connections exchanges, so the secure
+build needs the larger pool; the non-secure build shares it. No derive macros,
+executor, or HAL Embassy/SysTick time driver are enabled. The build and RAM-copy
+linker fragment are inherited from the P3 peripheral example.
 
 Keep this executable's `Cargo.lock` under version control and archive it with
 build artifacts. It pins the transitive `uuid` dependency to `1.17.0`, matching
@@ -179,6 +181,8 @@ the same echo passes on macOS and in the native fixture.
 - Complete local name: `wch585-p4`.
 - Static random address: `C1:FF:EE:00:00:15` (changed from `...:14` when the P5
   service database was added, because iOS caches a peer's GATT layout by address).
+  The `secure` build replaces the least-significant octet with a byte from the
+  measured entropy seed, so each boot is a new device (see S2 below).
 - GAP service `1800`: Device Name `2A00` and Appearance `2A01` (unknown, zero).
 - GATT service `1801`.
 - Custom service: `00001000-b0cd-11ec-871f-d45ddf138840`.
@@ -249,6 +253,55 @@ rate; the separate three-cycle regression above validates the functional change.
 It does not retroactively alter archived images, reclassify earlier failures, or
 validate calibrated clock/IFS compliance.
 
+## S2: LE Secure Connections (feature `secure`)
+
+`--features secure` enables `trouble-host/security` (RustCrypto AES-128,
+CMAC, P-256) and adds the controller side of the peripheral start-encryption
+procedure. It is a separate finite-run acceptance image; the default build is
+the P4/P5 image.
+
+What the image does differently:
+
+- Seeds the controller DRBG and a separate Host RNG stream from measured ADC
+  temperature noise, and refuses to advertise when the health check fails.
+- Advertises LE Encryption with the legacy HCI ACL buffer of 27 plaintext
+  octets; encryption adds the 4-octet MIC for a 31-octet on-air payload.
+- Owns `LL_ENC_REQ`/`LL_ENC_RSP`, the Host's `LE LTK Request` reply, the
+  plaintext `LL_START_ENC_REQ`, and the encrypted `LL_START_ENC_RSP`. All
+  AES-CCM runs outside the connection event: TX is encrypted before the
+  event, RX is decrypted after it. The CH585 AES block shares registers with
+  the RF IP, so the engine reloads the key before every CCM operation.
+- Rotates the least-significant octet of the static random address from the
+  entropy seed. The image has no bond store (S3), so a peer that bonded an
+  earlier boot would otherwise insist on an LTK this build cannot supply.
+  Android does not drop its bond on `LL_REJECT_IND(0x06)`, so per-boot
+  identity is the supported behaviour, not a workaround hidden in the client.
+- Exposes `SECURE_STATS[16]` (ENC_REQ/RSP, LTK request/reply, START_ENC
+  request/response, encrypted TX/RX, active, MIC failures, errors, entropy
+  flags) and `SEC_DIAG` with the packed ACL ring and the last HCI commands
+  and command responses.
+
+Acceptance (Just Works, no MITM protection): the phone must report
+`BOND_BONDED` and then complete an encrypted read/write/read-back; the Host
+`SECURITY` state must be `Encrypted`; and a passive capture must contain the
+SMP exchange, `ENC_REQ`/`ENC_RSP`/`START_ENC_REQ`, and no decodable ATT PDU
+after the encryption start. Connecting without encryption is not acceptance.
+
+`tools/secure_run.py` drives the Android client (`tools/android-pair`), and
+`tools/secure_capture.py` wraps it with the sniffer. The capture wrapper
+starts the sniffer only after the probe flash (so the firmware is already
+advertising), scans for the rotated address and follows it; `--follow-by-name`
+alone races the sniffer's one-shot name lookup. Both runners flash with the
+single-session preflight helper and restore the smoke image in a `finally`.
+
+Android 15 (CPH2411) passed this matrix on 2026-11-12. The iOS round has not
+been attempted and is tracked in the backlog: this repository has no iOS
+client, and the test iPhone (registered with the Mac as `mono@iphone`, not
+bonded to this firmware) is offline. The iOS acceptance client is nRF Connect,
+already installed on that phone and used for the P5 manual checks. S2 is
+accepted on the Android evidence only; do not describe the iOS support as
+verified.
+
 ## Build and validate
 
 Build from this directory with `cargo build --release --locked`. The default
@@ -299,6 +352,23 @@ A failed run is retained, not automatically retried. The client discovers the
 custom service and characteristic, performs three write/readback pairs, subscribes
 and checks ten numbered notifications, unsubscribes, reads back 110, and waits for
 its expected disconnect. No phone client should run concurrently.
+
+The secure image uses the same output path as the default build, so rebuild
+with the feature right before the run (`tools/secure_run.py` refuses an ELF
+without the crypto backend):
+
+```sh
+cargo build --release --features secure
+python3 tools/secure_capture.py \
+  --out local-docs/results/s2-run-<unique> \
+  --sniffer /tmp/wchble-nrfutil-state-20261109/bin/nrfutil-ble-sniffer \
+  --nrfutil-home /tmp/wchble-nrfutil-state-20261109 \
+  --sniffer-port /dev/cu.usbmodem21301 --follow-by-name \
+  --run-seconds 60 --timeout 50 --full-logcat
+```
+
+The pairing dialog on Android needs one manual confirmation; the runner taps
+it and records the action. Use a new output directory for every attempt.
 
 The runner does not start the optional nRF Sniffer itself. `tools/capture.py`
 wraps the same safe runner with capture of `C1:FF:EE:00:00:15 random`. Confirm the

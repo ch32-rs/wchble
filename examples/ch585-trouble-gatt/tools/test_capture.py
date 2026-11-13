@@ -116,13 +116,13 @@ class CaptureTests(unittest.TestCase):
             result = capture.stop_capture(process)
         self.assertTrue(result['clean'])
         kill.assert_called_once_with(123, signal.SIGINT)
-        process.wait.assert_called_once_with(timeout=5)
+        process.wait.assert_called_once_with(timeout=12)
 
     def test_term_or_kill_are_not_clean_even_with_valid_pcap(self):
         for timeouts, code in ((1, -15), (2, -9)):
             process = Mock(pid=123, returncode=code)
             process.poll.return_value = None
-            process.wait.side_effect = ([subprocess.TimeoutExpired('sniffer', 5)] * timeouts + [code])
+            process.wait.side_effect = ([subprocess.TimeoutExpired('sniffer', 12)] * timeouts + [code])
             with patch.object(capture.os, 'killpg'):
                 result = capture.stop_capture(process)
             self.assertFalse(result['clean'])
@@ -136,7 +136,7 @@ class CaptureTests(unittest.TestCase):
             capture.stop_capture(process)
         self.assertEqual(kill.call_count, 3)
         self.assertTrue(all(call.args[0] == 456 for call in kill.call_args_list))
-        self.assertEqual([call.kwargs['timeout'] for call in process.wait.call_args_list], [5, 2, 2])
+        self.assertEqual([call.kwargs['timeout'] for call in process.wait.call_args_list], [12, 2, 2])
 
     def test_startup_is_configuration_not_claimed_follow(self):
         process = Mock()

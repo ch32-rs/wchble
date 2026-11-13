@@ -3,13 +3,18 @@
 //! Standalone `probe-rs read` resumes the core after each access, so separate
 //! register reads cannot establish that RF stays stopped. This helper halts
 //! once, performs the documented engine shutdown, requires two zero CMD
-//! acknowledgements, and only then downloads and starts the requested ELF.
+//! acknowledgements, and only then downloads and starts the requested image.
+//! Images may be ELF or Intel HEX (the vendor EVT packages ship `.hex`), so
+//! differential runs against the vendor stack take the same stop-first path.
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use probe_rs::flashing::{download_file_with_options, DownloadOptions, ElfLoader, ElfOptions};
+use probe_rs::flashing::{
+    download_file_with_options, DownloadOptions, ElfLoader, ElfOptions, HexLoader,
+};
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbeSelector, WireProtocol};
 use probe_rs::Permissions;
@@ -73,7 +78,7 @@ fn run() -> Result<(), (u8, String)> {
     }
     let selector = selector.ok_or((2, "missing --probe".into()))?;
     let target = target.ok_or((2, "missing --chip".into()))?;
-    let elf = elf.ok_or((2, "missing ELF path".into()))?;
+    let image = elf.ok_or((2, "missing image path".into()))?;
 
     let selector: DebugProbeSelector = selector
         .parse()
@@ -105,8 +110,17 @@ fn run() -> Result<(), (u8, String)> {
     let mut options = DownloadOptions::default();
     options.verify = verify;
     let download_started = Instant::now();
-    download_file_with_options(&mut session, &elf, ElfLoader(ElfOptions::default()), options)
-        .map_err(|e| (4, format!("download: {e:?}")))?;
+    let is_hex = Path::new(&image)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("hex"));
+    if is_hex {
+        download_file_with_options(&mut session, &image, HexLoader, options)
+            .map_err(|e| (4, format!("download: {e:?}")))?;
+    } else {
+        download_file_with_options(&mut session, &image, ElfLoader(ElfOptions::default()), options)
+            .map_err(|e| (4, format!("download: {e:?}")))?;
+    }
     let download_ms = download_started.elapsed().as_millis();
 
     {
@@ -115,7 +129,7 @@ fn run() -> Result<(), (u8, String)> {
             .map_err(|e| (5, format!("reset: {e}")))?;
         core.run().map_err(|e| (5, format!("start: {e}")))?;
     }
-    println!("preflight: downloaded and started {elf} (download {download_ms} ms)");
+    println!("preflight: downloaded and started {image} (download {download_ms} ms)");
     Ok(())
 }
 

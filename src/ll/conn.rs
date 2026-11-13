@@ -381,19 +381,22 @@ impl PeripheralConnection {
     }
 
     /// End of the possible packet-start window. The radio must allow a packet
-    /// starting before this deadline to finish (up to 296 us for 27 bytes).
+    /// starting before this deadline to finish (up to 328 us for a 31-octet
+    /// encrypted legacy payload).
     pub fn rx_end_us(&self) -> u32 {
         self.event_start_us
             .wrapping_add(self.window_width_us + self.widening_us())
     }
 
     /// Allow the latest-starting legacy LE 1M packet to finish: 80 us overhead
-    /// plus 27 payload bytes. Address match cannot occur before the 40 us
-    /// preamble/AA reception; its exact hardware flag latency is not assumed.
+    /// plus the largest on-air payload (31 octets with the 4-octet MIC).
+    /// Address match cannot occur before the 40 us preamble/AA reception; its
+    /// exact hardware flag latency is not assumed.
     /// Use this for the initial hardware window and software no-capture timeout,
     /// while still honoring earlier finite, supervision and event deadlines.
     pub fn rx_complete_end_us(&self) -> u32 {
-        self.rx_end_us().wrapping_add(80 + 27 * 8)
+        self.rx_end_us()
+            .wrapping_add(80 + super::enc::MAX_ENCRYPTED as u32 * 8)
     }
 
     /// Until the first valid data PDU, establishment is bounded by six
@@ -416,7 +419,9 @@ impl PeripheralConnection {
     /// A later packet in the same event refreshes supervision, not the anchor.
     /// Returns false for an invalid length or a link that already expired.
     pub fn on_rx_anchor(&mut self, rx_done_us: u32, payload_len: u8) -> bool {
-        if payload_len > 27 || self.supervision_expired(rx_done_us) {
+        if usize::from(payload_len) > super::enc::MAX_ENCRYPTED
+            || self.supervision_expired(rx_done_us)
+        {
             return false;
         }
         self.supervision_base_us = rx_done_us;
@@ -624,6 +629,16 @@ mod tests {
             // Completion allowance must not revive an expired link.
             assert!(!conn.on_rx_anchor(conn.supervision_deadline_us(), 27));
         }
+    }
+
+    #[test]
+    fn receive_ceiling_covers_the_encrypted_legacy_payload() {
+        // 27 plaintext octets plus the 4-octet MIC is the largest legacy PDU.
+        let mut conn = PeripheralConnection::new(params(), 0);
+        assert!(conn.on_rx_anchor(2_500, 31));
+        assert_eq!(conn.event_start_us(), 2_500 - (80 + 31 * 8));
+        let mut conn = PeripheralConnection::new(params(), 0);
+        assert!(!conn.on_rx_anchor(2_500, 32));
     }
 
     #[test]

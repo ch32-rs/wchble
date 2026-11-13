@@ -10,12 +10,17 @@ use core::task::{Context, Waker};
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
-use wchble::hci::connection::{ConnectionBridge, ConnectionInfo, RadioRequest, TxTag};
+use wchble::crypto::BLE_MIC_LEN;
+use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxTag};
+use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::conn::{ConnectParams, PeripheralConnection};
-use wchble::ll::ctrl::{ControlAction, ControlState, LocalVersion};
-use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE};
+use wchble::ll::ctrl::{ControlAction, ControlPdu, ControlState, LocalVersion};
+use wchble::ll::enc::{
+    EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
+};
+use wchble::rf::family::ch585::{Ch585Aes, Ch585Radio, BB_BASE, LLE_BASE};
 use wchble::rf::regs::{self, bb, bb_irq, lle};
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
@@ -23,6 +28,13 @@ use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use {panic_halt as _, portable_atomic as _};
 
 mod host;
+#[cfg(feature = "secure")]
+mod rng;
+#[cfg(feature = "secure")]
+mod time_driver;
+
+#[cfg(feature = "secure")]
+use embassy_crypto_rustcrypto as _;
 
 static SCRATCH: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
@@ -32,13 +44,46 @@ static DATA: StaticCell<DmaBuf<64>> = StaticCell::new();
 
 #[no_mangle]
 #[used]
-pub static RUN_SECONDS: u32 = if cfg!(feature = "long-run") { 360 } else { 25 };
+// The secure flow is much slower than P4: the phone only starts bonding after
+// its own service discovery, and the Just Works consent dialog needs a user
+// decision. 25 s expires while the link is still in ENCRYPTION_PENDING.
+pub static RUN_SECONDS: u32 = if cfg!(feature = "long-run") {
+    360
+} else if cfg!(feature = "secure") {
+    60
+} else {
+    25
+};
 #[no_mangle]
 static mut STATS: [u32; 64] = [0; 64];
 #[no_mangle]
 static mut HOST_STATS: [u32; 16] = [0; 16];
 #[no_mangle]
 static mut TRACE: [u32; 128 * 8] = [0; 128 * 8];
+/// S2 encryption evidence, kept separate so the P4 STATS invariants and the
+/// existing runner remain untouched.
+#[no_mangle]
+static mut SECURE_STATS: [u32; 16] = [0; 16];
+
+const SEC_MAGIC: u32 = 0x5332_3538;
+const SEC_ENC_REQ: usize = 2;
+const SEC_ENC_RSP: usize = 3;
+const SEC_LTK_REQUEST: usize = 4;
+const SEC_LTK_REPLY: usize = 5;
+const SEC_START_REQ: usize = 6;
+const SEC_START_RSP: usize = 7;
+const SEC_ENCRYPTED_TX: usize = 8;
+const SEC_ENCRYPTED_RX: usize = 9;
+const SEC_ACTIVE: usize = 10;
+const SEC_MIC_FAILURE: usize = 11;
+const SEC_ERRORS: usize = 12;
+const SEC_PREPARED: usize = 13;
+const SEC_LAST_ERROR: usize = 15;
+
+#[cfg(feature = "secure")]
+const LOCAL_FEATURES: [u8; 8] = [0x01, 0, 0, 0, 0, 0, 0, 0];
+#[cfg(not(feature = "secure"))]
+const LOCAL_FEATURES: [u8; 8] = [0; 8];
 
 fn put(i: usize, v: u32) {
     unsafe {
@@ -58,6 +103,160 @@ fn get(i: usize) -> u32 {
 }
 fn inc(i: usize) {
     put(i, get(i).wrapping_add(1));
+}
+fn sec_put(i: usize, v: u32) {
+    unsafe {
+        core::ptr::addr_of_mut!(SECURE_STATS)
+            .cast::<u32>()
+            .add(i)
+            .write_volatile(v)
+    }
+}
+fn sec_inc(i: usize) {
+    let current = unsafe {
+        core::ptr::addr_of!(SECURE_STATS)
+            .cast::<u32>()
+            .add(i)
+            .read_volatile()
+    };
+    sec_put(i, current.wrapping_add(1));
+}
+fn sec_error(reason: u8) {
+    sec_inc(SEC_ERRORS);
+    sec_put(SEC_LAST_ERROR, u32::from(reason));
+}
+
+/// S2 pairing diagnostics: packed rings of the last ACL fragments forwarded to
+/// the Host (RX) and requested by the Host (TX), plus Host disconnect requests.
+///
+/// Layout: `[0]` RX sequence, `[1]` TX sequence, `[2..18)` RX entries,
+/// `[18..34)` TX entries, `[34]` last disconnect reason, `[35]` disconnect count.
+/// Each entry packs `seq << 24 | llid << 16 | cid << 8 | opcode`, where `cid`
+/// comes from the L2CAP header of a start fragment (`llid == 2`), `0xff` marks
+/// a continuation fragment, and `opcode` is the first L2CAP/SMP byte.
+#[no_mangle]
+static mut SEC_DIAG: [u32; DIAG_WORDS] = [0; DIAG_WORDS];
+
+const DIAG_RX_BASE: usize = 2;
+const DIAG_TX_BASE: usize = 18;
+const DIAG_DISCONNECT_REASON: usize = 34;
+const DIAG_DISCONNECT_COUNT: usize = 35;
+const DIAG_SLOW_POLLS: usize = 36;
+const DIAG_SKIPPED_EVENTS: usize = 37;
+/// The Peripheral's plaintext `LL_START_ENC_REQ` was handed to the link layer.
+const DIAG_START_REQ_QUEUED: usize = 38;
+/// The Peripheral's encrypted `LL_START_ENC_RSP` was handed to the link layer.
+const DIAG_START_RSP_QUEUED: usize = 39;
+
+/// Last HCI command the runner answered with a non-success status:
+/// `(opcode << 8) | status`.
+const DIAG_HCI_FAILURE: usize = 40;
+/// Newest eight HCI commands, `(opcode << 8) | status`, oldest first.
+const DIAG_HCI_LOG: usize = 41;
+/// Total number of commands logged, so a wrapped ring is distinguishable.
+const DIAG_HCI_LOG_LEN: usize = 49;
+/// Newest eight command responses actually sent to the Host, oldest first:
+/// `0xE000_0000 | opcode << 8 | status` (Complete), `0xF000_0000 | ...` (Status).
+const DIAG_HCI_SENT: usize = 50;
+const DIAG_HCI_SENT_LEN: usize = 58;
+const DIAG_WORDS: usize = 64;
+
+/// Static random address advertised this boot as two little-endian words
+/// (bytes 0..4, then 4..6 with padding). The secure build rotates the low
+/// octet from measured entropy so a bonded peer treats every run as a new
+/// device; the test runner reads this symbol to aim the sniffer and the
+/// capture filter.
+#[no_mangle]
+static mut PERIPHERAL_ADDRESS: [u32; 2] = [0; 2];
+
+fn set_peripheral_address(address: &[u8; 6]) {
+    let words = [
+        u32::from_le_bytes([address[0], address[1], address[2], address[3]]),
+        u32::from_le_bytes([address[4], address[5], 0, 0]),
+    ];
+    unsafe {
+        let dst = core::ptr::addr_of_mut!(PERIPHERAL_ADDRESS).cast::<u32>();
+        dst.add(0).write_volatile(words[0]);
+        dst.add(1).write_volatile(words[1]);
+    }
+}
+
+/// Per-opcode counters for start fragments, which never wrap in a 25 s run:
+/// `[0..16)` SMP RX by instruction code, `[16..32)` SMP TX,
+/// `[32..64)` ATT RX by opcode, `[64..96)` ATT TX.
+#[no_mangle]
+static mut SEC_OPCODES: [u32; 96] = [0; 96];
+
+fn opcode_get(i: usize) -> u32 {
+    unsafe {
+        core::ptr::addr_of!(SEC_OPCODES)
+            .cast::<u32>()
+            .add(i)
+            .read_volatile()
+    }
+}
+fn opcode_inc(i: usize) {
+    unsafe {
+        core::ptr::addr_of_mut!(SEC_OPCODES)
+            .cast::<u32>()
+            .add(i)
+            .write_volatile(opcode_get(i).wrapping_add(1))
+    }
+}
+
+fn diag_get(i: usize) -> u32 {
+    unsafe {
+        core::ptr::addr_of!(SEC_DIAG)
+            .cast::<u32>()
+            .add(i)
+            .read_volatile()
+    }
+}
+fn diag_put(i: usize, v: u32) {
+    unsafe {
+        core::ptr::addr_of_mut!(SEC_DIAG)
+            .cast::<u32>()
+            .add(i)
+            .write_volatile(v)
+    }
+}
+
+fn diag_acl(rx: bool, llid: u8, payload: &[u8]) {
+    let (seq_index, base) = if rx {
+        (0, DIAG_RX_BASE)
+    } else {
+        (1, DIAG_TX_BASE)
+    };
+    let seq = diag_get(seq_index);
+    diag_put(seq_index, seq.wrapping_add(1));
+    let (cid, opcode) = match llid {
+        2 => (
+            payload.get(2).copied().unwrap_or(0),
+            payload.get(4).copied().unwrap_or(0),
+        ),
+        1 => (0xff, 0),
+        _ => (0, payload.first().copied().unwrap_or(0)),
+    };
+    if llid == 2 {
+        let slot = match cid {
+            6 => Some(if rx { 0 } else { 16 } + usize::from(opcode & 0x0f)),
+            4 => Some(if rx { 32 } else { 64 } + usize::from(opcode & 0x1f)),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            opcode_inc(slot);
+        }
+    }
+    let entry = ((seq & 0xff) << 24)
+        | (u32::from(llid) << 16)
+        | (u32::from(cid) << 8)
+        | u32::from(opcode);
+    diag_put(base + (seq as usize & 0x0f), entry);
+}
+
+fn diag_disconnect(reason: u8) {
+    diag_put(DIAG_DISCONNECT_REASON, u32::from(reason));
+    diag_put(DIAG_DISCONNECT_COUNT, diag_get(DIAG_DISCONNECT_COUNT).wrapping_add(1));
 }
 fn reg(base: usize, offset: usize) -> u32 {
     unsafe { regs::read(base, offset) }
@@ -233,6 +432,26 @@ fn transmit(radio: &mut Ch585Radio, clock: &Clock, frame: &[u8], end: u32) -> bo
     result.is_ok()
 }
 
+/// An encrypted PDU prepared before the connection event. The radio event
+/// only copies it into the link layer; AES never runs inside the IFS window.
+struct EncTx {
+    llid: u8,
+    bytes: [u8; MAX_ENCRYPTED],
+    len: u8,
+    tag: Option<TxTag>,
+    /// When set, a successful acknowledgment ends the link with this reason.
+    terminate: Option<u8>,
+}
+
+/// A received encrypted PDU held until after the event, when AES-CCM can run
+/// outside the 150 us response deadline.
+struct DeferredRx {
+    header: u8,
+    payload: [u8; MAX_ENCRYPTED],
+    len: u8,
+    end: u32,
+}
+
 struct Session {
     conn: PeripheralConnection,
     link: LinkSequence,
@@ -240,24 +459,93 @@ struct Session {
     pending_control: Option<DataPdu>,
     acl_tag: Option<TxTag>,
     terminating: Option<u8>,
+    /// End the link after the control PDU now in `pending_control` has been
+    /// queued: its ACK is then the one that closes the connection.
+    terminate_after_control: Option<u8>,
     terminate_requested: Option<u8>,
     update_instant: Option<u16>,
     update_report: Option<(u16, u16, u16)>,
     began: u32,
+    /// Start-encryption sequencing (peripheral role).
+    start: PeripheralStart,
+    /// Session cipher, present once the Host supplied the LTK.
+    enc: Option<Encryption<Ch585Aes>>,
+    /// Both directions encrypted; new TX PDUs must be pre-encrypted.
+    enc_active: bool,
+    /// Our plaintext LL_START_ENC_REQ was sent and RX decryption is on:
+    /// incoming non-empty PDUs are ciphertext and must be deferred.
+    rx_encrypted: bool,
+    /// The prebuilt `LL_ENC_RSP` sits in `pending_control`.
+    enc_rsp_queued: bool,
+    /// The prebuilt `LL_ENC_RSP` was handed to the link layer; the next event
+    /// may carry the Peripheral's own `LL_START_ENC_REQ`.
+    enc_rsp_sent: bool,
+    /// Encrypted `LL_START_ENC_RSP` decrypted; send our precomputed response
+    /// in the next event (it is the Peripheral's TX counter 0).
+    pending_start_rsp: Option<EncTx>,
+    /// `LE Encryption Change` must be handed to the Host once our encrypted
+    /// response is on air, outside the event path.
+    enc_change_pending: bool,
+    pending_enc_control: Option<EncTx>,
+    pending_enc_acl: Option<EncTx>,
+    deferred_rx: Option<DeferredRx>,
+    /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
+    /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
+    /// inside the 150 us response deadline.
+    enc_rsp_random: [u8; 12],
+    /// Full `LL_ENC_RSP` payload (opcode + SKDs + IVs), built when the link is
+    /// established. The event path only copies it into the link layer; parsing
+    /// the request and building the response costs enough flash-fetch time to
+    /// push the reply past T_IFS.
+    enc_rsp_payload: [u8; 13],
+    /// The central's `LL_ENC_REQ`, parsed after the event for the same reason.
+    pending_enc_req: Option<[u8; 23]>,
+    /// Time after which `LL_ENC_RSP` may be queued (0 = none pending). The
+    /// reference peer (macOS) answers the request two events later, after its
+    /// own empty PDUs have acknowledged it; this phone's controller never
+    /// sends `LL_START_ENC_REQ` when the response arrives sooner.
+    enc_rsp_at: u32,
+    /// `LE LTK Request` handed to the Host after the event. Building the HCI
+    /// event inside the response window made `LL_ENC_RSP` late, and a central
+    /// that answers one event late abandons start encryption (Android only
+    /// ACKs the late response and never sends `LL_START_ENC_REQ`).
+    pending_ltk: Option<([u8; 8], u16)>,
 }
 impl Session {
-    fn new(params: ConnectParams, end: u32, now: u32) -> Self {
+    fn new(params: ConnectParams, end: u32, now: u32, enc_rsp_random: [u8; 12]) -> Self {
+        let mut control = ControlState::new();
+        control.local_features = LOCAL_FEATURES;
+        let mut enc_rsp_payload = [0u8; 13];
+        enc_rsp_payload[0] = 0x04;
+        enc_rsp_payload[1..].copy_from_slice(&enc_rsp_random);
         Self {
             conn: PeripheralConnection::new(params, end),
             link: LinkSequence::new(),
-            control: ControlState::new(),
+            control,
             pending_control: None,
             acl_tag: None,
             terminating: None,
+            terminate_after_control: None,
             terminate_requested: None,
             update_instant: None,
             update_report: None,
             began: now,
+            start: PeripheralStart::new(),
+            enc: None,
+            enc_active: false,
+            rx_encrypted: false,
+            enc_rsp_queued: false,
+            enc_rsp_sent: false,
+            pending_start_rsp: None,
+            enc_change_pending: false,
+            pending_enc_control: None,
+            pending_enc_acl: None,
+            deferred_rx: None,
+            enc_rsp_random,
+            enc_rsp_payload,
+            pending_enc_req: None,
+            enc_rsp_at: 0,
+            pending_ltk: None,
         }
     }
     fn expiration(&self, now: u32) -> Option<u8> {
@@ -286,7 +574,7 @@ fn connection_event(
     rx: &mut DmaBuf<RX_DMA_MIN>,
     tx: &mut DmaBuf<64>,
     s: &mut Session,
-    bridge: &mut ConnectionBridge,
+    soft: &mut SoftRunner,
     finish: u32,
 ) -> Option<u8> {
     if let Some(reason) = s.expiration(clock.now_us()) {
@@ -337,20 +625,35 @@ fn connection_event(
         };
         let header = rx.0[0];
         let payload = &rx.0[2..packet.len];
-        if payload.len() > 27 {
+        if payload.len() > MAX_ENCRYPTED {
             inc(9);
             break;
         }
         let llid = header & 3;
-        let capacity = match llid {
-            1 if payload.is_empty() => true,
-            1 | 2 => bridge.can_receive_acl(llid, payload.len()),
-            3 => {
-                s.pending_control.is_none()
-                    && s.terminate_requested.is_none()
-                    && s.update_report.is_none()
+        // After our plaintext LL_START_ENC_REQ, the Central's next non-empty
+        // PDU is its encrypted LL_START_ENC_RSP (the link's first encrypted
+        // PDU); empty PDUs stay plaintext.
+        let ciphertext = s.rx_encrypted && !(llid == 1 && payload.is_empty());
+        let capacity = if ciphertext {
+            // The bridge stores plaintext: drop the MIC before admission.
+            let plain_len = payload.len().saturating_sub(BLE_MIC_LEN);
+            s.deferred_rx.is_none()
+                && match llid {
+                    1 | 2 => soft.bridge.can_receive_acl(llid, plain_len),
+                    3 => true,
+                    _ => false,
+                }
+        } else {
+            match llid {
+                1 if payload.is_empty() => true,
+                1 | 2 => soft.bridge.can_receive_acl(llid, payload.len()),
+                3 => {
+                    s.pending_control.is_none()
+                        && s.terminate_requested.is_none()
+                        && s.update_report.is_none()
+                }
+                _ => false,
             }
-            _ => false,
         };
         let outcome = s.link.on_rx(header, payload, true, capacity);
         if outcome.status == RxStatus::Invalid {
@@ -388,32 +691,82 @@ fn connection_event(
         match outcome.status {
             RxStatus::Accepted => {
                 inc(41);
-                if llid == 3 {
+                if matches!(llid, 1 | 2) {
+                    diag_acl(true, llid, payload);
+                }
+                if ciphertext {
+                    // AES-CCM cannot fit in the 150 us response window; hold
+                    // the PDU and decrypt it after the event.
+                    let mut copy = [0u8; MAX_ENCRYPTED];
+                    copy[..payload.len()].copy_from_slice(payload);
+                    s.deferred_rx = Some(DeferredRx {
+                        header,
+                        payload: copy,
+                        len: payload.len() as u8,
+                        end: packet.end,
+                    });
+                } else if llid == 3 {
                     inc(26);
                     put(38, u32::from(payload[0]));
-                    let local = LocalVersion {
-                        version: 0x0d,
-                        company_id: 0xffff,
-                        subversion: 1,
-                    };
-                    match s.control.on_pdu(&mut s.conn, payload, local) {
-                        Ok(ControlAction::Reply(pdu)) => {
-                            if pdu.as_bytes().first() == Some(&7) {
-                                inc(27);
+                    match payload[0] {
+                        0x03 if s.start.stage() == StartStage::Idle => {
+                            // Hand the request over for parsing once the event
+                            // is over. This event answers with an empty PDU
+                            // (acknowledging the request); the prebuilt
+                            // response leaves two events later, as macOS does.
+                            // Land in the idle gap after the next event, so
+                            // the response is queued for the second event after
+                            // the request, which is exactly what macOS does.
+                            s.enc_rsp_at = packet.end.wrapping_add(
+                                u32::from(s.conn.params.interval) * 1250 * 3 / 2,
+                            );
+                            if payload.len() == 23 {
+                                let mut req = [0u8; 23];
+                                req.copy_from_slice(payload);
+                                s.pending_enc_req = Some(req);
+                                sec_inc(SEC_ENC_REQ);
+                            } else {
+                                s.enc_rsp_at = 0;
+                                sec_error(0x1e);
+                                s.request_terminate(0x1e, packet.end);
                             }
-                            s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
                         }
-                        Ok(ControlAction::Terminate(reason)) => remote_terminate = Some(reason),
-                        Ok(ControlAction::None) => {
-                            if payload[0] == 0 && payload.len() == 12 {
-                                s.update_instant =
-                                    Some(u16::from_le_bytes([payload[10], payload[11]]));
+                        0x05 => {
+                            // Core §5.1.3.1 has the Peripheral send this PDU;
+                            // a Central that sends one is not followed, but it
+                            // is counted so the sniffer evidence can be tied
+                            // to the firmware.
+                            sec_inc(SEC_START_REQ);
+                        }
+                        _ => {
+                            let local = LocalVersion {
+                                version: 0x0d,
+                                company_id: 0xffff,
+                                subversion: 1,
+                            };
+                            match s.control.on_pdu(&mut s.conn, payload, local) {
+                                Ok(ControlAction::Reply(pdu)) => {
+                                    if pdu.as_bytes().first() == Some(&7) {
+                                        inc(27);
+                                    }
+                                    s.pending_control =
+                                        Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+                                }
+                                Ok(ControlAction::Terminate(reason)) => {
+                                    remote_terminate = Some(reason)
+                                }
+                                Ok(ControlAction::None) => {
+                                    if payload[0] == 0 && payload.len() == 12 {
+                                        s.update_instant =
+                                            Some(u16::from_le_bytes([payload[10], payload[11]]));
+                                    }
+                                }
+                                Err(error) => s.request_terminate(
+                                    wchble::ll::ctrl::termination_reason(error),
+                                    packet.end,
+                                ),
                             }
                         }
-                        Err(error) => s.request_terminate(
-                            wchble::ll::ctrl::termination_reason(error),
-                            packet.end,
-                        ),
                     }
                 } else {
                     deliver_acl = !(llid == 1 && payload.is_empty());
@@ -433,14 +786,91 @@ fn connection_event(
         let handled_us = clock.now_us().wrapping_sub(packet.end);
         let retry = s.link.has_outstanding();
         if !retry {
-            if let Some(pdu) = s.pending_control.take() {
+            if s.enc_active {
+                // Every new PDU was encrypted before the event; the IFS budget
+                // only covers copying it into the link layer.
+                if let Some(tx) = s
+                    .pending_enc_control
+                    .take()
+                    .or_else(|| s.pending_enc_acl.take())
+                {
+                    s.link
+                        .queue(tx.llid, &tx.bytes[..usize::from(tx.len)])
+                        .unwrap();
+                    s.acl_tag = tx.tag;
+                    if tx.terminate.is_some() {
+                        s.terminating = tx.terminate;
+                    }
+                    sec_inc(SEC_ENCRYPTED_TX);
+                }
+            } else if let Some(tx) = s.pending_start_rsp.take() {
+                // The Central's encrypted LL_START_ENC_RSP was the previous
+                // event's PDU: answer with our precomputed encrypted response
+                // (Peripheral TX counter 0). The link is encrypted from here.
+                s.link
+                    .queue(tx.llid, &tx.bytes[..usize::from(tx.len)])
+                    .unwrap();
+                s.acl_tag = tx.tag;
+                s.enc_active = true;
+                s.enc_change_pending = true;
+                sec_inc(SEC_START_RSP);
+                sec_inc(SEC_ENCRYPTED_TX);
+                sec_inc(SEC_ACTIVE);
+                diag_put(
+                    DIAG_START_RSP_QUEUED,
+                    diag_get(DIAG_START_RSP_QUEUED).wrapping_add(1),
+                );
+            } else if s.rx_encrypted {
+                // LL_START_ENC_REQ is outstanding: only Empty PDUs may share
+                // this window until the Central's encrypted response.
+            } else if s.enc_rsp_queued {
+                // The prebuilt LL_ENC_RSP owns this event.
+                let pdu = s.pending_control.take().unwrap();
                 s.link.queue(3, pdu.payload()).unwrap();
+                s.enc_rsp_queued = false;
+                s.enc_rsp_sent = true;
+                if let Some(reason) = s.terminate_after_control.take() {
+                    s.terminating = Some(reason);
+                }
+            } else if s.enc_rsp_sent && s.start.stage() == StartStage::Prepared {
+                // Core 5.4 Vol 6 Part B §5.1.3.1: the Peripheral owns this
+                // step. Send the plaintext LL_START_ENC_REQ and start RX
+                // decryption; the Central answers with the link's first
+                // encrypted PDU.
+                let (start, enc) = (&mut s.start, &mut s.enc);
+                match start.start_enc_req(enc.as_mut().unwrap()) {
+                    Ok(pdu) => {
+                        s.link.queue(3, pdu.as_bytes()).unwrap();
+                        s.rx_encrypted = true;
+                        sec_inc(SEC_START_REQ);
+                        diag_put(
+                            DIAG_START_REQ_QUEUED,
+                            diag_get(DIAG_START_REQ_QUEUED).wrapping_add(1),
+                        );
+                    }
+                    Err(_) => {
+                        sec_error(0x1e);
+                        s.request_terminate(0x1e, packet.end);
+                    }
+                }
             } else if let Some(reason) = s.terminate_requested.take() {
                 s.link.queue(3, &[2, reason]).unwrap();
                 s.terminating = Some(reason);
-            } else if let Some(acl) = bridge.take_tx_acl() {
-                s.link.queue(acl.llid, &acl.bytes[..acl.len]).unwrap();
-                s.acl_tag = Some(acl.tag);
+            } else if let Some(pdu) = s.pending_control.take() {
+                // Ordinary control replies wait for the encryption procedure
+                // to finish; only Empty/TERMINATE PDUs may share that window.
+                s.link.queue(3, pdu.payload()).unwrap();
+                if let Some(reason) = s.terminate_after_control.take() {
+                    s.terminating = Some(reason);
+                }
+            } else if s.enc_rsp_at == 0 || reached(clock.now_us(), s.enc_rsp_at) {
+                // The encryption procedure owns the link until it ends:
+                // no ACL data may share the event with LL_ENC_REQ/LL_ENC_RSP.
+                if let Some(acl) = soft.bridge.take_tx_acl() {
+                    diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
+                    s.link.queue(acl.llid, &acl.bytes[..acl.len]).unwrap();
+                    s.acl_tag = Some(acl.tag);
+                }
             }
         }
         let pdu = s.link.tx_pdu();
@@ -466,7 +896,12 @@ fn connection_event(
             trace(clock, 8, event, channel, 0, 0, arm_times[0], arm_times[1]);
         }
         if !sent {
-            return Some(0x3f);
+            // A late command means nothing went on air. That is a missed
+            // event, not a failed link: the PDU stays queued and is
+            // retransmitted in the next event, exactly as after a lost ACK.
+            // Terminating here killed the link right after LL_ENC_REQ, when a
+            // long pairing poll had already consumed most of the window.
+            return None;
         }
         // Serialize HCI output only after the time-critical radio response.
         // No Host poll can consume the RX reservation in this interval.
@@ -482,18 +917,18 @@ fn connection_event(
                 supervision_timeout: p.timeout,
                 master_clock_accuracy: p.sca,
             };
-            if bridge.connected(info).is_err() {
+            if soft.bridge.connected(info).is_err() {
                 inc(63);
                 return Some(0x1f);
             }
         }
         if let Some(tag) = acknowledged_acl {
-            if !bridge.ack_tx(tag) {
+            if !soft.bridge.ack_tx(tag) {
                 inc(63);
                 return Some(0x1f);
             }
         }
-        if deliver_acl && bridge.receive_acl(llid, payload).is_err() {
+        if deliver_acl && soft.bridge.receive_acl(llid, payload).is_err() {
             inc(63);
             return Some(0x1f);
         }
@@ -530,6 +965,200 @@ fn connection_event(
     s.expiration(clock.now_us())
 }
 
+/// Turn the Host's LTK answer into a session cipher and precompute the
+/// encrypted START_ENC_RSP. Runs outside the radio event.
+fn service_encryption(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
+    if s.enc.is_some() || s.start.stage() != StartStage::AwaitingKey {
+        return None;
+    }
+    let reply = soft.take_ltk_reply()?;
+    let ltk = match reply {
+        LtkReply::Key(ltk) => ltk,
+        LtkReply::Rejected => {
+            // Core 5.4 Vol 6 Part B §5.1.4: a negative reply becomes
+            // LL_REJECT_IND with 0x06 (PIN or Key Missing) on the encrypted
+            // procedure, and the link ends. Reporting 0x06 is also what makes
+            // the Central drop a stale bond instead of retrying the same LTK,
+            // so the next connection can pair from scratch.
+            sec_error(0x06);
+            s.start.abort();
+            s.enc_rsp_at = 0;
+            s.enc_rsp_queued = false;
+            s.pending_control =
+                Some(DataPdu::new(3, ControlPdu::reject_ind(0x06).as_bytes()).expect("fits"));
+            // End the link only once this PDU is queued and acknowledged; the
+            // next event's ACK belongs to the PDU sent before it.
+            s.terminate_after_control = Some(0x06);
+            return None;
+        }
+    };
+    sec_inc(SEC_LTK_REPLY);
+    let session = match s.start.session(&ltk) {
+        Ok(session) => session,
+        Err(_) => {
+            sec_error(0x1e);
+            return Some(0x1e);
+        }
+    };
+    let engine = Ch585Aes::new(session.key());
+    let mut enc = Encryption::new(session, EncRole::Peripheral, engine);
+    if s.start.prepare_start_rsp(&mut enc).is_err() {
+        sec_error(0x1e);
+        return Some(0x1e);
+    }
+    s.enc = Some(enc);
+    sec_inc(SEC_PREPARED);
+    None
+}
+
+/// Produce at most one prepared ciphertext PDU before the next event. The
+/// event only queues what is already encrypted.
+///
+/// Encryption assigns the CCM counter, so exactly one slot may be occupied at
+/// a time: a control PDU prepared later would otherwise be sent ahead of an
+/// older ACL PDU whose counter was already handed out, and the peer would
+/// reject it as a MIC failure. Control still wins, but only while both slots
+/// are empty; the event's priority check then never reorders two ciphertexts.
+fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
+    if !s.enc_active || s.pending_enc_control.is_some() || s.pending_enc_acl.is_some() {
+        return None;
+    }
+    let enc = s.enc.as_mut()?;
+    let mut out = [0u8; MAX_ENCRYPTED];
+    let prepared = if let Some(reason) = s.terminate_requested.take() {
+        Some((enc.encrypt(3, &[2, reason], &mut out), Some(reason)))
+    } else if let Some(pdu) = s.pending_control.take() {
+        Some((enc.encrypt(3, pdu.payload(), &mut out), None))
+    } else {
+        None
+    };
+    if let Some((result, terminate)) = prepared {
+        match result {
+            Ok(len) => {
+                s.pending_enc_control = Some(EncTx {
+                    llid: 3,
+                    bytes: out,
+                    len: len as u8,
+                    tag: None,
+                    terminate,
+                });
+            }
+            Err(_) => {
+                sec_error(0x1e);
+                return Some(0x1e);
+            }
+        }
+        return None;
+    }
+    if let Some(acl) = soft.bridge.take_tx_acl() {
+        diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
+        match enc.encrypt(acl.llid, &acl.bytes[..acl.len], &mut out) {
+            Ok(len) => {
+                s.pending_enc_acl = Some(EncTx {
+                    llid: acl.llid,
+                    bytes: out,
+                    len: len as u8,
+                    tag: Some(acl.tag),
+                    terminate: None,
+                });
+            }
+            Err(_) => {
+                sec_error(0x1e);
+                return Some(0x1e);
+            }
+        }
+    }
+    None
+}
+
+/// Decrypt the PDU deferred by the last event and dispatch it. MIC failure
+/// terminates the link with reason 0x3d, per Core 5.4 Vol 6 Part E.
+fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
+    let rx = s.deferred_rx.take()?;
+    let mut plain = [0u8; MAX_PLAINTEXT];
+    let payload = &rx.payload[..usize::from(rx.len)];
+    let len = {
+        let enc = s.enc.as_mut()?;
+        match enc.decrypt(rx.header, payload, &mut plain) {
+            Ok(len) => len,
+            Err(EncError::MicFailure) => {
+                sec_inc(SEC_MIC_FAILURE);
+                sec_error(0x3d);
+                return Some(0x3d);
+            }
+            Err(_) => {
+                sec_error(0x1e);
+                return Some(0x1e);
+            }
+        }
+    };
+    sec_inc(SEC_ENCRYPTED_RX);
+    let llid = rx.header & 3;
+    if !s.enc_active {
+        // The link's first encrypted PDU must be the Central's START_ENC_RSP;
+        // our own encrypted response is queued for the next event.
+        if llid == 3 && len == 1 && plain[0] == 0x06 {
+            match s.start.on_start_enc_rsp() {
+                Ok(bytes) => {
+                    let mut out = [0u8; MAX_ENCRYPTED];
+                    out[..bytes.len()].copy_from_slice(bytes);
+                    s.pending_start_rsp = Some(EncTx {
+                        llid: 3,
+                        bytes: out,
+                        len: bytes.len() as u8,
+                        tag: None,
+                        terminate: None,
+                    });
+                    return None;
+                }
+                Err(_) => {
+                    sec_error(0x1e);
+                    return Some(0x1e);
+                }
+            }
+        }
+        sec_error(0x1e);
+        return Some(0x1e);
+    }
+    match llid {
+        3 => {
+            put(38, u32::from(plain[0]));
+            let local = LocalVersion {
+                version: 0x0d,
+                company_id: 0xffff,
+                subversion: 1,
+            };
+            match s.control.on_pdu(&mut s.conn, &plain[..len], local) {
+                Ok(ControlAction::Reply(pdu)) => {
+                    if pdu.as_bytes().first() == Some(&7) {
+                        inc(27);
+                    }
+                    s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+                }
+                Ok(ControlAction::Terminate(reason)) => s.request_terminate(reason, rx.end),
+                Ok(ControlAction::None) => {
+                    if plain[0] == 0 && len == 12 {
+                        s.update_instant = Some(u16::from_le_bytes([plain[10], plain[11]]));
+                    }
+                }
+                Err(error) => {
+                    s.request_terminate(wchble::ll::ctrl::termination_reason(error), rx.end)
+                }
+            }
+            None
+        }
+        1 | 2 => {
+            if soft.bridge.receive_acl(llid, &plain[..len]).is_err() {
+                inc(63);
+                Some(0x1f)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn host_snapshot(stats: &host::HostStats) {
     for i in 0..16 {
         unsafe {
@@ -551,11 +1180,24 @@ fn idle<F: Future>(
     for _ in 0..4 {
         // A poll is non-preemptible. This guard is backed by measured maximum
         // poll time, not a promise that arbitrary futures are hard real-time.
+        #[cfg(feature = "secure")]
+        time_driver::advance(clock.now_us());
         let before = clock.now_us();
         if reached(before.wrapping_add(2000), until) {
             break;
         }
         soft.pump_once();
+        if let Some(failure) = soft.last_command_failure() {
+            diag_put(DIAG_HCI_FAILURE, failure);
+        }
+        for (i, entry) in soft.command_log().into_iter().enumerate() {
+            diag_put(DIAG_HCI_LOG + i, entry);
+        }
+        diag_put(DIAG_HCI_LOG_LEN, soft.command_log_len());
+        for (i, entry) in soft.sent_log().into_iter().enumerate() {
+            diag_put(DIAG_HCI_SENT + i, entry);
+        }
+        diag_put(DIAG_HCI_SENT_LEN, soft.sent_log_len());
         let mut cx = Context::from_waker(Waker::noop());
         if future.as_mut().poll(&mut cx).is_ready() {
             inc(63);
@@ -563,6 +1205,9 @@ fn idle<F: Future>(
         let took = clock.now_us().wrapping_sub(before);
         if took > get(61) {
             put(61, took);
+        }
+        if took > 100_000 {
+            diag_put(DIAG_SLOW_POLLS, diag_get(DIAG_SLOW_POLLS).wrapping_add(1));
         }
         if reached(clock.now_us(), until) {
             inc(62);
@@ -579,15 +1224,15 @@ fn main() -> ! {
     // HSE/PLL nominal is more accurate than the RC-referenced delay estimate.
     let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
-        ticks: Cell::new(ExtendingTicks::new(
-            hal::pac::SYSTICK.cntl().read().cntl(),
-        )),
+        ticks: Cell::new(ExtendingTicks::new(hal::pac::SYSTICK.cntl().read().cntl())),
         rate: TickRate::new(hz).unwrap(),
     };
     put(0, 0x5034_3538);
     put(1, 1);
     put(2, 1);
     put(35, hz);
+    sec_put(0, SEC_MAGIC);
+    sec_put(1, 1);
     let scratch = SCRATCH.init(DmaBuf::zeroed());
     let rx = RX.init(DmaBuf::zeroed());
     let adv_buf = ADV.init(DmaBuf::zeroed());
@@ -602,8 +1247,61 @@ fn main() -> ! {
     stop(&mut radio, &clock);
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
+    let mut peripheral_address = host::RANDOM_ADDRESS;
+    // S2 must not pair from a deterministic stream. Collect ADC temperature
+    // noise (the S0 source), refuse a stuck converter, then give the Host a
+    // second DRBG stream drawn from the seeded controller DRBG.
+    #[cfg(feature = "secure")]
+    {
+        use wchble::rand::EntropyPool;
+        let mut pool = EntropyPool::new();
+        let mut adc = hal::adc::Adc::new(_p.ADC, hal::adc::Config::default());
+        let mut temperature = adc.enable_temperature();
+        let mut values = [0u32; 32];
+        let mut distinct = 0usize;
+        let mut count = 0u32;
+        let mut min = u32::MAX;
+        let mut max = 0u32;
+        for _ in 0..128 {
+            if let Ok(value) = adc.blocking_read(&mut temperature) {
+                let value = u32::from(value);
+                pool.add_sample(value);
+                pool.add_sample(hal::pac::SYSTICK.cntl().read().cntl());
+                count += 1;
+                min = min.min(value);
+                max = max.max(value);
+                if !values[..distinct].contains(&value) && distinct < values.len() {
+                    values[distinct] = value;
+                    distinct += 1;
+                }
+            }
+        }
+        let entropy_ok = count >= 64 && max.wrapping_sub(min) >= 2 && distinct >= 4;
+        if !entropy_ok {
+            put(2, 0xe2);
+            park();
+        }
+        let seed = pool.seed();
+        let _ = soft.set_entropy_seed(&seed);
+        // Advance the controller stream, then seed the Host from fresh output.
+        let mut host_seed = [0u8; 32];
+        soft.fill_random(&mut host_seed);
+        rng::seed(&host_seed);
+        // New device per boot: the low octet of the static random address
+        // comes from the seeded DRBG, so a bonded peer cannot replay an old
+        // LTK that this firmware (which has no bond store) could not answer.
+        peripheral_address[0] = host_seed[0];
+        sec_put(
+            1,
+            1 | (1 << 8)
+                | (u32::from(rng::seeded()) << 9)
+                | (u32::from(soft.entropy_seeded()) << 10),
+        );
+    }
+    soft.set_le_features(LOCAL_FEATURES);
     let app_stats = host::HostStats::new();
-    let mut app = core::pin::pin!(host::run(controller, &app_stats));
+    set_peripheral_address(&peripheral_address);
+    let mut app = core::pin::pin!(host::run(controller, &app_stats, peripheral_address));
     let started = clock.now_us();
     let budget = *core::hint::black_box(&RUN_SECONDS) * 1_000_000;
     let finish = started.wrapping_add(budget);
@@ -611,6 +1309,8 @@ fn main() -> ! {
     let mut next_adv = started;
     put(2, 2);
     while !reached(clock.now_us(), finish) {
+        #[cfg(feature = "secure")]
+        time_driver::advance(clock.now_us());
         if let Some(request) = soft.bridge.take_radio_request() {
             match request {
                 RadioRequest::Reset => {
@@ -620,6 +1320,7 @@ fn main() -> ! {
                     put(2, 2);
                 }
                 RadioRequest::Disconnect { reason } => {
+                    diag_disconnect(reason);
                     if let Some(s) = session.as_mut() {
                         s.request_terminate(reason, clock.now_us());
                     }
@@ -628,6 +1329,67 @@ fn main() -> ! {
         }
         if let Some(s) = session.as_mut() {
             let mut reason = s.expiration(clock.now_us());
+            let mut prepare = s.conn.rx_start_us().wrapping_sub(100);
+            // A Host poll is non-preemptible, and LESC key agreement blocks the
+            // executor for more than a second. Transmitting into an event whose
+            // window already closed is what kills the link (`!sent` below), so
+            // step over the missed events instead: the anchor and channel map
+            // stay authoritative, and the peer simply retransmits its PDU.
+            while reached(clock.now_us().wrapping_sub(2_000), prepare) {
+                if s.conn.next_event().is_err() {
+                    break;
+                }
+                diag_put(DIAG_SKIPPED_EVENTS, diag_get(DIAG_SKIPPED_EVENTS).wrapping_add(1));
+                prepare = s.conn.rx_start_us().wrapping_sub(100);
+                if reason.is_none() {
+                    reason = s.expiration(clock.now_us());
+                }
+            }
+            // AES-CCM runs only while at least 3 ms remain before RX arming.
+            // Pairing state advances when the Host answers the LTK request;
+            // TX ciphertext is produced here, never inside the event.
+            // Outside the connection event: parsing and the HCI event must not
+            // extend the response window that LL_ENC_RSP has to fit in.
+            if let Some(req) = s.pending_enc_req.take() {
+                let random = s.enc_rsp_random;
+                let mut skds = [0u8; 8];
+                skds.copy_from_slice(&random[..8]);
+                let mut ivs = [0u8; 4];
+                ivs.copy_from_slice(&random[8..]);
+                match s.start.on_enc_req(&req, skds, ivs) {
+                    Ok(_) => {
+                        let parsed = wchble::ll::ctrl::EncReq::parse(&req).unwrap();
+                        s.pending_ltk = Some((parsed.rand, parsed.ediv));
+                    }
+                    Err(_) => {
+                        sec_error(0x1e);
+                        s.request_terminate(0x1e, clock.now_us());
+                    }
+                }
+            }
+            if s.enc_rsp_at != 0
+                && s.start.stage() != StartStage::Idle
+                && reached(clock.now_us(), s.enc_rsp_at)
+            {
+                s.enc_rsp_at = 0;
+                s.pending_control = Some(DataPdu::new(3, &s.enc_rsp_payload).unwrap());
+                s.enc_rsp_queued = true;
+                sec_inc(SEC_ENC_RSP);
+            }
+            if let Some((rand, ediv)) = s.pending_ltk.take() {
+                if soft.push_ltk_request(rand, ediv) {
+                    sec_inc(SEC_LTK_REQUEST);
+                } else {
+                    sec_error(0x1e);
+                    s.request_terminate(0x1e, clock.now_us());
+                }
+            }
+            if reason.is_none() && !reached(clock.now_us().wrapping_add(3000), prepare) {
+                reason = service_encryption(&mut soft, s);
+                if reason.is_none() {
+                    reason = prefetch_encrypted(&mut soft, s);
+                }
+            }
             if let Some((interval, latency, timeout)) = s.update_report {
                 if soft
                     .bridge
@@ -642,7 +1404,6 @@ fn main() -> ! {
             if reason.is_none() && radio.channel() != s.conn.channel() {
                 radio.set_channel(s.conn.channel()).unwrap();
             }
-            let prepare = s.conn.rx_start_us().wrapping_sub(100);
             if reason.is_none() && !reached(clock.now_us().wrapping_add(2000), prepare) {
                 let mut until = earlier(prepare, earlier(finish, s.conn.supervision_deadline_us()));
                 if let Some(end) = s.control.termination_deadline_us() {
@@ -652,10 +1413,18 @@ fn main() -> ! {
                 continue;
             }
             if reason.is_none() {
-                reason =
-                    connection_event(&mut radio, &clock, rx, data, s, &mut soft.bridge, finish);
+                reason = connection_event(&mut radio, &clock, rx, data, s, &mut soft, finish);
                 if s.conn.established() {
                     soft.ll.adv.enabled = false;
+                }
+                if reason.is_none() {
+                    reason = finish_deferred(&mut soft, s);
+                }
+                if s.enc_change_pending {
+                    // Our encrypted START_ENC_RSP is on air: tell the Host the
+                    // link is encrypted. HCI work stays outside the event.
+                    s.enc_change_pending = false;
+                    let _ = soft.encryption_change(1, 0, 1);
                 }
             }
             if let Some(reason) = reason {
@@ -763,7 +1532,14 @@ fn main() -> ! {
                             u32::from_le_bytes(params.channel_map[..4].try_into().unwrap()),
                         );
                         put(48, u32::from(params.channel_map[4]));
-                        let s = Session::new(params, packet.end, clock.now_us());
+                        let mut enc_rsp_random = [0u8; 12];
+                        soft.fill_random(&mut enc_rsp_random);
+                        let s = Session::new(
+                            params,
+                            packet.end,
+                            clock.now_us(),
+                            enc_rsp_random,
+                        );
                         put(49, s.conn.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(s.conn.channel()));

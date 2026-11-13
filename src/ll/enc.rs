@@ -18,22 +18,26 @@
 //! The counters are separate per direction, and a MIC failure must terminate
 //! the link (reason 0x3d); the failed packet does not advance the counter.
 //!
-//! Sequence tested by [`tests::full_start_procedure_round_trip`]:
-//! Central sends `LL_ENC_REQ`, Peripheral replies `LL_ENC_RSP`, Central sends
-//! `LL_START_ENC_REQ`, Peripheral replies with an encrypted `LL_START_ENC_RSP`,
-//! then Central replies with its own encrypted `LL_START_ENC_RSP`. The
-//! Peripheral enables TX before its RSP and RX after it; the Central enables
-//! RX after `LL_ENC_RSP` and TX before its RSP. Counters reset on every start
-//! or pause/resume procedure.
+//! Sequence tested by [`tests::full_start_procedure_round_trip`] (Core 5.4
+//! Vol 6 Part B §5.1.3.1): Central sends `LL_ENC_REQ`, Peripheral replies
+//! `LL_ENC_RSP`, **Peripheral sends the plaintext `LL_START_ENC_REQ`**, then
+//! the Central answers with the link's first encrypted PDU (its
+//! `LL_START_ENC_RSP`, TX counter 0) and the Peripheral answers with its own
+//! encrypted `LL_START_ENC_RSP` (TX counter 0). The Peripheral enables TX
+//! before precomputing its RSP and RX when it sends `LL_START_ENC_REQ`; the
+//! Central enables RX after `LL_ENC_RSP` and TX before its RSP. Counters reset
+//! on every start or pause/resume procedure.
 
 use crate::crypto::ccm::{decrypt as ccm_decrypt, encrypt as ccm_encrypt, CcmError, BLE_MIC_LEN};
 use crate::crypto::{Aes128, AesEngine};
 
-/// Largest plaintext payload of an encrypted legacy PDU (27 on-air octets
-/// including the 4-octet MIC).
-pub const MAX_PLAINTEXT: usize = 27 - BLE_MIC_LEN;
+use super::ctrl::{ControlPdu, EncReq, EncRsp};
+
+/// Largest plaintext payload of an encrypted legacy PDU (27 plaintext
+/// octets; the 4-octet MIC pushes the on-air payload to 31).
+pub const MAX_PLAINTEXT: usize = 27;
 /// Largest encrypted payload including the MIC.
-pub const MAX_ENCRYPTED: usize = 27;
+pub const MAX_ENCRYPTED: usize = MAX_PLAINTEXT + BLE_MIC_LEN;
 
 /// Header bits that are excluded from the authenticated data.
 const AAD_MASK: u8 = !0x1c; // ~(NESN | SN | MD)
@@ -83,16 +87,30 @@ impl core::fmt::Debug for SessionKey {
 }
 
 impl SessionKey {
-    /// `SK = AES-128(LTK, SKD)`, with `SKD = SKDm || SKDs` and
-    /// `IV = IVm || IVs` in wire order.
+    /// `SK = AES-128(LTK, SKD)` (Core Vol 6 Part C §1.2).
+    ///
+    /// The cipher works on the *values* in most-significant-octet order, while
+    /// every field arrives little-endian on the air: `SKD` is
+    /// `SKDs || SKDm` (Peripheral half first) with each half byte-reversed from
+    /// the wire, and the Host supplies the LTK as HCI little-endian octets.
+    /// `iv` is already the nonce form (`IVm || IVs`, wire octets as received).
     #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn derive(ltk: &[u8; 16], skd: &[u8; 16], iv: &[u8; 8]) -> Self {
-        let mut key = *skd;
-        Aes128::new(ltk).encrypt_block(&mut key);
-        Self { key, iv: *iv }
+        let mut key = [0u8; 16];
+        for (dst, src) in key.iter_mut().zip(ltk.iter().rev()) {
+            *dst = *src;
+        }
+        let mut session = *skd;
+        Aes128::new(&key).encrypt_block(&mut session);
+        Self {
+            key: session,
+            iv: *iv,
+        }
     }
 
-    /// Convenience wrapper for the two exchanged contributions.
+    /// Convenience wrapper for the two exchanged contributions. `skdm`, `skds`,
+    /// `ivm` and `ivs` are the octets exactly as received in `LL_ENC_REQ` /
+    /// `LL_ENC_RSP`.
     pub fn from_parts(
         ltk: &[u8; 16],
         skdm: &[u8; 8],
@@ -101,8 +119,12 @@ impl SessionKey {
         ivs: &[u8; 4],
     ) -> Self {
         let mut skd = [0; 16];
-        skd[..8].copy_from_slice(skdm);
-        skd[8..].copy_from_slice(skds);
+        for (dst, src) in skd[..8].iter_mut().zip(skds.iter().rev()) {
+            *dst = *src;
+        }
+        for (dst, src) in skd[8..].iter_mut().zip(skdm.iter().rev()) {
+            *dst = *src;
+        }
         let mut iv = [0; 8];
         iv[..4].copy_from_slice(ivm);
         iv[4..].copy_from_slice(ivs);
@@ -230,6 +252,7 @@ impl<E: AesEngine> Encryption<E> {
         let aad = [llid & AAD_MASK];
         let mut mic = [0u8; BLE_MIC_LEN];
         let len = plaintext.len();
+        self.engine.reload();
         ccm_encrypt::<BLE_MIC_LEN>(
             &mut self.engine,
             &nonce,
@@ -275,6 +298,7 @@ impl<E: AesEngine> Encryption<E> {
         mic.copy_from_slice(&payload[split..]);
         let nonce = nonce(&self.iv, self.rx_counter, !self.role.tx_direction());
         let aad = [header & AAD_MASK];
+        self.engine.reload();
         ccm_decrypt::<BLE_MIC_LEN>(
             &mut self.engine,
             &nonce,
@@ -289,6 +313,187 @@ impl<E: AesEngine> Encryption<E> {
         })?;
         self.rx_counter += 1;
         Ok(split)
+    }
+}
+
+/// Where the Peripheral is in the start-encryption exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum StartStage {
+    /// No `LL_ENC_REQ` seen yet; PDUs are plaintext.
+    Idle,
+    /// `LL_ENC_RSP` prepared; waiting for the Host's LTK answer.
+    AwaitingKey,
+    /// Encrypted `LL_START_ENC_RSP` precomputed; the Peripheral's own
+    /// `LL_START_ENC_REQ` has not been sent yet.
+    Prepared,
+    /// `LL_START_ENC_REQ` sent and RX decryption on; waiting for the Central's
+    /// encrypted `LL_START_ENC_RSP`.
+    WaitingRsp,
+    /// Both sides encrypted.
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum StartError {
+    /// A new `LL_ENC_REQ` arrived while a procedure is already running.
+    NotIdle,
+    /// A later step ran before its predecessor.
+    NotReady,
+    /// Malformed control PDU.
+    Length,
+    /// Not the expected opcode.
+    Opcode,
+    Enc(EncError),
+}
+
+impl From<EncError> for StartError {
+    fn from(error: EncError) -> Self {
+        Self::Enc(error)
+    }
+}
+
+/// Peripheral-side start-encryption sequencing.
+///
+/// The RF owner supplies the Central's `LL_ENC_REQ`, its own SKDs/IVs and the
+/// Host's LTK; this type enforces the order in Core 5.4 Vol 6 Part B §5.1.3.1
+/// and owns the precomputed encrypted response. All AES work happens through
+/// [`Encryption`], so callers can keep it off the connection-event path:
+///
+/// 1. [`Self::on_enc_req`] returns the plaintext `LL_ENC_RSP` to send.
+/// 2. After the Host answers, build `Encryption::new(session, Peripheral, ..)`
+///    and call [`Self::prepare_start_rsp`]. This enables TX and burns TX
+///    counter 0.
+/// 3. [`Self::start_enc_req`] sends the Peripheral's plaintext
+///    `LL_START_ENC_REQ` and enables RX; the Central's answer is the link's
+///    first encrypted PDU.
+/// 4. After decrypting the Central's response, [`Self::on_start_enc_rsp`]
+///    returns the precomputed encrypted response to send.
+pub struct PeripheralStart {
+    stage: StartStage,
+    req: Option<EncReq>,
+    skds: [u8; 8],
+    ivs: [u8; 4],
+    prepared: [u8; MAX_ENCRYPTED],
+    prepared_len: u8,
+}
+
+impl Default for PeripheralStart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeripheralStart {
+    pub const fn new() -> Self {
+        Self {
+            stage: StartStage::Idle,
+            req: None,
+            skds: [0; 8],
+            ivs: [0; 4],
+            prepared: [0; MAX_ENCRYPTED],
+            prepared_len: 0,
+        }
+    }
+
+    pub fn stage(&self) -> StartStage {
+        self.stage
+    }
+
+    /// Abandon the procedure, e.g. after the Host rejected the LTK. The link
+    /// then answers `LL_ENC_REQ` with `LL_REJECT_IND` and ends; a later
+    /// `LL_ENC_REQ` starts from [`StartStage::Idle`] again.
+    pub fn abort(&mut self) {
+        self.stage = StartStage::Idle;
+        self.req = None;
+        self.prepared_len = 0;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.stage == StartStage::Active
+    }
+
+    pub fn enc_req(&self) -> Option<&EncReq> {
+        self.req.as_ref()
+    }
+
+    /// Parse the Central's `LL_ENC_REQ` and produce the plaintext response.
+    ///
+    /// `skds` and `ivs` must come from the controller's random source. The
+    /// caller sends the returned PDU and asks the Host for the LTK.
+    pub fn on_enc_req(
+        &mut self,
+        payload: &[u8],
+        skds: [u8; 8],
+        ivs: [u8; 4],
+    ) -> Result<ControlPdu, StartError> {
+        if self.stage != StartStage::Idle {
+            return Err(StartError::NotIdle);
+        }
+        let req = EncReq::parse(payload).map_err(|error| match error {
+            super::conn::ConnError::Length => StartError::Length,
+            _ => StartError::Opcode,
+        })?;
+        self.req = Some(req);
+        self.skds = skds;
+        self.ivs = ivs;
+        self.stage = StartStage::AwaitingKey;
+        Ok(ControlPdu::enc_rsp(&EncRsp { skds, ivs }))
+    }
+
+    /// Derive the session key from the Host's LTK and the stored exchange.
+    pub fn session(&self, ltk: &[u8; 16]) -> Result<SessionKey, StartError> {
+        if !matches!(self.stage, StartStage::AwaitingKey | StartStage::Prepared) {
+            return Err(StartError::NotReady);
+        }
+        let req = self.req.as_ref().ok_or(StartError::NotReady)?;
+        Ok(SessionKey::from_parts(
+            ltk, &req.skdm, &self.skds, &req.ivm, &self.ivs,
+        ))
+    }
+
+    /// Precompute the encrypted `LL_START_ENC_RSP` (TX counter 0).
+    pub fn prepare_start_rsp<E: AesEngine>(
+        &mut self,
+        enc: &mut Encryption<E>,
+    ) -> Result<(), StartError> {
+        if self.stage != StartStage::AwaitingKey {
+            return Err(StartError::NotReady);
+        }
+        enc.enable_tx();
+        let mut out = [0; MAX_ENCRYPTED];
+        // AAD is the masked PDU header first octet: LLID=3 for a control PDU.
+        let len = enc.encrypt(3, ControlPdu::start_enc_rsp().as_bytes(), &mut out)?;
+        self.prepared[..len].copy_from_slice(&out[..len]);
+        self.prepared_len = len as u8;
+        self.stage = StartStage::Prepared;
+        Ok(())
+    }
+
+    /// Send the Peripheral's plaintext `LL_START_ENC_REQ` and enable RX: the
+    /// Central's next non-empty PDU is its encrypted `LL_START_ENC_RSP`, the
+    /// first encrypted PDU of the link (RX counter 0).
+    pub fn start_enc_req<E: AesEngine>(
+        &mut self,
+        enc: &mut Encryption<E>,
+    ) -> Result<ControlPdu, StartError> {
+        if self.stage != StartStage::Prepared {
+            return Err(StartError::NotReady);
+        }
+        enc.enable_rx();
+        self.stage = StartStage::WaitingRsp;
+        Ok(ControlPdu::start_enc_req())
+    }
+
+    /// Record that the Central's encrypted `LL_START_ENC_RSP` was decrypted
+    /// and return the precomputed encrypted response to send.
+    pub fn on_start_enc_rsp(&mut self) -> Result<&[u8], StartError> {
+        if self.stage != StartStage::WaitingRsp {
+            return Err(StartError::NotReady);
+        }
+        self.stage = StartStage::Active;
+        Ok(&self.prepared[..usize::from(self.prepared_len)])
     }
 }
 
@@ -322,18 +527,63 @@ mod tests {
         Encryption::new(session, EncRole::Peripheral, engine)
     }
 
+    /// The LTK arrives from the Host as HCI little-endian octets, while every
+    /// `SKD`/`IV` field arrives little-endian on the air; Core Vol 6 Part C
+    /// §1.2 works on the values most-significant-octet first for the cipher
+    /// input (`SKD = SKDs || SKDm`) but on the wire octets for the nonce IV.
     #[test]
-    fn session_key_matches_independent_vector() {
-        // Produced with Python `cryptography` AES-ECB: SK = AES(LTK, SKD).
-        let sk = session();
+    fn session_key_matches_core_sample_data() {
+        let ltk = [
+            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
+            0x68, 0x4c,
+        ];
+        let sk = SessionKey::from_parts(
+            &ltk,
+            &[0x13, 0x02, 0xf1, 0xe0, 0xdf, 0xce, 0xbd, 0xac],
+            &[0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02],
+            &[0x24, 0xab, 0xdc, 0xba],
+            &[0xbe, 0xba, 0xaf, 0xde],
+        );
         assert_eq!(
             sk.key(),
             &[
-                0x0a, 0x94, 0x0b, 0xb5, 0x41, 0x6e, 0xf0, 0x45, 0xf1, 0xc3, 0x94, 0x58, 0xc6, 0x53,
-                0xea, 0x5a,
+                0x99, 0xad, 0x1b, 0x52, 0x26, 0xa3, 0x7e, 0x3e, 0x05, 0x8e, 0x3b, 0x8e, 0x27, 0xc2,
+                0xc6, 0x66,
             ]
         );
-        assert_eq!(sk.iv(), &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(sk.iv(), &[0x24, 0xab, 0xdc, 0xba, 0xbe, 0xba, 0xaf, 0xde]);
+    }
+
+    /// First encrypted PDU of each direction from the same sample data.
+    #[test]
+    fn start_enc_rsp_matches_core_sample_data() {
+        let ltk = [
+            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
+            0x68, 0x4c,
+        ];
+        let sk = SessionKey::from_parts(
+            &ltk,
+            &[0x13, 0x02, 0xf1, 0xe0, 0xdf, 0xce, 0xbd, 0xac],
+            &[0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02],
+            &[0x24, 0xab, 0xdc, 0xba],
+            &[0xbe, 0xba, 0xaf, 0xde],
+        );
+        let mut out = [0; MAX_ENCRYPTED];
+
+        let mut central = Encryption::new(sk.clone(), EncRole::Central, Aes128::new(sk.key()));
+        central.enable_tx();
+        let len = central
+            .encrypt(0x03, ControlPdu::start_enc_rsp().as_bytes(), &mut out)
+            .unwrap();
+        assert_eq!(&out[..len], &[0x9f, 0xcd, 0xa7, 0xf4, 0x48]);
+
+        let mut peripheral =
+            Encryption::new(sk.clone(), EncRole::Peripheral, Aes128::new(sk.key()));
+        peripheral.enable_tx();
+        let len = peripheral
+            .encrypt(0x03, ControlPdu::start_enc_rsp().as_bytes(), &mut out)
+            .unwrap();
+        assert_eq!(&out[..len], &[0xa3, 0x4c, 0x13, 0xa4, 0x15]);
     }
 
     #[test]
@@ -366,8 +616,8 @@ mod tests {
         assert_eq!(
             &out[..len],
             &[
-                0xa6, 0x20, 0x57, 0x69, 0x6b, 0x70, 0x4e, 0x6a, 0x8d, 0x2c, 0x53, 0x9b, 0x0e, 0x2e,
-                0xd0, 0xd5, 0x10, 0x0b,
+                0x9c, 0x9e, 0x9f, 0x3d, 0xab, 0x75, 0x3f, 0xdb, 0xc3, 0xe6, 0x8b, 0x2e, 0xea, 0x9a,
+                0x7f, 0xa9, 0x26, 0x3a,
             ]
         );
         assert_eq!(enc.tx_counter(), 1);
@@ -384,7 +634,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             &out[..len],
-            &[0xe1, 0xbe, 0x4b, 0xe8, 0xbe, 0xd5, 0x94, 0x3e]
+            &[0xf1, 0x2a, 0xa7, 0x82, 0xd0, 0xc8, 0xff, 0x3f]
         );
         assert_eq!(enc.tx_counter(), 2);
     }
@@ -395,7 +645,7 @@ mod tests {
         enc.enable_tx();
         let mut out = [0; MAX_ENCRYPTED];
         let len = enc.encrypt(0x03, &[0x0a, 0x0b, 0x0c], &mut out).unwrap();
-        assert_eq!(&out[..len], &[0x7f, 0x17, 0xc2, 0xb4, 0xcd, 0xec, 0x77]);
+        assert_eq!(&out[..len], &[0xf6, 0x67, 0xe6, 0x6f, 0x9f, 0xb6, 0x77]);
     }
 
     #[test]
@@ -455,6 +705,21 @@ mod tests {
     }
 
     #[test]
+    fn largest_legacy_payload_round_trips_with_the_mic_on_air() {
+        let mut tx = central();
+        tx.enable_tx();
+        let mut rx = peripheral();
+        rx.enable_rx();
+        let plaintext: [u8; MAX_PLAINTEXT] = core::array::from_fn(|i| i as u8);
+        let mut out = [0; MAX_ENCRYPTED];
+        let len = tx.encrypt(0x02, &plaintext, &mut out).unwrap();
+        assert_eq!(len, MAX_ENCRYPTED);
+        let mut back = [0; MAX_PLAINTEXT];
+        assert_eq!(rx.decrypt(0x02, &out[..len], &mut back), Ok(MAX_PLAINTEXT));
+        assert_eq!(back, plaintext);
+    }
+
+    #[test]
     fn counters_are_independent_per_direction() {
         let mut c = central();
         c.enable_tx();
@@ -503,6 +768,9 @@ mod tests {
 
     /// Fake-LL start procedure: the Central and Peripheral exchange the real
     /// control PDUs and then encrypted PDUs under one software engine each.
+    /// Core 5.4 Vol 6 Part B §5.1.3.1: the Peripheral sends the plaintext
+    /// `LL_START_ENC_REQ`; the Central's `LL_START_ENC_RSP` is the first
+    /// encrypted PDU of the link.
     #[test]
     fn full_start_procedure_round_trip() {
         // 1. Central -> LL_ENC_REQ.
@@ -517,17 +785,20 @@ mod tests {
         assert_eq!(parsed, req);
 
         // 2. Peripheral -> LL_ENC_RSP.
+        let mut start = PeripheralStart::new();
         let rsp = EncRsp {
             skds: SKDS,
             ivs: IVS,
         };
-        let rsp_bytes = ControlPdu::enc_rsp(&rsp);
-        let parsed_rsp = EncRsp::parse(rsp_bytes.as_bytes()).unwrap();
-        assert_eq!(parsed_rsp, rsp);
+        let rsp_bytes = start
+            .on_enc_req(req_bytes.as_bytes(), SKDS, IVS)
+            .unwrap();
+        assert_eq!(rsp_bytes.as_bytes(), ControlPdu::enc_rsp(&rsp).as_bytes());
+        assert_eq!(start.stage(), StartStage::AwaitingKey);
 
         // Both sides derive the same session key.
         let c_key = SessionKey::from_parts(&LTK, &req.skdm, &rsp.skds, &req.ivm, &rsp.ivs);
-        let p_key = SessionKey::from_parts(&LTK, &req.skdm, &rsp.skds, &req.ivm, &rsp.ivs);
+        let p_key = start.session(&LTK).unwrap();
         assert_eq!(c_key.key(), p_key.key());
         assert_eq!(c_key.iv(), p_key.iv());
 
@@ -538,28 +809,39 @@ mod tests {
         // Central receives the Peripheral's encrypted RSP next.
         c_enc.enable_rx();
 
-        // 3. Central -> LL_START_ENC_REQ (unencrypted).
-        assert_eq!(ControlPdu::start_enc_req().as_bytes(), &[0x05]);
+        // The Peripheral precomputes its encrypted response (TX counter 0).
+        start.prepare_start_rsp(&mut p_enc).unwrap();
+        assert_eq!(start.stage(), StartStage::Prepared);
 
-        // 4. Peripheral -> encrypted LL_START_ENC_RSP (TX counter 0).
-        p_enc.enable_tx();
+        // 3. Peripheral -> LL_START_ENC_REQ (unencrypted); RX starts now.
+        let pdu = start.start_enc_req(&mut p_enc).unwrap();
+        assert_eq!(pdu.as_bytes(), &[0x05]);
+        assert_eq!(start.stage(), StartStage::WaitingRsp);
+        assert!(p_enc.rx_enabled());
+
+        // 4. Central -> encrypted LL_START_ENC_RSP (TX counter 0).
+        c_enc.enable_tx();
         let mut ccm_out = [0; MAX_ENCRYPTED];
         let rsp_pt = ControlPdu::start_enc_rsp();
-        let len = p_enc
+        let len = c_enc
             .encrypt(0x03, rsp_pt.as_bytes(), &mut ccm_out)
             .unwrap();
         assert_eq!(len, 5);
         let mut plain = [0; MAX_PLAINTEXT];
-        let n = c_enc.decrypt(0x03, &ccm_out[..len], &mut plain).unwrap();
-        assert_eq!(&plain[..n], rsp_pt.as_bytes());
-        p_enc.enable_rx();
-
-        // 5. Central -> encrypted LL_START_ENC_RSP (TX counter 0).
-        c_enc.enable_tx();
-        let len = c_enc
-            .encrypt(0x03, rsp_pt.as_bytes(), &mut ccm_out)
-            .unwrap();
         let n = p_enc.decrypt(0x03, &ccm_out[..len], &mut plain).unwrap();
+        assert_eq!(&plain[..n], rsp_pt.as_bytes());
+
+        // 5. Peripheral -> precomputed encrypted LL_START_ENC_RSP (TX counter 0).
+        let mut prepared = [0; MAX_ENCRYPTED];
+        let prepared_len = {
+            let bytes = start.on_start_enc_rsp().unwrap();
+            prepared[..bytes.len()].copy_from_slice(bytes);
+            bytes.len()
+        };
+        assert_eq!(start.stage(), StartStage::Active);
+        let n = c_enc
+            .decrypt(0x03, &prepared[..prepared_len], &mut plain)
+            .unwrap();
         assert_eq!(&plain[..n], rsp_pt.as_bytes());
 
         // Data flows both ways with independent counters.
@@ -641,5 +923,103 @@ mod tests {
             enc.decrypt(0x02, &out[..5], &mut [0; MAX_PLAINTEXT]),
             Err(EncError::CounterExhausted)
         );
+    }
+
+    #[test]
+    fn peripheral_start_sequence_matches_central() {
+        let req = EncReq {
+            rand: [0; 8],
+            ediv: 0,
+            skdm: SKDM,
+            ivm: IVM,
+        };
+        let mut start = PeripheralStart::new();
+        let rsp = start
+            .on_enc_req(ControlPdu::enc_req(&req).as_bytes(), SKDS, IVS)
+            .unwrap();
+        assert_eq!(
+            rsp.as_bytes(),
+            ControlPdu::enc_rsp(&EncRsp {
+                skds: SKDS,
+                ivs: IVS
+            })
+            .as_bytes()
+        );
+        assert_eq!(start.stage(), StartStage::AwaitingKey);
+        assert_eq!(start.enc_req(), Some(&req));
+
+        let c_key = SessionKey::from_parts(&LTK, &SKDM, &SKDS, &IVM, &IVS);
+        let p_key = start.session(&LTK).unwrap();
+        let p_engine = Aes128::new(p_key.key());
+        let mut p_enc = Encryption::new(p_key, EncRole::Peripheral, p_engine);
+        start.prepare_start_rsp(&mut p_enc).unwrap();
+        assert_eq!(start.stage(), StartStage::Prepared);
+        assert!(p_enc.tx_enabled());
+        assert_eq!(p_enc.tx_counter(), 1);
+
+        let c_engine = Aes128::new(c_key.key());
+        let mut c_enc = Encryption::new(c_key, EncRole::Central, c_engine);
+        c_enc.enable_rx();
+        // Peripheral sends the plaintext LL_START_ENC_REQ and starts RX.
+        let pdu = start.start_enc_req(&mut p_enc).unwrap();
+        assert_eq!(pdu.as_bytes(), &[0x05]);
+        assert_eq!(start.stage(), StartStage::WaitingRsp);
+        assert!(p_enc.rx_enabled());
+
+        // Central's encrypted response is the link's first encrypted PDU.
+        c_enc.enable_tx();
+        let mut ccm_out = [0; MAX_ENCRYPTED];
+        let mut plain = [0; MAX_PLAINTEXT];
+        let len = c_enc
+            .encrypt(0x03, ControlPdu::start_enc_rsp().as_bytes(), &mut ccm_out)
+            .unwrap();
+        assert_eq!(p_enc.decrypt(0x03, &ccm_out[..len], &mut plain), Ok(1));
+        assert_eq!(plain[0], 0x06);
+
+        // The precomputed response is handed back for the next event.
+        let mut prepared_copy = [0; MAX_ENCRYPTED];
+        let prepared_len = {
+            let prepared = start.on_start_enc_rsp().unwrap();
+            prepared_copy[..prepared.len()].copy_from_slice(prepared);
+            prepared.len()
+        };
+        assert_eq!(prepared_len, 5);
+        assert!(start.is_active());
+        assert_eq!(start.on_start_enc_rsp(), Err(StartError::NotReady));
+        let n = c_enc
+            .decrypt(0x03, &prepared_copy[..prepared_len], &mut plain)
+            .unwrap();
+        assert_eq!(&plain[..n], &[0x06]);
+    }
+
+    #[test]
+    fn peripheral_start_enforces_order_and_rejects_duplicates() {
+        let mut start = PeripheralStart::new();
+        let req = ControlPdu::enc_req(&EncReq {
+            rand: [0; 8],
+            ediv: 0,
+            skdm: SKDM,
+            ivm: IVM,
+        });
+        assert_eq!(
+            start.on_enc_req(&[0x03], SKDS, IVS),
+            Err(StartError::Length)
+        );
+        assert_eq!(
+            start.on_enc_req(&[0x04; 23], SKDS, IVS),
+            Err(StartError::Opcode)
+        );
+        start.on_enc_req(req.as_bytes(), SKDS, IVS).unwrap();
+        assert_eq!(
+            start.on_enc_req(req.as_bytes(), SKDS, IVS),
+            Err(StartError::NotIdle)
+        );
+        assert_eq!(start.prepare_start_rsp(&mut peripheral()), Ok(()));
+        assert_eq!(
+            start.start_enc_req(&mut peripheral()).unwrap().as_bytes(),
+            &[0x05]
+        );
+        assert_eq!(start.on_start_enc_rsp().unwrap().len(), 5);
+        assert!(start.is_active());
     }
 }
