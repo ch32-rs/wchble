@@ -594,7 +594,8 @@ def execute(args):
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
         for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'PERIPHERAL_ADDRESS'):
+                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'X1_STATS',
+                     'PERIPHERAL_ADDRESS'):
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
             if len(matches) != 1:

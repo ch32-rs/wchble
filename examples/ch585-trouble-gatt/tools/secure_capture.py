@@ -38,7 +38,8 @@ FIELDS = ['frame.number', 'nordic_ble.crcok', 'nordic_ble.direction',
           'btle.access_address', 'btle.advertising_address',
           'btle.advertising_header.pdu_type',
           'btle.link_layer_data.access_address', 'btl2cap.cid', 'btl2cap.length',
-          'btatt.opcode', 'btle.control_opcode',
+          'btatt.opcode', 'btle.control_opcode', 'btle.data_header.length',
+          'btle.data_header.llid',
           'btsmp.opcode', 'btsmp.io_capability', 'btsmp.oob_data_flags',
           'btsmp.authreq', 'btsmp.bonding_flags', 'btsmp.mitm_flag',
           'btsmp.sc_flag', 'btsmp.max_enc_key_size',
@@ -111,10 +112,25 @@ def analyze(rows, out, target):
         if row.get('btatt.opcode'):
             att.append({'frame': frame, 'dir': direction,
                         'opcode': row['btatt.opcode'], 'cid': cid})
+    # DLE is visible on air even when the payloads are encrypted: the LL
+    # header stays plaintext, so a 132-octet payload can only exist after a
+    # data length update. (LL control PDUs are encrypted once the link is,
+    # so LENGTH_REQ/RSP themselves are opaque without the session key.)
+    lengths = [int(row['btle.data_header.length']) for row in good
+               if row.get('btle.data_header.length')]
+    histogram = {}
+    for length in lengths:
+        histogram[str(length)] = histogram.get(str(length), 0) + 1
     assessed = {'target': target, 'connect_frame': int(connects[0]['frame.number']) if connects else None,
                 'access_address': link, 'smp': smp, 'll_control': control,
                 'att_frames': len(att), 'att_last_frame': att[-1]['frame'] if att else None,
-                'crc_valid_link_pdus': len(good)}
+                'crc_valid_link_pdus': len(good),
+                'll_payload_lengths': {
+                    'pdus': len(lengths),
+                    'max': max(lengths) if lengths else 0,
+                    'over_27': sum(1 for length in lengths if length > 27),
+                    'histogram': dict(sorted(histogram.items(), key=lambda item: int(item[0]))),
+                }}
     # First LL encryption control PDU on the link marks the plaintext boundary.
     start = next((entry for entry in control
                   if entry['name'] in ('ENC_REQ', 'START_ENC_REQ', 'START_ENC_RSP')),
