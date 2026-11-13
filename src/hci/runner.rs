@@ -747,9 +747,16 @@ impl SoftRunner {
             // LE Encrypt — one AES-128 block, software engine (Host utility;
             // not on the connection timing path).
             0x2017 if params.len() == 32 => {
+                // HCI carries 128-bit values least-significant-octet first,
+                // while the AES block is big-endian: reverse in, reverse out.
+                let mut key = [0u8; 16];
+                key.copy_from_slice(&params[..16]);
+                key.reverse();
                 let mut block = [0u8; 16];
                 block.copy_from_slice(&params[16..32]);
-                Aes128::new(params[..16].try_into().unwrap()).encrypt_block(&mut block);
+                block.reverse();
+                Aes128::new(&key).encrypt_block(&mut block);
+                block.reverse();
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
@@ -1656,11 +1663,45 @@ mod tests {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
+        // HCI sends 128-bit values least-significant-octet first, so the FIPS
+        // key 000102..0f and plaintext 001122..ff travel reversed.
         let mut params = [0u8; 32];
         for i in 0..16 {
-            params[i] = i as u8; // key 000102..0f
-            params[16 + i] = (i as u8) * 0x11; // plaintext 001122..ff
+            params[i] = 15 - i as u8;
+            params[16 + i] = 0xff - (i as u8) * 0x11;
         }
+
+        pollster::block_on(async {
+            inject_cmd(0x2017, &params);
+            runner.serve_one().await;
+            // AES(000102..0f, 001122..ff) = 69c4e0d8..b4c55a, returned reversed.
+            expect_command_complete(
+                0x2017,
+                HCI_SUCCESS,
+                &[
+                    0x5a, 0xc5, 0xb4, 0x70, 0x80, 0xb7, 0xcd, 0xd8, 0x30, 0x04, 0x7b, 0x6a, 0xd8,
+                    0xe0, 0xc4, 0x69,
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn le_encrypt_matches_the_core_session_key_sample() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        // Core 5.4 Vol 6 Part C: SK = AES(LTK, SKD) with SKD = r ||
+        // (diversifier || 0). Both inputs and the result are in HCI wire order.
+        let mut params = [0u8; 32];
+        params[..16].copy_from_slice(&[
+            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
+            0x68, 0x4c,
+        ]);
+        params[16..].copy_from_slice(&[
+            0x13, 0x02, 0xf1, 0xe0, 0xdf, 0xce, 0xbd, 0xac, 0x79, 0x68, 0x57, 0x46, 0x35, 0x24,
+            0x13, 0x02,
+        ]);
 
         pollster::block_on(async {
             inject_cmd(0x2017, &params);
@@ -1669,10 +1710,26 @@ mod tests {
                 0x2017,
                 HCI_SUCCESS,
                 &[
-                    0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70,
-                    0xb4, 0xc5, 0x5a,
+                    0x66, 0xc6, 0xc2, 0x27, 0x8e, 0x3b, 0x8e, 0x05, 0x3e, 0x7e, 0xa3, 0x26, 0x52,
+                    0x1b, 0xad, 0x99,
                 ],
             );
+        });
+    }
+
+    #[test]
+    fn le_encrypt_rejects_a_wrong_parameter_length() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x2017, &[0u8; 31]);
+            runner.serve_one().await;
+            expect_command_complete(0x2017, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2017, &[0u8; 33]);
+            runner.serve_one().await;
+            expect_command_complete(0x2017, HCI_INVALID_PARAMETERS, &[]);
         });
     }
 
