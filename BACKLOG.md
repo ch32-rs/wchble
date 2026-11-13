@@ -121,12 +121,16 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   sample vectors in unit tests). DLE advertises 251-octet buffers from startup,
   segments every Host ACL packet at the negotiated on-air size, keeps the HCI
   tag only on the final fragment, and scales receive windows with
-  `rx_complete_allowance_us()`. Effective limits stay 27 TX / 31 RX until the
-  peer answers, then min(local, peer), with 247 plaintext under the MIC.
-  Offline: 166 library tests, both Host fixtures, all examples build. Still to
-  record: the `att --require-dle` hardware round, S2/X4b regressions, and a
-  capture showing `LL_LENGTH_REQ/RSP` plus a 251-octet PDU. 2M/Coded remain
-  unadvertised.
+  `rx_complete_allowance_us()`. `LL_LENGTH_*` octets are payload octets, so the
+  controller advertises 247 under its 251-octet air ceiling and accepts the
+  peer's payload plus MIC; effective limits stay 27 TX / 31 RX until the peer
+  answers, then min(local, peer). Offline: 168 library tests, both Host
+  fixtures, all examples build. Hardware (`att --require-dle`): algorithm 2
+  with both ChSel bits, effective TX 251 / RX 132, 132-octet PDUs both ways,
+  App `att_mtu_long_burst_ok`, no refused PDU. Regressions after the change:
+  S2 fresh-bond `encrypted_read_write_ok`, X4b payload and app rounds green.
+  Still to record: a keyed capture of `LL_LENGTH_REQ/RSP` (they are encrypted
+  after `START_ENC_RSP`). 2M/Coded remain unadvertised.
 - [ ] **X1b: 2M/Coded PHY.** Both feature bits stay 0 because the PHY switch and
   its timing are not implemented. Claim either only after a measured air
   comparison against a controlled peer.
@@ -296,6 +300,12 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   Vol 3 Part G §3.3.3.3). The pinned Host exposes
   `get/set_client_att_table`; without this, #7's HID keyboard can resume
   encryption after reboot with notifications still disabled.
+- [ ] **Bond record has no local identity.** The record stores only the peer
+  identity, so a bond written by the trouble-gatt image (`...18`) is loaded by
+  the HID image (`...17`) and breaks its next fresh pairing with
+  `SMP_DHKEY_CHK_FAIL`. Until the record carries (and filters on) the local
+  identity, wipe between example families. Also open: after the phone unpairs,
+  our retained record blocks re-pairing until the store is erased.
 - [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).

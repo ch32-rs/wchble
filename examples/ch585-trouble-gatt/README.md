@@ -240,8 +240,11 @@ sample vectors in `src/ll/conn.rs`.
 DLE is fully bidirectional: `LE Read Buffer Size` reports 251 octets and five
 credits, the LL splits each Host ACL packet at the negotiated on-air size
 (27 octets until the peer answers), and only the last fragment returns the HCI
-credit. Encryption runs per fragment, so the negotiated 251 includes the MIC
-(247 plaintext). Receive windows and the software no-capture timeout scale
+credit. `LL_LENGTH_REQ/RSP` fields are payload octets (Core 5.4 Vol 6 Part B
+4.5.10), so the controller advertises 247 and adds the 4-octet MIC on air; the
+peer's declared payload is likewise accepted plus MIC (an Android Central that
+advertises 128 sends 132 octets once encrypted). Encryption runs per fragment.
+Receive windows and the software no-capture timeout scale
 with `rx_complete_allowance_us()`, and the pre-negotiation receive limit stays
 31 octets so the observed 28-octet Android PDU is still valid.
 
