@@ -623,12 +623,12 @@ mod tests {
         assert_eq!(rsp.as_bytes().len(), 9);
         assert_eq!(
             rsp.as_bytes(),
-            &[0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+            &[0x15, 0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08]
         );
         assert!(ctrl.data_length.negotiated());
         assert!(ctrl.data_length.requested());
-        assert_eq!(ctrl.data_length.tx_octets(), 251);
-        assert_eq!(ctrl.data_length.rx_octets(), 251);
+        assert_eq!(ctrl.data_length.tx_octets(false), 247);
+        assert_eq!(ctrl.data_length.rx_octets(true), 251);
         // A peer-initiated exchange is complete; do not send our own request.
         assert_eq!(ctrl.request_length_if_supported(), None);
 
@@ -637,8 +637,8 @@ mod tests {
         ctrl.data_length.mark_requested();
         let rsp = [0x15, 0x41, 0, 0x50, 0x03, 0x41, 0, 0x50, 0x03];
         assert_eq!(ctrl.on_pdu(&mut c, &rsp, LOCAL), Ok(ControlAction::None));
-        assert_eq!(ctrl.data_length.tx_octets(), 65);
-        assert_eq!(ctrl.data_length.rx_octets(), 65);
+        assert_eq!(ctrl.data_length.tx_octets(false), 65);
+        assert_eq!(ctrl.data_length.rx_octets(false), 65);
     }
 
     #[test]
@@ -648,13 +648,14 @@ mod tests {
         ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
         let huge = [0x14, 0xe8, 0x03, 0x01, 0x00, 0xe8, 0x03, 0x01, 0x00];
         let rsp = reply(ctrl.on_pdu(&mut c, &huge, LOCAL).unwrap());
-        // The response carries our own limits (251 octets, 2120 us); the
-        // peer's 1000 octets are clamped before they cap our TX/RX.
+        // The response carries our own payload limit (247 octets, MIC
+        // excluded) and 2120 us; the peer's 1000 octets are clamped before
+        // they cap our RX.
         assert_eq!(
             rsp.as_bytes(),
-            &[0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+            &[0x15, 0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08]
         );
-        assert_eq!(ctrl.data_length.rx_octets(), 251);
+        assert_eq!(ctrl.data_length.rx_octets(true), 251);
         let mut ctrl = ControlState::new();
         ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
         assert_eq!(ctrl.on_pdu(&mut c, &[0x14], LOCAL), Err(ConnError::Length));
@@ -704,7 +705,7 @@ mod tests {
         assert_eq!(req.as_bytes()[0], 0x14);
         assert_eq!(
             &req.as_bytes()[1..],
-            &[0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08]
+            &[0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08]
         );
         assert_eq!(ctrl.request_length_if_supported(), None);
     }

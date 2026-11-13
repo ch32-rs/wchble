@@ -33,13 +33,14 @@ use crate::crypto::{Aes128, AesEngine};
 
 use super::ctrl::{ControlPdu, EncReq, EncRsp};
 
-/// Largest plaintext payload of an encrypted PDU. This is the DLE maximum
-/// (251 on air, MIC included) and also covers pre-DLE peers: an Android
-/// Central has been observed sending 28-octet encrypted PDUs without
-/// negotiating. The negotiated per-link limit is smaller until DLE completes;
-/// see [`super::dle::DataLength`].
+/// Largest plaintext payload of an encrypted PDU: the 251-octet air ceiling
+/// minus the MIC. It also covers pre-DLE peers: an Android Central has been
+/// observed sending 28-octet encrypted PDUs without negotiating. The
+/// negotiated per-link limit is smaller until DLE completes; see
+/// [`super::dle::DataLength`].
 pub const MAX_PLAINTEXT: usize = crate::ll::dle::LL_MAX_PLAINTEXT as usize;
-/// Largest encrypted payload including the MIC.
+/// Largest encrypted payload on air, MIC included; also the ceiling that
+/// bounds every `LinkSequence` receive/tx limit.
 pub const MAX_ENCRYPTED: usize = crate::ll::dle::LL_MAX_PAYLOAD as usize;
 
 /// Header bits that are excluded from the authenticated data.

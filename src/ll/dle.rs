@@ -3,17 +3,19 @@
 
 use crate::crypto::BLE_MIC_LEN;
 
-/// Largest LL Data PDU payload on air, MIC included. The one-octet length
-/// field would allow 255, but the specification caps DLE at 251 octets.
+/// Largest payload field an `LL_LENGTH_REQ`/`LL_LENGTH_RSP` may carry
+/// (Core 5.4, Vol 6, Part B, §4.5.10). The MIC is a separate on-air field,
+/// so an encrypted PDU may reach 255 octets on air; this controller keeps
+/// its air ceiling at 251 and therefore advertises `LL_MAX_PLAINTEXT`.
 pub const LL_MAX_PAYLOAD: u16 = 251;
-/// Largest plaintext carried in one encrypted LL PDU.
+/// Largest payload this controller receives or sends inside one LL PDU:
+/// 251 on air minus the MIC, which is what we put in the octet fields.
 pub const LL_MAX_PLAINTEXT: u16 = LL_MAX_PAYLOAD - BLE_MIC_LEN as u16;
-/// Legacy on-air data PDU payload, MIC included.
+/// Legacy payload of a data PDU, MIC excluded.
 pub const LL_LEGACY_PAYLOAD: u16 = 27;
-/// Legacy on-air plaintext payload of an encrypted PDU.
-pub const LL_LEGACY_PLAINTEXT: u16 = LL_LEGACY_PAYLOAD - BLE_MIC_LEN as u16;
-/// Receive ceiling before DLE: one 24-octet Host fragment plus MIC, the size
-/// Android Centrals were observed sending without negotiating.
+/// On-air receive ceiling before DLE: one 24-octet Host fragment plus MIC,
+/// the size Android Centrals were observed sending without negotiating. This
+/// is an air limit, so it is used as-is on encrypted and plaintext links.
 pub const LL_DEFAULT_RX_PAYLOAD: u16 = 31;
 /// `MaxRxTime`/`MaxTxTime` suggested by the specification for 251 octets.
 /// The value is informational here; the radio timing uses `air_time_us`.
@@ -80,6 +82,15 @@ impl LengthParams {
     }
 }
 
+/// MIC octets added on air by encryption, separate from the payload count.
+const fn mic_octets(encrypted: bool) -> u16 {
+    if encrypted {
+        BLE_MIC_LEN as u16
+    } else {
+        0
+    }
+}
+
 const fn clamp(value: u16, min: u16, max: u16) -> u16 {
     if value < min {
         min
@@ -92,11 +103,13 @@ const fn clamp(value: u16, min: u16, max: u16) -> u16 {
 
 /// Per-direction DLE state for one link.
 ///
-/// The peer's request and response fields are the same shape: `MaxRxOctets`
-/// is what that peer can receive, so it caps our TX; `MaxTxOctets` is what it
-/// will send, so it caps our RX. Before any exchange the legacy defaults stay
-/// in force (27 on air, 31 for receive compatibility) and are never widened
-/// merely because a request was sent.
+/// Every octet field counts payload octets, MIC excluded (§4.5.10); the MIC
+/// is added on top when a PDU is encrypted on air. The peer's request and
+/// response fields are the same shape: `MaxRxOctets` is what that peer can
+/// receive, so it caps our TX; `MaxTxOctets` is what it will send, so it caps
+/// our RX. Before any exchange the legacy defaults stay in force (27 payload,
+/// 31 on air for receive compatibility) and are never widened merely because
+/// a request was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DataLength {
@@ -118,7 +131,7 @@ impl Default for DataLength {
 impl DataLength {
     pub const fn new() -> Self {
         Self {
-            local_octets: LL_MAX_PAYLOAD,
+            local_octets: LL_MAX_PLAINTEXT,
             local_time: LL_MAX_TIME_US,
             peer_rx_octets: None,
             peer_rx_time: None,
@@ -138,9 +151,11 @@ impl DataLength {
         }
     }
 
-    /// Apply the Host's `LE Set Data Length` request.
+    /// Apply the Host's `LE Set Data Length` request. The advertised value is
+    /// a payload count, so a request for 251 is granted as 247: the MIC must
+    /// still fit inside this controller's 251-octet on-air ceiling.
     pub fn set_local(&mut self, octets: u16, time: u16) {
-        self.local_octets = clamp(octets, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+        self.local_octets = clamp(octets, LL_LEGACY_PAYLOAD, LL_MAX_PLAINTEXT);
         self.local_time = clamp(time, air_time_us(LL_LEGACY_PAYLOAD), LL_MAX_TIME_US);
     }
 
@@ -167,20 +182,34 @@ impl DataLength {
         self.local_params()
     }
 
-    /// Effective on-air TX payload, MIC included. 27 until the peer reports
-    /// what it can receive.
-    pub fn tx_octets(&self) -> u16 {
+    /// Effective TX payload, MIC excluded. 27 until the peer reports what it
+    /// can receive.
+    pub fn tx_payload(&self) -> u16 {
         match self.peer_rx_octets {
             Some(peer) => self.local_octets.min(peer),
             None => LL_LEGACY_PAYLOAD,
         }
     }
 
-    /// Effective on-air RX payload, MIC included. 31 until the peer reports
-    /// what it will send, which keeps the observed 28-octet Android PDU valid.
-    pub fn rx_octets(&self) -> u16 {
+    /// Effective RX payload, MIC excluded.
+    pub fn rx_payload(&self) -> u16 {
         match self.peer_tx_octets {
             Some(peer) => self.local_octets.min(peer),
+            None => LL_LEGACY_PAYLOAD,
+        }
+    }
+
+    /// Effective TX payload on air: the negotiated payload plus the MIC when
+    /// the link is encrypted.
+    pub fn tx_octets(&self, encrypted: bool) -> u16 {
+        self.tx_payload() + mic_octets(encrypted)
+    }
+
+    /// Effective RX ceiling on air. 31 until the peer reports what it will
+    /// send, which keeps the observed 28-octet Android PDU valid.
+    pub fn rx_octets(&self, encrypted: bool) -> u16 {
+        match self.peer_tx_octets {
+            Some(_) => self.rx_payload() + mic_octets(encrypted),
             None => LL_DEFAULT_RX_PAYLOAD,
         }
     }
@@ -203,11 +232,9 @@ impl DataLength {
         }
     }
 
-    /// Largest Host ACL fragment that fits one LL PDU. Encryption adds the MIC
-    /// inside the negotiated on-air limit.
-    pub fn tx_plaintext(&self, encrypted: bool) -> usize {
-        let mic = if encrypted { BLE_MIC_LEN as u16 } else { 0 };
-        usize::from(self.tx_octets().saturating_sub(mic).max(1))
+    /// Largest Host ACL fragment that fits one LL PDU.
+    pub fn tx_plaintext(&self) -> usize {
+        usize::from(self.tx_payload().max(1))
     }
 }
 
@@ -293,13 +320,15 @@ mod tests {
     #[test]
     fn defaults_stay_legacy_until_the_peer_answers() {
         let mut dle = DataLength::new();
-        assert_eq!(dle.tx_octets(), 27);
-        assert_eq!(dle.rx_octets(), 31);
+        assert_eq!(dle.tx_octets(false), 27);
+        assert_eq!(dle.tx_octets(true), 31);
+        assert_eq!(dle.rx_octets(false), 31);
+        assert_eq!(dle.rx_octets(true), 31);
         assert!(!dle.negotiated());
         dle.mark_requested();
         assert!(dle.requested());
         // Sending a request must not widen anything by itself.
-        assert_eq!(dle.tx_octets(), 27);
+        assert_eq!(dle.tx_payload(), 27);
         let rsp = dle.on_peer_length(LengthParams {
             max_rx_octets: 251,
             max_rx_time: 2120,
@@ -307,11 +336,33 @@ mod tests {
             max_tx_time: 2120,
         });
         assert!(dle.negotiated());
-        assert_eq!(rsp.max_rx_octets, 251);
-        assert_eq!(dle.tx_octets(), 251);
-        assert_eq!(dle.rx_octets(), 251);
-        assert_eq!(dle.tx_plaintext(true), 247);
-        assert_eq!(dle.tx_plaintext(false), 251);
+        // The local advertisement is a payload count: 251 on air minus MIC.
+        assert_eq!(rsp.max_rx_octets, 247);
+        assert_eq!(rsp.max_tx_octets, 247);
+        assert_eq!(dle.tx_payload(), 247);
+        assert_eq!(dle.rx_payload(), 247);
+        assert_eq!(dle.tx_octets(false), 247);
+        assert_eq!(dle.tx_octets(true), 251);
+        assert_eq!(dle.rx_octets(false), 247);
+        assert_eq!(dle.rx_octets(true), 251);
+        assert_eq!(dle.tx_plaintext(), 247);
+    }
+
+    #[test]
+    fn encrypted_peer_payload_keeps_its_mic_on_air() {
+        // An Android Central that declared 128 payload octets sends 132
+        // octets on air once the link is encrypted.
+        let mut dle = DataLength::new();
+        dle.on_peer_length(LengthParams {
+            max_rx_octets: 251,
+            max_rx_time: 2120,
+            max_tx_octets: 128,
+            max_tx_time: 1120,
+        });
+        assert_eq!(dle.rx_payload(), 128);
+        assert_eq!(dle.rx_octets(true), 132);
+        assert_eq!(dle.rx_octets(false), 128);
+        assert_eq!(dle.tx_octets(true), 251);
     }
 
     #[test]
@@ -324,13 +375,13 @@ mod tests {
             max_tx_octets: 100,
             max_tx_time: 1120,
         });
-        assert_eq!(dle.tx_octets(), 65);
-        assert_eq!(dle.rx_octets(), 100);
+        assert_eq!(dle.tx_octets(false), 65);
+        assert_eq!(dle.rx_octets(false), 100);
         assert_eq!(dle.tx_time_us(), 848);
         assert_eq!(dle.rx_time_us(), 1120);
         dle.set_local(27, 328);
-        assert_eq!(dle.tx_octets(), 27);
-        assert_eq!(dle.rx_octets(), 27);
+        assert_eq!(dle.tx_octets(false), 27);
+        assert_eq!(dle.rx_octets(false), 27);
         assert_eq!(dle.tx_time_us(), 328);
         assert_eq!(dle.rx_time_us(), 328);
     }

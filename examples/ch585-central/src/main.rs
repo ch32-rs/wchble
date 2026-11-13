@@ -614,9 +614,11 @@ impl Session {
     }
 
     /// Copy the negotiated DLE limits into the link and the receive window.
+    /// The LL octet fields are payload octets; this example never encrypts,
+    /// so no MIC is added on either direction.
     fn apply_data_length(&mut self) {
-        let tx = self.control.data_length.tx_octets();
-        let rx = self.control.data_length.rx_octets();
+        let tx = self.control.data_length.tx_octets(false);
+        let rx = self.control.data_length.rx_octets(false);
         self.link.set_max_payloads(tx, rx);
         self.conn.set_rx_max_payload(rx);
     }

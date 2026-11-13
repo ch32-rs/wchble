@@ -676,9 +676,12 @@ impl Session {
     }
 
     /// Copy the negotiated DLE limits into the link and the receive window.
+    /// The LL octet fields are payload octets; the MIC rides on top of each
+    /// already-encrypted direction, so both limits move when encryption turns
+    /// on.
     fn apply_data_length(&mut self) {
-        let tx = self.control.data_length.tx_octets();
-        let rx = self.control.data_length.rx_octets();
+        let tx = self.control.data_length.tx_octets(self.enc_active);
+        let rx = self.control.data_length.rx_octets(self.rx_encrypted);
         self.link.set_max_payloads(tx, rx);
         self.conn.set_rx_max_payload(rx);
     }
@@ -973,6 +976,8 @@ fn connection_event(
                 s.acl_tag = tx.tag;
                 s.enc_active = true;
                 s.enc_change_pending = true;
+                // TX grows by the MIC now that our PDUs are encrypted.
+                s.apply_data_length();
                 sec_inc(SEC_START_RSP);
                 sec_inc(SEC_ENCRYPTED_TX);
                 sec_inc(SEC_ACTIVE);
@@ -1002,6 +1007,8 @@ fn connection_event(
                     Ok(pdu) => {
                         s.link.queue(3, pdu.as_bytes()).unwrap();
                         s.rx_encrypted = true;
+                        // The Central's PDUs carry the MIC from here on.
+                        s.apply_data_length();
                         sec_inc(SEC_START_REQ);
                         diag_put(
                             DIAG_START_REQ_QUEUED,
@@ -1060,6 +1067,18 @@ fn connection_event(
             // retransmitted in the next event, exactly as after a lost ACK.
             // Terminating here killed the link right after LL_ENC_REQ, when a
             // long pairing poll had already consumed most of the window.
+            //
+            // The received PDU, however, was already acknowledged in the LL
+            // sequence (`on_rx` above) and the peer will never send it again:
+            // dropping it here loses a fragment of a multi-PDU L2CAP frame.
+            // Trouble then sees a continuation with no reassembly in progress,
+            // returns `InvalidState`, and closes the link with 0x13 — the
+            // `x1-att-5` failure, where the Central's 65-byte public key lost
+            // its first fragment. Deliver it even though the response is late.
+            if deliver_acl && soft.bridge.receive_acl(llid, payload).is_err() {
+                inc(63);
+                return Some(0x1f);
+            }
             return None;
         }
         // Serialize HCI output only after the time-critical radio response.
@@ -1275,8 +1294,14 @@ fn publish_x1(s: &Session) {
     x1_put(X1_LENGTH_RSP_RX, s.length_rsp_rx);
     x1_put(X1_LENGTH_REQ_TX, s.length_req_tx);
     x1_put(X1_LENGTH_RSP_TX, s.length_rsp_tx);
-    x1_put(X1_TX_OCTETS, u32::from(data_length.tx_octets()));
-    x1_put(X1_RX_OCTETS, u32::from(data_length.rx_octets()));
+    x1_put(
+        X1_TX_OCTETS,
+        u32::from(data_length.tx_octets(s.enc_active)),
+    );
+    x1_put(
+        X1_RX_OCTETS,
+        u32::from(data_length.rx_octets(s.rx_encrypted)),
+    );
     x1_put(X1_TX_TIME, u32::from(data_length.tx_time_us()));
     x1_put(X1_RX_TIME, u32::from(data_length.rx_time_us()));
     x1_put(X1_MAX_TX_PDU, u32::from(s.max_tx_pdu));

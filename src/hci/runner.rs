@@ -7,7 +7,9 @@
 use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
-use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PAYLOAD, LL_MAX_TIME_US};
+use crate::ll::dle::{
+    LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US,
+};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -536,7 +538,12 @@ impl SoftRunner {
         self.event_mask = u64::MAX;
         self.le_event_mask = 0x1f;
         self.bridge.set_masks(self.event_mask, self.le_event_mask);
+        // ChSel is a controller capability configured by the RF owner, not
+        // HCI state. The Host sends Reset before advertising; losing it here
+        // silently downgrades every link to CSA #1.
+        let adv_chsel = self.ll.adv.chsel;
         self.ll = LinkLayer::new();
+        self.ll.adv.chsel = adv_chsel;
         self.scan = ScanState::default();
         self.pending_connect = None;
         self.clear_encryption();
@@ -659,7 +666,7 @@ impl SoftRunner {
                 let handle = u16::from_le_bytes([params[0], params[1]]);
                 let octets = u16::from_le_bytes([params[2], params[3]]);
                 let time = u16::from_le_bytes([params[4], params[5]]);
-                let status = if !(LL_LEGACY_PAYLOAD..=LL_MAX_PAYLOAD).contains(&octets)
+                let status = if !(LL_LEGACY_PAYLOAD..=LL_MAX_PLAINTEXT).contains(&octets)
                     || !(LL_LEGACY_TIME_US..=LL_MAX_TIME_US).contains(&time)
                 {
                     HCI_INVALID_PARAMETERS
@@ -688,7 +695,7 @@ impl SoftRunner {
             0x2024 if params.len() == 4 => {
                 let octets = u16::from_le_bytes([params[0], params[1]]);
                 let time = u16::from_le_bytes([params[2], params[3]]);
-                let status = if (LL_LEGACY_PAYLOAD..=LL_MAX_PAYLOAD).contains(&octets)
+                let status = if (LL_LEGACY_PAYLOAD..=LL_MAX_PLAINTEXT).contains(&octets)
                     && (LL_LEGACY_TIME_US..=LL_MAX_TIME_US).contains(&time)
                 {
                     self.suggested_tx_octets = octets;
@@ -700,9 +707,10 @@ impl SoftRunner {
                 self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
                 return;
             }
-            // LE Read Maximum Data Length.
+            // LE Read Maximum Data Length. The fields are payload octets, so
+            // the 251-octet air ceiling minus the MIC is what we can grant.
             0x202f if params.is_empty() => {
-                let octets = LL_MAX_PAYLOAD.to_le_bytes();
+                let octets = LL_MAX_PLAINTEXT.to_le_bytes();
                 let time = LL_MAX_TIME_US.to_le_bytes();
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
@@ -1096,6 +1104,19 @@ mod tests {
     }
 
     #[test]
+    fn reset_keeps_configured_advertising_chsel() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.ll.adv.chsel = true;
+        runner.finish_reset();
+        // The Host resets the controller before it advertises. ChSel is a
+        // controller capability, so Reset must not silently select CSA #1.
+        assert!(runner.ll.adv.chsel);
+        transport::drain_channels_for_test();
+    }
+
+    #[test]
     fn le_set_adv_data_builds_pdu() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
@@ -1301,7 +1322,7 @@ mod tests {
             expect_command_complete(
                 0x202f,
                 HCI_SUCCESS,
-                &[0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08],
+                &[0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08],
             );
 
             inject_cmd(0x2060, &[]);
@@ -1312,15 +1333,17 @@ mod tests {
             runner.serve_one().await;
             expect_command_complete(0x2023, HCI_SUCCESS, &[27, 0, 0x48, 0x01]);
 
-            inject_cmd(0x2024, &[0xfb, 0, 0x48, 0x08]);
+            inject_cmd(0x2024, &[0xf7, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2024, HCI_SUCCESS, &[]);
-            assert_eq!(runner.suggested_data_length(), (251, 2120));
+            assert_eq!(runner.suggested_data_length(), (247, 2120));
 
-            inject_cmd(0x2024, &[0x1a, 0, 0x48, 0x08]);
+            // 251 payload octets would need 255 on air; refuse instead of
+            // advertising a length the receive path cannot hold.
+            inject_cmd(0x2024, &[0xfb, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2024, HCI_INVALID_PARAMETERS, &[]);
-            assert_eq!(runner.suggested_data_length(), (251, 2120));
+            assert_eq!(runner.suggested_data_length(), (247, 2120));
         });
     }
 
@@ -1332,14 +1355,14 @@ mod tests {
         open(&mut runner);
 
         pollster::block_on(async {
-            inject_cmd(0x2022, &[1, 0, 0xfb, 0, 0x48, 0x08]);
+            inject_cmd(0x2022, &[1, 0, 0xf7, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2022, HCI_SUCCESS, &[1, 0]);
-            assert_eq!(runner.take_data_length_request(), Some((251, 2120)));
+            assert_eq!(runner.take_data_length_request(), Some((247, 2120)));
             assert_eq!(runner.take_data_length_request(), None);
 
             // Unknown handle.
-            inject_cmd(0x2022, &[0xfe, 0x0f, 0xfb, 0, 0x48, 0x08]);
+            inject_cmd(0x2022, &[0xfe, 0x0f, 0xf7, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2022, HCI_UNKNOWN_CONNECTION, &[0xfe, 0x0f]);
 
