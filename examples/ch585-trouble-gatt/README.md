@@ -264,8 +264,8 @@ What the image does differently:
 
 - Seeds the controller DRBG and a separate Host RNG stream from measured ADC
   temperature noise, and refuses to advertise when the health check fails.
-- Advertises LE Encryption and caps Host ACL fragments at 23 octets so every
-  encrypted on-air PDU fits 27 bytes (23 + 4-octet MIC).
+- Advertises LE Encryption with the legacy HCI ACL buffer of 27 plaintext
+  octets; encryption adds the 4-octet MIC for a 31-octet on-air payload.
 - Owns `LL_ENC_REQ`/`LL_ENC_RSP`, the Host's `LE LTK Request` reply, the
   plaintext `LL_START_ENC_REQ`, and the encrypted `LL_START_ENC_RSP`. All
   AES-CCM runs outside the connection event: TX is encrypted before the

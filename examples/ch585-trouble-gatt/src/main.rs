@@ -10,6 +10,7 @@ use core::task::{Context, Waker};
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
+use wchble::crypto::BLE_MIC_LEN;
 use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxTag};
 use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
@@ -624,7 +625,7 @@ fn connection_event(
         };
         let header = rx.0[0];
         let payload = &rx.0[2..packet.len];
-        if payload.len() > 27 {
+        if payload.len() > MAX_ENCRYPTED {
             inc(9);
             break;
         }
@@ -634,9 +635,11 @@ fn connection_event(
         // PDU); empty PDUs stay plaintext.
         let ciphertext = s.rx_encrypted && !(llid == 1 && payload.is_empty());
         let capacity = if ciphertext {
+            // The bridge stores plaintext: drop the MIC before admission.
+            let plain_len = payload.len().saturating_sub(BLE_MIC_LEN);
             s.deferred_rx.is_none()
                 && match llid {
-                    1 | 2 => soft.bridge.can_receive_acl(llid, payload.len()),
+                    1 | 2 => soft.bridge.can_receive_acl(llid, plain_len),
                     3 => true,
                     _ => false,
                 }
@@ -1296,12 +1299,6 @@ fn main() -> ! {
         );
     }
     soft.set_le_features(LOCAL_FEATURES);
-    #[cfg(feature = "secure")]
-    {
-        // The Host fragments ACL data at this length, so every fragment fits
-        // a 27-octet encrypted on-air payload (23 + 4-octet MIC).
-        let _ = soft.set_acl_packet_length(23);
-    }
     let app_stats = host::HostStats::new();
     set_peripheral_address(&peripheral_address);
     let mut app = core::pin::pin!(host::run(controller, &app_stats, peripheral_address));

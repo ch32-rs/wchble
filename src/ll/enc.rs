@@ -33,11 +33,11 @@ use crate::crypto::{Aes128, AesEngine};
 
 use super::ctrl::{ControlPdu, EncReq, EncRsp};
 
-/// Largest plaintext payload of an encrypted legacy PDU (27 on-air octets
-/// including the 4-octet MIC).
-pub const MAX_PLAINTEXT: usize = 27 - BLE_MIC_LEN;
+/// Largest plaintext payload of an encrypted legacy PDU (27 plaintext
+/// octets; the 4-octet MIC pushes the on-air payload to 31).
+pub const MAX_PLAINTEXT: usize = 27;
 /// Largest encrypted payload including the MIC.
-pub const MAX_ENCRYPTED: usize = 27;
+pub const MAX_ENCRYPTED: usize = MAX_PLAINTEXT + BLE_MIC_LEN;
 
 /// Header bits that are excluded from the authenticated data.
 const AAD_MASK: u8 = !0x1c; // ~(NESN | SN | MD)
@@ -702,6 +702,21 @@ mod tests {
             enc.decrypt(0x02, &[0; 4], &mut [0; MAX_PLAINTEXT]),
             Err(EncError::Length)
         );
+    }
+
+    #[test]
+    fn largest_legacy_payload_round_trips_with_the_mic_on_air() {
+        let mut tx = central();
+        tx.enable_tx();
+        let mut rx = peripheral();
+        rx.enable_rx();
+        let plaintext: [u8; MAX_PLAINTEXT] = core::array::from_fn(|i| i as u8);
+        let mut out = [0; MAX_ENCRYPTED];
+        let len = tx.encrypt(0x02, &plaintext, &mut out).unwrap();
+        assert_eq!(len, MAX_ENCRYPTED);
+        let mut back = [0; MAX_PLAINTEXT];
+        assert_eq!(rx.decrypt(0x02, &out[..len], &mut back), Ok(MAX_PLAINTEXT));
+        assert_eq!(back, plaintext);
     }
 
     #[test]

@@ -3,7 +3,6 @@
 
 use bt_hci::transport::PacketKind;
 
-use crate::ll::enc::MAX_PLAINTEXT as MAX_ENCRYPTED_PLAINTEXT;
 use crate::ll::Role;
 
 use super::transport::{self, Packet};
@@ -81,10 +80,6 @@ pub struct ConnectionBridge {
     reset_done: bool,
     event_mask: u64,
     le_event_mask: u64,
-    /// Largest Host-to-Controller ACL payload accepted. 27 is the legacy
-    /// on-air maximum; encrypted links use 23 so every fragment fits after the
-    /// 4-octet MIC is added.
-    acl_packet_length: u16,
 }
 
 impl Default for ConnectionBridge {
@@ -109,23 +104,7 @@ impl ConnectionBridge {
             reset_done: false,
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
-            acl_packet_length: ACL_DATA_PACKET_LENGTH as u16,
         }
-    }
-
-    /// Limit the ACL payload the Host may hand to the controller. Return false
-    /// outside 23..=27. The value survives Reset because it is a controller
-    /// property, not per-connection state.
-    pub fn set_acl_packet_length(&mut self, len: u16) -> bool {
-        if !(MAX_ENCRYPTED_PLAINTEXT as u16..=ACL_DATA_PACKET_LENGTH as u16).contains(&len) {
-            return false;
-        }
-        self.acl_packet_length = len;
-        true
-    }
-
-    pub fn acl_packet_length(&self) -> u16 {
-        self.acl_packet_length
     }
 
     pub fn is_connected(&self) -> bool {
@@ -427,7 +406,7 @@ impl ConnectionBridge {
         if flags & 0x0fff != info.handle
             || flags & 0xc000 != 0
             || !matches!(pb, 0 | 1)
-            || len > usize::from(self.acl_packet_length)
+            || len > ACL_DATA_PACKET_LENGTH
             || bytes.len() != len + 4
         {
             return Err(BridgeError::InvalidPacket);

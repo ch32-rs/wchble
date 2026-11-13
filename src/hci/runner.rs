@@ -107,8 +107,6 @@ pub struct SoftRunner {
     ltk_reply: Option<LtkReply>,
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
-    /// ACL payload length advertised through `LE Read Buffer Size`.
-    acl_packet_length: u16,
     /// Most recent command that answered with a non-success status:
     /// `(opcode << 8) | status`, for firmware-side diagnostics.
     last_command_failure: Option<u32>,
@@ -150,7 +148,6 @@ impl SoftRunner {
             pending_encryption: None,
             ltk_reply: None,
             le_features: [0; 8],
-            acl_packet_length: ACL_DATA_PACKET_LENGTH,
             last_command_failure: None,
             command_log: [0; 8],
             command_log_len: 0,
@@ -266,23 +263,6 @@ impl SoftRunner {
 
     pub fn le_features(&self) -> [u8; 8] {
         self.le_features
-    }
-
-    /// Report a smaller ACL payload than the legacy maximum.
-    ///
-    /// Encrypted links must cap Host fragments at 23 octets: the controller
-    /// adds a 4-octet MIC and the on-air payload limit is 27. Returns false
-    /// for values outside 23..=27.
-    pub fn set_acl_packet_length(&mut self, len: u16) -> bool {
-        if !self.bridge.set_acl_packet_length(len) {
-            return false;
-        }
-        self.acl_packet_length = len;
-        true
-    }
-
-    pub fn acl_packet_length(&self) -> u16 {
-        self.acl_packet_length
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -637,7 +617,7 @@ impl SoftRunner {
             0x1405 => Err(HCI_COMMAND_DISALLOWED),
             // LE Read Buffer Size (v1)
             0x2002 if params.is_empty() => {
-                let [lo, hi] = self.acl_packet_length.to_le_bytes();
+                let [lo, hi] = ACL_DATA_PACKET_LENGTH.to_le_bytes();
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
@@ -1185,33 +1165,30 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_build_can_cap_host_acl_at_23_octets() {
+    fn host_acl_fragments_stay_within_the_legacy_plaintext_limit() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
-        assert!(!runner.set_acl_packet_length(22));
-        assert!(!runner.set_acl_packet_length(28));
-        assert!(runner.set_acl_packet_length(23));
         open(&mut runner);
+        // 27 plaintext octets become 31 on air once the MIC is added.
         assert_eq!(
-            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 24])),
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 28])),
             Err(BridgeError::InvalidPacket)
         );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 23])).is_ok());
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
     }
 
     #[test]
-    fn host_reads_configured_buffer_size_and_features() {
+    fn host_reads_buffer_size_and_features() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
-        runner.set_acl_packet_length(23);
         runner.set_le_features([1, 0, 0, 0, 0, 0, 0, 0]);
 
         pollster::block_on(async {
             inject_cmd(0x2002, &[]);
             runner.serve_one().await;
-            expect_command_complete(0x2002, HCI_SUCCESS, &[23, 0, ACL_CREDITS]);
+            expect_command_complete(0x2002, HCI_SUCCESS, &[27, 0, ACL_CREDITS]);
 
             inject_cmd(0x2003, &[]);
             runner.serve_one().await;

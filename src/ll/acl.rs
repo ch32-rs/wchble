@@ -17,7 +17,12 @@ pub struct AclFragment {
     pub len: u16,
 }
 
-pub const MAX_LEGACY_PAYLOAD: usize = 27;
+/// Largest on-air data payload before DLE: 27 plaintext octets, or 31 when
+/// the 4-octet MIC is added by link-layer encryption.
+pub const MAX_LEGACY_PAYLOAD: usize = crate::ll::enc::MAX_ENCRYPTED;
+
+/// Two-byte header plus the largest on-air legacy payload.
+const DATA_PDU_CAPACITY: usize = 2 + MAX_LEGACY_PAYLOAD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxError {
@@ -26,11 +31,11 @@ pub enum TxError {
     Llid,
 }
 
-/// Two-byte data-channel header followed by at most 27 payload bytes, no CRC.
+/// Two-byte data-channel header followed by the legacy payload, no CRC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(4))]
 pub struct DataPdu {
-    bytes: [u8; 32],
+    bytes: [u8; DATA_PDU_CAPACITY],
 }
 
 impl DataPdu {
@@ -41,7 +46,9 @@ impl DataPdu {
         if !(1..=3).contains(&llid) || (llid != 1 && payload.is_empty()) {
             return Err(TxError::Llid);
         }
-        let mut pdu = Self { bytes: [0; 32] };
+        let mut pdu = Self {
+            bytes: [0; DATA_PDU_CAPACITY],
+        };
         pdu.bytes[0] = llid;
         pdu.bytes[1] = payload.len() as u8;
         pdu.bytes[2..payload.len() + 2].copy_from_slice(payload);
@@ -127,7 +134,9 @@ impl LinkSequence {
     /// this marks it as sent. The SN and payload survive all retries; NESN is
     /// refreshed to acknowledge the newest accepted peer packet.
     pub fn tx_pdu(&mut self) -> DataPdu {
-        let pdu = self.outstanding.get_or_insert(DataPdu { bytes: [0; 32] });
+        let pdu = self.outstanding.get_or_insert(DataPdu {
+            bytes: [0; DATA_PDU_CAPACITY],
+        });
         if pdu.bytes[0] & 3 == 0 {
             pdu.bytes[0] = 1;
         }
@@ -182,11 +191,13 @@ mod tests {
 
     #[test]
     fn pdu_bounds_and_llid() {
-        assert_eq!(core::mem::size_of::<DataPdu>(), 32);
+        assert_eq!(core::mem::size_of::<DataPdu>(), 36);
         assert_eq!(core::mem::align_of::<DataPdu>(), 4);
         assert_eq!(DataPdu::new(1, &[]).unwrap().as_bytes(), &[1, 0]);
         assert_eq!(DataPdu::new(2, &[1; 27]).unwrap().as_bytes().len(), 29);
-        assert_eq!(DataPdu::new(2, &[1; 28]), Err(TxError::Length));
+        // Encrypted legacy payloads carry 27 plaintext + 4 MIC octets.
+        assert_eq!(DataPdu::new(2, &[1; 31]).unwrap().as_bytes().len(), 33);
+        assert_eq!(DataPdu::new(2, &[1; 32]), Err(TxError::Length));
         assert_eq!(DataPdu::new(0, &[1]), Err(TxError::Llid));
         assert_eq!(DataPdu::new(3, &[]), Err(TxError::Llid));
         assert_eq!(DataPdu::new(2, &[]), Err(TxError::Llid));
@@ -305,7 +316,7 @@ mod tests {
             (4, &[1][..], true),
             (0x25, &[1][..], true),
             (7, &[][..], true),
-            (5, &[1; 28][..], true),
+            (5, &[1; 32][..], true),
         ] {
             assert_eq!(
                 link.on_rx(header, payload, crc, true),
