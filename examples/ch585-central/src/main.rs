@@ -12,7 +12,7 @@ use core::task::{Context, Waker};
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
-use wchble::hci::connection::{ConnectionBridge, ConnectionInfo, RadioRequest, TxTag};
+use wchble::hci::connection::{ConnectionBridge, ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use wchble::ll::central::CentralConnection;
@@ -21,6 +21,7 @@ use wchble::ll::ctrl::{
     feature_bits, ControlAction, ControlState, LocalVersion, FEATURE_LE_CSA2,
     FEATURE_LE_DATA_LENGTH_EXTENSION,
 };
+use wchble::ll::enc::MAX_ENCRYPTED;
 use wchble::ll::scan;
 
 /// CSA #2 and DLE; this example does not drive encryption.
@@ -30,7 +31,7 @@ const LOCAL_FEATURES: [u8; 8] = feature_bits(&[
 ]);
 use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE};
 use wchble::rf::regs::{self, bb, bb_irq, lle};
-use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
+use wchble::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use portable_atomic as _;
@@ -46,7 +47,7 @@ static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 struct ConnIndBuf(DmaBuf<128>);
 const CONN_IND_CSEL_OFFSET: usize = 64;
 static CONN_IND: StaticCell<ConnIndBuf> = StaticCell::new();
-static DATA: StaticCell<DmaBuf<64>> = StaticCell::new();
+static DATA: StaticCell<DmaBuf<MAX_PDU>> = StaticCell::new();
 
 #[no_mangle]
 #[used]
@@ -111,13 +112,15 @@ const CONNECT_OFFSET_US: u32 = 0;
 /// `tx_basic` is not late. A constant error cancels because the peer anchors on
 /// our actual packets. Not an air-IFS claim.
 const EVENT_TX_LEAD_US: u32 = 100;
-/// Responder window after our packet; covers T_IFS plus a 27-byte packet.
+/// Latest start for the peer's response after our packet. The completion
+/// allowance itself scales with the negotiated RX payload.
 const RESPONSE_WINDOW_US: u32 = 2_000;
 /// Give up on an initiator request if the target advertisement never arrives.
 const INITIATOR_TIMEOUT_US: u32 = 6_000_000;
 const SCAN_WINDOW_US: u32 = 15_000;
-/// Extra time for the latest-starting LE1M packet to complete.
-const RX_COMPLETE_US: u32 = 80 + 27 * 8;
+/// Extra time for the latest-starting LE1M advertising packet (at most 40
+/// on-air octets) to complete. Connection PDUs use the negotiated scale.
+const SCAN_RX_COMPLETE_US: u32 = 80 + 40 * 8;
 
 const STAGE_INIT: u32 = 1;
 const STAGE_SCANNING: u32 = 2;
@@ -412,6 +415,7 @@ fn receive_response(
     rx: &mut DmaBuf<RX_DMA_MIN>,
     until: u32,
     expires: u32,
+    capture_us: u32,
 ) -> Option<Received> {
     unsafe {
         regs::write(BB_BASE, bb::IRQSTAT, 0xf0);
@@ -442,7 +446,7 @@ fn receive_response(
             capture = Some(now);
         }
         let expired = match capture {
-            Some(at) => now.wrapping_sub(at) >= 700,
+            Some(at) => now.wrapping_sub(at) >= capture_us,
             None => reached(now, until),
         };
         if expired {
@@ -462,7 +466,7 @@ fn receive_response(
         });
     }
     let len = usize::from(rx.0[1]) + 2;
-    if len > 40 {
+    if len > MAX_ENCRYPTED + 2 {
         return Some(Received {
             len: 0,
             end,
@@ -549,11 +553,20 @@ fn prepare_initiator(
     })
 }
 
+/// Host ACL packet being split across LL PDUs. The Host may hand over up to
+/// 251 octets even before DLE; each LL PDU takes the negotiated on-air size
+/// and only the final fragment owns the HCI tag.
+struct PendingHost {
+    acl: TxAcl,
+    offset: usize,
+}
+
 struct Session {
     conn: CentralConnection,
     link: LinkSequence,
     control: ControlState,
     pending_control: Option<DataPdu>,
+    pending_host: Option<PendingHost>,
     acl_tag: Option<TxTag>,
     terminating: Option<u8>,
     terminate_requested: Option<u8>,
@@ -574,6 +587,7 @@ impl Session {
                 control
             },
             pending_control: None,
+            pending_host: None,
             acl_tag: None,
             terminating: None,
             terminate_requested: None,
@@ -598,6 +612,81 @@ impl Session {
         self.control
             .start_termination(now, self.conn.params.timeout);
     }
+
+    /// Copy the negotiated DLE limits into the link and the receive window.
+    fn apply_data_length(&mut self) {
+        let tx = self.control.data_length.tx_octets();
+        let rx = self.control.data_length.rx_octets();
+        self.link.set_max_payloads(tx, rx);
+        self.conn.set_rx_max_payload(rx);
+    }
+
+    /// True while no control exchange or queued Host data owns the link.
+    fn link_idle(&self) -> bool {
+        self.pending_control.is_none()
+            && self.pending_host.is_none()
+            && self.terminate_requested.is_none()
+            && self.terminating.is_none()
+            && !self.link.has_outstanding()
+    }
+}
+
+/// Queue the next LL fragment of the Host ACL packet, taking a new one from
+/// the bridge when needed. Only the fragment that ends the Host packet owns
+/// the HCI tag, so the bridge credit is returned once, after the LL
+/// acknowledges the final fragment. Returns false when nothing was queued.
+fn queue_next_host_fragment(bridge: &mut ConnectionBridge, s: &mut Session) -> bool {
+    if s.pending_host.is_none() {
+        let Some(acl) = bridge.take_tx_acl() else {
+            return false;
+        };
+        if acl.len == 0 {
+            let _ = bridge.ack_tx(acl.tag);
+            return false;
+        }
+        s.pending_host = Some(PendingHost { acl, offset: 0 });
+    }
+    let max_fragment = usize::from(s.link.tx_max_payload());
+    let done = {
+        let host = s.pending_host.as_mut().unwrap();
+        let remaining = host.acl.len - host.offset;
+        let n = remaining.min(max_fragment);
+        let llid = if host.offset == 0 { host.acl.llid } else { 1 };
+        let start = host.offset;
+        let end = start + n;
+        s.link.queue(llid, &host.acl.bytes[start..end]).unwrap();
+        host.offset = end;
+        (end == host.acl.len).then_some(host.acl.tag)
+    };
+    if let Some(tag) = done {
+        s.pending_host = None;
+        s.acl_tag = Some(tag);
+    }
+    inc(61);
+    true
+}
+
+/// Ask for DLE once features are known and the link is otherwise idle.
+/// Encryption is not driven in this example, so an idle link is enough.
+fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
+    if !s.conn.established() || !s.link_idle() {
+        return None;
+    }
+    if let Some((octets, time)) = soft.take_data_length_request() {
+        s.control.data_length.set_local(octets, time);
+        let pdu = s.control.length_request();
+        s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+        return None;
+    }
+    if s.control.data_length.requested() {
+        return None;
+    }
+    if let Some(pdu) = s.control.request_length_if_supported() {
+        s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+    } else if let Some(pdu) = s.control.feature_request() {
+        s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+    }
+    None
 }
 
 #[link_section = ".highcode"]
@@ -606,7 +695,7 @@ fn connection_event(
     radio: &mut Ch585Radio,
     clock: &Clock,
     rx: &mut DmaBuf<RX_DMA_MIN>,
-    tx: &mut DmaBuf<64>,
+    tx: &mut DmaBuf<MAX_PDU>,
     s: &mut Session,
     bridge: &mut ConnectionBridge,
     finish: u32,
@@ -658,11 +747,7 @@ fn connection_event(
         } else if let Some(reason) = s.terminate_requested.take() {
             s.link.queue(3, &[2, reason]).unwrap();
             s.terminating = Some(reason);
-        } else if let Some(acl) = bridge.take_tx_acl() {
-            s.link.queue(acl.llid, &acl.bytes[..acl.len]).unwrap();
-            s.acl_tag = Some(acl.tag);
-            inc(61);
-        } else {
+        } else if !queue_next_host_fragment(bridge, s) {
             s.link.queue(1, &[]).unwrap();
         }
     }
@@ -704,10 +789,11 @@ fn connection_event(
 
     // TX_DONE leaves the LLE command engaged; `rx_basic` force-stops it and
     // re-arms, exactly like the O2 scan-request path.
+    let capture_us = s.conn.rx_complete_allowance_us() + 64;
     let rx_until = earlier(tx_return.wrapping_add(RESPONSE_WINDOW_US), event_limit);
-    let rx_expires = earlier(rx_until.wrapping_add(RX_COMPLETE_US), expires);
+    let rx_expires = earlier(rx_until.wrapping_add(capture_us), expires);
     put(50, clock.now_us().wrapping_sub(tx_return));
-    let packet = receive_response(radio, clock, rx, rx_until, rx_expires);
+    let packet = receive_response(radio, clock, rx, rx_until, rx_expires, capture_us);
     let mut remote_terminate = None;
     let mut first = false;
     if let Some(packet) = packet {
@@ -717,7 +803,7 @@ fn connection_event(
             inc(23);
             let header = rx.0[0];
             let payload = &rx.0[2..packet.len];
-            if payload.len() > 27 {
+            if payload.len() > usize::from(s.link.rx_max_payload()) {
                 inc(63);
             } else {
                 let llid = header & 3;
@@ -803,13 +889,15 @@ fn connection_event(
                                 };
                                 match s.control.on_pdu(&mut s.conn, payload, local) {
                                     Ok(ControlAction::Reply(reply)) => {
+                                        s.apply_data_length();
                                         s.pending_control =
                                             Some(DataPdu::new(3, reply.as_bytes()).unwrap());
                                     }
                                     Ok(ControlAction::Terminate(reason)) => {
+                                        s.apply_data_length();
                                         remote_terminate = Some(reason)
                                     }
-                                    Ok(ControlAction::None) => {}
+                                    Ok(ControlAction::None) => s.apply_data_length(),
                                     Err(error) => s.request_terminate(
                                         wchble::ll::ctrl::termination_reason(error),
                                         packet.end,
@@ -1130,8 +1218,6 @@ fn main() -> ! {
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
     soft.set_le_features(LOCAL_FEATURES);
-    // Keep the pre-DLE Host framing until the segmentation path takes over.
-    let _ = soft.set_acl_packet_length(27);
     let app_stats = host::HostStats::new();
     let mut app = core::pin::pin!(host::run(controller, &app_stats));
     let started = clock.now_us();
@@ -1185,6 +1271,7 @@ fn main() -> ! {
                 continue;
             }
             if reason.is_none() {
+                let _ = service_dle(&mut soft, s);
                 reason = connection_event(
                     &mut radio,
                     &clock,
@@ -1266,7 +1353,7 @@ fn main() -> ! {
         radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
         let now = clock.now_us();
         let until = now.wrapping_add(SCAN_WINDOW_US);
-        let expires = earlier(finish, until.wrapping_add(RX_COMPLETE_US));
+        let expires = earlier(finish, until.wrapping_add(SCAN_RX_COMPLETE_US));
         if let Some(packet) = receive_scan(
             &mut radio,
             &clock,

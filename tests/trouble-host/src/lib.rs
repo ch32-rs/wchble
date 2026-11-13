@@ -85,10 +85,10 @@ mod tests {
             });
         }
 
-        /// Inbound ACL payload: the Host fragments at the legacy ACL size, so
-        /// the peer side of the fixture mirrors it (5 fragments for a 128-byte
-        /// PDU; an encrypted link fragments at the same 27 plaintext octets).
-        const ACL_FRAGMENT: usize = 27;
+        /// Inbound ACL payload: the Host fragments at the controller's
+        /// advertised 251-byte DLE buffer, so even a 128-byte L2CAP PDU fits in
+        /// one ACL packet.
+        const ACL_FRAGMENT: usize = wchble::hci::connection::ACL_DATA_PACKET_LENGTH;
 
         fn inject(&mut self, att: &[u8]) {
             self.inject_fragmented(att);
@@ -381,8 +381,9 @@ mod tests {
     fn real_host_discovery_read_write_notify_and_reconnect() {
         // The transport is process-global: keep the whole lifecycle in one test.
         let stats = host::HostStats::new();
-        // The legacy 27-octet ACL buffer is also an encrypted link's plaintext
-        // fragment size, so the X4 phase exercises the same ACL split.
+        // The controller advertises the 251-byte DLE buffer from startup, so
+        // the Host hands over full ACL packets and the LL (not the Host) owns
+        // segmentation after negotiation.
         let controller = SoftRunner::new();
         let mut future = pin!(host::run(wchble::hci::new(), &stats, host::RANDOM_ADDRESS));
         let mut fixture = Fixture {
@@ -637,10 +638,11 @@ mod tests {
         assert_eq!(stats.word(host::STAT_DISCONNECTS), 3);
         assert_eq!(stats.word(host::STAT_ADVERTISE_ATTEMPTS), 4);
         assert_eq!(stats.word(host::STAT_ERRORS), 0);
-        // Ledger of ACL fragments acknowledged over the whole fixture. The
-        // 90-fragment baseline includes the three UART echoes; X4 adds 77:
-        // discovery, the 124-byte read, both writes and the seven queued
-        // 128-byte notifications at the legacy 27-octet fragmentation.
-        assert_eq!(fixture.acknowledged, 167);
+        // Ledger of Host ACL packets acknowledged over the whole fixture. At
+        // the 251-byte DLE buffer the Host no longer fragments: every 128-byte
+        // notification and every ATT reply is one ACL packet, so the ledger
+        // counts PDUs rather than LL fragments. The full MTU-23 UART write adds
+        // the request and its echo.
+        assert_eq!(fixture.acknowledged, 114);
     }
 }

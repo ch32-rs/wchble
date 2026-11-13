@@ -91,6 +91,11 @@ impl CentralConnection {
         self.rx_max_payload = octets.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
     }
 
+    /// Time the latest-starting LE 1M packet of this size needs on air.
+    pub fn rx_complete_allowance_us(&self) -> u32 {
+        80 + u32::from(self.rx_max_payload) * 8
+    }
+
     pub fn event_counter(&self) -> u16 {
         self.event_counter
     }

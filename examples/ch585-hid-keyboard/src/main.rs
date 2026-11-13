@@ -10,7 +10,7 @@ use core::task::{Context, Waker};
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
-use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxTag};
+use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
@@ -33,7 +33,7 @@ use wchble::storage::bond::{decode_bonds, encode_bonds, PersistedBond, MAX_BONDS
 #[cfg(feature = "secure")]
 use wchble::storage::DualCopyStore;
 use wchble::rf::regs::{self, bb, bb_irq, lle};
-use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
+use wchble::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use {panic_halt as _, portable_atomic as _};
@@ -54,7 +54,7 @@ static SCRATCH: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static ADV: StaticCell<DmaBuf<64>> = StaticCell::new();
 static RSP: StaticCell<DmaBuf<64>> = StaticCell::new();
-static DATA: StaticCell<DmaBuf<64>> = StaticCell::new();
+static DATA: StaticCell<DmaBuf<MAX_PDU>> = StaticCell::new();
 
 #[no_mangle]
 #[used]
@@ -391,6 +391,7 @@ fn receive(
     rx: &mut DmaBuf<RX_DMA_MIN>,
     until: u32,
     expires: u32,
+    capture_timeout_us: u32,
     arm_times: &mut [u32; 2],
 ) -> Option<Received> {
     unsafe {
@@ -428,7 +429,7 @@ fn receive(
             capture = Some(now);
         }
         let expired = match capture {
-            Some(at) => now.wrapping_sub(at) >= 700,
+            Some(at) => now.wrapping_sub(at) >= capture_timeout_us,
             None => reached(now, until),
         };
         if expired {
@@ -444,7 +445,7 @@ fn receive(
         return None;
     }
     let len = usize::from(rx.0[1]) + 2;
-    if len > 40 {
+    if len > MAX_ENCRYPTED + 2 {
         inc(9);
         return None;
     }
@@ -477,6 +478,14 @@ struct EncTx {
     tag: Option<TxTag>,
     /// When set, a successful acknowledgment ends the link with this reason.
     terminate: Option<u8>,
+}
+
+/// Host ACL packet being split across LL PDUs. The Host may hand over up to
+/// 251 octets even before DLE; each LL PDU takes the negotiated plaintext
+/// size and only the final fragment owns the HCI tag.
+struct PendingHost {
+    acl: TxAcl,
+    offset: usize,
 }
 
 /// A received encrypted PDU held until after the event, when AES-CCM can run
@@ -524,6 +533,7 @@ struct Session {
     enc_change_pending: bool,
     pending_enc_control: Option<EncTx>,
     pending_enc_acl: Option<EncTx>,
+    pending_host: Option<PendingHost>,
     deferred_rx: Option<DeferredRx>,
     /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
     /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
@@ -582,6 +592,7 @@ impl Session {
             enc_change_pending: false,
             pending_enc_control: None,
             pending_enc_acl: None,
+            pending_host: None,
             deferred_rx: None,
             enc_rsp_random,
             enc_rsp_payload,
@@ -606,6 +617,27 @@ impl Session {
         self.control
             .start_termination(now, self.conn.params.timeout);
     }
+
+    /// Copy the negotiated DLE limits into the link and the receive window.
+    fn apply_data_length(&mut self) {
+        let tx = self.control.data_length.tx_octets();
+        let rx = self.control.data_length.rx_octets();
+        self.link.set_max_payloads(tx, rx);
+        self.conn.set_rx_max_payload(rx);
+    }
+
+    /// True while no encryption exchange or queued PDU owns the link.
+    fn encryption_idle(&self) -> bool {
+        matches!(self.start.stage(), StartStage::Idle | StartStage::Active)
+            && !self.rx_encrypted
+            && !self.enc_rsp_queued
+            && !self.enc_rsp_sent
+            && !self.enc_change_pending
+            && self.pending_control.is_none()
+            && self.pending_enc_control.is_none()
+            && self.pending_enc_acl.is_none()
+            && self.pending_start_rsp.is_none()
+    }
 }
 
 #[link_section = ".highcode"]
@@ -614,7 +646,7 @@ fn connection_event(
     radio: &mut Ch585Radio,
     clock: &Clock,
     rx: &mut DmaBuf<RX_DMA_MIN>,
-    tx: &mut DmaBuf<64>,
+    tx: &mut DmaBuf<MAX_PDU>,
     s: &mut Session,
     soft: &mut SoftRunner,
     finish: u32,
@@ -659,7 +691,16 @@ fn connection_event(
         }
         let first_exchange = !any_rx;
         let mut arm_times = [0; 2];
-        let Some(packet) = receive(radio, clock, rx, until, expires, &mut arm_times) else {
+        let capture_us = s.conn.rx_complete_allowance_us() + 64;
+        let Some(packet) = receive(
+            radio,
+            clock,
+            rx,
+            until,
+            expires,
+            capture_us,
+            &mut arm_times,
+        ) else {
             if first_exchange {
                 trace(clock, 8, event, channel, 0, 0, arm_times[0], arm_times[1]);
             }
@@ -790,20 +831,29 @@ fn connection_event(
                                 subversion: 1,
                             };
                             match s.control.on_pdu(&mut s.conn, payload, local) {
-                                Ok(ControlAction::Reply(pdu)) => {
-                                    if pdu.as_bytes().first() == Some(&7) {
-                                        inc(27);
-                                    }
-                                    s.pending_control =
-                                        Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
-                                }
-                                Ok(ControlAction::Terminate(reason)) => {
-                                    remote_terminate = Some(reason)
-                                }
-                                Ok(ControlAction::None) => {
-                                    if payload[0] == 0 && payload.len() == 12 {
-                                        s.update_instant =
-                                            Some(u16::from_le_bytes([payload[10], payload[11]]));
+                                Ok(action) => {
+                                    // DLE takes effect once the request or
+                                    // response has been received.
+                                    s.apply_data_length();
+                                    match action {
+                                        ControlAction::Reply(pdu) => {
+                                            if pdu.as_bytes().first() == Some(&7) {
+                                                inc(27);
+                                            }
+                                            s.pending_control =
+                                                Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+                                        }
+                                        ControlAction::Terminate(reason) => {
+                                            remote_terminate = Some(reason)
+                                        }
+                                        ControlAction::None => {
+                                            if payload[0] == 0 && payload.len() == 12 {
+                                                s.update_instant = Some(u16::from_le_bytes([
+                                                    payload[10],
+                                                    payload[11],
+                                                ]));
+                                            }
+                                        }
                                     }
                                 }
                                 Err(error) => s.request_terminate(
@@ -911,11 +961,7 @@ fn connection_event(
             } else if s.enc_rsp_at == 0 || reached(clock.now_us(), s.enc_rsp_at) {
                 // The encryption procedure owns the link until it ends:
                 // no ACL data may share the event with LL_ENC_REQ/LL_ENC_RSP.
-                if let Some(acl) = soft.bridge.take_tx_acl() {
-                    diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
-                    s.link.queue(acl.llid, &acl.bytes[..acl.len]).unwrap();
-                    s.acl_tag = Some(acl.tag);
-                }
+                queue_next_host_fragment(soft, s);
             }
         }
         let pdu = s.link.tx_pdu();
@@ -981,7 +1027,11 @@ fn connection_event(
             inc(28);
             return Some(reason);
         }
-        until = earlier(clock.now_us().wrapping_add(500), event_limit);
+        until = earlier(
+            clock.now_us()
+                .wrapping_add(s.conn.rx_complete_allowance_us() + 64),
+            event_limit,
+        );
     }
     if !any_rx {
         inc(23);
@@ -1056,6 +1106,70 @@ fn service_encryption(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
     None
 }
 
+/// Queue the next plaintext LL fragment of the Host ACL packet, taking a new
+/// one from the bridge when needed. Only the fragment that ends the Host
+/// packet owns the HCI tag, so the bridge credit is returned once, after the
+/// LL acknowledges the final fragment.
+fn queue_next_host_fragment(soft: &mut SoftRunner, s: &mut Session) {
+    if s.pending_host.is_none() {
+        let Some(acl) = soft.bridge.take_tx_acl() else {
+            return;
+        };
+        if acl.len == 0 {
+            let _ = soft.bridge.ack_tx(acl.tag);
+            return;
+        }
+        diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
+        s.pending_host = Some(PendingHost { acl, offset: 0 });
+    }
+    let max = usize::from(s.link.tx_max_payload());
+    let done = {
+        let host = s.pending_host.as_mut().unwrap();
+        let remaining = host.acl.len - host.offset;
+        let n = remaining.min(max);
+        let llid = if host.offset == 0 { host.acl.llid } else { 1 };
+        let start = host.offset;
+        let end = start + n;
+        s.link.queue(llid, &host.acl.bytes[start..end]).unwrap();
+        host.offset = end;
+        if end == host.acl.len {
+            Some(host.acl.tag)
+        } else {
+            None
+        }
+    };
+    if let Some(tag) = done {
+        s.pending_host = None;
+        s.acl_tag = Some(tag);
+    }
+}
+
+/// Start DLE from the peripheral side. Android Centrals have been observed
+/// sending LL_FEATURE_REQ without LL_LENGTH_REQ, so the controller asks first
+/// once the peer features are known and the encryption procedure is idle.
+fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
+    if !s.conn.established() || s.link.has_outstanding() || !s.encryption_idle() {
+        return None;
+    }
+    let requested = soft.take_data_length_request();
+    if let Some((octets, time)) = requested {
+        s.control.data_length.set_local(octets, time);
+        let pdu = s.control.length_request();
+        s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+        return None;
+    }
+    if !s.control.data_length.requested() {
+        if let Some(pdu) = s.control.request_length_if_supported() {
+            s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+            return None;
+        }
+        if let Some(pdu) = s.control.feature_request() {
+            s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+        }
+    }
+    None
+}
+
 /// Produce at most one prepared ciphertext PDU before the next event. The
 /// event only queues what is already encrypted.
 ///
@@ -1069,47 +1183,86 @@ fn prefetch_encrypted(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
         return None;
     }
     let enc = s.enc.as_mut()?;
-    let mut out = [0u8; MAX_ENCRYPTED];
-    let prepared = if let Some(reason) = s.terminate_requested.take() {
-        Some((enc.encrypt(3, &[2, reason], &mut out), Some(reason)))
-    } else if let Some(pdu) = s.pending_control.take() {
-        Some((enc.encrypt(3, pdu.payload(), &mut out), None))
-    } else {
-        None
-    };
-    if let Some((result, terminate)) = prepared {
-        match result {
-            Ok(len) => {
-                s.pending_enc_control = Some(EncTx {
-                    llid: 3,
-                    bytes: out,
-                    len: len as u8,
-                    tag: None,
-                    terminate,
-                });
-            }
-            Err(_) => {
-                sec_error(0x1e);
-                return Some(0x1e);
+    if s.pending_enc_control.is_none() {
+        let mut out = [0u8; MAX_ENCRYPTED];
+        let prepared = if let Some(reason) = s.terminate_requested.take() {
+            Some((enc.encrypt(3, &[2, reason], &mut out), Some(reason)))
+        } else if let Some(pdu) = s.pending_control.take() {
+            Some((enc.encrypt(3, pdu.payload(), &mut out), None))
+        } else {
+            None
+        };
+        if let Some((result, terminate)) = prepared {
+            match result {
+                Ok(len) => {
+                    s.pending_enc_control = Some(EncTx {
+                        llid: 3,
+                        bytes: out,
+                        len: len as u8,
+                        tag: None,
+                        terminate,
+                    });
+                }
+                Err(_) => {
+                    sec_error(0x1e);
+                    return Some(0x1e);
+                }
             }
         }
-        return None;
     }
-    if let Some(acl) = soft.bridge.take_tx_acl() {
-        diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
-        match enc.encrypt(acl.llid, &acl.bytes[..acl.len], &mut out) {
-            Ok(len) => {
-                s.pending_enc_acl = Some(EncTx {
-                    llid: acl.llid,
-                    bytes: out,
-                    len: len as u8,
-                    tag: Some(acl.tag),
-                    terminate: None,
-                });
+    if s.pending_enc_control.is_none() && s.pending_enc_acl.is_none() {
+        if s.pending_host.is_none() {
+            if let Some(acl) = soft.bridge.take_tx_acl() {
+                if acl.len == 0 {
+                    let _ = soft.bridge.ack_tx(acl.tag);
+                } else {
+                    diag_acl(false, acl.llid, &acl.bytes[..acl.len]);
+                    s.pending_host = Some(PendingHost { acl, offset: 0 });
+                }
             }
-            Err(_) => {
-                sec_error(0x1e);
-                return Some(0x1e);
+        }
+        // The MIC lives inside the negotiated on-air limit.
+        let max_plain = usize::from(s.link.tx_max_payload()).saturating_sub(BLE_MIC_LEN);
+        let prepared = if let Some(host) = s.pending_host.as_mut() {
+            let remaining = host.acl.len - host.offset;
+            let n = remaining.min(max_plain);
+            let llid = if host.offset == 0 { host.acl.llid } else { 1 };
+            let start = host.offset;
+            let end = start + n;
+            let mut out = [0u8; MAX_ENCRYPTED];
+            match enc.encrypt(llid, &host.acl.bytes[start..end], &mut out) {
+                Ok(len) => Some((
+                    llid,
+                    out,
+                    len,
+                    if end == host.acl.len {
+                        Some(host.acl.tag)
+                    } else {
+                        None
+                    },
+                    end,
+                )),
+                Err(_) => {
+                    sec_error(0x1e);
+                    return Some(0x1e);
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((llid, out, len, tag, offset)) = prepared {
+            s.pending_enc_acl = Some(EncTx {
+                llid,
+                bytes: out,
+                len: len as u8,
+                tag,
+                terminate: None,
+            });
+            if let Some(host) = s.pending_host.as_mut() {
+                host.offset = offset;
+            }
+            if tag.is_some() {
+                s.pending_host = None;
             }
         }
     }
@@ -1174,16 +1327,26 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                 subversion: 1,
             };
             match s.control.on_pdu(&mut s.conn, &plain[..len], local) {
-                Ok(ControlAction::Reply(pdu)) => {
-                    if pdu.as_bytes().first() == Some(&7) {
-                        inc(27);
-                    }
-                    s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
-                }
-                Ok(ControlAction::Terminate(reason)) => s.request_terminate(reason, rx.end),
-                Ok(ControlAction::None) => {
-                    if plain[0] == 0 && len == 12 {
-                        s.update_instant = Some(u16::from_le_bytes([plain[10], plain[11]]));
+                Ok(action) => {
+                    // DLE takes effect once the request or response has been
+                    // received.
+                    s.apply_data_length();
+                    match action {
+                        ControlAction::Reply(pdu) => {
+                            if pdu.as_bytes().first() == Some(&7) {
+                                inc(27);
+                            }
+                            s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+                        }
+                        ControlAction::Terminate(reason) => {
+                            s.request_terminate(reason, rx.end)
+                        }
+                        ControlAction::None => {
+                            if plain[0] == 0 && len == 12 {
+                                s.update_instant =
+                                    Some(u16::from_le_bytes([plain[10], plain[11]]));
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -1583,8 +1746,11 @@ fn main() -> ! {
                     s.request_terminate(0x1e, clock.now_us());
                 }
             }
-            if reason.is_none() && !reached(clock.now_us().wrapping_add(3000), prepare) {
+            if reason.is_none() && !reached(clock.now_us().wrapping_add(4000), prepare) {
                 reason = service_encryption(&mut soft, s);
+                if reason.is_none() {
+                    reason = service_dle(&mut soft, s);
+                }
                 if reason.is_none() {
                     reason = prefetch_encrypted(&mut soft, s);
                 }
@@ -1706,6 +1872,7 @@ fn main() -> ! {
                 rx,
                 clock.now_us().wrapping_add(600),
                 finish,
+                700,
                 &mut [0; 2],
             ) else {
                 continue;
