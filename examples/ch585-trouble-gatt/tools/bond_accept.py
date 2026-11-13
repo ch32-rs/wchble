@@ -454,7 +454,8 @@ def options(argv=None):
     parser.add_argument('phase', choices=PHASES)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--elf', type=Path, default=secure.DEFAULT_ELF,
-                        help='image to flash (bond-fault build for `fault`)')
+                        help='image to flash (secure,accept-control build; '
+                             'bond-fault build for `fault`)')
     parser.add_argument('--smoke-elf', type=Path, default=secure.SMOKE)
     parser.add_argument('--serial', default=secure.ADB_SERIAL)
     parser.add_argument('--run-seconds', type=int, default=60)

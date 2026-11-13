@@ -332,7 +332,12 @@ The secure image keeps its bonds across resets and power loss.
 - A test-only control characteristic (`00001002-b0cd-11ec-871f-d45ddf138840`)
   takes `DEL!` (remove + tombstone), `WIPE` (erase both slots) and `FALT`
   (truncate the next save; needs `--features bond-fault`). It is deliberately
-  unauthenticated so a peer can clear a stale bond it cannot use.
+  unauthenticated so a peer can clear a stale bond it cannot use, so it only
+  exists in images built with the non-default `accept-control` feature
+  (`--features secure,accept-control`; `bond-fault` implies it). A `secure`
+  product image does not expose it. `DEL!`/`WIPE` also discard any bond
+  snapshot queued before the command, so a deferred save cannot recreate a
+  deleted bond.
 
 Measured on hardware: a save takes about 22 ms and erasing both pages about
 35 ms; boot reads take 25-39 us for an empty store, 121-128 us for a valid
@@ -344,7 +349,8 @@ save fell back to the previous copy.
 
 `tools/bond_accept.py PHASE --out DIR` runs one phase per invocation
 (`wipe`, `pair`, `reconnect`, `delete`, `repair`, `fault`, `powercycle`) with
-the phone app in `--es mode`. `pair` and `fault` keep the image in flash so
+the phone app in `--es mode`; the acceptance image is built with
+`--features secure,accept-control` (`bond-fault` for the `fault` phase). `pair` and `fault` keep the image in flash so
 `reconnect`/`powercycle` are a reset or a real power cycle without a download;
 every other exit restores and scans the smoke image. The `delete` phase expects
 the operator to forget the bond on the phone before `repair`.

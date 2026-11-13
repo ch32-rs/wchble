@@ -169,6 +169,12 @@ impl BondSignals {
     pub fn take_pending(&self) -> Option<BondSnapshot> {
         self.pending.take()
     }
+
+    /// Drop a queued snapshot. A delete/wipe must not be undone by a snapshot
+    /// captured before it.
+    pub fn discard_pending(&self) {
+        self.pending.set(None);
+    }
 }
 
 /// Convert a Host bond into the stored record.

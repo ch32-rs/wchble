@@ -200,7 +200,7 @@ pub async fn run(
     }
     // Remove every in-memory bond; the RF owner erases the flash copy after
     // the Host has dropped them.
-    #[cfg(feature = "secure")]
+    #[cfg(feature = "accept-control")]
     let remove_all_bonds = || {
         let identities = stack.with_bond_information(|bonds| {
             let mut list = heapless::Vec::<Identity, BOND_CAPACITY>::new();
@@ -220,7 +220,7 @@ pub async fn run(
 
     let appearance = [0u8, 0];
     let mut storage = [0u8; 4];
-    #[cfg(feature = "secure")]
+    #[cfg(feature = "accept-control")]
     let mut control_storage = [0u8; 4];
     let mut uart_rx_storage = [0u8; 64];
     let mut uart_tx_storage = [0u8; 64];
@@ -262,9 +262,10 @@ pub async fn run(
 
     // S3 acceptance commands: `DEL!` removes the bond and writes a tombstone,
     // `WIPE` erases both slots, `FALT` truncates the next save. This is a test
-    // control, not part of a product profile; it is deliberately unauthenticated
-    // because the phone has to be able to erase a stale bond it cannot use.
-    #[cfg(feature = "secure")]
+    // control, not part of a product profile: it is unauthenticated (a peer
+    // must be able to clear a bond it cannot use), so it only exists in images
+    // built with the non-default `accept-control` feature.
+    #[cfg(feature = "accept-control")]
     let control: Characteristic<[u8; 4]> = vendor
         .add_characteristic(
             BOND_CONTROL_UUID,
@@ -420,7 +421,7 @@ pub async fn run(
                     GattConnectionEvent::Gatt { event } => {
                         let mut wrote_value = false;
                         let mut wrote_uart = false;
-                        #[cfg(feature = "secure")]
+                        #[cfg(feature = "accept-control")]
                         let mut wrote_control = false;
                         #[cfg(any(feature = "conn-params-30", feature = "conn-params-48"))]
                         let is_write = matches!(&event, GattEvent::Write(_));
@@ -434,7 +435,7 @@ pub async fn run(
                             GattEvent::Write(event) if event.handle() == uart_rx.handle => {
                                 wrote_uart = true;
                             }
-                            #[cfg(feature = "secure")]
+                            #[cfg(feature = "accept-control")]
                             GattEvent::Write(event) if event.handle() == control.handle => {
                                 wrote_control = true;
                             }
@@ -445,7 +446,7 @@ pub async fn run(
                             Ok(reply) => reply.send().await,
                             Err(_) => fatal(stats, 7).await,
                         }
-                        #[cfg(feature = "secure")]
+                        #[cfg(feature = "accept-control")]
                         if wrote_control {
                             let command = match connection.get(&control) {
                                 Ok(command) => command,
@@ -456,10 +457,14 @@ pub async fn run(
                                 b"DEL!" => {
                                     crate::bond::bump(crate::bond::STAT_CLEAR_REQUESTS);
                                     remove_all_bonds();
+                                    // A snapshot queued before this command must
+                                    // not be written after the tombstone.
+                                    crate::bond::signals().discard_pending();
                                     crate::bond::signals().delete.set(true);
                                 }
                                 b"WIPE" => {
                                     remove_all_bonds();
+                                    crate::bond::signals().discard_pending();
                                     crate::bond::signals().wipe.set(true);
                                 }
                                 b"FALT" => crate::bond::signals().fault.set(true),
