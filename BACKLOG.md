@@ -237,7 +237,28 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [ ] **Multi-bond and resolving list.** The store holds up to four records per
   slot and keeps the IRK field, but only one peer, one record and no RPA
   resolution were exercised on hardware. Capacity and IRK round-trip are
-  host-tested only.
+  host-tested only. A full table also has no admission policy: Trouble's
+  `add_bond` returns `OutOfMemory` before `PairingComplete`, so a fifth peer
+  fails at DHKeyCheck until a slot is freed. Define eviction/admission before
+  insertion rather than evicting a trusted peer on an arbitrary attempt.
+- [ ] **Bond write scheduling and durability policy.** A save takes ~22 ms; the
+  deferral guard is `max(observed + 2 ms, 8 ms)`, so at intervals <= 24 ms
+  nothing is persisted while connected (only on disconnect), and `WIPE`'s
+  ~35 ms erase raises the guard for the rest of the boot. A cap at
+  `interval/2` cannot make a 22 ms synchronous flash operation fit a 7.5 ms
+  budget; the policy needs an explicit scheduling/durability decision.
+- [ ] **Store hardening from the S3 review.** `erase_all()` erases slot 0
+  before slot 1 (unlike the tombstone-first `clear()`); `new()` + `save()`
+  without `load()` can resurrect an older higher-sequence record; `load()`
+  computes the payload CRC through the caller buffer, aborts on one slot's
+  read error instead of trying the other, and treats a version mismatch as
+  empty; `save()` reads back only the 24-byte header, not the payload. Fix
+  together with a mock flash that completes but corrupts a payload byte.
+- [ ] **Bonded CCCD persistence.** `PersistedBond` does not store client ATT
+  state, so a bonded peer's CCCD subscription disappears on reboot (Core 5.4
+  Vol 3 Part G §3.3.3.3). The pinned Host exposes
+  `get/set_client_att_table`; without this, #7's HID keyboard can resume
+  encryption after reboot with notifications still disabled.
 - [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).
