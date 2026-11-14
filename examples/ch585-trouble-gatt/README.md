@@ -414,9 +414,16 @@ The secure image keeps its bonds across resets and power loss.
   against the 232-byte slot payload, so an oversized combination is counted
   as overflow instead of failing at save time. `CATT_STATS[16]` reports
   load/restore/snapshot/save outcomes (the last word is the shadow's record
-  count); a table whose bytes do not read back unchanged is counted invalid
-  and rolled back to the previous table, so a layout change cannot enable a
-  notification through a recycled handle.
+  count). The read-back after `set_client_att_table` proves the stored bytes
+  landed on the same handles; it cannot prove those handles still belong to
+  the same characteristics. A layout change that moves a CCCD, resizes the
+  table or changes a subscription value is detected and rolled back, but a
+  build that keeps the same handles and values under different characteristic
+  UUIDs is byte-identical and therefore indistinguishable (tracked as the GATT
+  database fingerprint item in `BACKLOG.md`).
+  handles and values under different characteristic UUIDs is byte-identical
+  and therefore indistinguishable (tracked as the GATT database fingerprint
+  item in `BACKLOG.md`).
 - The CH585 backend (`Ch585DataFlash`) uses the DataFlash command path
   (`0x81` erase, `0x02` program, `0x0B` read) from `.highcode` RAM with
   interrupts masked; the safe-access window is only a few system clocks.
