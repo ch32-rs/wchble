@@ -11,7 +11,7 @@ use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
 use wchble::crypto::BLE_MIC_LEN;
-use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
+use wchble::hci::connection::{ConnectionBridge, ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use wchble::hci::runner::LtkReply;
 use wchble::hci::SoftRunner;
 use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
@@ -581,6 +581,9 @@ struct Session {
     /// First DLE failure: 0x14 = peer answered LL_UNKNOWN_RSP to our
     /// LL_LENGTH_REQ, 0x1e = malformed or rejected length parameters.
     x1_last_error: u32,
+    /// Negotiated `(tx octets, tx time, rx octets, rx time)` already exported
+    /// through `LE Data Length Change`.
+    dl_reported: Option<(u16, u16, u16, u16)>,
     deferred_rx: Option<DeferredRx>,
     /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
     /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
@@ -655,6 +658,7 @@ impl Session {
             length_req_rx: 0,
             length_rsp_rx: 0,
             x1_last_error: 0,
+            dl_reported: None,
             deferred_rx: None,
             enc_rsp_random,
             enc_rsp_payload,
@@ -683,12 +687,27 @@ impl Session {
     /// Copy the negotiated DLE limits into the link and the receive window.
     /// The LL octet fields are payload octets; the MIC rides on top of each
     /// already-encrypted direction, so both limits move when encryption turns
-    /// on.
-    fn apply_data_length(&mut self) {
+    /// on. A completed negotiation is reported to the Host once per change.
+    fn apply_data_length(&mut self, bridge: &mut ConnectionBridge) {
         let tx = self.control.data_length.tx_octets(self.enc_active);
         let rx = self.control.data_length.rx_octets(self.rx_encrypted);
         self.link.set_max_payloads(tx, rx);
         self.conn.set_rx_max_payload(rx);
+        let data = &self.control.data_length;
+        let reported = (
+            data.tx_payload(),
+            data.tx_time_us(),
+            data.rx_payload(),
+            data.rx_time_us(),
+        );
+        if data.negotiated() && self.dl_reported != Some(reported) {
+            if bridge
+                .data_length_change(reported.0, reported.1, reported.2, reported.3)
+                .is_ok()
+            {
+                self.dl_reported = Some(reported);
+            }
+        }
     }
 
     /// True while no encryption exchange or queued PDU owns the link.
@@ -905,7 +924,7 @@ fn connection_event(
                                 Ok(action) => {
                                     // DLE takes effect once the request or
                                     // response has been received.
-                                    s.apply_data_length();
+                                    s.apply_data_length(&mut soft.bridge);
                                     match action {
                                         ControlAction::Reply(pdu) => {
                                             if pdu.as_bytes().first() == Some(&7) {
@@ -988,7 +1007,7 @@ fn connection_event(
                 s.enc_active = true;
                 s.enc_change_pending = true;
                 // TX grows by the MIC now that our PDUs are encrypted.
-                s.apply_data_length();
+                s.apply_data_length(&mut soft.bridge);
                 sec_inc(SEC_START_RSP);
                 sec_inc(SEC_ENCRYPTED_TX);
                 sec_inc(SEC_ACTIVE);
@@ -1019,7 +1038,7 @@ fn connection_event(
                         s.link.queue(3, pdu.as_bytes()).unwrap();
                         s.rx_encrypted = true;
                         // The Central's PDUs carry the MIC from here on.
-                        s.apply_data_length();
+                        s.apply_data_length(&mut soft.bridge);
                         sec_inc(SEC_START_REQ);
                         diag_put(
                             DIAG_START_REQ_QUEUED,
@@ -1358,7 +1377,7 @@ fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
             s.length_req_tx += 1;
             return None;
         }
-        if let Some(pdu) = s.control.feature_request() {
+        if let Some(pdu) = s.control.feature_request(true) {
             s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
         }
     }
@@ -1541,15 +1560,15 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                     if pdu.as_bytes().first() == Some(&0x15) {
                         s.length_rsp_tx += 1;
                     }
-                    s.apply_data_length();
+                    s.apply_data_length(&mut soft.bridge);
                     s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
                 }
                 Ok(ControlAction::Terminate(reason)) => {
-                    s.apply_data_length();
+                    s.apply_data_length(&mut soft.bridge);
                     s.request_terminate(reason, rx.end)
                 }
                 Ok(ControlAction::None) => {
-                    s.apply_data_length();
+                    s.apply_data_length(&mut soft.bridge);
                     if plain[0] == 0 && len == 12 {
                         s.update_instant = Some(u16::from_le_bytes([plain[10], plain[11]]));
                     }

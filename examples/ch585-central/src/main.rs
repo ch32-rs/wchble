@@ -572,6 +572,9 @@ struct Session {
     terminate_requested: Option<u8>,
     began: u32,
     complete_sent: bool,
+    /// Negotiated `(tx octets, tx time, rx octets, rx time)` already exported
+    /// through `LE Data Length Change`.
+    dl_reported: Option<(u16, u16, u16, u16)>,
 }
 
 impl Session {
@@ -593,6 +596,7 @@ impl Session {
             terminate_requested: None,
             began: now,
             complete_sent: false,
+            dl_reported: None,
         }
     }
 
@@ -616,11 +620,26 @@ impl Session {
     /// Copy the negotiated DLE limits into the link and the receive window.
     /// The LL octet fields are payload octets; this example never encrypts,
     /// so no MIC is added on either direction.
-    fn apply_data_length(&mut self) {
+    fn apply_data_length(&mut self, bridge: &mut ConnectionBridge) {
         let tx = self.control.data_length.tx_octets(false);
         let rx = self.control.data_length.rx_octets(false);
         self.link.set_max_payloads(tx, rx);
         self.conn.set_rx_max_payload(rx);
+        let data = &self.control.data_length;
+        let reported = (
+            data.tx_payload(),
+            data.tx_time_us(),
+            data.rx_payload(),
+            data.rx_time_us(),
+        );
+        if data.negotiated() && self.dl_reported != Some(reported) {
+            if bridge
+                .data_length_change(reported.0, reported.1, reported.2, reported.3)
+                .is_ok()
+            {
+                self.dl_reported = Some(reported);
+            }
+        }
     }
 
     /// True while no control exchange or queued Host data owns the link.
@@ -685,7 +704,7 @@ fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
     }
     if let Some(pdu) = s.control.request_length_if_supported() {
         s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
-    } else if let Some(pdu) = s.control.feature_request() {
+    } else if let Some(pdu) = s.control.feature_request(false) {
         s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
     }
     None
@@ -891,15 +910,15 @@ fn connection_event(
                                 };
                                 match s.control.on_pdu(&mut s.conn, payload, local) {
                                     Ok(ControlAction::Reply(reply)) => {
-                                        s.apply_data_length();
+                                        s.apply_data_length(bridge);
                                         s.pending_control =
                                             Some(DataPdu::new(3, reply.as_bytes()).unwrap());
                                     }
                                     Ok(ControlAction::Terminate(reason)) => {
-                                        s.apply_data_length();
+                                        s.apply_data_length(bridge);
                                         remote_terminate = Some(reason)
                                     }
-                                    Ok(ControlAction::None) => s.apply_data_length(),
+                                    Ok(ControlAction::None) => s.apply_data_length(bridge),
                                     Err(error) => s.request_terminate(
                                         wchble::ll::ctrl::termination_reason(error),
                                         packet.end,
