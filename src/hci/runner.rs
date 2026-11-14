@@ -111,10 +111,12 @@ pub struct SoftRunner {
     drbg: ChaCha20Drbg,
     /// True once a HAL supplied a measured entropy seed.
     entropy_seeded: bool,
-    /// Pending `LE Enable Encryption` for the RF owner (Central role).
-    pending_encryption: Option<EnableEncryption>,
-    /// Host answer waiting for the RF owner (Peripheral role).
-    ltk_reply: Option<LtkReply>,
+    /// Pending `LE Enable Encryption` for the RF owner (Central role), tagged
+    /// with the connection epoch that created it.
+    pending_encryption: Option<(u32, EnableEncryption)>,
+    /// Host answer waiting for the RF owner (Peripheral role), tagged with the
+    /// connection epoch that requested it.
+    ltk_reply: Option<(u32, LtkReply)>,
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
     /// Host's `LE Write Suggested Default Data Length` values.
@@ -313,13 +315,19 @@ impl SoftRunner {
     }
 
     /// Take the pending `LE Enable Encryption` request (Central role).
+    ///
+    /// A request queued on an earlier connection is discarded: every link uses
+    /// handle 1, so without the epoch check the RF owner would start encryption
+    /// on the new link with the old key material.
     pub fn take_encryption_request(&mut self) -> Option<EnableEncryption> {
-        self.pending_encryption.take()
+        let (epoch, request) = self.pending_encryption.take()?;
+        (epoch == self.bridge.epoch()).then_some(request)
     }
 
     /// Take the Host's answer to an `LE LTK Request` (Peripheral role).
     pub fn take_ltk_reply(&mut self) -> Option<LtkReply> {
-        self.ltk_reply.take()
+        let (epoch, reply) = self.ltk_reply.take()?;
+        (epoch == self.bridge.epoch()).then_some(reply)
     }
 
     /// Drop encryption state when the link is gone or Reset is processed.
@@ -507,7 +515,7 @@ impl SoftRunner {
             return progressed;
         };
         match packet.kind {
-            PacketKind::Cmd => self.handle_command(packet.payload()),
+            PacketKind::Cmd => self.handle_command(packet.payload(), packet.epoch),
             PacketKind::AclData => {
                 if self.bridge.enqueue_tx(&packet) == Err(BridgeError::Full) {
                     self.pending_input = Some((packet, epoch));
@@ -575,7 +583,7 @@ impl SoftRunner {
         self.pending_reply = Some(transport::command_complete_packet(0x0c03, HCI_SUCCESS, &[]));
     }
 
-    fn handle_command(&mut self, bytes: &[u8]) {
+    fn handle_command(&mut self, bytes: &[u8], epoch: u32) {
         if bytes.len() < 3 || bytes.len() != 3 + usize::from(bytes[2]) {
             return;
         }
@@ -589,6 +597,10 @@ impl SoftRunner {
                     || !matches!(params[2], 0x05 | 0x13 | 0x14 | 0x15 | 0x1a | 0x29 | 0x3b)
                 {
                     HCI_INVALID_PARAMETERS
+                } else if epoch != self.bridge.epoch() {
+                    // Queued for a link that is already gone; every link uses
+                    // handle 1, so the handle check alone would kill this one.
+                    HCI_UNKNOWN_CONNECTION
                 } else {
                     self.bridge
                         .request_disconnect(u16::from_le_bytes([params[0], params[1]]), params[2])
@@ -612,7 +624,7 @@ impl SoftRunner {
                 return;
             }
             0x2019 => {
-                let status = self.enable_encryption(params);
+                let status = self.enable_encryption(params, epoch);
                 self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
@@ -686,7 +698,10 @@ impl SoftRunner {
                 let handle = u16::from_le_bytes([params[0], params[1]]);
                 let octets = u16::from_le_bytes([params[2], params[3]]);
                 let time = u16::from_le_bytes([params[4], params[5]]);
-                let status = if !(HCI_MIN_TX_OCTETS..=HCI_MAX_TX_OCTETS).contains(&octets)
+                let status = if epoch != self.bridge.epoch() {
+                    // Queued for a previous link; do not apply it to this one.
+                    HCI_UNKNOWN_CONNECTION
+                } else if !(HCI_MIN_TX_OCTETS..=HCI_MAX_TX_OCTETS).contains(&octets)
                     || !(HCI_MIN_TX_TIME..=HCI_MAX_TX_TIME).contains(&time)
                 {
                     HCI_INVALID_PARAMETERS
@@ -867,21 +882,21 @@ impl SoftRunner {
             // (Core 5.4 Vol 4 Part E §7.8.25/26); a Host that cannot decode it
             // reports `Invalid HCI Command Parameters` even on success.
             0x201a if params.len() == 18 => {
-                if self.bridge.handle() != Some(le16_from(params)) {
+                if epoch != self.bridge.epoch() || self.bridge.handle() != Some(le16_from(params)) {
                     Err(HCI_UNKNOWN_CONNECTION)
                 } else {
                     let mut ltk = [0u8; 16];
                     ltk.copy_from_slice(&params[2..18]);
-                    self.ltk_reply = Some(LtkReply::Key(ltk));
+                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Key(ltk)));
                     Ok(&params[..2])
                 }
             }
             0x201a => Err(HCI_INVALID_PARAMETERS),
             0x201b if params.len() == 2 => {
-                if self.bridge.handle() != Some(le16_from(params)) {
+                if epoch != self.bridge.epoch() || self.bridge.handle() != Some(le16_from(params)) {
                     Err(HCI_UNKNOWN_CONNECTION)
                 } else {
-                    self.ltk_reply = Some(LtkReply::Rejected);
+                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Rejected));
                     Ok(&params[..2])
                 }
             }
@@ -1017,11 +1032,16 @@ impl SoftRunner {
         HCI_SUCCESS
     }
 
-    fn enable_encryption(&mut self, params: &[u8]) -> u8 {
+    fn enable_encryption(&mut self, params: &[u8], epoch: u32) -> u8 {
         // Connection_Handle 2 + Random_Number 8 + Encrypted_Diversifier 2 +
         // Long_Term_Key 16 = 28 octets (Core 5.4 Vol 4 Part E §7.8.24).
         if params.len() != 28 {
             return HCI_INVALID_PARAMETERS;
+        }
+        // The command may have waited in the Host→Controller queue across a
+        // reconnect; its key belongs to the old link, not this one.
+        if epoch != self.bridge.epoch() {
+            return HCI_UNKNOWN_CONNECTION;
         }
         let handle = le16_from(params);
         if self.bridge.handle() != Some(handle) || self.bridge.is_disconnecting() {
@@ -1032,19 +1052,27 @@ impl SoftRunner {
         if self.bridge.role() != Some(crate::ll::Role::Central) {
             return HCI_COMMAND_DISALLOWED;
         }
-        if self.pending_encryption.is_some() {
+        // A request left over from an earlier connection must not block this
+        // one; overwrite it with the current epoch.
+        if self
+            .pending_encryption
+            .is_some_and(|(epoch, _)| epoch == self.bridge.epoch())
+        {
             return HCI_COMMAND_DISALLOWED;
         }
         let mut rand = [0u8; 8];
         rand.copy_from_slice(&params[2..10]);
         let mut ltk = [0u8; 16];
         ltk.copy_from_slice(&params[12..28]);
-        self.pending_encryption = Some(EnableEncryption {
-            handle,
-            rand,
-            ediv: u16::from_le_bytes([params[10], params[11]]),
-            ltk,
-        });
+        self.pending_encryption = Some((
+            self.bridge.epoch(),
+            EnableEncryption {
+                handle,
+                rand,
+                ediv: u16::from_le_bytes([params[10], params[11]]),
+                ltk,
+            },
+        ));
         HCI_SUCCESS
     }
 }
@@ -2051,6 +2079,201 @@ mod tests {
             runner.serve_one().await;
             expect_command_complete(0x201b, HCI_UNKNOWN_CONNECTION, &[]);
         });
+    }
+
+    /// Drain every queued controller event, including the lifecycle pair a
+    /// disconnect/reconnect produces, so the next command sees an idle channel.
+    fn drain_controller(runner: &mut SoftRunner) {
+        while runner.pump_once() {
+            while transport::try_receive_controller_packet().is_some() {}
+        }
+        while transport::try_receive_controller_packet().is_some() {}
+    }
+
+    #[test]
+    fn ltk_reply_does_not_survive_disconnect_and_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x33; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x201a, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+        });
+
+        // The reply was queued for the first link; every link uses handle 1, so
+        // the epoch is the only thing that can reject it after a reconnect.
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        drain_controller(&mut runner);
+        assert!(runner.take_ltk_reply().is_none());
+
+        // A fresh reply on the new link still reaches the RF owner.
+        pollster::block_on(async {
+            inject_cmd(0x201a, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+        });
+        assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
+    }
+
+    #[test]
+    fn enable_encryption_does_not_survive_disconnect_and_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        drain_controller(&mut runner);
+
+        let mut params = [0u8; 28];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[12..28].copy_from_slice(&[0x5a; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_SUCCESS);
+        });
+
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(info).unwrap();
+        drain_controller(&mut runner);
+        assert!(runner.take_encryption_request().is_none());
+
+        // A stale entry must not make the new link look busy.
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_SUCCESS);
+        });
+        assert_eq!(
+            runner.take_encryption_request(),
+            Some(EnableEncryption {
+                handle: 1,
+                rand: [0; 8],
+                ediv: 0,
+                ltk: [0x5a; 16],
+            })
+        );
+    }
+
+    /// Flush connection lifecycle events without pumping the Host command
+    /// queue, so a command queued before the transition is still pending.
+    fn flush_lifecycle_events(runner: &mut SoftRunner) {
+        while runner.bridge.flush_one() {
+            while transport::try_receive_controller_packet().is_some() {}
+        }
+        while transport::try_receive_controller_packet().is_some() {}
+    }
+
+    #[test]
+    fn queued_ltk_reply_does_not_cross_a_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x33; 16]);
+
+        // The Host queued the reply for this link but the runner has not
+        // parsed it yet. The epoch must come from the queueing time.
+        inject_cmd(0x201a, &params);
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        flush_lifecycle_events(&mut runner);
+
+        assert!(runner.pump_once());
+        expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[]);
+        assert!(runner.take_ltk_reply().is_none());
+
+        // A reply queued on the new link still reaches the RF owner.
+        inject_cmd(0x201a, &params);
+        assert!(runner.pump_once());
+        expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+        assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
+    }
+
+    #[test]
+    fn queued_enable_encryption_does_not_cross_a_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        flush_lifecycle_events(&mut runner);
+
+        let mut params = [0u8; 28];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[12..28].copy_from_slice(&[0x5a; 16]);
+
+        inject_cmd(0x2019, &params);
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(info).unwrap();
+        flush_lifecycle_events(&mut runner);
+
+        assert!(runner.pump_once());
+        expect_command_status(0x2019, HCI_UNKNOWN_CONNECTION);
+        assert!(runner.take_encryption_request().is_none());
+    }
+
+    #[test]
+    fn queued_data_length_does_not_cross_a_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        // 251 octets, 2120 us for handle 1.
+        inject_cmd(0x2022, &[1, 0, 0xfb, 0x00, 0x48, 0x08]);
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        flush_lifecycle_events(&mut runner);
+
+        assert!(runner.pump_once());
+        expect_command_complete(0x2022, HCI_UNKNOWN_CONNECTION, &[1, 0]);
+        assert!(runner.bridge.take_data_length_request().is_none());
+    }
+
+    #[test]
+    fn queued_disconnect_does_not_cross_a_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        // The Host asked to disconnect the old link but the runner has not
+        // parsed it yet. After a reconnect the same handle 1 is live again,
+        // so the queued request must not tear the new link down.
+        inject_cmd(0x0406, &[1, 0, 0x13]);
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        flush_lifecycle_events(&mut runner);
+
+        assert!(runner.pump_once());
+        expect_command_status(0x0406, HCI_UNKNOWN_CONNECTION);
+        assert!(runner.bridge.take_radio_request().is_none());
+
+        // A disconnect queued for the new link still reaches the RF owner.
+        inject_cmd(0x0406, &[1, 0, 0x13]);
+        assert!(runner.pump_once());
+        expect_command_status(0x0406, HCI_SUCCESS);
+        assert_eq!(
+            runner.bridge.take_radio_request(),
+            Some(super::super::connection::RadioRequest::Disconnect { reason: 0x13 })
+        );
     }
 
     #[test]

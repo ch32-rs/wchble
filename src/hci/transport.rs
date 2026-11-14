@@ -5,6 +5,7 @@
 //! [`crate::hci::runner::SoftRunner`] must be polled or Trouble's `exec` hangs
 //! waiting for Command Complete.
 
+use core::cell::Cell;
 use core::convert::Infallible;
 
 use bt_hci::transport::{
@@ -12,6 +13,7 @@ use bt_hci::transport::{
 };
 use bt_hci::{FromHciBytesError, ReadHciError};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 /// Bytes reserved for one HCI packet on this soft transport: the four-octet
@@ -27,12 +29,34 @@ static HOST_TO_CONTROLLER: Channel<CriticalSectionRawMutex, Packet, HOST_TO_CONT
 static CONTROLLER_TO_HOST: Channel<CriticalSectionRawMutex, Packet, CONTROLLER_TO_HOST_CAPACITY> =
     Channel::new();
 
+/// Connection epoch of the current link, read when a Host command is queued.
+///
+/// A command travels through [`HOST_TO_CONTROLLER`] before the runner parses
+/// it. Stamping it at enqueue keeps a reply queued for connection A from being
+/// attributed to connection B after a disconnect and reconnect: every link
+/// uses handle 1, so the epoch is the only discriminator.
+static HOST_EPOCH: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+
+/// Publish the current connection epoch to Host writes. Called by
+/// [`ConnectionBridge`](crate::hci::connection::ConnectionBridge) on connect,
+/// disconnect and reset.
+pub(crate) fn set_host_epoch(epoch: u32) {
+    HOST_EPOCH.lock(|cell| cell.set(epoch));
+}
+
+fn host_epoch() -> u32 {
+    HOST_EPOCH.lock(|cell| cell.get())
+}
+
 /// Owned HCI packet stored in the static channels.
 #[derive(Clone, Copy, Debug)]
 pub struct Packet {
     pub kind: PacketKind,
     pub len: usize,
     pub bytes: [u8; HCI_PACKET_CAPACITY],
+    /// Connection epoch when a Host command was queued. Controller→Host
+    /// packets leave it at zero.
+    pub(crate) epoch: u32,
 }
 
 impl Packet {
@@ -41,6 +65,7 @@ impl Packet {
             kind,
             len: 0,
             bytes: [0; HCI_PACKET_CAPACITY],
+            epoch: 0,
         }
     }
 
@@ -141,6 +166,9 @@ impl TransportTrait for HciTransport {
             .write_hci(&mut destination)
             .map_err(|_| Error::PacketTooLarge)?;
         packet.len = size;
+        // Capture the epoch at the Host's write call, before any await on the
+        // queue: a blocked send must not pick up a later connection's epoch.
+        packet.epoch = host_epoch();
 
         HOST_TO_CONTROLLER.send(packet).await;
         Ok(())
@@ -161,7 +189,8 @@ pub fn try_receive_host_packet() -> Option<Packet> {
 ///
 /// For cooperative pumps and diagnostics that have no async Host; production
 /// Hosts use [`HciTransport`] through `bt-hci`.
-pub fn try_send_host_packet(packet: Packet) -> Result<(), Error> {
+pub fn try_send_host_packet(mut packet: Packet) -> Result<(), Error> {
+    packet.epoch = host_epoch();
     HOST_TO_CONTROLLER
         .try_send(packet)
         .map_err(|_| Error::PacketTooLarge)

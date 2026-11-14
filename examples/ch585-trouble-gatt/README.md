@@ -398,6 +398,32 @@ The secure image keeps its bonds across resets and power loss.
   payload CRC32, header CRC32 and wrap-safe sequence number; the previous copy
   stays valid until the new one has been read back. Deletion writes a
   zero-length tombstone (higher sequence) before erasing the old page.
+- Sequential payload version 2 starts with the local random address and its
+  kind. A store written by an image advertising a different identity is read
+  and ignored (`BOND_STATS.load_result = 4`, `records_loaded = 0`) instead of
+  being served to the peer, which used to end pairing in `DHKeyCheck`. The old
+  version is not migrated; the first boot after this change starts empty.
+- A second dual-copy store (`0x7C00`, `0x7D00`) keeps each bonded peer's raw
+  `ClientAttTable` under the same local identity. The Host applies it after
+  `with_attribute_server` (before that call `set_client_att_table` is a silent
+  no-op), snapshots after an accepted CCCD write, after `PairingComplete` when
+  the peer subscribed before bonding, and on disconnect. `DEL!` and `WIPE`
+  clear both stores and the RAM shadow, one flash operation per flush call.
+  The shadow holds one record per bond (four). A record only consumes the
+  bytes its table actually serializes to, and the total is still checked
+  against the 232-byte slot payload, so an oversized combination is counted
+  as overflow instead of failing at save time. `CATT_STATS[16]` reports
+  load/restore/snapshot/save outcomes (the last word is the shadow's record
+  count). The read-back after `set_client_att_table` proves the stored bytes
+  landed on the same handles; it cannot prove those handles still belong to
+  the same characteristics. A layout change that moves a CCCD, resizes the
+  table or changes a subscription value is detected and rolled back, but a
+  build that keeps the same handles and values under different characteristic
+  UUIDs is byte-identical and therefore indistinguishable (tracked as the GATT
+  database fingerprint item in `BACKLOG.md`).
+  handles and values under different characteristic UUIDs is byte-identical
+  and therefore indistinguishable (tracked as the GATT database fingerprint
+  item in `BACKLOG.md`).
 - The CH585 backend (`Ch585DataFlash`) uses the DataFlash command path
   (`0x81` erase, `0x02` program, `0x0B` read) from `.highcode` RAM with
   interrupts masked; the safe-access window is only a few system clocks.
@@ -410,8 +436,9 @@ The secure image keeps its bonds across resets and power loss.
   session, or at the end of the run. The value characteristic requires
   encryption; night-time reads no longer rely on the peer.
 - `BOND_STATS[32]` and `BOND_ECHO[16]` expose load/save/clear counters, the
-  winner slot/sequence and the key the Host used, so the runner can compare
-  the DataFlash dump with the live session.
+  winner slot/sequence, the key the Host used and the local identity the
+  record was written under, so the runner can compare the DataFlash dump with
+  the live session. `CATT_STATS[16]` covers the client ATT store.
 - A test-only control characteristic (`00001002-b0cd-11ec-871f-d45ddf138840`)
   takes `DEL!` (remove + tombstone), `WIPE` (erase both slots) and `FALT`
   (truncate the next save; needs `--features bond-fault`). It is deliberately
@@ -432,7 +459,9 @@ save fell back to the previous copy.
 
 `tools/bond_accept.py PHASE --out DIR` runs one phase per invocation
 (`wipe`, `pair`, `reconnect`, `delete`, `repair`, `fault`, `powercycle`) with
-the phone app in `--es mode`; the acceptance image is built with
+the phone app in `--es mode`. `--dataflash-addr/--att-addr` select the bond and
+client ATT stores for the dump; `reconnect` requires the stored client ATT
+table to be applied. The acceptance image is built with
 `--features secure,accept-control` (`bond-fault` for the `fault` phase). `pair` and `fault` keep the image in flash so
 `reconnect`/`powercycle` are a reset or a real power cycle without a download;
 every other exit restores and scans the smoke image. The `delete` phase expects

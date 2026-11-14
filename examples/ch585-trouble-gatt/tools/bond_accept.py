@@ -40,6 +40,11 @@ STORE_MAGIC = 0x3344_4E42
 HOST_SECURITY = 15  # HOST_STATS.reserved_15 carries the Host security state
 LL_REJECT_UNKNOWN_KEY = 0x06
 PHASES = ('wipe', 'pair', 'reconnect', 'delete', 'repair', 'fault', 'powercycle')
+STORE_VERSION = 2
+LOCAL_IDENTITY_LEN = 7
+BOND_HEADER_LEN = LOCAL_IDENTITY_LEN + 1
+CATT_RECORD_OVERHEAD = 8
+CATT_MAGIC = 0x4333_4130
 
 
 def run_logged(args, out, prefix, timeout=240):
@@ -51,13 +56,17 @@ def reset(out):
                 '--protocol', 'jtag', '--reset'], out, 'reset')
 
 
-def dump(out, address, length, prefix='dataflash'):
+def dump_path(out, address, length, prefix='dataflash'):
     path = out / f'{prefix}.bin'
     run_logged([str(io.PREFLIGHT), '--probe', PROBE, '--chip', 'CH585',
                 '--protocol', 'jtag', '--dump-dataflash', str(path),
                 '--dataflash-addr', hex(address), '--dataflash-len', str(length)],
                out, prefix)
-    return parse_dump(path)
+    return path
+
+
+def dump(out, address, length, prefix='dataflash'):
+    return parse_dump(dump_path(out, address, length, prefix))
 
 
 def parse_dump(path):
@@ -68,24 +77,92 @@ def parse_dump(path):
         page = data[index * PAGE:(index + 1) * PAGE]
         magic, version, flags, seq, length, _reserved, payload_crc, header_crc = \
             struct.unpack_from('<IHHIHHII', page)
-        header_ok = (magic == STORE_MAGIC and version == 1
+        header_ok = (magic == STORE_MAGIC and version == STORE_VERSION
                      and header_crc == zlib.crc32(page[:20]))
         payload_ok = header_ok and payload_crc == zlib.crc32(page[24:24 + length])
+        record = None
+        local = None
+        count = 0
+        if header_ok and length > BOND_HEADER_LEN:
+            payload = page[24:24 + length]
+            local = payload[:LOCAL_IDENTITY_LEN].hex()
+            count = payload[LOCAL_IDENTITY_LEN]
+            if count:
+                start = BOND_HEADER_LEN
+                record = payload[start:start + 52].hex()
         slots.append({
             'slot': index,
             'magic': f'{magic:#010x}',
+            'version': version,
             'seq': seq,
             'length': length,
             'header_ok': header_ok,
             'payload_ok': payload_ok,
             'tombstone': header_ok and length == 0,
-            'record': page[24:24 + 1 + 52].hex() if header_ok and length > 1 else None,
+            'local': local,
+            'count': count,
+            'record': record,
         })
     return slots
 
 
 def valid_slots(slots):
     return [slot for slot in slots if slot['payload_ok'] and not slot['tombstone']]
+
+
+def valid_att_slots(slots):
+    """Client ATT pages with a decodable, non-empty, non-tombstone record."""
+    return [slot for slot in slots
+            if slot['payload_ok'] and not slot['tombstone'] and slot['count']]
+
+
+def parse_att_dump(path):
+    """Decode the client ATT store: `[local 7][count][kind addr len raw]`."""
+    data = Path(path).read_bytes()
+    slots = []
+    for index in range(len(data) // PAGE):
+        page = data[index * PAGE:(index + 1) * PAGE]
+        magic, version, _flags, seq, length, _reserved, payload_crc, header_crc = \
+            struct.unpack_from('<IHHIHHII', page)
+        header_ok = (magic == STORE_MAGIC and version == STORE_VERSION
+                     and header_crc == zlib.crc32(page[:20]))
+        payload_ok = header_ok and payload_crc == zlib.crc32(page[24:24 + length])
+        local = None
+        records = []
+        if header_ok and length > BOND_HEADER_LEN:
+            payload = page[24:24 + length]
+            local = payload[:LOCAL_IDENTITY_LEN].hex()
+            count = payload[LOCAL_IDENTITY_LEN]
+            offset = BOND_HEADER_LEN
+            for _ in range(count):
+                if offset + CATT_RECORD_OVERHEAD > len(payload):
+                    break
+                raw_len = payload[offset + 7]
+                records.append({
+                    'kind': payload[offset],
+                    'address': payload[offset + 1:offset + 7].hex(),
+                    'raw': payload[offset + CATT_RECORD_OVERHEAD:
+                                   offset + CATT_RECORD_OVERHEAD + raw_len].hex(),
+                })
+                offset += CATT_RECORD_OVERHEAD + raw_len
+        slots.append({
+            'slot': index,
+            'magic': f'{magic:#010x}',
+            'version': version,
+            'seq': seq,
+            'length': length,
+            'header_ok': header_ok,
+            'payload_ok': payload_ok,
+            'tombstone': header_ok and length == 0,
+            'local': local,
+            'count': len(records),
+            'records': records,
+        })
+    return slots
+
+
+def dump_att(out, address, length):
+    return parse_att_dump(dump_path(out, address, length, 'client-att'))
 
 
 def start_app(args, mode):
@@ -139,7 +216,8 @@ def collect(out, symbols, seconds, prefix=''):
     for name, count, names in (('STATS', 64, secure.STAT_NAMES),
                                ('HOST_STATS', 16, secure.HOST_NAMES),
                                ('SECURE_STATS', 16, secure.SEC_NAMES),
-                               ('BOND_STATS', 32, secure.BOND_NAMES)):
+                               ('BOND_STATS', 32, secure.BOND_NAMES),
+                               ('CATT_STATS', 16, secure.CATT_NAMES)):
         words = io.read32(symbols[name], count, out / f'{prefix}{name.lower()}.txt')
         raw[name] = words
         named[name] = dict(zip(names, words))
@@ -152,6 +230,8 @@ def collect(out, symbols, seconds, prefix=''):
         errors.append('BOND_STATS magic missing')
     if named['BOND_STATS']['version'] != 1:
         errors.append('BOND_STATS version is not 1')
+    if named['CATT_STATS']['magic'] != CATT_MAGIC:
+        errors.append('CATT_STATS magic missing')
     return named, raw, echo, errors
 
 
@@ -176,16 +256,22 @@ def dump_matches_echo(slots, echo):
     if len(valid) != 1:
         return [f'expected one valid stored copy, saw {len(valid)}']
     record = bytes.fromhex(valid[0]['record'] or '')
-    if len(record) < 1 + 52:
+    if len(record) < 52:
         return ['stored record is too short']
     if not echo.get('present'):
         return ['the Host never recorded a bond to compare against']
-    if record[1:17].hex() != echo['ltk']:
+    if record[0:16].hex() != echo['ltk']:
         return ['stored LTK differs from the key the Host used']
+    if echo.get('local_present'):
+        expected = bytes([echo['local_address_kind']]) + bytes.fromhex(
+            echo['local_address'].replace(':', ''))
+        if valid[0].get('local') != expected.hex():
+            return [f'stored local identity {valid[0].get("local")} differs from '
+                    f'the advertised one {expected.hex()}']
     return []
 
 
-def checks_pair(named, raw, echo, rows, slots, seconds):
+def checks_pair(named, raw, echo, rows, slots, seconds, att, expect_att='any'):
     errors = security_errors(named, raw, seconds)
     errors += app_errors(rows, 'encrypted_read_write_ok')
     bonds = named['BOND_STATS']
@@ -197,11 +283,25 @@ def checks_pair(named, raw, echo, rows, slots, seconds):
         errors.append('the new bond was never saved')
     if bonds['save_fail']:
         errors.append(f'{bonds["save_fail"]} bond saves failed')
+
+    catt = named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    stored = bool(valid_att_slots(att))
+    if stored != (catt['save_ok'] > 0):
+        errors.append('the client ATT dump and its save report disagree')
+    # Only a round whose app actually subscribes can prove the persistence
+    # path; `--expect-att loaded` turns that into a gate.
+    if expect_att == 'loaded':
+        if catt['snapshots'] < 1:
+            errors.append('the client wrote no CCCD, so no ATT record was exercised')
+        if catt['save_ok'] < 1 or not stored:
+            errors.append('the client ATT record was not saved')
     errors += dump_matches_echo(slots, echo)
     return errors
 
 
-def checks_reconnect(named, raw, rows, seconds):
+def checks_reconnect(named, raw, rows, seconds, att, expect_att='any'):
     errors = security_errors(named, raw, seconds)
     errors += app_errors(rows, 'reconnect_encrypted_read_write_ok')
     bonds = named['BOND_STATS']
@@ -216,6 +316,34 @@ def checks_reconnect(named, raw, rows, seconds):
         errors.append(f'{bonds["save_attempts"]} bond writes on a resumed session')
     if bonds['add_bond_ok'] < bonds['records_loaded']:
         errors.append('the boot restore did not hand every record to the Host')
+
+    catt = named['CATT_STATS']
+    if catt['restore_attempts'] < 1:
+        errors.append('the Host never attempted a client ATT restore')
+    if catt['restore_invalid']:
+        errors.append(f'{catt["restore_invalid"]} stored client ATT tables were rejected')
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    # The reported boot decode and the flash dump must agree, whichever way
+    # the round went; a mismatch means one of the two stores is lying.
+    loaded = bool(catt['records_loaded'])
+    if loaded != bool(valid_att_slots(att)):
+        errors.append('the client ATT store and its boot report disagree')
+    if loaded and catt['restore_ok'] < 1:
+        errors.append('a stored client ATT table was not applied to the peer')
+    if not loaded and catt['restore_ok']:
+        errors.append('a client ATT table was applied without a stored record')
+    if loaded and catt['restore_no_record']:
+        errors.append('the reconnecting peer had no stored client ATT record')
+    # `--expect-att loaded` is for rounds whose client subscribed: those must
+    # show the stored record and its restore, not just self-consistency.
+    if expect_att == 'loaded':
+        if not loaded:
+            errors.append('no client ATT record was decoded at boot')
+        if catt['restore_ok'] < 1:
+            errors.append('the stored client ATT table was not applied to the peer')
+    elif expect_att == 'empty' and loaded:
+        errors.append('client ATT records were present but expected to be absent')
     if sec['ltk_request'] < 1 or sec['ltk_reply'] < 1:
         errors.append(f'controller did not use the stored LTK: '
                       f'request={sec["ltk_request"]} reply={sec["ltk_reply"]}')
@@ -224,7 +352,7 @@ def checks_reconnect(named, raw, rows, seconds):
     return errors
 
 
-def checks_delete(delete_named, delete_raw, delete_rows, slots,
+def checks_delete(delete_named, delete_raw, delete_rows, slots, att_slots,
                   reject_named, reject_rows, seconds):
     errors = security_errors(delete_named, delete_raw, seconds)
     errors += app_errors(delete_rows, 'bond_delete_ok')
@@ -238,6 +366,16 @@ def checks_delete(delete_named, delete_raw, delete_rows, slots,
         errors.append('a valid bond survived deletion')
     if not any(slot['tombstone'] for slot in slots):
         errors.append('no tombstone was written')
+
+    # `DEL!` clears the client ATT store in the same run; a surviving record
+    # would let the next snapshot resurrect the deleted peer's subscription.
+    catt = delete_named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    if valid_att_slots(att_slots):
+        errors.append('a stored client ATT record survived deletion')
+    if not any(slot['tombstone'] for slot in att_slots):
+        errors.append('no client ATT tombstone was written')
     errors += app_errors(reject_rows, 'reconnect_encrypted_read_write_ok', pass_expected=False)
     sec = reject_named['SECURE_STATS']
     if sec['ltk_request'] < 1:
@@ -251,7 +389,7 @@ def checks_delete(delete_named, delete_raw, delete_rows, slots,
     return errors
 
 
-def checks_wipe(named, rows, slots):
+def checks_wipe(named, rows, slots, att_slots):
     errors = app_errors(rows, 'bond_wipe_ok')
     bonds = named['BOND_STATS']
     if bonds['clear_requests'] < 1 or bonds['clear_ok'] != 1:
@@ -261,11 +399,18 @@ def checks_wipe(named, rows, slots):
         errors.append('a valid record survived the wipe')
     if any(slot['header_ok'] for slot in slots):
         errors.append('a store header survived the wipe')
+
+    # The ATT store is erased on the next idle flush call; it must be empty too.
+    catt = named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    if any(slot['header_ok'] for slot in att_slots):
+        errors.append('a client ATT store header survived the wipe')
     return errors
 
 
 def checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
-                 reconnect_rows, seconds):
+                 reconnect_rows, seconds, att, expect_att='any'):
     errors = app_errors(rows, 'fault_injected_ok')
     bonds = named['BOND_STATS']
     if bonds['fault_injected'] != 1:
@@ -276,7 +421,7 @@ def checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
     if not any(slot['header_ok'] and not slot['payload_ok'] for slot in slots):
         errors.append('the interrupted copy has a valid payload; expected a CRC mismatch')
     errors += checks_reconnect(reconnect_named, reconnect_raw,
-                               reconnect_rows, seconds)
+                               reconnect_rows, seconds, att, expect_att)
     return errors
 
 
@@ -288,8 +433,11 @@ def phase_pair(args, out, symbols, image, seconds):
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
-    errors += checks_pair(named, raw, echo, rows, slots, seconds)
-    return errors, {'stats': named, 'echo': echo, 'dataflash': slots}
+    att = dump_att(out, args.att_addr, args.att_len)
+    errors += checks_pair(named, raw, echo, rows, slots, seconds, att,
+                          args.expect_att)
+    return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
+                    'client_att': att}
 
 
 def phase_wipe(args, out, symbols, image, seconds):
@@ -300,8 +448,10 @@ def phase_wipe(args, out, symbols, image, seconds):
     p4.wait_until(started + seconds + 3)
     named, _raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
-    errors += checks_wipe(named, rows, slots)
-    return errors, {'stats': named, 'echo': echo, 'dataflash': slots}
+    att = dump_att(out, args.att_addr, args.att_len)
+    errors += checks_wipe(named, rows, slots, att)
+    return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
+                    'client_att': att}
 
 
 def phase_reconnect(args, out, symbols, seconds):
@@ -311,8 +461,9 @@ def phase_reconnect(args, out, symbols, seconds):
     rows = wait_for_app(args, out, 'reconnect')
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
-    errors += checks_reconnect(named, raw, rows, seconds)
-    return errors, {'stats': named, 'echo': echo}
+    att = dump_att(out, args.att_addr, args.att_len)
+    errors += checks_reconnect(named, raw, rows, seconds, att, args.expect_att)
+    return errors, {'stats': named, 'echo': echo, 'client_att': att}
 
 
 def phase_powercycle(args, out, symbols, seconds):
@@ -322,8 +473,9 @@ def phase_powercycle(args, out, symbols, seconds):
     rows = wait_for_app(args, out, 'reconnect')
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
-    errors += checks_reconnect(named, raw, rows, seconds)
-    return errors, {'stats': named, 'echo': echo}
+    att = dump_att(out, args.att_addr, args.att_len)
+    errors += checks_reconnect(named, raw, rows, seconds, att, args.expect_att)
+    return errors, {'stats': named, 'echo': echo, 'client_att': att}
 
 
 def phase_delete(args, out, symbols, image, seconds):
@@ -334,6 +486,7 @@ def phase_delete(args, out, symbols, image, seconds):
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
+    att = dump_att(out, args.att_addr, args.att_len)
 
     # Same image, fresh boot: the phone still holds the key, the board no
     # longer does, so the controller must reject it.
@@ -345,9 +498,10 @@ def phase_delete(args, out, symbols, image, seconds):
     reject_named, reject_raw, _, reject_errors = collect(out, symbols, seconds,
                                                          prefix='reject-')
     errors += reject_errors
-    errors += checks_delete(named, raw, rows, slots, reject_named, reject_rows, seconds)
+    errors += checks_delete(named, raw, rows, slots, att, reject_named, reject_rows,
+                            seconds)
     return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
-                    'reject': reject_named}
+                    'client_att': att, 'reject': reject_named}
 
 
 def phase_fault(args, out, symbols, image, seconds, nm_text):
@@ -368,19 +522,20 @@ def phase_fault(args, out, symbols, image, seconds, nm_text):
     p4.wait_until(started + seconds + 3)
     reconnect_named, reconnect_raw, _, reconnect_errors = collect(
         out, symbols, seconds, prefix='reconnect-')
+    att = dump_att(out, args.att_addr, args.att_len)
     errors += reconnect_errors
     errors += checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
-                           reconnect_rows, seconds)
+                           reconnect_rows, seconds, att, args.expect_att)
     return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
-                    'reconnect': reconnect_named}
+                    'client_att': att, 'reconnect': reconnect_named}
 
 
 def load_symbols(image):
     nm_text = io.command([p4.NM, str(image)], Path(f'{image}.nm.txt'))
     symbols = p4.symbols_from(nm_text)
     for name in ('STATS', 'HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES',
-                 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO', 'PERIPHERAL_ADDRESS',
-                 'TRACE', 'RUN_SECONDS'):
+                 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO', 'CATT_STATS',
+                 'PERIPHERAL_ADDRESS', 'TRACE', 'RUN_SECONDS'):
         matches = [parts for line in nm_text.splitlines()
                    if len(parts := line.split()) == 3 and parts[2] == name]
         if len(matches) != 1:
@@ -464,11 +619,22 @@ def options(argv=None):
                         default=0x77E00)
     parser.add_argument('--dataflash-len', type=lambda text: int(text, 0),
                         default=512)
+    parser.add_argument('--att-addr', type=lambda text: int(text, 0),
+                        default=0x77C00,
+                        help='client ATT store slots (0x7C00/0x7D00)')
+    parser.add_argument('--att-len', type=lambda text: int(text, 0),
+                        default=512)
+    parser.add_argument('--expect-att', choices=('any', 'loaded', 'empty'),
+                        default='any',
+                        help='require a stored client ATT record (app subscribes) '
+                             'or its absence; the default only checks consistency')
     parser.add_argument('--keep-image', action='store_true',
                         help='leave the test image in flash instead of restoring smoke')
     args = parser.parse_args(argv)
     if args.dataflash_len % PAGE or not 2 * PAGE <= args.dataflash_len <= 0x8000:
         parser.error('--dataflash-len must cover whole 256-byte pages')
+    if args.att_len % PAGE or not 2 * PAGE <= args.att_len <= 0x8000:
+        parser.error('--att-len must cover whole 256-byte pages')
     args.out, args.elf, args.smoke_elf = (args.out.resolve(), args.elf.resolve(),
                                           args.smoke_elf.resolve())
     return args

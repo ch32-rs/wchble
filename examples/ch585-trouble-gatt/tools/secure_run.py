@@ -43,8 +43,12 @@ BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
     clear_requests clear_ok clear_fail fault_injected last_error max_save_us
     last_save_us boot_read_us pairs_complete pairs_without_bond in_memory_removed
     control_writes malformed_control_writes add_bond_ok add_bond_fail
-    reserved0 reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
+    identity_mismatch reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
 BOND_MAGIC = 0x4233_5330
+CATT_NAMES = '''magic version load_result records_loaded identity_mismatch
+    save_attempts save_ok save_fail snapshots restore_attempts restore_ok
+    restore_no_record restore_invalid overflow last_error shadow_records'''.split()
+CATT_MAGIC = 0x4333_4130
 X4_MAGIC = 0x5834_0001
 X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match
     burst_runs burst_attempts burst_sent burst_queue_full burst_busy burst_other
@@ -201,7 +205,7 @@ def validate_observation_buffers(image, symbols, extra=()):
     ranges = []
     buffers = (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
                ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
-               ('BOND_STATS', 32), ('BOND_ECHO', 16),
+               ('BOND_STATS', 32), ('BOND_ECHO', 16), ('CATT_STATS', 16),
                ('PERIPHERAL_ADDRESS', 2),
                ('TRACE', 128 * 8)) + tuple(extra)
     for name, count in buffers:
@@ -511,6 +515,7 @@ def decode_bond_echo(words):
         return {'present': False}
     address = words[2].to_bytes(4, 'big') + bytes([words[3] >> 24, (words[3] >> 16) & 0xFF])
     ltk = b''.join(word.to_bytes(4, 'little') for word in words[4:8])
+    local = words[9].to_bytes(4, 'big') + bytes([words[10] >> 24, (words[10] >> 16) & 0xFF])
     return {
         'present': True,
         'count': words[1],
@@ -521,6 +526,9 @@ def decode_bond_echo(words):
         'security_level': (words[8] >> 8) & 0xFF,
         'has_irk': bool((words[8] >> 16) & 1),
         'key_len': (words[8] >> 24) & 0xFF,
+        'local_address': ':'.join(f'{byte:02x}' for byte in local),
+        'local_address_kind': (words[10] >> 8) & 0xFF,
+        'local_present': bool(words[10] & 0xFF),
     }
 
 
@@ -594,7 +602,7 @@ def execute(args):
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
         for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'X1_STATS',
+                     'BOND_STATS', 'BOND_ECHO', 'CATT_STATS', 'X4_STATS', 'X1_STATS',
                      'PERIPHERAL_ADDRESS'):
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
@@ -710,6 +718,12 @@ def execute(args):
         (args.out / 'bond_stats.json').write_text(
             json.dumps({'stats': metadata['bond_stats'], 'echo': metadata['bond_echo']},
                        indent=2) + '\n')
+        catt_words = io.read32(symbols['CATT_STATS'], 16, args.out / 'catt_stats.txt')
+        metadata['catt_stats'] = dict(zip(CATT_NAMES, catt_words))
+        if catt_words[0] != CATT_MAGIC:
+            errors.append(f'invalid CATT_STATS magic: {catt_words[0]:08x}')
+        (args.out / 'catt_stats.json').write_text(
+            json.dumps(metadata['catt_stats'], indent=2) + '\n')
         diag_words = io.read32(symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
         metadata['sec_diag'] = decode_diag(diag_words)
         metadata['sec_diag'].update({

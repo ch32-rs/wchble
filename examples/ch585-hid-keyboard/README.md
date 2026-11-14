@@ -76,10 +76,16 @@ these two values, so this is an observed platform boundary rather than a
 documented Apple requirement. Reports never leave the device before encryption
 is active.
 
-The bond store persists keys and peer identity, not the client ATT table. A
-bonded host's report CCCD subscription is therefore lost across a reboot; this
-is tracked as the first follow-up after the keyboard PR (`BACKLOG.md`, "Bonded
-CCCD persistence"). The encrypted link itself resumes.
+The bond store persists keys and peer identity; a second dual-copy store
+(`0x7C00`/`0x7D00`) keeps each bonded peer's raw client ATT table, so the report
+CCCD subscription survives a reboot and the Host applies it when the peer
+reconnects (`CATT_STATS[16]`, `--expect restored` in
+`tools/android_hid_run.py`). The encrypted link itself resumes either way. A
+table stored by a build with a different GATT layout is normally rolled back:
+moving or resizing a CCCD changes the read-back. The exception is a build whose
+layout keeps the same CCCD handles and values under different characteristic
+UUIDs, which the byte comparison cannot tell apart from a match (BACKLOG: GATT
+database fingerprint).
 
 The report mirror exists because Apple's Accessory Design Guidelines filter the
 BLE HID service out of CoreBluetooth discovery: a macOS app never sees
