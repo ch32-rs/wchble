@@ -249,6 +249,40 @@ impl ConnectionBridge {
         Ok(())
     }
 
+    /// Emit `LE Data Length Change` (LE Meta subevent 0x07) for the
+    /// connected handle. The octet values are payload octets, MIC excluded.
+    /// The controller generates this whenever the effective data length
+    /// changes as a result of DLE (Core 5.4 Vol 4 Part E 7.7.65.7).
+    pub fn data_length_change(
+        &mut self,
+        max_tx_octets: u16,
+        max_tx_time: u16,
+        max_rx_octets: u16,
+        max_rx_time: u16,
+    ) -> Result<(), BridgeError> {
+        let info = self.info.as_ref().ok_or(BridgeError::NotConnected)?;
+        if self.resetting {
+            return Err(BridgeError::NotConnected);
+        }
+        if !self.le_event_enabled(7) {
+            return Ok(());
+        }
+        let handle = info.handle;
+        // Keep one slot reserved for Disconnection Complete.
+        if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
+            return Err(BridgeError::Full);
+        }
+        let mut parameters = [0; 11];
+        parameters[0] = 0x07;
+        parameters[1..3].copy_from_slice(&handle.to_le_bytes());
+        parameters[3..5].copy_from_slice(&max_tx_octets.to_le_bytes());
+        parameters[5..7].copy_from_slice(&max_tx_time.to_le_bytes());
+        parameters[7..9].copy_from_slice(&max_rx_octets.to_le_bytes());
+        parameters[9..11].copy_from_slice(&max_rx_time.to_le_bytes());
+        self.push_event(event_packet(0x3e, &parameters));
+        Ok(())
+    }
+
     /// Emit `Encryption Change` for the connected handle.
     ///
     /// `enabled` is the HCI Encryption_Enabled value (0x00 off, 0x01 on).
