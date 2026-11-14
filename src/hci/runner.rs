@@ -7,9 +7,7 @@
 use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
-use crate::ll::dle::{
-    LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US,
-};
+use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -113,6 +111,9 @@ pub struct SoftRunner {
     /// Host's `LE Write Suggested Default Data Length` values.
     suggested_tx_octets: u16,
     suggested_tx_time: u16,
+    /// True once the Host explicitly set the suggestion; until then the
+    /// controller keeps its own larger default for new connections.
+    suggested_tx_explicit: bool,
     /// Most recent command that answered with a non-success status:
     /// `(opcode << 8) | status`, for firmware-side diagnostics.
     last_command_failure: Option<u32>,
@@ -156,6 +157,7 @@ impl SoftRunner {
             le_features: [0; 8],
             suggested_tx_octets: LL_LEGACY_PAYLOAD,
             suggested_tx_time: LL_LEGACY_TIME_US,
+            suggested_tx_explicit: false,
             last_command_failure: None,
             command_log: [0; 8],
             command_log_len: 0,
@@ -276,6 +278,14 @@ impl SoftRunner {
     /// Suggested default TX data length last written by the Host.
     pub fn suggested_data_length(&self) -> (u16, u16) {
         (self.suggested_tx_octets, self.suggested_tx_time)
+    }
+
+    /// The Host's suggestion, but only once it actually set one. New
+    /// connections seed their TX preference from this; the controller's own
+    /// default stays in force until then.
+    pub fn suggested_data_length_explicit(&self) -> Option<(u16, u16)> {
+        self.suggested_tx_explicit
+            .then_some((self.suggested_tx_octets, self.suggested_tx_time))
     }
 
     /// Take a Host `LE Set Data Length` request (`TX_Octets`, `TX_Time`).
@@ -549,6 +559,7 @@ impl SoftRunner {
         self.clear_encryption();
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
         self.suggested_tx_time = LL_LEGACY_TIME_US;
+        self.suggested_tx_explicit = false;
         if self.random_addr.is_some() {
             self.sync_adv_addr();
         }
@@ -700,6 +711,7 @@ impl SoftRunner {
                 {
                     self.suggested_tx_octets = octets;
                     self.suggested_tx_time = time;
+                    self.suggested_tx_explicit = true;
                     HCI_SUCCESS
                 } else {
                     HCI_INVALID_PARAMETERS
@@ -728,7 +740,7 @@ impl SoftRunner {
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
-                    &[lo, hi, ACL_CREDITS, 0, 0, 0, 0],
+                    &[lo, hi, ACL_CREDITS, 0, 0, 0],
                 ));
                 return;
             }
@@ -1314,22 +1326,25 @@ mod tests {
 
             inject_cmd(0x2060, &[]);
             runner.serve_one().await;
-            expect_command_complete(0x2060, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS, 0, 0, 0, 0]);
+            expect_command_complete(0x2060, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS, 0, 0, 0]);
 
             inject_cmd(0x2023, &[]);
             runner.serve_one().await;
             expect_command_complete(0x2023, HCI_SUCCESS, &[27, 0, 0x48, 0x01]);
 
+            assert_eq!(runner.suggested_data_length_explicit(), None);
             inject_cmd(0x2024, &[0xf7, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2024, HCI_SUCCESS, &[]);
             assert_eq!(runner.suggested_data_length(), (247, 2120));
+            assert_eq!(runner.suggested_data_length_explicit(), Some((247, 2120)));
 
             // 251 payload octets would need 255 on air; refuse instead of
             // advertising a length the receive path cannot hold.
             inject_cmd(0x2024, &[0xfb, 0, 0x48, 0x08]);
             runner.serve_one().await;
             expect_command_complete(0x2024, HCI_INVALID_PARAMETERS, &[]);
+            assert_eq!(runner.suggested_data_length_explicit(), Some((247, 2120)));
             assert_eq!(runner.suggested_data_length(), (247, 2120));
         });
     }
