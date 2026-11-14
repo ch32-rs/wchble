@@ -377,33 +377,52 @@ impl<R: FlashRegion> DualCopyStore<R> {
     /// call [`load`](Self::load) first.
     ///
     /// Without this, `new() + save()` writes sequence 1 and an older slot with
-    /// sequence 5 wins on the next load. Header-only probing is deliberate: a
-    /// corrupt payload still carries a newer sequence and must not be
-    /// resurrected over. If a header itself cannot be read, refuse to write
-    /// blind.
+    /// sequence 5 wins on the next load. The next write must not erase the only
+    /// valid copy: when the newest header carries a corrupt payload and the
+    /// other slot is still valid, `active` is the valid slot, so the write goes
+    /// into the corrupt one. The sequence is always taken from the newest
+    /// header, valid or not, so a corrupt record is never resurrected over.
+    /// If a header itself cannot be read, refuse to write blind.
     fn locate(&mut self) -> Result<(), StoreError> {
         if self.active.is_some() || self.seq != 0 {
             return Ok(());
         }
-        let mut best: Option<(usize, Header)> = None;
+        let mut newest: Option<(usize, Header)> = None;
+        let mut newest_valid: Option<(usize, Header)> = None;
         let mut first_error = None;
         for slot in 0..2 {
-            match self.read_header(slot) {
-                Ok(Some(header)) => {
-                    if best.is_none_or(|(_, current)| seq_after(header.seq, current.seq)) {
-                        best = Some((slot, header));
-                    }
-                }
-                Ok(None) => {}
+            let header = match self.read_header(slot) {
+                Ok(Some(header)) => header,
+                Ok(None) => continue,
                 Err(error) => {
                     first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if newest.is_none_or(|(_, current)| seq_after(header.seq, current.seq)) {
+                newest = Some((slot, header));
+            }
+            if header.payload_len as usize <= self.max_payload() {
+                match self.payload_crc_ok(slot, &header) {
+                    Ok(true) => {
+                        if newest_valid
+                            .is_none_or(|(_, current)| seq_after(header.seq, current.seq))
+                        {
+                            newest_valid = Some((slot, header));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
         }
-        match best {
-            Some((slot, header)) => {
+        let seq = newest.map_or(0, |(_, header)| header.seq);
+        match newest_valid.or(newest) {
+            Some((slot, _)) => {
                 self.active = Some(slot);
-                self.seq = header.seq;
+                self.seq = seq;
                 Ok(())
             }
             None => match first_error {
@@ -652,6 +671,46 @@ mod tests {
         store.region.data[offset] ^= 0x40;
         let mut out = [0u8; 16];
         assert_eq!(store.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
+    fn save_without_load_does_not_erase_the_only_valid_copy() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        // The newest header stays valid; only its payload is damaged.
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        // A fresh store that never calls `load()` must write into the damaged
+        // slot, not erase the older valid copy.
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        next.save(b"next").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(4)));
+        assert_eq!(&out[..4], b"next");
+
+        // The previous record still backs up the new one.
+        let current = next.active_slot().unwrap();
+        next.region.data[current * PAGE + HEADER_LEN + 2] ^= 0x80;
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
+    fn failed_save_without_load_keeps_the_only_valid_copy() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        next.region.corrupt_next_payload = true;
+        assert!(next.save(b"next").is_err());
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
         assert_eq!(&out[..3], b"old");
     }
 

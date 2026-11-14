@@ -140,6 +140,9 @@ pub fn decode_bonds(
     if stored != *local {
         return Ok(None);
     }
+    if input.len() < HEADER_LEN {
+        return Err(StoreError::BadFormat);
+    }
     let count = input[LOCAL_IDENTITY_LEN] as usize;
     if count > MAX_BONDS
         || count > out.len()
@@ -217,6 +220,19 @@ mod tests {
         let other = LocalIdentity::random([0x18, 0x00, 0x00, 0xee, 0xff, 0xc1]);
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
         assert_eq!(decode_bonds(&payload[..len], &other, &mut decoded), Ok(None));
+    }
+
+    #[test]
+    fn identity_only_payload_is_rejected_not_read() {
+        // Exactly the local identity: the count byte is missing. This used to
+        // index past the end after the identity matched.
+        let local = local();
+        let input = local.encode();
+        let mut decoded = [PersistedBond::empty(); MAX_BONDS];
+        assert_eq!(
+            decode_bonds(&input, &local, &mut decoded),
+            Err(StoreError::BadFormat)
+        );
     }
 
     #[test]

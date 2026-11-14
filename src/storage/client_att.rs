@@ -115,6 +115,9 @@ pub fn decode_client_att(
     if stored != *local {
         return Ok(None);
     }
+    if input.len() < HEADER_LEN {
+        return Err(StoreError::BadFormat);
+    }
     let count = input[LOCAL_IDENTITY_LEN] as usize;
     if count > MAX_CLIENT_ATT || count > out.len() {
         return Err(StoreError::BadFormat);
@@ -196,6 +199,19 @@ mod tests {
         let len = encode_client_att(&local(), &records, &mut payload).unwrap();
         assert_eq!(len, MAX_PAYLOAD);
         assert!(MAX_PAYLOAD <= 256 - super::super::HEADER_LEN);
+    }
+
+    #[test]
+    fn identity_only_payload_is_rejected_not_read() {
+        // Exactly the local identity: the count byte is missing. This used to
+        // index past the end after the identity matched.
+        let local = local();
+        let input = local.encode();
+        let mut decoded = [ClientAttRecord::empty(); MAX_CLIENT_ATT];
+        assert_eq!(
+            decode_client_att(&input, &local, &mut decoded),
+            Err(StoreError::BadFormat)
+        );
     }
 
     #[test]
