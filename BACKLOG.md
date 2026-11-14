@@ -241,6 +241,18 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   `add_bond` returns `OutOfMemory` before `PairingComplete`, so a fifth peer
   fails at DHKeyCheck until a slot is freed. Define eviction/admission before
   insertion rather than evicting a trusted peer on an arbitrary attempt.
+- [ ] **Bond records are keyed only by the peer identity.** A record stores the
+  peer identity and IRK but not the local advertised identity, and DataFlash
+  survives reflashes. A record written by an image that advertised a different
+  address (the secure build once rotated the low octet from entropy) is loaded
+  and offered to the same phone, so a fresh pairing fails at DHKeyCheck
+  (`SMP_DHKEY_CHK_FAIL`, phone reports `BOND_REJECTED`) until the store is
+  wiped. Observed 2026-11-14: the `...16` image loaded a record left by an
+  earlier rotating-address boot (`records_loaded=1`), and `--mode wipe` cleared
+  it (`load_result=0`, both slots `0xFFFFFFFF`) before a clean pairing
+  (`pairs_complete=1`, `save_ok=1`). Test images sharing one board and one
+  phone hit this repeatedly; wipe before a fresh-pair round and decide whether
+  records should carry the local identity.
 - [ ] **Bond write scheduling and durability policy.** A save takes ~22 ms; the
   deferral guard is `max(observed + 2 ms, 8 ms)`, so at intervals <= 24 ms
   nothing is persisted while connected (only on disconnect), and `WIPE`'s
