@@ -1,6 +1,6 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-10. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-12. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
 failures or retroactively change archived results.
@@ -204,7 +204,7 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   any future Android-based acceptance source does the same instead of treating
   the first failure as a controller defect.
 
-## S2 security gaps
+## Security gaps (S2/S3)
 
 - [ ] **iOS round never started (backlogged 2026-11-12 by project decision).**
   No iOS client exists in this repository and none was ever installed on the
@@ -219,9 +219,61 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   0, `SECURE_STATS` encryption counters, and a capture with ciphertext after
   `START_ENC_RSP`. It does not establish repeatability across boots, per-model
   behaviour, MTU above 23, or an encrypted notification path.
-- [ ] **No bond store.** Every boot rotates the static random address, so an
-  existing bond can never be reused and the phone sees a new device each time.
-  This is the S3 entry condition, not a property of a finished design.
+- [x] **Bond store (S3, 2026-11-12).** Two DataFlash pages, 24-byte header with
+  payload/header CRC32 and a wrap-safe sequence, a zero-length tombstone for
+  deletion, and the whole engine sequence in `.highcode` RAM with interrupts
+  masked. The address is now fixed (`C1:FF:EE:00:00:16`) so a peer can find the
+  key it stored on an earlier boot. Hardware evidence: probe reset and a real
+  USB unplug/replug reconnect encrypted with `pairs_complete=0` and
+  `save_attempts=0`; deletion produced `LL_REJECT_IND(0x06)` with
+  `start_req=0`, then a fresh pairing wrote a new record; a truncated save left
+  the older copy valid and the reboot loaded it (`winner_seq` unchanged). See
+  [S3 results](local-docs/research/ch585-s3-results.md).
+- [ ] **Air capture of the post-delete rejection.** Android re-pairs within the
+  same app run after the peripheral rejects the stale key (`BONDED→BONDING→
+  BONDED`), so the sniffer's first followed link shows the new pairing, not the
+  `REJECT_IND`. The rejection is proven by firmware counters
+  (`last_error=0x06`, `start_req=0`) and the phone's ATT 0x85, not on air.
+- [ ] **Multi-bond and resolving list.** The store holds up to four records per
+  slot and keeps the IRK field, but only one peer, one record and no RPA
+  resolution were exercised on hardware. Capacity and IRK round-trip are
+  host-tested only. A full table also has no admission policy: Trouble's
+  `add_bond` returns `OutOfMemory` before `PairingComplete`, so a fifth peer
+  fails at DHKeyCheck until a slot is freed. Define eviction/admission before
+  insertion rather than evicting a trusted peer on an arbitrary attempt.
+- [ ] **Bond records are keyed only by the peer identity.** A record stores the
+  peer identity and IRK but not the local advertised identity, and DataFlash
+  survives reflashes. A record written by an image that advertised a different
+  address (the secure build once rotated the low octet from entropy) is loaded
+  and offered to the same phone, so a fresh pairing fails at DHKeyCheck
+  (`SMP_DHKEY_CHK_FAIL`, phone reports `BOND_REJECTED`) until the store is
+  wiped. Observed 2026-11-14: the `...16` image loaded a record left by an
+  earlier rotating-address boot (`records_loaded=1`), and `--mode wipe` cleared
+  it (`load_result=0`, both slots `0xFFFFFFFF`) before a clean pairing
+  (`pairs_complete=1`, `save_ok=1`). Test images sharing one board and one
+  phone hit this repeatedly; wipe before a fresh-pair round and decide whether
+  records should carry the local identity.
+- [ ] **Bond write scheduling and durability policy.** A save takes ~22 ms; the
+  deferral guard is `max(observed + 2 ms, 8 ms)`, so at intervals <= 24 ms
+  nothing is persisted while connected (only on disconnect), and `WIPE`'s
+  ~35 ms erase raises the guard for the rest of the boot. A cap at
+  `interval/2` cannot make a 22 ms synchronous flash operation fit a 7.5 ms
+  budget; the policy needs an explicit scheduling/durability decision.
+- [ ] **Store hardening from the S3 review.** `erase_all()` erases slot 0
+  before slot 1 (unlike the tombstone-first `clear()`); `new()` + `save()`
+  without `load()` can resurrect an older higher-sequence record; `load()`
+  computes the payload CRC through the caller buffer, aborts on one slot's
+  read error instead of trying the other, and treats a version mismatch as
+  empty; `save()` reads back only the 24-byte header, not the payload. Fix
+  together with a mock flash that completes but corrupts a payload byte.
+- [ ] **Bonded CCCD persistence.** `PersistedBond` does not store client ATT
+  state, so a bonded peer's CCCD subscription disappears on reboot (Core 5.4
+  Vol 3 Part G §3.3.3.3). The pinned Host exposes
+  `get/set_client_att_table`; without this, #7's HID keyboard can resume
+  encryption after reboot with notifications still disabled.
+- [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
+  SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
+  (security spec §2).
 
 ## Explicitly outside this milestone
 

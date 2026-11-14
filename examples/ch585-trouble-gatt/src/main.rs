@@ -21,6 +21,12 @@ use wchble::ll::enc::{
     EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
 };
 use wchble::rf::family::ch585::{Ch585Aes, Ch585Radio, BB_BASE, LLE_BASE};
+#[cfg(feature = "secure")]
+use wchble::rf::family::ch585::Ch585DataFlash;
+#[cfg(feature = "secure")]
+use wchble::storage::bond::{decode_bonds, encode_bonds, PersistedBond, MAX_BONDS, MAX_PAYLOAD};
+#[cfg(feature = "secure")]
+use wchble::storage::DualCopyStore;
 use wchble::rf::regs::{self, bb, bb_irq, lle};
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
@@ -28,6 +34,8 @@ use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use {panic_halt as _, portable_atomic as _};
 
 mod host;
+#[cfg(feature = "secure")]
+mod bond;
 #[cfg(feature = "secure")]
 mod rng;
 #[cfg(feature = "secure")]
@@ -1170,6 +1178,131 @@ fn host_snapshot(stats: &host::HostStats) {
     }
 }
 
+/// Time reserved between starting a bond save and the next RX prepare: the
+/// measured worst case plus 2 ms, never below 8 ms. It is a software budget,
+/// not an air-interface requirement.
+#[cfg(feature = "secure")]
+fn save_guard_us() -> u32 {
+    let observed = bond::value(bond::STAT_MAX_SAVE_US) + 2_000;
+    if observed < 8_000 {
+        8_000
+    } else {
+        observed
+    }
+}
+
+#[cfg(feature = "secure")]
+fn record_save_time(clock: &Clock, started: u32) {
+    let took = clock.now_us().wrapping_sub(started);
+    bond::set(bond::STAT_LAST_SAVE_US, took);
+    bond::observe_max(bond::STAT_MAX_SAVE_US, took);
+}
+
+/// Persist pending bond changes. `deadline` is the next RX prepare time when a
+/// connection is active; the save is deferred instead of running into an event.
+#[cfg(feature = "secure")]
+fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadline: Option<u32>) {
+    let signals = bond::signals();
+    if let Some(deadline) = deadline {
+        if reached(clock.now_us().wrapping_add(save_guard_us()), deadline) {
+            bond::bump(bond::STAT_DEFERRED);
+            return;
+        }
+    }
+    if signals.wipe.take() {
+        // Erasing the store also drops any snapshot captured before the wipe.
+        signals.discard_pending();
+        let started = clock.now_us();
+        bond::bump(bond::STAT_CLEAR_REQUESTS);
+        match store.erase_all() {
+            Ok(()) => bond::bump(bond::STAT_CLEAR_OK),
+            Err(_) => {
+                bond::bump(bond::STAT_CLEAR_FAIL);
+                bond::set(bond::STAT_LAST_ERROR, 1);
+            }
+        }
+        record_save_time(clock, started);
+        return;
+    }
+    if signals.delete.take() {
+        signals.discard_pending();
+        let started = clock.now_us();
+        bond::bump(bond::STAT_CLEAR_REQUESTS);
+        match store.clear() {
+            Ok(()) => bond::bump(bond::STAT_CLEAR_OK),
+            Err(_) => {
+                bond::bump(bond::STAT_CLEAR_FAIL);
+                bond::set(bond::STAT_LAST_ERROR, 1);
+            }
+        }
+        record_save_time(clock, started);
+        return;
+    }
+    if signals.fault.take() {
+        #[cfg(feature = "bond-fault")]
+        {
+            // Re-write the stored payload, but stop part-way: the previous copy
+            // must still load after the reboot.
+            let mut payload = [0u8; MAX_PAYLOAD];
+            let started = clock.now_us();
+            match store.load(&mut payload) {
+                Ok(Some(len)) => {
+                    // Half the record reaches flash; the header still claims
+                    // the full length, so its payload CRC must fail. A fixed
+                    // prefix longer than the record would write it complete.
+                    match store.save_with_fault(&payload[..len], len / 2) {
+                        Err(wchble::storage::StoreError::Injected) => {
+                            bond::bump(bond::STAT_FAULT_INJECTED)
+                        }
+                        _ => bond::bump(bond::STAT_SAVE_FAIL),
+                    }
+                }
+                _ => bond::bump(bond::STAT_SAVE_FAIL),
+            }
+            record_save_time(clock, started);
+        }
+        #[cfg(not(feature = "bond-fault"))]
+        bond::bump(bond::STAT_SAVE_FAIL);
+        return;
+    }
+    let Some(snapshot) = signals.take_pending() else {
+        return;
+    };
+    let mut records = [PersistedBond::empty(); MAX_BONDS];
+    let mut count = 0usize;
+    for entry in &snapshot {
+        if count == MAX_BONDS {
+            break;
+        }
+        records[count] = bond::from_bond(entry);
+        count += 1;
+    }
+    let mut payload = [0u8; MAX_PAYLOAD];
+    let len = match encode_bonds(&records[..count], &mut payload) {
+        Ok(len) => len,
+        Err(_) => {
+            bond::bump(bond::STAT_SAVE_FAIL);
+            bond::set(bond::STAT_LAST_ERROR, 2);
+            return;
+        }
+    };
+    bond::bump(bond::STAT_SAVE_ATTEMPTS);
+    let started = clock.now_us();
+    match store.save(&payload[..len]) {
+        Ok(()) => {
+            bond::bump(bond::STAT_SAVE_OK);
+            if deadline.is_none() {
+                bond::bump(bond::STAT_SAVE_ON_DISCONNECT);
+            }
+        }
+        Err(_) => {
+            bond::bump(bond::STAT_SAVE_FAIL);
+            bond::set(bond::STAT_LAST_ERROR, 3);
+        }
+    }
+    record_save_time(clock, started);
+}
+
 fn idle<F: Future>(
     soft: &mut SoftRunner,
     mut future: Pin<&mut F>,
@@ -1247,7 +1380,7 @@ fn main() -> ! {
     stop(&mut radio, &clock);
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
-    let mut peripheral_address = host::RANDOM_ADDRESS;
+    let peripheral_address = host::RANDOM_ADDRESS;
     // S2 must not pair from a deterministic stream. Collect ADC temperature
     // noise (the S0 source), refuse a stuck converter, then give the Host a
     // second DRBG stream drawn from the seeded controller DRBG.
@@ -1287,10 +1420,8 @@ fn main() -> ! {
         let mut host_seed = [0u8; 32];
         soft.fill_random(&mut host_seed);
         rng::seed(&host_seed);
-        // New device per boot: the low octet of the static random address
-        // comes from the seeded DRBG, so a bonded peer cannot replay an old
-        // LTK that this firmware (which has no bond store) could not answer.
-        peripheral_address[0] = host_seed[0];
+        // S3 keeps the identity fixed: the bond store answers the peer's old
+        // LTK, so a reboot must look like the same device to reuse it.
         sec_put(
             1,
             1 | (1 << 8)
@@ -1299,6 +1430,39 @@ fn main() -> ! {
         );
     }
     soft.set_le_features(LOCAL_FEATURES);
+    // S3: restore bonds before the Host advertises. The read is a flash-engine
+    // command, so it happens here with the radio stopped.
+    #[cfg(feature = "secure")]
+    let mut store = DualCopyStore::new(Ch585DataFlash, Ch585DataFlash::BOND_SLOTS);
+    #[cfg(feature = "secure")]
+    {
+        bond::set(0, bond::BOND_MAGIC);
+        bond::set(1, 1);
+        let mut boot_bonds = [PersistedBond::empty(); MAX_BONDS];
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let read_started = clock.now_us();
+        match store.load(&mut payload) {
+            Ok(Some(len)) => match decode_bonds(&payload[..len], &mut boot_bonds) {
+                Ok(count) => {
+                    bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_VALID);
+                    bond::set(bond::STAT_RECORDS_LOADED, count as u32);
+                    bond::set(bond::STAT_WINNER_SLOT, store.active_slot().unwrap_or(0) as u32);
+                    bond::set(bond::STAT_WINNER_SEQ, store.seq());
+                    bond::set_boot_bonds(&boot_bonds[..count]);
+                }
+                Err(_) => bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_CORRUPT),
+            },
+            Ok(None) => bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_NONE),
+            Err(_) => {
+                bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_IO);
+                bond::set(bond::STAT_LAST_ERROR, 4);
+            }
+        }
+        bond::set(
+            bond::STAT_BOOT_READ_US,
+            clock.now_us().wrapping_sub(read_started),
+        );
+    }
     let app_stats = host::HostStats::new();
     set_peripheral_address(&peripheral_address);
     let mut app = core::pin::pin!(host::run(controller, &app_stats, peripheral_address));
@@ -1405,6 +1569,8 @@ fn main() -> ! {
                 radio.set_channel(s.conn.channel()).unwrap();
             }
             if reason.is_none() && !reached(clock.now_us().wrapping_add(2000), prepare) {
+                #[cfg(feature = "secure")]
+                flush_bonds(&mut store, &clock, Some(prepare));
                 let mut until = earlier(prepare, earlier(finish, s.conn.supervision_deadline_us()));
                 if let Some(end) = s.control.termination_deadline_us() {
                     until = earlier(until, end);
@@ -1450,10 +1616,14 @@ fn main() -> ! {
                 session = None;
                 put(2, 2);
                 next_adv = clock.now_us();
+                #[cfg(feature = "secure")]
+                flush_bonds(&mut store, &clock, None);
             }
             continue;
         }
         let now = clock.now_us();
+        #[cfg(feature = "secure")]
+        flush_bonds(&mut store, &clock, None);
         let idle_until = if soft.adv_enabled() && !reached(now, next_adv) {
             next_adv
         } else {
@@ -1580,6 +1750,9 @@ fn main() -> ! {
         next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
     }
     stop(&mut radio, &clock);
+    // A pairing that completed in the last event may still be pending.
+    #[cfg(feature = "secure")]
+    flush_bonds(&mut store, &clock, None);
     host_snapshot(&app_stats);
     put(32, clock.now_us().wrapping_sub(started));
     put(33, reg(LLE_BASE, lle::CMD));

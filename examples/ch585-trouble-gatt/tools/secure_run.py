@@ -38,11 +38,25 @@ SEC_MAGIC = 0x5332_3538
 SEC_NAMES = '''magic version_flags enc_req enc_rsp ltk_request ltk_reply
     start_req start_rsp encrypted_tx encrypted_rx active mic_failure errors prepared
     plaintext_start_retry last_error'''.split()
+BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
+    save_attempts save_ok save_fail deferred_no_window save_on_disconnect
+    clear_requests clear_ok clear_fail fault_injected last_error max_save_us
+    last_save_us boot_read_us pairs_complete pairs_without_bond in_memory_removed
+    control_writes malformed_control_writes add_bond_ok add_bond_fail
+    reserved0 reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
+BOND_MAGIC = 0x4233_5330
 HOST_NAMES = p4.HOST_NAMES
 STAT_NAMES = p4.STAT_NAMES
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
 SECURITY_ENCRYPTED = 3
+SUMMARY_REASONS = {
+    'pair': 'encrypted_read_write_ok',
+    'reconnect': 'reconnect_encrypted_read_write_ok',
+    'delete': 'bond_delete_ok',
+    'wipe': 'bond_wipe_ok',
+    'fault': 'fault_injected_ok',
+}
 ui_path = '/sdcard/wchble-ui.xml'
 
 
@@ -149,6 +163,7 @@ def validate_observation_buffers(image, symbols):
     ranges = []
     for name, count in (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
                         ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
+                        ('BOND_STATS', 32), ('BOND_ECHO', 16),
                         ('PERIPHERAL_ADDRESS', 2),
                         ('TRACE', 128 * 8)):
         address, size = symbols[name], count * 4
@@ -227,34 +242,103 @@ def read_log(lines):
     return rows
 
 
-def evaluate_transcript(rows):
+def evaluate_transcript(rows, mode='pair'):
     errors = []
     events = [row.get('event') for row in rows]
     summaries = [row for row in rows if row.get('event') == 'summary']
     if len(summaries) != 1:
         return [f'expected exactly one app summary, saw {len(summaries)}: {events}']
     summary = summaries[0]
-    if summary.get('pass') is not True or summary.get('reason') != 'encrypted_read_write_ok':
+    if summary.get('pass') is not True or summary.get('reason') != SUMMARY_REASONS[mode]:
         errors.append(f'app summary is not a pass: {summary}')
-    if summary.get('bonded') is not True:
+    # A reused bond has no BOND_BONDED broadcast; the Host counters prove the
+    # session resumed the stored key instead.
+    already_bonded = 'already_bonded' in events
+    if mode in ('pair', 'reconnect') and summary.get('bonded') is not True:
         errors.append('app summary did not observe a completed bond')
-    for required in ('scan_started', 'found', 'connecting', 'connection_state',
-                     'bond_requested', 'bond_state', 'services_discovered',
-                     'encrypted_gatt_start', 'read', 'write_requested', 'write_ack'):
-        if required not in events:
-            errors.append(f'app transcript is missing {required}')
-    bond_states = [row.get('state') for row in rows if row.get('event') == 'bond_state']
-    if 12 not in bond_states:  # BOND_BONDED
-        errors.append(f'bond state never reached BOND_BONDED: {bond_states}')
-    reads = [row for row in rows if row.get('event') == 'read' and row.get('status') == 0]
-    if not reads or reads[0].get('value') != 0:
-        errors.append(f'first encrypted read did not return the initial value 0: {reads[:1]}')
-    if len(reads) < 2 or reads[-1].get('value') != 43:
-        errors.append(f'read-back after write did not return 43: {reads}')
+    if mode == 'wipe':
+        required = ('scan_started', 'found', 'connecting', 'connection_state',
+                    'services_discovered', 'control_start', 'write_ack')
+    elif mode in ('pair', 'reconnect'):
+        required = ('scan_started', 'found', 'connecting', 'connection_state',
+                    'services_discovered', 'encrypted_gatt_start', 'read',
+                    'write_requested', 'write_ack')
+        if mode == 'pair' and not already_bonded:
+            required += ('bond_requested', 'bond_state')
+    else:
+        required = ('scan_started', 'found', 'connecting', 'connection_state',
+                    'services_discovered', 'encrypted_gatt_start', 'read',
+                    'control_write', 'write_ack')
+    for required_event in required:
+        if required_event not in events:
+            errors.append(f'app transcript is missing {required_event}')
+    if mode == 'pair' and not already_bonded:
+        bond_states = [row.get('state') for row in rows if row.get('event') == 'bond_state']
+        if 12 not in bond_states:  # BOND_BONDED
+            errors.append(f'bond state never reached BOND_BONDED: {bond_states}')
+    if mode in ('pair', 'reconnect'):
+        reads = [row for row in rows if row.get('event') == 'read' and row.get('status') == 0]
+        if not reads or reads[0].get('value') != 0:
+            errors.append(f'first encrypted read did not return the initial value 0: {reads[:1]}')
+        if len(reads) < 2 or reads[-1].get('value') != 43:
+            errors.append(f'read-back after write did not return 43: {reads}')
     writes = [row for row in rows if row.get('event') == 'write_ack' and row.get('status') == 0]
     if not writes:
         errors.append('no successful ATT write response')
     return errors
+
+
+def evaluate_rejection(rows):
+    """Same app flow as `reconnect`, but the board no longer holds the key."""
+    errors = []
+    summaries = [row for row in rows if row.get('event') == 'summary']
+    if len(summaries) != 1:
+        return [f'expected exactly one app summary, saw {len(summaries)}']
+    app = summaries[0]
+    if app.get('pass') is not False:
+        errors.append(f'the reconnect unexpectedly succeeded: {app}')
+    if app.get('reason') not in ('read_failed', 'disconnected', 'reconnect_not_bonded'):
+        errors.append(f'unexpected rejection reason: {app.get("reason")}')
+    return errors
+
+
+def evaluate_rejected_link(sec, host):
+    """Firmware-side proof that the controller refused the deleted key."""
+    errors = []
+    if len(sec) != 16 or sec[0] != SEC_MAGIC:
+        return ['invalid SECURE_STATS']
+    ltk, start, active = (SEC_NAMES.index(name) for name in
+                          ('ltk_request', 'start_req', 'active'))
+    if sec[ltk] < 1:
+        errors.append('the controller never asked for the deleted LTK')
+    if sec[start] != 0:
+        errors.append(f'encryption started after deletion: start_req={sec[start]}')
+    if sec[SEC_NAMES.index("last_error")] != 0x06:
+        errors.append(f'expected LL_REJECT_IND 0x06, last_error={sec[SEC_NAMES.index("last_error")]}')
+    if sec[active] != 0:
+        errors.append('the run reports an active encrypted link')
+    if len(host) == 16 and host[15] == SECURITY_ENCRYPTED:
+        errors.append('the Host still reports an encrypted link')
+    return errors
+
+
+def decode_bond_echo(words):
+    """Key material the Host last stored, for comparison with the flash dump."""
+    if not words or words[0] != 0x4F48_4345:
+        return {'present': False}
+    address = words[2].to_bytes(4, 'big') + bytes([words[3] >> 24, (words[3] >> 16) & 0xFF])
+    ltk = b''.join(word.to_bytes(4, 'little') for word in words[4:8])
+    return {
+        'present': True,
+        'count': words[1],
+        'address': ':'.join(f'{byte:02x}' for byte in address),
+        'address_kind': (words[3] >> 8) & 0xFF,
+        'is_bonded': bool(words[3] & 0xFF),
+        'ltk': ltk.hex(),
+        'security_level': (words[8] >> 8) & 0xFF,
+        'has_irk': bool((words[8] >> 16) & 1),
+        'key_len': (words[8] >> 24) & 0xFF,
+    }
 
 
 def evaluate_security(sec, host, stats, run_seconds):
@@ -303,7 +387,8 @@ def evaluate_security(sec, host, stats, run_seconds):
 def execute(args):
     args.out.mkdir(parents=True, exist_ok=False)
     errors, metadata = [], {
-        'probe': PROBE, 'scope': 'S2 Just Works pairing + encrypted GATT',
+        'probe': PROBE, 'scope': 'S2/S3 Just Works + encrypted GATT',
+        'mode': args.mode,
         'run_seconds': args.run_seconds, 'timeout': args.timeout,
         'air_ifs': 'UNMEASURED', 'mitm': 'not protected (Just Works)',
     }
@@ -319,7 +404,7 @@ def execute(args):
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
         for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'PERIPHERAL_ADDRESS'):
+                     'BOND_STATS', 'BOND_ECHO', 'PERIPHERAL_ADDRESS'):
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
             if len(matches) != 1:
@@ -369,7 +454,8 @@ def execute(args):
         hook = getattr(args, 'capture_hook', None)
         if hook is not None:
             hook.before_app(args)
-        adb(args.serial, 'shell', 'am', 'start', '-W', '-n', ACTIVITY)
+        adb(args.serial, 'shell', 'am', 'start', '-W', '-n', ACTIVITY,
+            '--es', 'mode', args.mode)
         deadline = time.monotonic() + args.timeout
         metadata['pairing_consent'] = []
         while time.monotonic() < deadline:
@@ -397,7 +483,10 @@ def execute(args):
             '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
         metadata['client_summary'] = next(
             (row for row in reversed(rows) if row.get('event') == 'summary'), None)
-        errors.extend(evaluate_transcript(rows))
+        if args.reject:
+            errors.extend(evaluate_rejection(rows))
+        else:
+            errors.extend(evaluate_transcript(rows, args.mode))
 
         p4.wait_until(safe_read_at)
         observations = {}
@@ -409,9 +498,21 @@ def execute(args):
             metadata[name.lower()] = dict(zip(names, words))
             (args.out / f'{name.lower()}.json').write_text(
                 json.dumps(metadata[name.lower()], indent=2) + '\n')
-        errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
-                                        observations.get('HOST_STATS', []),
-                                        observations.get('STATS', []), args.run_seconds))
+        if args.reject:
+            errors.extend(evaluate_rejected_link(observations.get('SECURE_STATS', []),
+                                                 observations.get('HOST_STATS', [])))
+        else:
+            errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
+                                            observations.get('HOST_STATS', []),
+                                            observations.get('STATS', []),
+                                            args.run_seconds))
+        bond_words = io.read32(symbols['BOND_STATS'], 32, args.out / 'bond_stats.txt')
+        metadata['bond_stats'] = dict(zip(BOND_NAMES, bond_words))
+        echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
+        metadata['bond_echo'] = decode_bond_echo(echo_words)
+        (args.out / 'bond_stats.json').write_text(
+            json.dumps({'stats': metadata['bond_stats'], 'echo': metadata['bond_echo']},
+                       indent=2) + '\n')
         diag_words = io.read32(symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
         metadata['sec_diag'] = decode_diag(diag_words)
         if diag_words[40]:
@@ -437,8 +538,8 @@ def execute(args):
         metadata['sec_opcodes']['skipped_events'] = diag_words[37]
         metadata['sec_opcodes']['start_req_queued'] = diag_words[38]
         metadata['sec_opcodes']['start_rsp_queued'] = diag_words[39]
-        # LSO-first static random address; the secure build rotates octet 0
-        # from measured entropy so each run is a fresh device for a bonded peer.
+        # LSO-first static random address. S3 keeps it fixed so a bonded peer
+        # can find the bond it saved on an earlier boot.
         address_words = io.read32(symbols['PERIPHERAL_ADDRESS'], 2,
                                   args.out / 'address.txt')
         address = bytes(byte for word in address_words
@@ -492,6 +593,10 @@ def options(argv=None):
     parser.add_argument('--serial', default=ADB_SERIAL)
     parser.add_argument('--run-seconds', type=int, default=25)
     parser.add_argument('--timeout', type=float, default=45)
+    parser.add_argument('--mode', choices=tuple(SUMMARY_REASONS), default='pair',
+                        help='app phase: pair, reconnect, delete, wipe or fault')
+    parser.add_argument('--reject', action='store_true',
+                        help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')
     parser.add_argument('--full-logcat', action='store_true')
     args = parser.parse_args(argv)

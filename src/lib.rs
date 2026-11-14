@@ -35,6 +35,7 @@ compile_error!(
 );
 
 pub mod rf;
+pub mod storage;
 pub mod time;
 
 #[cfg(feature = "phy")]

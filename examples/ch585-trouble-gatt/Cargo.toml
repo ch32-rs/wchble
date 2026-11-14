@@ -18,6 +18,12 @@ secure = [
     "dep:embassy-crypto-rustcrypto",
     "dep:embassy-time-driver",
 ]
+# S3 acceptance control characteristic (`DEL!`, `WIPE`, `FALT`). Non-default
+# and never part of a product image: it lets any peer in range erase bonds.
+accept-control = ["secure"]
+# S3 acceptance: `FALT` truncates the next save so the dual-copy fallback can
+# be tested on hardware.
+bond-fault = ["accept-control", "wchble/storage-fault"]
 # Test-only: ask the central for a fixed connection interval over L2CAP.
 conn-params-30 = []
 conn-params-48 = []

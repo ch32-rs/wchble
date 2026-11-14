@@ -30,7 +30,9 @@ before building. The local Trouble checkout revision above must also match.
 
 The first manual phone check passed on 2026-11-10. In one directly flashed
 360-second window the user reported all five requested operations completed on
-Android and a later iOS attempt also succeeded: read, Write Request/readback,
+Android. A separate manual iOS observation with the third-party nRF Connect
+client (P4/P5 image, not the S2 secure image) also reported success: read,
+Write Request/readback,
 numbered notifications, a write/read with notifications disabled, and
 disconnect/reconnect persistence. Firmware recorded four accepted connections
 and disconnects, six reads, five writes, five queued notifications, final value
@@ -271,11 +273,10 @@ What the image does differently:
   AES-CCM runs outside the connection event: TX is encrypted before the
   event, RX is decrypted after it. The CH585 AES block shares registers with
   the RF IP, so the engine reloads the key before every CCM operation.
-- Rotates the least-significant octet of the static random address from the
-  entropy seed. The image has no bond store (S3), so a peer that bonded an
-  earlier boot would otherwise insist on an LTK this build cannot supply.
-  Android does not drop its bond on `LL_REJECT_IND(0x06)`, so per-boot
-  identity is the supported behaviour, not a workaround hidden in the client.
+- Uses a fixed static random address (`C1:FF:EE:00:00:16`,
+  `host::RANDOM_ADDRESS`) so a peer can find the bond it saved on an earlier
+  boot. S2 rotated the address because it had no bond store; a phone that
+  bonded a rotation-era address must forget it once.
 - Exposes `SECURE_STATS[16]` (ENC_REQ/RSP, LTK request/reply, START_ENC
   request/response, encrypted TX/RX, active, MIC failures, errors, entropy
   flags) and `SEC_DIAG` with the packed ACL ring and the last HCI commands
@@ -287,12 +288,15 @@ Acceptance (Just Works, no MITM protection): the phone must report
 SMP exchange, `ENC_REQ`/`ENC_RSP`/`START_ENC_REQ`, and no decodable ATT PDU
 after the encryption start. Connecting without encryption is not acceptance.
 
-`tools/secure_run.py` drives the Android client (`tools/android-pair`), and
-`tools/secure_capture.py` wraps it with the sniffer. The capture wrapper
-starts the sniffer only after the probe flash (so the firmware is already
-advertising), scans for the rotated address and follows it; `--follow-by-name`
-alone races the sniffer's one-shot name lookup. Both runners flash with the
-single-session preflight helper and restore the smoke image in a `finally`.
+`tools/secure_run.py` drives the Android client (`tools/android-pair`) and
+takes `--mode pair|reconnect|delete|wipe|fault` plus `--reject` (expect the
+reconnect to be refused). `tools/secure_capture.py` wraps it with the sniffer;
+its `--mode` also gates the pcap (reconnect/fault forbid new SMP frames,
+delete/reject require `LL_REJECT_IND`). The capture wrapper starts the sniffer
+only after the probe flash (so the firmware is already advertising) and
+follows the fixed address; `--follow-by-name` alone races the sniffer's
+one-shot name lookup. Both runners flash with the single-session preflight
+helper and restore the smoke image in a `finally`.
 
 Android 15 (CPH2411) passed this matrix on 2026-11-12. The iOS round has not
 been attempted and is tracked in the backlog: this repository has no iOS
@@ -301,6 +305,55 @@ bonded to this firmware) is offline. The iOS acceptance client is nRF Connect,
 already installed on that phone and used for the P5 manual checks. S2 is
 accepted on the Android evidence only; do not describe the iOS support as
 verified.
+
+## S3: bond persistence (feature `secure`)
+
+The secure image keeps its bonds across resets and power loss.
+
+- `wchble::storage::DualCopyStore` writes the bond list to one of two
+  DataFlash pages (`0x7E00`, `0x7F00`). Each copy has a 24-byte header with a
+  payload CRC32, header CRC32 and wrap-safe sequence number; the previous copy
+  stays valid until the new one has been read back. Deletion writes a
+  zero-length tombstone (higher sequence) before erasing the old page.
+- The CH585 backend (`Ch585DataFlash`) uses the DataFlash command path
+  (`0x81` erase, `0x02` program, `0x0B` read) from `.highcode` RAM with
+  interrupts masked; the safe-access window is only a few system clocks.
+  DataFlash is not memory-mapped: `ch585-preflight --dump-dataflash` reads it
+  through the target's `ch5xx-data-flash` algorithm, never `probe-rs read`.
+- The Host restores bonds before advertising and answers the controller's LTK
+  request from the bond table. A new bond is saved from `PairingComplete` in
+  the idle path, deferred while the next RX prepare is within the measured
+  save time plus 2 ms (never below 8 ms), and forced on disconnect, with no
+  session, or at the end of the run. The value characteristic requires
+  encryption; night-time reads no longer rely on the peer.
+- `BOND_STATS[32]` and `BOND_ECHO[16]` expose load/save/clear counters, the
+  winner slot/sequence and the key the Host used, so the runner can compare
+  the DataFlash dump with the live session.
+- A test-only control characteristic (`00001002-b0cd-11ec-871f-d45ddf138840`)
+  takes `DEL!` (remove + tombstone), `WIPE` (erase both slots) and `FALT`
+  (truncate the next save; needs `--features bond-fault`). It is deliberately
+  unauthenticated so a peer can clear a stale bond it cannot use, so it only
+  exists in images built with the non-default `accept-control` feature
+  (`--features secure,accept-control`; `bond-fault` implies it). A `secure`
+  product image does not expose it. `DEL!`/`WIPE` also discard any bond
+  snapshot queued before the command, so a deferred save cannot recreate a
+  deleted bond.
+
+Measured on hardware: a save takes about 22 ms and erasing both pages about
+35 ms; boot reads take 25-39 us for an empty store, 121-128 us for a valid
+record and about 1.2 ms when one slot must be rejected. Android 15 evidence is
+in `local-docs/research/ch585-s3-results.md`: reset and real unplug both
+resumed the stored key without pairing, deletion produced
+`LL_REJECT_IND(0x06)` and a later pairing wrote a new record, and a truncated
+save fell back to the previous copy.
+
+`tools/bond_accept.py PHASE --out DIR` runs one phase per invocation
+(`wipe`, `pair`, `reconnect`, `delete`, `repair`, `fault`, `powercycle`) with
+the phone app in `--es mode`; the acceptance image is built with
+`--features secure,accept-control` (`bond-fault` for the `fault` phase). `pair` and `fault` keep the image in flash so
+`reconnect`/`powercycle` are a reset or a real power cycle without a download;
+every other exit restores and scans the smoke image. The `delete` phase expects
+the operator to forget the bond on the phone before `repair`.
 
 ## Build and validate
 
@@ -322,6 +375,9 @@ example's embedded target configuration:
 ```sh
 cargo test --locked --manifest-path tests/trouble-host/Cargo.toml
 python3 examples/ch585-trouble-gatt/tools/test_run.py
+python3 examples/ch585-trouble-gatt/tools/test_capture.py
+python3 examples/ch585-trouble-gatt/tools/test_bond_accept.py
+python3 examples/ch585-trouble-gatt/tools/test_secure_run.py
 swiftc -typecheck examples/ch585-trouble-gatt/tools/central.swift
 swiftc -typecheck examples/ch585-trouble-gatt/tools/p5_uart.swift
 ```
