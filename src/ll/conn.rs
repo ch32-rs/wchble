@@ -1,5 +1,7 @@
 //! Pure legacy LE 1M peripheral connection timing and channel selection.
 
+use super::dle::{LL_DEFAULT_RX_PAYLOAD, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD};
+
 /// Connection handle / timing placeholders retained for the HCI scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -39,6 +41,9 @@ pub enum ConnError {
 pub struct ConnectParams {
     pub peer_addr: [u8; 6],
     pub peer_random: bool,
+    /// ChSel: the initiator supports CSA #2. The connection uses CSA #2 only
+    /// when the advertiser also set ChSel in ADV_IND/ADV_SCAN_IND.
+    pub chsel: bool,
     pub access_addr: u32,
     pub crc_init: u32,
     pub win_size: u8,
@@ -53,10 +58,9 @@ pub struct ConnectParams {
 
 impl ConnectParams {
     /// Parse a complete advertising PDU (two header bytes, 34 payload bytes,
-    /// no CRC). This peripheral advertises ChSel=0 and supports only CSA #1.
-    /// RFU header bits are ignored. A CSA #2-capable initiator is allowed to
-    /// send ChSel=1 even though our ADV_IND had ChSel=0 (Core 5.4, 2.3.3.1);
-    /// selection still remains CSA #1 for this advertiser.
+    /// no CRC). `chsel` records the initiator's ChSel bit; whether the link
+    /// actually uses CSA #2 also depends on the advertiser's own ChSel, so the
+    /// caller must keep them separate. RFU header bits are ignored.
     pub fn parse(
         pdu: &[u8],
         crc_ok: bool,
@@ -83,6 +87,7 @@ impl ConnectParams {
         let params = Self {
             peer_addr,
             peer_random: pdu[0] & 0x40 != 0,
+            chsel: pdu[0] & 0x20 != 0,
             access_addr: u32::from_le_bytes(pdu[14..18].try_into().unwrap()),
             crc_init: u32::from_le_bytes([pdu[18], pdu[19], pdu[20], 0]),
             win_size: pdu[21],
@@ -140,6 +145,7 @@ impl ConnectParams {
         }
         out[0] = 0x05
             | if init_random { 0x40 } else { 0 }
+            | if self.chsel { 0x20 } else { 0 }
             | if self.peer_random { 0x80 } else { 0 };
         out[1] = 34;
         out[2..8].copy_from_slice(&init_addr);
@@ -277,6 +283,143 @@ impl Csa1 {
     }
 }
 
+/// CSA #2 (Core 5.4, Vol 6, Part B, 4.5.8.3). Unlike CSA #1 the channel is a
+/// pure function of the event counter, so missed events need no extra state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Csa2 {
+    map: [u8; 5],
+    channel_id: u16,
+}
+
+impl Csa2 {
+    pub fn new(map: [u8; 5], access_addr: u32) -> Result<Self, ConnError> {
+        validate_channel_map(map)?;
+        Ok(Self {
+            map,
+            channel_id: ((access_addr >> 16) as u16) ^ (access_addr as u16),
+        })
+    }
+
+    pub fn set_map(&mut self, map: [u8; 5]) -> Result<(), ConnError> {
+        validate_channel_map(map)?;
+        self.map = map;
+        Ok(())
+    }
+
+    pub fn channel_id(&self) -> u16 {
+        self.channel_id
+    }
+
+    /// Pseudo-random number `prn_e` before mapping. Exposed for diagnostics
+    /// and to test against the specification's intermediate values.
+    pub fn prn_e(&self, event_counter: u16) -> u16 {
+        csa2_prn_e(event_counter, self.channel_id)
+    }
+
+    /// Call once for every connection event, including missed events.
+    pub fn next_channel(&self, event_counter: u16) -> u8 {
+        let prn_e = self.prn_e(event_counter);
+        let unmapped = (prn_e % 37) as u8;
+        if self.map[usize::from(unmapped / 8)] & (1 << (unmapped % 8)) != 0 {
+            return unmapped;
+        }
+        let used = self.map.iter().map(|b| b.count_ones()).sum::<u32>();
+        // remapIndex = floor(N * prn_e / 65536), Core 5.4 Vol 6 Part B 4.5.8.3.
+        let remap_index = (used * u32::from(prn_e)) >> 16;
+        let mut index = remap_index as u32;
+        for channel in 0..37 {
+            if self.map[usize::from(channel / 8)] & (1 << (channel % 8)) != 0 {
+                if index == 0 {
+                    return channel;
+                }
+                index -= 1;
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn csa2_prn_e(event_counter: u16, channel_id: u16) -> u16 {
+    let mut prn = event_counter ^ channel_id;
+    for _ in 0..3 {
+        prn = csa2_perm(prn);
+        prn = (17 * u32::from(prn) + u32::from(channel_id)) as u16;
+    }
+    prn ^ channel_id
+}
+
+/// Reverse the bits of each byte independently. A full 16-bit reversal looks
+/// plausible but disagrees with the Core sample vectors from the first event.
+fn csa2_perm(value: u16) -> u16 {
+    fn reverse(byte: u8) -> u8 {
+        byte.reverse_bits()
+    }
+    u16::from(reverse(value as u8)) | (u16::from(reverse((value >> 8) as u8)) << 8)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelSelectionAlgorithm {
+    Csa1,
+    Csa2,
+}
+
+impl ChannelSelectionAlgorithm {
+    /// CSA #2 requires both the advertiser's ADV_IND ChSel and the initiator's
+    /// CONNECT_IND ChSel (Core 5.4, Vol 6, Part B, 2.3.3.1).
+    pub fn negotiate(advertiser_chsel: bool, initiator_chsel: bool) -> Self {
+        if advertiser_chsel && initiator_chsel {
+            Self::Csa2
+        } else {
+            Self::Csa1
+        }
+    }
+}
+
+/// Channel selection for one link. CSA #1 keeps a hop chain; CSA #2 is
+/// stateless so `next_channel` takes the event counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelSelection {
+    Csa1(Csa1),
+    Csa2(Csa2),
+}
+
+impl ChannelSelection {
+    pub fn new(
+        algorithm: ChannelSelectionAlgorithm,
+        map: [u8; 5],
+        access_addr: u32,
+        hop: u8,
+    ) -> Result<Self, ConnError> {
+        Ok(match algorithm {
+            ChannelSelectionAlgorithm::Csa1 => Self::Csa1(Csa1::new(map, hop)?),
+            ChannelSelectionAlgorithm::Csa2 => Self::Csa2(Csa2::new(map, access_addr)?),
+        })
+    }
+
+    pub fn algorithm(&self) -> ChannelSelectionAlgorithm {
+        match self {
+            Self::Csa1(_) => ChannelSelectionAlgorithm::Csa1,
+            Self::Csa2(_) => ChannelSelectionAlgorithm::Csa2,
+        }
+    }
+
+    pub fn set_map(&mut self, map: [u8; 5]) -> Result<(), ConnError> {
+        match self {
+            Self::Csa1(csa) => csa.set_map(map),
+            Self::Csa2(csa) => csa.set_map(map),
+        }
+    }
+
+    /// Call once for every connection event, including missed events. The
+    /// counter is part of the CSA #2 input and ignored by CSA #1.
+    pub fn next_channel(&mut self, event_counter: u16) -> u8 {
+        match self {
+            Self::Csa1(csa) => csa.next_channel(),
+            Self::Csa2(csa) => csa.next_channel(event_counter),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionUpdate {
     pub win_size: u8,
@@ -318,8 +461,9 @@ pub fn validate_instant(current: u16, instant: u16) -> Result<(), ConnError> {
 #[derive(Debug, Clone)]
 pub struct PeripheralConnection {
     pub params: ConnectParams,
-    csa: Csa1,
+    csa: ChannelSelection,
     channel: u8,
+    rx_max_payload: u16,
     event_counter: u16,
     event_start_us: u32,
     window_width_us: u32,
@@ -332,14 +476,24 @@ pub struct PeripheralConnection {
 }
 
 impl PeripheralConnection {
-    /// `params` must have passed `parse` or `validate`.
-    pub fn new(params: ConnectParams, connect_end_us: u32) -> Self {
-        let mut csa = Csa1::new(params.channel_map, params.hop).expect("validated CONNECT_IND");
-        let channel = csa.next_channel();
+    /// `params` must have passed `parse` or `validate`. `advertiser_chsel` is
+    /// the ChSel bit this peripheral put in its own ADV_IND/ADV_SCAN_IND:
+    /// CSA #2 is used only when it and `params.chsel` are both set.
+    pub fn new(params: ConnectParams, connect_end_us: u32, advertiser_chsel: bool) -> Self {
+        let algorithm = ChannelSelectionAlgorithm::negotiate(advertiser_chsel, params.chsel);
+        let mut csa = ChannelSelection::new(
+            algorithm,
+            params.channel_map,
+            params.access_addr,
+            params.hop,
+        )
+        .expect("validated CONNECT_IND");
+        let channel = csa.next_channel(0);
         Self {
             params,
             csa,
             channel,
+            rx_max_payload: LL_DEFAULT_RX_PAYLOAD,
             event_counter: 0,
             event_start_us: connect_end_us.wrapping_add(1250 + u32::from(params.win_offset) * 1250),
             window_width_us: u32::from(params.win_size) * 1250,
@@ -355,6 +509,21 @@ impl PeripheralConnection {
     pub fn channel(&self) -> u8 {
         self.channel
     }
+    pub fn channel_selection_algorithm(&self) -> ChannelSelectionAlgorithm {
+        self.csa.algorithm()
+    }
+
+    /// Largest on-air PDU payload accepted from the peer, MIC included.
+    pub fn rx_max_payload(&self) -> u16 {
+        self.rx_max_payload
+    }
+
+    /// Apply the negotiated receive limit. Call only after DLE completed;
+    /// the pre-negotiation value stays in place while a request is in flight.
+    pub fn set_rx_max_payload(&mut self, octets: u16) {
+        self.rx_max_payload = octets.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+    }
+
     pub fn event_counter(&self) -> u16 {
         self.event_counter
     }
@@ -381,22 +550,27 @@ impl PeripheralConnection {
     }
 
     /// End of the possible packet-start window. The radio must allow a packet
-    /// starting before this deadline to finish (up to 328 us for a 31-octet
-    /// encrypted legacy payload).
+    /// starting before this deadline to finish; see
+    /// [`Self::rx_complete_allowance_us`] for the on-air size.
     pub fn rx_end_us(&self) -> u32 {
         self.event_start_us
             .wrapping_add(self.window_width_us + self.widening_us())
     }
 
-    /// Allow the latest-starting legacy LE 1M packet to finish: 80 us overhead
-    /// plus the largest on-air payload (31 octets with the 4-octet MIC).
-    /// Address match cannot occur before the 40 us preamble/AA reception; its
-    /// exact hardware flag latency is not assumed.
-    /// Use this for the initial hardware window and software no-capture timeout,
-    /// while still honoring earlier finite, supervision and event deadlines.
+    /// On-air time of the largest accepted PDU: 80 us preamble/AA/header/CRC
+    /// overhead plus 8 us per payload octet. Address match cannot occur before
+    /// the 40 us preamble/AA reception; its exact hardware flag latency is not
+    /// assumed.
+    pub fn rx_complete_allowance_us(&self) -> u32 {
+        80 + u32::from(self.rx_max_payload) * 8
+    }
+
+    /// Allow the latest-starting LE 1M packet to finish. Use this for the
+    /// initial hardware window and the software no-capture timeout, while
+    /// still honoring earlier finite, supervision and event deadlines.
     pub fn rx_complete_end_us(&self) -> u32 {
         self.rx_end_us()
-            .wrapping_add(80 + super::enc::MAX_ENCRYPTED as u32 * 8)
+            .wrapping_add(self.rx_complete_allowance_us())
     }
 
     /// Until the first valid data PDU, establishment is bounded by six
@@ -419,7 +593,7 @@ impl PeripheralConnection {
     /// A later packet in the same event refreshes supervision, not the anchor.
     /// Returns false for an invalid length or a link that already expired.
     pub fn on_rx_anchor(&mut self, rx_done_us: u32, payload_len: u8) -> bool {
-        if usize::from(payload_len) > super::enc::MAX_ENCRYPTED
+        if usize::from(payload_len) > usize::from(self.rx_max_payload)
             || self.supervision_expired(rx_done_us)
         {
             return false;
@@ -494,7 +668,7 @@ impl PeripheralConnection {
                 self.pending_update = None;
             }
         }
-        self.channel = self.csa.next_channel();
+        self.channel = self.csa.next_channel(self.event_counter);
         Ok(())
     }
 }
@@ -541,29 +715,33 @@ mod tests {
     fn connect_ind_builder_round_trips_all_address_types() {
         for peer_random in [false, true] {
             for init_random in [false, true] {
-                let mut expected = params();
-                expected.peer_random = peer_random;
-                expected.win_size = 2;
-                expected.win_offset = 3;
-                let init_addr = [9, 8, 7, 6, 5, 4];
-                let mut out = [0xaa; 36];
-                assert_eq!(
-                    expected.build_connect_ind(&mut out, init_addr, init_random),
-                    Some(36)
-                );
-                assert_eq!(out[0] & 0x40 != 0, init_random);
-                assert_eq!(out[0] & 0x80 != 0, peer_random);
-                assert_eq!(&out[2..8], &init_addr);
-                // From the advertiser's perspective, parse sees InitA as the
-                // peer; every other field must round-trip unchanged.
-                let parsed =
-                    ConnectParams::parse(&out, true, expected.peer_addr, peer_random).unwrap();
-                assert_eq!(parsed.peer_addr, init_addr);
-                assert_eq!(parsed.peer_random, init_random);
-                let mut expected_peer_view = expected;
-                expected_peer_view.peer_addr = init_addr;
-                expected_peer_view.peer_random = init_random;
-                assert_eq!(parsed, expected_peer_view);
+                for chsel in [false, true] {
+                    let mut expected = params();
+                    expected.peer_random = peer_random;
+                    expected.chsel = chsel;
+                    expected.win_size = 2;
+                    expected.win_offset = 3;
+                    let init_addr = [9, 8, 7, 6, 5, 4];
+                    let mut out = [0xaa; 36];
+                    assert_eq!(
+                        expected.build_connect_ind(&mut out, init_addr, init_random),
+                        Some(36)
+                    );
+                    assert_eq!(out[0] & 0x40 != 0, init_random);
+                    assert_eq!(out[0] & 0x20 != 0, chsel);
+                    assert_eq!(out[0] & 0x80 != 0, peer_random);
+                    assert_eq!(&out[2..8], &init_addr);
+                    // From the advertiser's perspective, parse sees InitA as the
+                    // peer; every other field must round-trip unchanged.
+                    let parsed =
+                        ConnectParams::parse(&out, true, expected.peer_addr, peer_random).unwrap();
+                    assert_eq!(parsed.peer_addr, init_addr);
+                    assert_eq!(parsed.peer_random, init_random);
+                    let mut expected_peer_view = expected;
+                    expected_peer_view.peer_addr = init_addr;
+                    expected_peer_view.peer_random = init_random;
+                    assert_eq!(parsed, expected_peer_view);
+                }
             }
         }
     }
@@ -594,7 +772,7 @@ mod tests {
         // from substituting an RC-referenced rate for the crystal clock.
         for (hz, inside_window) in [(62_400_000, true), (62_509_688, false)] {
             let rate = TickRate::new(hz).unwrap();
-            let mut conn = PeripheralConnection::new(params(), 0);
+            let mut conn = PeripheralConnection::new(params(), 0, false);
             let first_anchor_ticks = 624_000;
             let empty_airtime_ticks = 4_992;
             assert!(conn.on_rx_anchor(rate.micros(first_anchor_ticks + empty_airtime_ticks), 0));
@@ -614,7 +792,7 @@ mod tests {
         for origin in [0u32, u32::MAX - 5_000] {
             let mut p = params();
             p.sca = 1;
-            let mut conn = PeripheralConnection::new(p, origin);
+            let mut conn = PeripheralConnection::new(p, origin, false);
             let anchor = origin.wrapping_add(2_500);
             assert!(conn.on_rx_anchor(anchor.wrapping_add(80), 0));
             conn.next_event().unwrap();
@@ -634,10 +812,10 @@ mod tests {
     #[test]
     fn receive_ceiling_covers_the_encrypted_legacy_payload() {
         // 27 plaintext octets plus the 4-octet MIC is the largest legacy PDU.
-        let mut conn = PeripheralConnection::new(params(), 0);
+        let mut conn = PeripheralConnection::new(params(), 0, false);
         assert!(conn.on_rx_anchor(2_500, 31));
         assert_eq!(conn.event_start_us(), 2_500 - (80 + 31 * 8));
-        let mut conn = PeripheralConnection::new(params(), 0);
+        let mut conn = PeripheralConnection::new(params(), 0, false);
         assert!(!conn.on_rx_anchor(2_500, 32));
     }
 
@@ -646,7 +824,7 @@ mod tests {
         for completion_allowance in [false, true] {
             let mut p = params();
             p.sca = 1;
-            let mut conn = PeripheralConnection::new(p, 0);
+            let mut conn = PeripheralConnection::new(p, 0, false);
             let first_anchor = 2_500u32;
             assert!(conn.on_rx_anchor(first_anchor + 80, 0));
             for event in 1..=8 {
@@ -690,14 +868,107 @@ mod tests {
     }
 
     #[test]
-    fn parser_ignores_rfu_and_initiator_chsel_when_advertiser_uses_csa1() {
+    fn parser_records_chsel_but_advertiser_choice_gates_csa2() {
         for bits in [0, 0x10, 0x20, 0x30] {
             let mut pdu = connect_pdu();
             pdu[0] |= bits;
             let p = ConnectParams::parse(&pdu, true, [0xc0; 6], true).unwrap();
-            let c = PeripheralConnection::new(p, 0);
+            assert_eq!(p.chsel, bits & 0x20 != 0);
+            // Without ChSel in our own ADV_IND the link stays on CSA #1.
+            let c = PeripheralConnection::new(p, 0, false);
+            assert_eq!(
+                c.channel_selection_algorithm(),
+                ChannelSelectionAlgorithm::Csa1
+            );
             assert_eq!(c.channel(), 5);
         }
+    }
+
+    #[test]
+    fn csa2_matches_core_sample_vectors() {
+        let mut all = Csa2::new([0xff, 0xff, 0xff, 0xff, 0x1f], 0x8e89_bed6).unwrap();
+        assert_eq!(all.channel_id(), 0x305f);
+        for (event, prn_e, channel) in
+            [(0, 56857, 25), (1, 1685, 20), (2, 38301, 6), (3, 27475, 21)]
+        {
+            assert_eq!(all.prn_e(event), prn_e);
+            assert_eq!(all.next_channel(event), channel);
+        }
+
+        // Nine used channels: 9, 10, 21, 22, 23, 33, 34, 35, 36.
+        all.set_map([0x00, 0x06, 0xe0, 0x00, 0x1e]).unwrap();
+        for (event, prn_e, unmapped, channel) in
+            [(6, 10975, 23, 23), (7, 5490, 14, 9), (8, 46970, 17, 34)]
+        {
+            assert_eq!(all.prn_e(event), prn_e);
+            assert_eq!(all.prn_e(event) % 37, unmapped);
+            assert_eq!(all.next_channel(event), channel);
+        }
+    }
+
+    #[test]
+    fn csa2_selection_and_event_counter_wrap_in_a_connection() {
+        let mut p = params();
+        p.chsel = true;
+        let mut conn = PeripheralConnection::new(p, 0, true);
+        assert_eq!(
+            conn.channel_selection_algorithm(),
+            ChannelSelectionAlgorithm::Csa2
+        );
+        // AA 0x12345678: id = 0x1234 ^ 0x5678 = 0x444C, all channels used.
+        let id = 0x444c;
+        let prn = |ec: u16| -> u16 {
+            let mut x = ec ^ id;
+            for _ in 0..3 {
+                x = csa2_perm(x);
+                x = (17 * u32::from(x) + u32::from(id)) as u16;
+            }
+            x ^ id
+        };
+        assert_eq!(conn.channel(), (prn(0) % 37) as u8);
+        conn.next_event().unwrap();
+        assert_eq!(conn.channel(), (prn(1) % 37) as u8);
+        // Missed events advance the counter just like received ones.
+        conn.event_counter = 0xffff;
+        conn.next_event().unwrap();
+        assert_eq!(conn.event_counter(), 0);
+        assert_eq!(conn.channel(), (prn(0) % 37) as u8);
+    }
+
+    #[test]
+    fn channel_selection_negotiation_requires_both_sides() {
+        for (advertiser, initiator, expected) in [
+            (false, false, ChannelSelectionAlgorithm::Csa1),
+            (false, true, ChannelSelectionAlgorithm::Csa1),
+            (true, false, ChannelSelectionAlgorithm::Csa1),
+            (true, true, ChannelSelectionAlgorithm::Csa2),
+        ] {
+            let mut p = params();
+            p.chsel = initiator;
+            let conn = PeripheralConnection::new(p, 0, advertiser);
+            assert_eq!(conn.channel_selection_algorithm(), expected);
+        }
+    }
+
+    #[test]
+    fn csa2_channel_map_applies_at_the_instant() {
+        let mut p = params();
+        p.chsel = true;
+        let mut conn = PeripheralConnection::new(p, 0, true);
+        // All channels start out enabled, so remapping only starts after the
+        // map change. Instant 2 is the first event using the new map.
+        conn.schedule_channel_map([0x00, 0x06, 0xe0, 0x00, 0x1e], 2)
+            .unwrap();
+        let old = Csa2::new(p.channel_map, p.access_addr).unwrap();
+        let new = Csa2::new([0x00, 0x06, 0xe0, 0x00, 0x1e], p.access_addr).unwrap();
+        conn.next_event().unwrap();
+        assert_eq!(conn.channel(), old.next_channel(1));
+        conn.next_event().unwrap();
+        assert_eq!(conn.channel(), new.next_channel(2));
+        conn.next_event().unwrap();
+        assert_eq!(conn.channel(), new.next_channel(3));
+        // The two maps really do differ on these events.
+        assert_ne!(old.next_channel(2), new.next_channel(2));
     }
 
     #[test]
@@ -800,7 +1071,7 @@ mod tests {
     fn first_window_anchor_and_missed_events() {
         let mut p = params();
         p.win_offset = 3;
-        let mut c = PeripheralConnection::new(p, 1000);
+        let mut c = PeripheralConnection::new(p, 1000, false);
         assert_eq!(c.event_start_us(), 6000);
         assert!(c.rx_start_us() < 6000);
         assert!(c.rx_end_us() >= 8500);
@@ -822,7 +1093,7 @@ mod tests {
     #[test]
     fn supervision_and_time_wrap() {
         let start = u32::MAX - 2000;
-        let mut c = PeripheralConnection::new(params(), start);
+        let mut c = PeripheralConnection::new(params(), start, false);
         assert!(!c.supervision_expired(start.wrapping_add(179_999)));
         assert!(c.supervision_expired(start.wrapping_add(180_000)));
         c.on_rx_anchor(start.wrapping_add(5000), 27);
@@ -835,7 +1106,7 @@ mod tests {
 
     #[test]
     fn update_restarts_supervision_at_new_window() {
-        let mut c = PeripheralConnection::new(params(), 0);
+        let mut c = PeripheralConnection::new(params(), 0, false);
         c.on_rx_anchor(1330, 0);
         c.schedule_update(ConnectionUpdate {
             win_size: 1,
@@ -859,7 +1130,7 @@ mod tests {
     fn a_late_packet_cannot_revive_supervision_after_event_wait() {
         let mut p = params();
         p.timeout = 10;
-        let mut c = PeripheralConnection::new(p, 0);
+        let mut c = PeripheralConnection::new(p, 0, false);
         assert!(c.on_rx_anchor(1330, 0));
         assert_eq!(c.supervision_deadline_us(), 101_330);
         for _ in 0..4 {
@@ -874,7 +1145,7 @@ mod tests {
     fn planning_an_update_instant_cannot_hide_an_earlier_timeout() {
         let mut p = params();
         p.timeout = 10;
-        let mut c = PeripheralConnection::new(p, 0);
+        let mut c = PeripheralConnection::new(p, 0, false);
         assert!(c.on_rx_anchor(1330, 0));
         c.schedule_update(ConnectionUpdate {
             win_size: 1,
@@ -902,7 +1173,7 @@ mod tests {
 
     #[test]
     fn map_and_connection_update_at_wrapping_instant() {
-        let mut c = PeripheralConnection::new(params(), 0);
+        let mut c = PeripheralConnection::new(params(), 0, false);
         c.event_counter = 0xfffe;
         assert_eq!(validate_instant(0xfffe, 1), Ok(()));
         assert_eq!(validate_instant(1, 0xfffe), Err(ConnError::InstantPassed));

@@ -7,7 +7,10 @@ use crate::ll::Role;
 
 use super::transport::{self, Packet};
 
-pub const ACL_DATA_PACKET_LENGTH: usize = 27;
+/// Maximum Host ACL payload advertised through `LE Read Buffer Size`: the
+/// DLE on-air maximum of 251 octets. The Host may still hand over smaller
+/// packets, and the LL fragments them to the negotiated on-air length.
+pub const ACL_DATA_PACKET_LENGTH: usize = 251;
 pub const ACL_CREDITS: usize = 5;
 /// Scan reports share this queue with lifecycle events. Two slots stay
 /// reserved for Connection/Disconnection Complete.
@@ -80,6 +83,9 @@ pub struct ConnectionBridge {
     reset_done: bool,
     event_mask: u64,
     le_event_mask: u64,
+    /// Pending Host `LE Set Data Length` (`TX_Octets`, `TX_Time`) for the RF
+    /// owner to negotiate on the link.
+    data_length_request: Option<(u16, u16)>,
 }
 
 impl Default for ConnectionBridge {
@@ -104,7 +110,27 @@ impl ConnectionBridge {
             reset_done: false,
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
+            data_length_request: None,
         }
+    }
+
+    /// Queue a Host `LE Set Data Length` request for the RF owner. Returns an
+    /// HCI status: 0x00 accepted, 0x02 unknown connection, 0x0c disallowed.
+    pub(crate) fn request_data_length(&mut self, handle: u16, tx_octets: u16, tx_time: u16) -> u8 {
+        if self.handle() != Some(handle) {
+            return 0x02;
+        }
+        if self.disconnecting || self.resetting || self.info.is_none() {
+            return 0x0c;
+        }
+        self.data_length_request = Some((tx_octets, tx_time));
+        0
+    }
+
+    /// Take the pending data-length request; the RF owner applies it once the
+    /// link is idle enough to send `LL_LENGTH_REQ`.
+    pub fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
+        self.data_length_request.take()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -223,6 +249,40 @@ impl ConnectionBridge {
         Ok(())
     }
 
+    /// Emit `LE Data Length Change` (LE Meta subevent 0x07) for the
+    /// connected handle. The octet values are payload octets, MIC excluded.
+    /// The controller generates this whenever the effective data length
+    /// changes as a result of DLE (Core 5.4 Vol 4 Part E 7.7.65.7).
+    pub fn data_length_change(
+        &mut self,
+        max_tx_octets: u16,
+        max_tx_time: u16,
+        max_rx_octets: u16,
+        max_rx_time: u16,
+    ) -> Result<(), BridgeError> {
+        let info = self.info.as_ref().ok_or(BridgeError::NotConnected)?;
+        if self.resetting {
+            return Err(BridgeError::NotConnected);
+        }
+        if !self.le_event_enabled(7) {
+            return Ok(());
+        }
+        let handle = info.handle;
+        // Keep one slot reserved for Disconnection Complete.
+        if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
+            return Err(BridgeError::Full);
+        }
+        let mut parameters = [0; 11];
+        parameters[0] = 0x07;
+        parameters[1..3].copy_from_slice(&handle.to_le_bytes());
+        parameters[3..5].copy_from_slice(&max_tx_octets.to_le_bytes());
+        parameters[5..7].copy_from_slice(&max_tx_time.to_le_bytes());
+        parameters[7..9].copy_from_slice(&max_rx_octets.to_le_bytes());
+        parameters[9..11].copy_from_slice(&max_rx_time.to_le_bytes());
+        self.push_event(event_packet(0x3e, &parameters));
+        Ok(())
+    }
+
     /// Emit `Encryption Change` for the connected handle.
     ///
     /// `enabled` is the HCI Encryption_Enabled value (0x00 off, 0x01 on).
@@ -297,7 +357,12 @@ impl ConnectionBridge {
 
     pub fn receive_acl(&mut self, llid: u8, payload: &[u8]) -> Result<(), BridgeError> {
         let info = self.info.ok_or(BridgeError::NotConnected)?;
-        if !matches!(llid, 1 | 2) || payload.len() > ACL_DATA_PACKET_LENGTH {
+        // Do not rely on the destination buffer happening to be large enough:
+        // a 4-octet ACL header plus payload must fit one HCI packet.
+        if !matches!(llid, 1 | 2)
+            || payload.len() > ACL_DATA_PACKET_LENGTH
+            || 4 + payload.len() > transport::HCI_PACKET_CAPACITY
+        {
             return Err(BridgeError::InvalidPacket);
         }
         if !self.can_receive_acl(llid, payload.len()) {
@@ -477,6 +542,7 @@ impl ConnectionBridge {
         self.tx = [None; ACL_CREDITS];
         self.rx = [None; RX_CAPACITY];
         self.completed = 0;
+        self.data_length_request = None;
         transport::discard_connection_data();
     }
 

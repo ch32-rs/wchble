@@ -49,6 +49,11 @@ X4_MAGIC = 0x5834_0001
 X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match
     burst_runs burst_attempts burst_sent burst_queue_full burst_busy burst_other
     burst_len last_error'''.split()
+X1_MAGIC = 0x5831_0001
+X1_NAMES = '''magic version algorithm event_counter adv_chsel init_chsel length_req_rx
+    length_rsp_rx length_req_tx length_rsp_tx tx_octets rx_octets tx_time rx_time
+    max_tx_pdu max_rx_pdu rx_over_27 tx_over_27 host_packets_segmented host_fragments
+    tx_pdus rx_pdus feature_exchange last_error'''.split()
 BULK_LEN = 200
 BULK_WRITE_SUM = sum(255 - index for index in range(BULK_LEN))
 BURST_LEN = 121
@@ -330,6 +335,41 @@ def evaluate_att_transcript(rows):
     return errors
 
 
+def evaluate_x1(x1, require_dle=False):
+    """Firmware-side X1 proof: CSA #2 selection and bidirectional DLE."""
+    if len(x1) != 24 or x1[0] != X1_MAGIC or x1[1] != 1:
+        return [f'invalid X1_STATS: {x1[:2]}']
+    word = dict(zip(X1_NAMES, x1))
+    errors = []
+    algorithm, adv, init = word['algorithm'], word['adv_chsel'], word['init_chsel']
+    if algorithm not in (1, 2):
+        errors.append(f"unknown channel selection algorithm {algorithm}")
+    elif algorithm == 2 and not (adv and init):
+        errors.append(f"CSA#2 selected with adv_chsel={adv} init_chsel={init}")
+    elif algorithm == 1 and adv and init:
+        errors.append('both ChSel bits set but CSA#1 selected')
+    for name in ('tx_octets', 'rx_octets'):
+        if not 27 <= word[name] <= 251:
+            errors.append(f"{name}={word[name]} outside 27..=251")
+    for name in ('tx_time', 'rx_time'):
+        if not 328 <= word[name] <= 2120:
+            errors.append(f"{name}={word[name]} outside 328..=2120 us")
+    if word['max_tx_pdu'] > 251 or word['max_rx_pdu'] > 251:
+        errors.append(f"on-air PDU exceeds 251 octets: {word['max_tx_pdu']}/{word['max_rx_pdu']}")
+    if word['last_error']:
+        errors.append(f"X1 last_error=0x{word['last_error']:02x}")
+    if require_dle:
+        if not word['feature_exchange']:
+            errors.append('peer feature set was never observed')
+        if word['tx_over_27'] < 1:
+            errors.append('no transmitted PDU above the legacy 27 octets')
+        if word['rx_over_27'] < 1:
+            errors.append('no received PDU above the legacy 27 octets')
+        if word['host_packets_segmented'] < 1:
+            errors.append('no Host ACL packet needed more than one LL fragment')
+    return errors
+
+
 def evaluate_att(x4, opcodes, delivered, refused=0):
     """Firmware-side proof: negotiated MTU, Blob/Prepare/Execute and the burst."""
     errors = []
@@ -554,13 +594,15 @@ def execute(args):
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
         for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'PERIPHERAL_ADDRESS'):
+                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'X1_STATS',
+                     'PERIPHERAL_ADDRESS'):
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
             if len(matches) != 1:
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = int(matches[0][0], 16)
-        symbols = validate_observation_buffers(image, symbols, extra=(('X4_STATS', 16),))
+        symbols = validate_observation_buffers(
+            image, symbols, extra=(('X4_STATS', 16), ('X1_STATS', 24)))
         # Both feature sets write the same output path, so a plain `cargo
         # build` right after a secure build silently replaces this image.
         # Refuse to spend a probe session on a Host without the crypto backend.
@@ -698,6 +740,10 @@ def execute(args):
         metadata['x4_stats'] = dict(zip(X4_NAMES, x4_words))
         (args.out / 'x4_stats.json').write_text(
             json.dumps(metadata['x4_stats'], indent=2) + '\n')
+        x1_words = io.read32(symbols['X1_STATS'], 24, args.out / 'x1_stats.txt')
+        metadata['x1_stats'] = dict(zip(X1_NAMES, x1_words))
+        (args.out / 'x1_stats.json').write_text(
+            json.dumps(metadata['x1_stats'], indent=2) + '\n')
         opcode_words = io.read32(symbols['SEC_OPCODES'], 96, args.out / 'sec_opcodes.txt')
         metadata['sec_opcodes'] = decode_opcodes(opcode_words)
         metadata['sec_opcodes']['slow_polls_over_100ms'] = diag_words[36]
@@ -727,6 +773,7 @@ def execute(args):
         (args.out / 'trace.json').write_text(json.dumps(trace_rows, indent=2) + '\n')
         print('SMP', json.dumps(metadata['sec_opcodes']['smp'], sort_keys=True))
         print('ATT', json.dumps(metadata['sec_opcodes']['att'], sort_keys=True))
+        errors.extend(evaluate_x1(x1_words, args.require_dle))
         if args.mode == 'att':
             delivered = sum(1 for row in rows if row.get('event') == 'burst_notification')
             errors.extend(evaluate_att(x4_words, metadata['sec_opcodes'], delivered,
@@ -765,6 +812,8 @@ def options(argv=None):
     parser.add_argument('--timeout', type=float, default=45)
     parser.add_argument('--mode', choices=tuple(SUMMARY_REASONS), default='pair',
                         help='app phase: pair, reconnect, delete, wipe, fault or att')
+    parser.add_argument('--require-dle', action='store_true',
+                        help='require observed >27-byte PDUs and a fragmented Host packet')
     parser.add_argument('--reject', action='store_true',
                         help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')

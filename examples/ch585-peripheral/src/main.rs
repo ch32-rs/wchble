@@ -611,7 +611,7 @@ fn main() -> ! {
                             u32::from_le_bytes(params.channel_map[..4].try_into().unwrap()),
                         );
                         put(48, u32::from(params.channel_map[4]));
-                        let mut conn = PeripheralConnection::new(params, packet.end);
+                        let mut conn = PeripheralConnection::new(params, packet.end, false);
                         put(49, conn.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(conn.channel()));

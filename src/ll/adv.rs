@@ -15,6 +15,10 @@ pub struct AdvState {
     /// Own address used as AdvA (`TxAdd=random` when [`Self::random_addr`]).
     pub own_addr: [u8; 6],
     pub random_addr: bool,
+    /// Set ChSel in ADV_IND/ADV_SCAN_IND: this advertiser supports CSA #2.
+    /// A connection uses CSA #2 only if the initiator's CONNECT_IND says so
+    /// too. SCAN_RSP has no ChSel bit (RFU) and always leaves it clear.
+    pub chsel: bool,
     pub data_len: u8,
     pub data: [u8; ADV_DATA_MAX],
     pub scan_rsp_len: u8,
@@ -29,6 +33,7 @@ impl Default for AdvState {
             channel_map: 0x07,      // 37/38/39
             own_addr: [0; 6],
             random_addr: true,
+            chsel: false,
             data_len: 0,
             data: [0; ADV_DATA_MAX],
             scan_rsp_len: 0,
@@ -78,14 +83,14 @@ impl AdvState {
     /// Returns `None` if advertising is disabled, the stored length is invalid,
     /// or the output is too small. No bytes are written on failure.
     pub fn build_adv_scan_ind(&self, out: &mut [u8]) -> Option<usize> {
-        self.build_scannable_pdu(out, 0x06, self.data_len, &self.data)
+        self.build_scannable_pdu(out, 0x06, self.data_len, &self.data, self.chsel)
     }
 
     /// Build a legacy SCAN_RSP PDU (header + AdvA + scan response data).
     ///
     /// Returns `None` under the same conditions as [`Self::build_adv_scan_ind`].
     pub fn build_scan_rsp(&self, out: &mut [u8]) -> Option<usize> {
-        self.build_scannable_pdu(out, 0x04, self.scan_rsp_len, &self.scan_rsp)
+        self.build_scannable_pdu(out, 0x04, self.scan_rsp_len, &self.scan_rsp, false)
     }
 
     fn build_scannable_pdu(
@@ -94,13 +99,14 @@ impl AdvState {
         pdu_type: u8,
         data_len: u8,
         data: &[u8; ADV_DATA_MAX],
+        chsel: bool,
     ) -> Option<usize> {
         let n = usize::from(data_len);
         let total = 8 + n;
         if !self.enabled || n > ADV_DATA_MAX || out.len() < total {
             return None;
         }
-        out[0] = pdu_type | if self.random_addr { 0x40 } else { 0 };
+        out[0] = pdu_type | if self.random_addr { 0x40 } else { 0 } | if chsel { 0x20 } else { 0 };
         out[1] = (6 + n) as u8;
         out[2..8].copy_from_slice(&self.own_addr);
         out[8..total].copy_from_slice(&data[..n]);
@@ -135,8 +141,8 @@ impl AdvState {
         if out.len() < total || payload_len > 37 {
             return None;
         }
-        // PDU header: ADV_IND (0), TxAdd = random if own is random.
-        out[0] = if self.random_addr { 0x40 } else { 0x00 };
+        // PDU header: ADV_IND (0), TxAdd = random if own is random, ChSel.
+        out[0] = if self.random_addr { 0x40 } else { 0x00 } | if self.chsel { 0x20 } else { 0 };
         out[1] = payload_len as u8;
         out[2..8].copy_from_slice(&self.own_addr);
         if ad_len != 0 {
@@ -281,5 +287,29 @@ mod tests {
         assert_eq!(out[1], 9);
         assert_eq!(&out[2..8], &adv.own_addr);
         assert_eq!(&out[8..11], &[0x02, 0x01, 0x06]);
+    }
+
+    #[test]
+    fn chsel_is_set_on_scannable_advertising_but_not_scan_rsp() {
+        for random in [false, true] {
+            for chsel in [false, true] {
+                let mut adv = AdvState::default();
+                adv.enabled = true;
+                adv.random_addr = random;
+                adv.chsel = chsel;
+                assert!(adv.set_adv_data(1, &[0x02]));
+                assert!(adv.set_scan_rsp(1, &[0x02]));
+                let mut out = [0u8; 16];
+                adv.build_adv_ind(&mut out).unwrap();
+                assert_eq!(out[0] & 0x20 != 0, chsel);
+                assert_eq!(out[0] & 0x40 != 0, random);
+                adv.build_adv_scan_ind(&mut out).unwrap();
+                assert_eq!(out[0] & 0x0f, 0x06);
+                assert_eq!(out[0] & 0x20 != 0, chsel);
+                adv.build_scan_rsp(&mut out).unwrap();
+                assert_eq!(out[0] & 0x0f, 0x04);
+                assert_eq!(out[0] & 0x20, 0);
+            }
+        }
     }
 }

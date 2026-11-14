@@ -7,6 +7,7 @@
 use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
+use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -24,10 +25,19 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 /// Unknown connection identifier.
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 
-/// Default ACL data packet length reported by `LE Read Buffer Size` (no DLE).
+/// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
 /// Number of ACL credits advertised to the Host.
 const ACL_CREDITS: u8 = super::connection::ACL_CREDITS as u8;
+
+/// Wire-valid ranges for the TX_Octets/TX_Time fields of `LE Set Data Length`
+/// and `LE Write Suggested Default Data Length` (Core HCI §7.8.33/§7.8.35):
+/// the Host may ask for 27..=251 octets and 328..=17040 us regardless of what
+/// this controller implements; the LL negotiation then applies our own limit.
+const HCI_MIN_TX_OCTETS: u16 = 27;
+const HCI_MAX_TX_OCTETS: u16 = 251;
+const HCI_MIN_TX_TIME: u16 = 328;
+const HCI_MAX_TX_TIME: u16 = 17040;
 
 /// Default public BD_ADDR placeholder (HAL / OTP can override later).
 const DEFAULT_BD_ADDR: [u8; 6] = [0x00, 0x00, 0x00, 0xc1, 0xff, 0xee];
@@ -107,6 +117,12 @@ pub struct SoftRunner {
     ltk_reply: Option<LtkReply>,
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
+    /// Host's `LE Write Suggested Default Data Length` values.
+    suggested_tx_octets: u16,
+    suggested_tx_time: u16,
+    /// True once the Host explicitly set the suggestion; until then the
+    /// controller keeps its own larger default for new connections.
+    suggested_tx_explicit: bool,
     /// Most recent command that answered with a non-success status:
     /// `(opcode << 8) | status`, for firmware-side diagnostics.
     last_command_failure: Option<u32>,
@@ -148,6 +164,9 @@ impl SoftRunner {
             pending_encryption: None,
             ltk_reply: None,
             le_features: [0; 8],
+            suggested_tx_octets: LL_LEGACY_PAYLOAD,
+            suggested_tx_time: LL_LEGACY_TIME_US,
+            suggested_tx_explicit: false,
             last_command_failure: None,
             command_log: [0; 8],
             command_log_len: 0,
@@ -263,6 +282,24 @@ impl SoftRunner {
 
     pub fn le_features(&self) -> [u8; 8] {
         self.le_features
+    }
+
+    /// Suggested default TX data length last written by the Host.
+    pub fn suggested_data_length(&self) -> (u16, u16) {
+        (self.suggested_tx_octets, self.suggested_tx_time)
+    }
+
+    /// The Host's suggestion, but only once it actually set one. New
+    /// connections seed their TX preference from this; the controller's own
+    /// default stays in force until then.
+    pub fn suggested_data_length_explicit(&self) -> Option<(u16, u16)> {
+        self.suggested_tx_explicit
+            .then_some((self.suggested_tx_octets, self.suggested_tx_time))
+    }
+
+    /// Take a Host `LE Set Data Length` request (`TX_Octets`, `TX_Time`).
+    pub fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
+        self.bridge.take_data_length_request()
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -520,10 +557,18 @@ impl SoftRunner {
         self.event_mask = u64::MAX;
         self.le_event_mask = 0x1f;
         self.bridge.set_masks(self.event_mask, self.le_event_mask);
+        // ChSel is a controller capability configured by the RF owner, not
+        // HCI state. The Host sends Reset before advertising; losing it here
+        // silently downgrades every link to CSA #1.
+        let adv_chsel = self.ll.adv.chsel;
         self.ll = LinkLayer::new();
+        self.ll.adv.chsel = adv_chsel;
         self.scan = ScanState::default();
         self.pending_connect = None;
         self.clear_encryption();
+        self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
+        self.suggested_tx_time = LL_LEGACY_TIME_US;
+        self.suggested_tx_explicit = false;
         if self.random_addr.is_some() {
             self.sync_adv_addr();
         }
@@ -633,6 +678,78 @@ impl SoftRunner {
                     opcode,
                     HCI_SUCCESS,
                     &features,
+                ));
+                return;
+            }
+            // LE Set Data Length: the RF owner performs LL_LENGTH_REQ.
+            0x2022 if params.len() == 6 => {
+                let handle = u16::from_le_bytes([params[0], params[1]]);
+                let octets = u16::from_le_bytes([params[2], params[3]]);
+                let time = u16::from_le_bytes([params[4], params[5]]);
+                let status = if !(HCI_MIN_TX_OCTETS..=HCI_MAX_TX_OCTETS).contains(&octets)
+                    || !(HCI_MIN_TX_TIME..=HCI_MAX_TX_TIME).contains(&time)
+                {
+                    HCI_INVALID_PARAMETERS
+                } else {
+                    self.bridge.request_data_length(handle, octets, time)
+                };
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    status,
+                    &[params[0], params[1]],
+                ));
+                return;
+            }
+            // LE Read Suggested Default Data Length.
+            0x2023 if params.is_empty() => {
+                let octets = self.suggested_tx_octets.to_le_bytes();
+                let time = self.suggested_tx_time.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[octets[0], octets[1], time[0], time[1]],
+                ));
+                return;
+            }
+            // LE Write Suggested Default Data Length.
+            0x2024 if params.len() == 4 => {
+                let octets = u16::from_le_bytes([params[0], params[1]]);
+                let time = u16::from_le_bytes([params[2], params[3]]);
+                let status = if (HCI_MIN_TX_OCTETS..=HCI_MAX_TX_OCTETS).contains(&octets)
+                    && (HCI_MIN_TX_TIME..=HCI_MAX_TX_TIME).contains(&time)
+                {
+                    self.suggested_tx_octets = octets;
+                    self.suggested_tx_time = time;
+                    self.suggested_tx_explicit = true;
+                    HCI_SUCCESS
+                } else {
+                    HCI_INVALID_PARAMETERS
+                };
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Read Maximum Data Length. The fields are payload octets, so
+            // the 251-octet air ceiling minus the MIC is what we can grant.
+            0x202f if params.is_empty() => {
+                let octets = LL_MAX_PLAINTEXT.to_le_bytes();
+                let time = LL_MAX_TIME_US.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[
+                        octets[0], octets[1], time[0], time[1], octets[0], octets[1], time[0],
+                        time[1],
+                    ],
+                ));
+                return;
+            }
+            // LE Read Buffer Size v2: no ISO buffers.
+            0x2060 if params.is_empty() => {
+                let [lo, hi] = ACL_DATA_PACKET_LENGTH.to_le_bytes();
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[lo, hi, ACL_CREDITS, 0, 0, 0],
                 ));
                 return;
             }
@@ -1008,6 +1125,19 @@ mod tests {
     }
 
     #[test]
+    fn reset_keeps_configured_advertising_chsel() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.ll.adv.chsel = true;
+        runner.finish_reset();
+        // The Host resets the controller before it advertises. ChSel is a
+        // controller capability, so Reset must not silently select CSA #1.
+        assert!(runner.ll.adv.chsel);
+        transport::drain_channels_for_test();
+    }
+
+    #[test]
     fn le_set_adv_data_builds_pdu() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
@@ -1097,7 +1227,7 @@ mod tests {
             for n in 0..5 {
                 runner
                     .bridge
-                    .enqueue_tx(&acl(1, n % 2, &[cycle as u8; 27]))
+                    .enqueue_tx(&acl(1, n % 2, &[cycle as u8; 251]))
                     .unwrap();
             }
             assert_eq!(
@@ -1108,8 +1238,8 @@ mod tests {
             for (n, tag) in tags.iter_mut().enumerate() {
                 let tx = runner.bridge.take_tx_acl().unwrap();
                 assert_eq!(tx.llid, if n % 2 == 0 { 2 } else { 1 });
-                assert_eq!(tx.len, 27);
-                assert_eq!(&tx.bytes, &[cycle as u8; 27]);
+                assert_eq!(tx.len, 251);
+                assert_eq!(&tx.bytes[..tx.len], &[cycle as u8; 251]);
                 *tag = Some(tx.tag);
             }
             assert!(runner.bridge.take_tx_acl().is_none());
@@ -1134,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn acl_validates_handle_pb_bc_and_exact_27_byte_limit() {
+    fn acl_validates_handle_pb_bc_and_the_251_byte_limit() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
@@ -1148,34 +1278,26 @@ mod tests {
             acl(1, 2, &[1]),
             acl(1, 3, &[1]),
             acl(0x4001, 0, &[1]),
-            acl(1, 0, &[1; 28]),
         ] {
             assert_eq!(
                 runner.bridge.enqueue_tx(&packet),
                 Err(BridgeError::InvalidPacket)
             );
         }
+        // A claimed 252-octet payload cannot fit one HCI packet at all.
+        let mut oversized = acl(1, 0, &[1; 251]);
+        oversized.bytes[2..4].copy_from_slice(&252u16.to_le_bytes());
+        assert_eq!(
+            runner.bridge.enqueue_tx(&oversized),
+            Err(BridgeError::InvalidPacket)
+        );
         let mut truncated = acl(1, 0, &[1, 2]);
         truncated.len -= 1;
         assert_eq!(
             runner.bridge.enqueue_tx(&truncated),
             Err(BridgeError::InvalidPacket)
         );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
-    }
-
-    #[test]
-    fn host_acl_fragments_stay_within_the_legacy_plaintext_limit() {
-        let _guard = test_lock();
-        transport::drain_channels_for_test();
-        let mut runner = SoftRunner::new();
-        open(&mut runner);
-        // 27 plaintext octets become 31 on air once the MIC is added.
-        assert_eq!(
-            runner.bridge.enqueue_tx(&acl(1, 0, &[1; 28])),
-            Err(BridgeError::InvalidPacket)
-        );
-        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 27])).is_ok());
+        assert!(runner.bridge.enqueue_tx(&acl(1, 0, &[1; 251])).is_ok());
     }
 
     #[test]
@@ -1188,11 +1310,87 @@ mod tests {
         pollster::block_on(async {
             inject_cmd(0x2002, &[]);
             runner.serve_one().await;
-            expect_command_complete(0x2002, HCI_SUCCESS, &[27, 0, ACL_CREDITS]);
+            expect_command_complete(0x2002, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS]);
 
             inject_cmd(0x2003, &[]);
             runner.serve_one().await;
             expect_command_complete(0x2003, HCI_SUCCESS, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn dle_commands_report_the_maximum_and_store_the_suggestion() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x202f, &[]);
+            runner.serve_one().await;
+            expect_command_complete(
+                0x202f,
+                HCI_SUCCESS,
+                &[0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08],
+            );
+
+            inject_cmd(0x2060, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2060, HCI_SUCCESS, &[0xfb, 0, ACL_CREDITS, 0, 0, 0]);
+
+            inject_cmd(0x2023, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2023, HCI_SUCCESS, &[27, 0, 0x48, 0x01]);
+
+            assert_eq!(runner.suggested_data_length_explicit(), None);
+            inject_cmd(0x2024, &[0xf7, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_SUCCESS, &[]);
+            assert_eq!(runner.suggested_data_length(), (247, 2120));
+            assert_eq!(runner.suggested_data_length_explicit(), Some((247, 2120)));
+
+            // 251 octets / 2120 us is wire-valid even though this controller
+            // negotiates 247: the suggestion is stored and clamped when a
+            // session applies it.
+            inject_cmd(0x2024, &[0xfb, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_SUCCESS, &[]);
+            assert_eq!(runner.suggested_data_length_explicit(), Some((251, 2120)));
+            assert_eq!(runner.suggested_data_length(), (251, 2120));
+            // Outside the wire-valid range is still rejected.
+            inject_cmd(0x2024, &[0x1a, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_INVALID_PARAMETERS, &[]);
+            assert_eq!(runner.suggested_data_length(), (251, 2120));
+            inject_cmd(0x2024, &[0xfb, 0, 0x47, 0x01]);
+            runner.serve_one().await;
+            expect_command_complete(0x2024, HCI_INVALID_PARAMETERS, &[]);
+        });
+    }
+
+    #[test]
+    fn le_set_data_length_queues_a_request_for_a_live_handle() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        pollster::block_on(async {
+            inject_cmd(0x2022, &[1, 0, 0xf7, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_SUCCESS, &[1, 0]);
+            assert_eq!(runner.take_data_length_request(), Some((247, 2120)));
+            assert_eq!(runner.take_data_length_request(), None);
+
+            // Unknown handle.
+            inject_cmd(0x2022, &[0xfe, 0x0f, 0xf7, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_UNKNOWN_CONNECTION, &[0xfe, 0x0f]);
+
+            // Out-of-range octets.
+            inject_cmd(0x2022, &[1, 0, 0x1a, 0, 0x48, 0x08]);
+            runner.serve_one().await;
+            expect_command_complete(0x2022, HCI_INVALID_PARAMETERS, &[1, 0]);
+            assert_eq!(runner.take_data_length_request(), None);
         });
     }
 
@@ -1232,7 +1430,7 @@ mod tests {
         let mut runner = SoftRunner::new();
         runner.bridge.connected(connection_info()).unwrap();
         assert!(!runner.bridge.can_receive_acl(3, 1));
-        assert!(!runner.bridge.can_receive_acl(2, 28));
+        assert!(!runner.bridge.can_receive_acl(2, 252));
         assert_eq!(
             runner.bridge.receive_acl(3, &[0]),
             Err(BridgeError::InvalidPacket)
@@ -1376,6 +1574,35 @@ mod tests {
         assert!(!runner.bridge.ack_tx(old));
         assert!(!runner.bridge.is_connected());
         open(&mut runner);
+        assert!(!runner.pump_once());
+    }
+
+    #[test]
+    fn data_length_change_reports_the_negotiated_values() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        // The default mask enables subevents 1..=5; a Host that wants Data
+        // Length Change sets bit 6.
+        runner.bridge.set_masks(u64::MAX, 0x1f | (1 << 6));
+        runner
+            .bridge
+            .data_length_change(247, 2120, 132, 1120)
+            .unwrap();
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x3e, 11, 7, 1, 0, 0xf7, 0, 0x48, 0x08, 0x84, 0, 0x60, 0x04]
+        );
+        // Masked-off subevent is dropped.
+        runner.bridge.set_masks(u64::MAX, 0x1f & !(1 << 6));
+        runner
+            .bridge
+            .data_length_change(247, 2120, 247, 2120)
+            .unwrap();
         assert!(!runner.pump_once());
     }
 
