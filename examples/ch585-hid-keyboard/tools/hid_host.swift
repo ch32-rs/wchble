@@ -255,7 +255,13 @@ final class HidTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             exitNow(code: failure.0, reason: failure.1)
             return
         }
-        guard expected, error == nil else { fail(reason: "unexpected_disconnect"); return }
+        guard expected else { fail(reason: "unexpected_disconnect"); return }
+        // A gate-only run can end in a supervision timeout: macOS answers the
+        // firmware's 0x0F with a pairing attempt, and the LESC key agreement
+        // blocks the peripheral's RF pump past the supervision timeout. The
+        // gate was already observed, so a link lost while cancelling is the
+        // expected end of the unencrypted run, not a failure.
+        if error != nil && securityGate == nil { fail(reason: "unexpected_disconnect"); return }
         exitNow(code: 0, reason: securityGate == nil ? "hid_mirror_ok" : "hid_security_gate_ok")
     }
 

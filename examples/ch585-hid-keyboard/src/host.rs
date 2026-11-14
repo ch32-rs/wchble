@@ -18,10 +18,20 @@ use trouble_host::prelude::*;
 
 pub const LOCAL_NAME: &[u8] = b"wch585-hid";
 
-// New static identity: macOS and Android cache a peer's GATT layout by
-// address, and the P4/P5 databases do not contain a HID service. The address
-// is fixed across boots so the S3 bond store can answer the peer's old LTK.
-pub const RANDOM_ADDRESS: [u8; 6] = [0x17, 0x00, 0x00, 0xee, 0xff, 0xc1];
+// Static identity: macOS and Android cache a peer's GATT layout by address,
+// so every table change needs a new address (P4/P5 had no HID service; this
+// revision adds the mandatory Battery Service and DIS PnP ID). The address is
+// fixed across boots so the S3 bond store can answer the peer's old LTK; a
+// local-identity change therefore needs a store wipe before pairing.
+//
+// `accept-control` changes the table too (it adds characteristic 1A01), so the
+// acceptance-only build gets its own identity. Sharing the address would let
+// the wipe tool reuse a macOS cache made by the gate image, where 1A01 does
+// not exist.
+#[cfg(feature = "accept-control")]
+pub const RANDOM_ADDRESS: [u8; 6] = [0x31, 0x00, 0x00, 0xee, 0xff, 0xc1];
+#[cfg(not(feature = "accept-control"))]
+pub const RANDOM_ADDRESS: [u8; 6] = [0x21, 0x00, 0x00, 0xee, 0xff, 0xc1];
 
 /// Appearance 0x03C1: Human Interface Device / Keyboard.
 const APPEARANCE: u16 = 0x03C1;

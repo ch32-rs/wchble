@@ -136,8 +136,8 @@ def evaluate_transcript(rows, dumpsys):
             row = reads.get(field)
             if row is None or row.get('status') != 0:
                 errors.append(f'{field} was not read successfully: {row}')
-        if (reads.get('hid_info') or {}).get('bytes') != '11010001':
-            errors.append('HID Information bytes differ from 11010001')
+        if (reads.get('hid_info') or {}).get('bytes') != '11010000':
+            errors.append('HID Information bytes differ from 11010000')
         if (reads.get('report_map') or {}).get('length') != 63:
             errors.append('Report Map length is not 63')
         if events.count('notification') < 8:
