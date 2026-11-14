@@ -110,6 +110,12 @@ def valid_slots(slots):
     return [slot for slot in slots if slot['payload_ok'] and not slot['tombstone']]
 
 
+def valid_att_slots(slots):
+    """Client ATT pages with a decodable, non-empty, non-tombstone record."""
+    return [slot for slot in slots
+            if slot['payload_ok'] and not slot['tombstone'] and slot['count']]
+
+
 def parse_att_dump(path):
     """Decode the client ATT store: `[local 7][count][kind addr len raw]`."""
     data = Path(path).read_bytes()
@@ -265,7 +271,7 @@ def dump_matches_echo(slots, echo):
     return []
 
 
-def checks_pair(named, raw, echo, rows, slots, seconds):
+def checks_pair(named, raw, echo, rows, slots, seconds, att, expect_att='any'):
     errors = security_errors(named, raw, seconds)
     errors += app_errors(rows, 'encrypted_read_write_ok')
     bonds = named['BOND_STATS']
@@ -277,11 +283,25 @@ def checks_pair(named, raw, echo, rows, slots, seconds):
         errors.append('the new bond was never saved')
     if bonds['save_fail']:
         errors.append(f'{bonds["save_fail"]} bond saves failed')
+
+    catt = named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    stored = bool(valid_att_slots(att))
+    if stored != (catt['save_ok'] > 0):
+        errors.append('the client ATT dump and its save report disagree')
+    # Only a round whose app actually subscribes can prove the persistence
+    # path; `--expect-att loaded` turns that into a gate.
+    if expect_att == 'loaded':
+        if catt['snapshots'] < 1:
+            errors.append('the client wrote no CCCD, so no ATT record was exercised')
+        if catt['save_ok'] < 1 or not stored:
+            errors.append('the client ATT record was not saved')
     errors += dump_matches_echo(slots, echo)
     return errors
 
 
-def checks_reconnect(named, raw, rows, seconds):
+def checks_reconnect(named, raw, rows, seconds, att, expect_att='any'):
     errors = security_errors(named, raw, seconds)
     errors += app_errors(rows, 'reconnect_encrypted_read_write_ok')
     bonds = named['BOND_STATS']
@@ -302,10 +322,28 @@ def checks_reconnect(named, raw, rows, seconds):
         errors.append('the Host never attempted a client ATT restore')
     if catt['restore_invalid']:
         errors.append(f'{catt["restore_invalid"]} stored client ATT tables were rejected')
-    if catt['records_loaded'] and catt['restore_ok'] < 1:
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    # The reported boot decode and the flash dump must agree, whichever way
+    # the round went; a mismatch means one of the two stores is lying.
+    loaded = bool(catt['records_loaded'])
+    if loaded != bool(valid_att_slots(att)):
+        errors.append('the client ATT store and its boot report disagree')
+    if loaded and catt['restore_ok'] < 1:
         errors.append('a stored client ATT table was not applied to the peer')
-    if not catt['records_loaded'] and catt['restore_ok']:
+    if not loaded and catt['restore_ok']:
         errors.append('a client ATT table was applied without a stored record')
+    if loaded and catt['restore_no_record']:
+        errors.append('the reconnecting peer had no stored client ATT record')
+    # `--expect-att loaded` is for rounds whose client subscribed: those must
+    # show the stored record and its restore, not just self-consistency.
+    if expect_att == 'loaded':
+        if not loaded:
+            errors.append('no client ATT record was decoded at boot')
+        if catt['restore_ok'] < 1:
+            errors.append('the stored client ATT table was not applied to the peer')
+    elif expect_att == 'empty' and loaded:
+        errors.append('client ATT records were present but expected to be absent')
     if sec['ltk_request'] < 1 or sec['ltk_reply'] < 1:
         errors.append(f'controller did not use the stored LTK: '
                       f'request={sec["ltk_request"]} reply={sec["ltk_reply"]}')
@@ -314,7 +352,7 @@ def checks_reconnect(named, raw, rows, seconds):
     return errors
 
 
-def checks_delete(delete_named, delete_raw, delete_rows, slots,
+def checks_delete(delete_named, delete_raw, delete_rows, slots, att_slots,
                   reject_named, reject_rows, seconds):
     errors = security_errors(delete_named, delete_raw, seconds)
     errors += app_errors(delete_rows, 'bond_delete_ok')
@@ -328,6 +366,16 @@ def checks_delete(delete_named, delete_raw, delete_rows, slots,
         errors.append('a valid bond survived deletion')
     if not any(slot['tombstone'] for slot in slots):
         errors.append('no tombstone was written')
+
+    # `DEL!` clears the client ATT store in the same run; a surviving record
+    # would let the next snapshot resurrect the deleted peer's subscription.
+    catt = delete_named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    if valid_att_slots(att_slots):
+        errors.append('a stored client ATT record survived deletion')
+    if not any(slot['tombstone'] for slot in att_slots):
+        errors.append('no client ATT tombstone was written')
     errors += app_errors(reject_rows, 'reconnect_encrypted_read_write_ok', pass_expected=False)
     sec = reject_named['SECURE_STATS']
     if sec['ltk_request'] < 1:
@@ -341,7 +389,7 @@ def checks_delete(delete_named, delete_raw, delete_rows, slots,
     return errors
 
 
-def checks_wipe(named, rows, slots):
+def checks_wipe(named, rows, slots, att_slots):
     errors = app_errors(rows, 'bond_wipe_ok')
     bonds = named['BOND_STATS']
     if bonds['clear_requests'] < 1 or bonds['clear_ok'] != 1:
@@ -351,11 +399,18 @@ def checks_wipe(named, rows, slots):
         errors.append('a valid record survived the wipe')
     if any(slot['header_ok'] for slot in slots):
         errors.append('a store header survived the wipe')
+
+    # The ATT store is erased on the next idle flush call; it must be empty too.
+    catt = named['CATT_STATS']
+    if catt['save_fail']:
+        errors.append(f'{catt["save_fail"]} client ATT flash operations failed')
+    if any(slot['header_ok'] for slot in att_slots):
+        errors.append('a client ATT store header survived the wipe')
     return errors
 
 
 def checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
-                 reconnect_rows, seconds):
+                 reconnect_rows, seconds, att, expect_att='any'):
     errors = app_errors(rows, 'fault_injected_ok')
     bonds = named['BOND_STATS']
     if bonds['fault_injected'] != 1:
@@ -366,7 +421,7 @@ def checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
     if not any(slot['header_ok'] and not slot['payload_ok'] for slot in slots):
         errors.append('the interrupted copy has a valid payload; expected a CRC mismatch')
     errors += checks_reconnect(reconnect_named, reconnect_raw,
-                               reconnect_rows, seconds)
+                               reconnect_rows, seconds, att, expect_att)
     return errors
 
 
@@ -379,7 +434,8 @@ def phase_pair(args, out, symbols, image, seconds):
     named, raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
     att = dump_att(out, args.att_addr, args.att_len)
-    errors += checks_pair(named, raw, echo, rows, slots, seconds)
+    errors += checks_pair(named, raw, echo, rows, slots, seconds, att,
+                          args.expect_att)
     return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
                     'client_att': att}
 
@@ -392,8 +448,10 @@ def phase_wipe(args, out, symbols, image, seconds):
     p4.wait_until(started + seconds + 3)
     named, _raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
-    errors += checks_wipe(named, rows, slots)
-    return errors, {'stats': named, 'echo': echo, 'dataflash': slots}
+    att = dump_att(out, args.att_addr, args.att_len)
+    errors += checks_wipe(named, rows, slots, att)
+    return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
+                    'client_att': att}
 
 
 def phase_reconnect(args, out, symbols, seconds):
@@ -404,7 +462,7 @@ def phase_reconnect(args, out, symbols, seconds):
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
     att = dump_att(out, args.att_addr, args.att_len)
-    errors += checks_reconnect(named, raw, rows, seconds)
+    errors += checks_reconnect(named, raw, rows, seconds, att, args.expect_att)
     return errors, {'stats': named, 'echo': echo, 'client_att': att}
 
 
@@ -416,7 +474,7 @@ def phase_powercycle(args, out, symbols, seconds):
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
     att = dump_att(out, args.att_addr, args.att_len)
-    errors += checks_reconnect(named, raw, rows, seconds)
+    errors += checks_reconnect(named, raw, rows, seconds, att, args.expect_att)
     return errors, {'stats': named, 'echo': echo, 'client_att': att}
 
 
@@ -428,6 +486,7 @@ def phase_delete(args, out, symbols, image, seconds):
     p4.wait_until(started + seconds + 3)
     named, raw, echo, errors = collect(out, symbols, seconds)
     slots = dump(out, args.dataflash_addr, args.dataflash_len)
+    att = dump_att(out, args.att_addr, args.att_len)
 
     # Same image, fresh boot: the phone still holds the key, the board no
     # longer does, so the controller must reject it.
@@ -439,9 +498,10 @@ def phase_delete(args, out, symbols, image, seconds):
     reject_named, reject_raw, _, reject_errors = collect(out, symbols, seconds,
                                                          prefix='reject-')
     errors += reject_errors
-    errors += checks_delete(named, raw, rows, slots, reject_named, reject_rows, seconds)
+    errors += checks_delete(named, raw, rows, slots, att, reject_named, reject_rows,
+                            seconds)
     return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
-                    'reject': reject_named}
+                    'client_att': att, 'reject': reject_named}
 
 
 def phase_fault(args, out, symbols, image, seconds, nm_text):
@@ -462,11 +522,12 @@ def phase_fault(args, out, symbols, image, seconds, nm_text):
     p4.wait_until(started + seconds + 3)
     reconnect_named, reconnect_raw, _, reconnect_errors = collect(
         out, symbols, seconds, prefix='reconnect-')
+    att = dump_att(out, args.att_addr, args.att_len)
     errors += reconnect_errors
     errors += checks_fault(named, rows, slots, reconnect_named, reconnect_raw,
-                           reconnect_rows, seconds)
+                           reconnect_rows, seconds, att, args.expect_att)
     return errors, {'stats': named, 'echo': echo, 'dataflash': slots,
-                    'reconnect': reconnect_named}
+                    'client_att': att, 'reconnect': reconnect_named}
 
 
 def load_symbols(image):
@@ -563,6 +624,10 @@ def options(argv=None):
                         help='client ATT store slots (0x7C00/0x7D00)')
     parser.add_argument('--att-len', type=lambda text: int(text, 0),
                         default=512)
+    parser.add_argument('--expect-att', choices=('any', 'loaded', 'empty'),
+                        default='any',
+                        help='require a stored client ATT record (app subscribes) '
+                             'or its absence; the default only checks consistency')
     parser.add_argument('--keep-image', action='store_true',
                         help='leave the test image in flash instead of restoring smoke')
     args = parser.parse_args(argv)
