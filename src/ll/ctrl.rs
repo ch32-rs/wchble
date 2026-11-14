@@ -300,7 +300,7 @@ impl ControlState {
 
     /// Send one `LL_LENGTH_REQ` with the current local limits.
     pub fn length_request(&mut self) -> ControlPdu {
-        self.data_length.mark_requested();
+        self.data_length.mark_sent_request();
         ControlPdu::length_req(self.data_length.local_params())
     }
 
@@ -427,11 +427,17 @@ impl ControlState {
                 ControlPdu::length_rsp(rsp)
             }
             0x15 => {
-                if !self.dle_enabled() {
-                    return Ok(ControlAction::Reply(ControlPdu::unknown(0x15)));
+                // A response is never answered, and only the response to a
+                // request this side sent may move the negotiated limits. A
+                // stale or unsolicited one is ignored; without DLE we must
+                // not answer it either (that could loop with peers that
+                // answer unknown responses).
+                if !self.dle_enabled() || !self.data_length.awaiting_rsp() {
+                    return Ok(ControlAction::None);
                 }
                 exact_len(payload, 9)?;
                 let peer = LengthParams::from_octets(&payload[1..9]).ok_or(ConnError::Length)?;
+                self.data_length.clear_awaiting_rsp();
                 self.data_length.on_peer_length(peer);
                 return Ok(ControlAction::None);
             }
@@ -634,11 +640,17 @@ mod tests {
 
         // A response to a request we sent applies the peer's limits.
         ctrl.data_length = DataLength::new();
-        ctrl.data_length.mark_requested();
+        ctrl.data_length.mark_sent_request();
         let rsp = [0x15, 0x41, 0, 0x50, 0x03, 0x41, 0, 0x50, 0x03];
         assert_eq!(ctrl.on_pdu(&mut c, &rsp, LOCAL), Ok(ControlAction::None));
         assert_eq!(ctrl.data_length.tx_octets(false), 65);
         assert_eq!(ctrl.data_length.rx_octets(false), 65);
+        // An unsolicited or stale response changes nothing and is not
+        // answered.
+        ctrl.data_length = DataLength::new();
+        let stale = [0x15, 0x41, 0, 0x50, 0x03, 0x41, 0, 0x50, 0x03];
+        assert_eq!(ctrl.on_pdu(&mut c, &stale, LOCAL), Ok(ControlAction::None));
+        assert!(!ctrl.data_length.negotiated());
     }
 
     #[test]
@@ -659,6 +671,7 @@ mod tests {
         let mut ctrl = ControlState::new();
         ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
         assert_eq!(ctrl.on_pdu(&mut c, &[0x14], LOCAL), Err(ConnError::Length));
+        ctrl.data_length.mark_sent_request();
         assert_eq!(
             ctrl.on_pdu(&mut c, &[0x15, 0, 0, 0, 0, 0, 0, 0], LOCAL),
             Err(ConnError::Length)
@@ -675,11 +688,9 @@ mod tests {
             reply(ctrl.on_pdu(&mut c, &req, LOCAL).unwrap()).as_bytes(),
             &[0x07, 0x14]
         );
+        // A response is never answered, even without the feature bit.
         let rsp = [0x15, 0xfb, 0, 0x48, 0x08, 0xfb, 0, 0x48, 0x08];
-        assert_eq!(
-            reply(ctrl.on_pdu(&mut c, &rsp, LOCAL).unwrap()).as_bytes(),
-            &[0x07, 0x15]
-        );
+        assert_eq!(ctrl.on_pdu(&mut c, &rsp, LOCAL), Ok(ControlAction::None));
         assert!(!ctrl.data_length.negotiated());
     }
 
@@ -714,10 +725,12 @@ mod tests {
     fn unsupported_features_receive_unknown_not_fake_success() {
         let mut c = connection();
         let mut ctrl = ControlState::new();
-        for opcode in [0x03, 0x0f, 0x12, 0x14, 0x15, 0x16, 0xff] {
+        for opcode in [0x03, 0x0f, 0x12, 0x14, 0x16, 0xff] {
             let response = reply(ctrl.on_pdu(&mut c, &[opcode], LOCAL).unwrap());
             assert_eq!(response.as_bytes(), &[0x07, opcode]);
         }
+        // LL_LENGTH_RSP is a response: it must never be answered.
+        assert_eq!(ctrl.on_pdu(&mut c, &[0x15], LOCAL), Ok(ControlAction::None));
         assert_eq!(
             ctrl.on_pdu(&mut c, &[7, 0x14], LOCAL),
             Ok(ControlAction::None)
