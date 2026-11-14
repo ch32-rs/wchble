@@ -45,6 +45,15 @@ BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
     control_writes malformed_control_writes add_bond_ok add_bond_fail
     reserved0 reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
 BOND_MAGIC = 0x4233_5330
+X4_MAGIC = 0x5834_0001
+X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match
+    burst_runs burst_attempts burst_sent burst_queue_full burst_busy burst_other
+    burst_len last_error'''.split()
+BULK_LEN = 200
+BULK_WRITE_SUM = sum(255 - index for index in range(BULK_LEN))
+BURST_LEN = 121
+BURST_ATTEMPTS = 12
+ATT_REASON = 'att_mtu_long_burst_ok'
 HOST_NAMES = p4.HOST_NAMES
 STAT_NAMES = p4.STAT_NAMES
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
@@ -56,6 +65,7 @@ SUMMARY_REASONS = {
     'delete': 'bond_delete_ok',
     'wipe': 'bond_wipe_ok',
     'fault': 'fault_injected_ok',
+    'att': 'att_mtu_long_burst_ok',
 }
 ui_path = '/sdcard/wchble-ui.xml'
 
@@ -84,7 +94,9 @@ ATT_OPCODES = {
     0x06: 'FindByTypeValueReq', 0x07: 'FindByTypeValueRsp', 0x08: 'ReadByTypeReq', 0x09: 'ReadByTypeRsp',
     0x0a: 'ReadReq', 0x0b: 'ReadRsp', 0x0c: 'ReadBlobReq', 0x0d: 'ReadBlobRsp', 0x0e: 'ReadMultiReq',
     0x0f: 'ReadMultiRsp', 0x10: 'ReadByGroupReq', 0x11: 'ReadByGroupRsp', 0x12: 'WriteReq',
-    0x13: 'WriteRsp', 0x1b: 'Notification', 0x1d: 'Indication', 0x1e: 'Confirm', 0x52: 'WriteCmd',
+    0x13: 'WriteRsp', 0x16: 'PrepareWriteReq', 0x17: 'PrepareWriteRsp',
+    0x18: 'ExecuteWriteReq', 0x19: 'ExecuteWriteRsp',
+    0x1b: 'Notification', 0x1d: 'Indication', 0x1e: 'Confirm', 0x52: 'WriteCmd',
 }
 
 
@@ -131,6 +143,22 @@ def decode_trace(words, count):
     return rows
 
 
+def decode_refused_pdu(word):
+    """Decode the first connection PDU the link layer refused (SEC_DIAG[63]).
+
+    Packed as `1 | header << 8 | length << 16`; zero means every PDU was
+    accepted. A refused PDU is never acknowledged, so a non-zero value names
+    the frame the peer retransmits until supervision fails.
+    """
+    if not word:
+        return None
+    return {
+        'header': f'0x{(word >> 8) & 0xFF:02x}',
+        'llid': (word >> 8) & 3,
+        'length': (word >> 16) & 0xFF,
+    }
+
+
 def decode_diag(words):
     """Turn the packed diagnostic rings into an ordered transcript."""
     rows = []
@@ -158,14 +186,20 @@ def decode_diag(words):
     }
 
 
-def validate_observation_buffers(image, symbols):
+def validate_observation_buffers(image, symbols, extra=()):
+    """Check the shared observation buffers, plus `extra` fixture buffers.
+
+    `extra` is opt-in so examples that share this validator without the X4
+    GATT fixture (HID, bond store) do not have to define `X4_STATS`.
+    """
     sections = p4.p3.elf_sections(image)
     ranges = []
-    for name, count in (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
-                        ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
-                        ('BOND_STATS', 32), ('BOND_ECHO', 16),
-                        ('PERIPHERAL_ADDRESS', 2),
-                        ('TRACE', 128 * 8)):
+    buffers = (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
+               ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
+               ('BOND_STATS', 32), ('BOND_ECHO', 16),
+               ('PERIPHERAL_ADDRESS', 2),
+               ('TRACE', 128 * 8)) + tuple(extra)
+    for name, count in buffers:
         address, size = symbols[name], count * 4
         if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
                 or not any(section['flags'] & 3 == 3 and section['address'] <= address
@@ -242,7 +276,116 @@ def read_log(lines):
     return rows
 
 
+def evaluate_att_transcript(rows):
+    """App-side proof of MTU exchange, long read/write and burst delivery."""
+    errors = []
+    events = [row.get('event') for row in rows]
+    summaries = [row for row in rows if row.get('event') == 'summary']
+    if len(summaries) != 1:
+        return [f'expected exactly one app summary, saw {len(summaries)}: {events}']
+    summary = summaries[0]
+    if summary.get('pass') is not True or summary.get('reason') != ATT_REASON:
+        errors.append(f'app summary is not a pass: {summary}')
+    if summary.get('bonded') is not True:
+        errors.append('app summary did not observe a completed bond')
+    required = ('scan_started', 'found', 'connecting', 'connection_state',
+                'mtu_requested', 'mtu', 'services_discovered', 'att_start',
+                'bulk_read', 'bulk_write_requested', 'bulk_write_ack',
+                'bulk_verify', 'burst_cccd_requested', 'burst_cccd',
+                'burst_requested', 'burst_command_ack')
+    for required_event in required:
+        if required_event not in events:
+            errors.append(f'app transcript is missing {required_event}')
+    mtu = next((row for row in rows if row.get('event') == 'mtu'), None)
+    if mtu is None or mtu.get('status') != 0 or not (mtu.get('mtu') or 0) >= 60:
+        errors.append(f'MTU exchange did not succeed above 60: {mtu}')
+    first = next((row for row in rows if row.get('event') == 'bulk_read'), None)
+    if first is None or first.get('status') != 0 or first.get('length') != BULK_LEN \
+            or first.get('pattern_ok') is not True:
+        errors.append(f'long read did not return the {BULK_LEN}-byte pattern: {first}')
+    write = next((row for row in rows if row.get('event') == 'bulk_write_requested'), None)
+    if write is None or write.get('ok') is not True or write.get('length') != BULK_LEN:
+        errors.append(f'long write was not issued with {BULK_LEN} bytes: {write}')
+    ack = [row for row in rows if row.get('event') == 'bulk_write_ack']
+    if not ack or any(row.get('status') != 0 for row in ack):
+        errors.append(f'long write was not acknowledged: {ack}')
+    verify = next((row for row in rows if row.get('event') == 'bulk_verify'), None)
+    if verify is None or verify.get('status') != 0 or verify.get('length') != BULK_LEN \
+            or verify.get('match') is not True:
+        errors.append(f'long write read-back does not match: {verify}')
+    cccd = next((row for row in rows if row.get('event') == 'burst_cccd'), None)
+    if cccd is None or cccd.get('status') != 0:
+        errors.append(f'burst CCCD write failed: {cccd}')
+    command = next((row for row in rows if row.get('event') == 'burst_command_ack'), None)
+    if command is None or command.get('status') != 0:
+        errors.append(f'burst command was not acknowledged: {command}')
+    notifications = [row for row in rows if row.get('event') == 'burst_notification']
+    if not notifications:
+        errors.append('no burst notification reached the app')
+    for row in notifications:
+        if row.get('length') != BURST_LEN or row.get('pattern_ok') is not True:
+            errors.append(f'burst notification is not a {BURST_LEN}-byte pattern row: {row}')
+    if summary.get('notifications') != len(notifications):
+        errors.append('summary notification count disagrees with the logged rows')
+    return errors
+
+
+def evaluate_att(x4, opcodes, delivered, refused=0):
+    """Firmware-side proof: negotiated MTU, Blob/Prepare/Execute and the burst."""
+    errors = []
+    if len(x4) != 16 or x4[0] != X4_MAGIC or x4[1] != 1:
+        return [f'invalid X4_STATS: {x4[:2]}']
+    sample = decode_refused_pdu(refused)
+    if sample is not None:
+        # A refused PDU is never acknowledged, so the peer keeps
+        # retransmitting it until supervision fails.
+        errors.append(f'link layer refused an on-air PDU: {sample}')
+    word = dict(zip(X4_NAMES, x4))
+    if word['mtu'] < 60:
+        errors.append(f"negotiated ATT MTU={word['mtu']} is not above 60")
+    if word['bulk_reads'] < 2:
+        errors.append(f"long read used {word['bulk_reads']} ATT reads, expected at least 2")
+    if word['bulk_writes'] != 1:
+        errors.append(f"long write produced {word['bulk_writes']} write events, expected 1")
+    if word['bulk_len'] != BULK_LEN:
+        errors.append(f"stored bulk length {word['bulk_len']}, expected {BULK_LEN}")
+    if word['bulk_sum'] != BULK_WRITE_SUM:
+        errors.append(f"stored bulk checksum {word['bulk_sum']}, expected {BULK_WRITE_SUM}")
+    if word['bulk_match'] != 1:
+        errors.append('stored bulk value does not match the write pattern')
+    if word['burst_runs'] != 1:
+        errors.append(f"burst ran {word['burst_runs']} times, expected 1")
+    if word['burst_attempts'] != BURST_ATTEMPTS:
+        errors.append(f"burst attempted {word['burst_attempts']} notifications, expected {BURST_ATTEMPTS}")
+    if word['burst_sent'] < 1:
+        errors.append('burst queued no notification')
+    if word['burst_queue_full'] < 1:
+        errors.append('burst never observed a full notification queue')
+    if word['burst_len'] != BURST_LEN:
+        errors.append(f"burst payload length {word['burst_len']}, expected {BURST_LEN}")
+    if word['last_error']:
+        errors.append(f"X4 last_error=0x{word['last_error']:02x}")
+    queued = word['burst_sent']
+    if delivered != queued:
+        errors.append(f'app received {delivered} burst notifications, Host queued {queued}')
+    att = opcodes.get('att', {})
+    rx, tx = att.get('rx', {}), att.get('tx', {})
+    for name, direction in (('MtuReq', rx), ('MtuRsp', tx), ('ReadReq', rx),
+                            ('ReadBlobReq', rx), ('ReadBlobRsp', tx),
+                            ('PrepareWriteReq', rx), ('PrepareWriteRsp', tx),
+                            ('ExecuteWriteReq', rx), ('ExecuteWriteRsp', tx)):
+        if direction.get(name, 0) < 1:
+            errors.append(f'no {name} on air')
+    if tx.get('Notification', 0) < 1:
+        errors.append('no notification on air')
+    elif tx.get('Notification', 0) > word['burst_sent']:
+        errors.append('more notifications on air than the Host queued')
+    return errors
+
+
 def evaluate_transcript(rows, mode='pair'):
+    if mode == 'att':
+        return evaluate_att_transcript(rows)
     errors = []
     events = [row.get('event') for row in rows]
     summaries = [row for row in rows if row.get('event') == 'summary']
@@ -370,6 +513,13 @@ def evaluate_security(sec, host, stats, run_seconds):
         errors.append('invalid HOST_STATS size')
     elif host[15] != SECURITY_ENCRYPTED:
         errors.append(f'Host security state={host[15]}, expected encrypted ({SECURITY_ENCRYPTED})')
+    errors.extend(evaluate_finite_run(stats, run_seconds))
+    return errors
+
+
+def evaluate_finite_run(stats, run_seconds):
+    """Gates that apply to every mode, encrypted or not."""
+    errors = []
     if len(stats) == 64:
         if stats[:3] != [0x5034_3538, 1, 9]:
             errors.append(f'firmware did not finish: magic/version/stage={stats[:3]}')
@@ -404,13 +554,13 @@ def execute(args):
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
         for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'BOND_STATS', 'BOND_ECHO', 'PERIPHERAL_ADDRESS'):
+                     'BOND_STATS', 'BOND_ECHO', 'X4_STATS', 'PERIPHERAL_ADDRESS'):
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
             if len(matches) != 1:
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = int(matches[0][0], 16)
-        symbols = validate_observation_buffers(image, symbols)
+        symbols = validate_observation_buffers(image, symbols, extra=(('X4_STATS', 16),))
         # Both feature sets write the same output path, so a plain `cargo
         # build` right after a secure build silently replaces this image.
         # Refuse to spend a probe session on a Host without the crypto backend.
@@ -501,6 +651,11 @@ def execute(args):
         if args.reject:
             errors.extend(evaluate_rejected_link(observations.get('SECURE_STATS', []),
                                                  observations.get('HOST_STATS', [])))
+        elif args.mode == 'wipe':
+            # The wipe phase deliberately talks to the control characteristic
+            # before any bond exists, so only the finite-run gates apply.
+            errors.extend(evaluate_finite_run(observations.get('STATS', []),
+                                              args.run_seconds))
         else:
             errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
                                             observations.get('HOST_STATS', []),
@@ -515,6 +670,13 @@ def execute(args):
                        indent=2) + '\n')
         diag_words = io.read32(symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
         metadata['sec_diag'] = decode_diag(diag_words)
+        metadata['sec_diag'].update({
+            'rx_oversize': diag_words[59],
+            'rx_max_frame': diag_words[60],
+            'll_control_mask': f'0x{diag_words[61]:04x}',
+            'll_control_last': f'0x{diag_words[62]:02x}',
+            'refused_pdu': decode_refused_pdu(diag_words[63]),
+        })
         if diag_words[40]:
             metadata['sec_diag']['last_hci_failure'] = {
                 'opcode': f'0x{diag_words[40] >> 8:04x}',
@@ -532,6 +694,10 @@ def execute(args):
             for word in diag_words[50:58] if word]
         (args.out / 'sec_diag.json').write_text(
             json.dumps(metadata['sec_diag'], indent=2) + '\n')
+        x4_words = io.read32(symbols['X4_STATS'], 16, args.out / 'x4_stats.txt')
+        metadata['x4_stats'] = dict(zip(X4_NAMES, x4_words))
+        (args.out / 'x4_stats.json').write_text(
+            json.dumps(metadata['x4_stats'], indent=2) + '\n')
         opcode_words = io.read32(symbols['SEC_OPCODES'], 96, args.out / 'sec_opcodes.txt')
         metadata['sec_opcodes'] = decode_opcodes(opcode_words)
         metadata['sec_opcodes']['slow_polls_over_100ms'] = diag_words[36]
@@ -561,6 +727,10 @@ def execute(args):
         (args.out / 'trace.json').write_text(json.dumps(trace_rows, indent=2) + '\n')
         print('SMP', json.dumps(metadata['sec_opcodes']['smp'], sort_keys=True))
         print('ATT', json.dumps(metadata['sec_opcodes']['att'], sort_keys=True))
+        if args.mode == 'att':
+            delivered = sum(1 for row in rows if row.get('event') == 'burst_notification')
+            errors.extend(evaluate_att(x4_words, metadata['sec_opcodes'], delivered,
+                                       diag_words[63]))
 
         try:
             flash(smoke, args.out, 'restore')
@@ -594,7 +764,7 @@ def options(argv=None):
     parser.add_argument('--run-seconds', type=int, default=25)
     parser.add_argument('--timeout', type=float, default=45)
     parser.add_argument('--mode', choices=tuple(SUMMARY_REASONS), default='pair',
-                        help='app phase: pair, reconnect, delete, wipe or fault')
+                        help='app phase: pair, reconnect, delete, wipe, fault or att')
     parser.add_argument('--reject', action='store_true',
                         help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')
@@ -602,6 +772,8 @@ def options(argv=None):
     args = parser.parse_args(argv)
     if not (math.isfinite(args.timeout) and 0 < args.timeout <= args.run_seconds):
         parser.error('require finite timeout <= run-seconds')
+    if args.reject and args.mode == 'att':
+        parser.error('--reject is meaningless for the att phase')
     args.out, args.elf, args.smoke_elf = (args.out.resolve(), args.elf.resolve(),
                                           args.smoke_elf.resolve())
     return args

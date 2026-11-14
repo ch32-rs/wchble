@@ -40,7 +40,14 @@ portable-atomic = { version = "1.11", features = ["critical-section"] }
 # and the drop-out continuation makes the Host close the link as if the peer
 # had disconnected. Every packet in this example is <= 65 L2CAP bytes, so 128
 # is the smallest pool with room for LESC.
-trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-128"] }
+trouble-host = { path = "../../../trouble/host", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "default-packet-pool",
+    "default-packet-pool-mtu-128",
+    # X4: Prepare/Execute Write so a value longer than MTU-3 can be stored.
+    "att-queued-writes",
+] }
 embassy-sync = { version = "0.8", default-features = false }
 embassy-futures = "0.1"
 embassy-time = { version = "0.5", default-features = false, features = ["tick-hz-1_000_000"] }

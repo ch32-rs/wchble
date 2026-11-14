@@ -99,9 +99,32 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [x] **Device Information + UART echo v1:** standard DIS reads and a Nordic
   UART-style write/notify echo run in the Host/application layer. Native fixture
   and a three-cycle macOS run pass.
-- [ ] **ATT MTU negotiation and long data:** the image still fixes MTU 23 and a
-  27-byte packet pool. MTU exchange, longer writes, L2CAP fragmentation and
-  reads across multiple ACL packets are unimplemented/unvalidated.
+- [x] **ATT MTU negotiation and long data (2026-11-13).** The 60 s secure
+  image now negotiates MTU 124 (128-byte packet pool), answers a 200-byte read
+  with Read + Read Blob and a 200-byte write with Prepare/Execute; the Android
+  app read back the identical pattern and the air opcode counters prove both
+  paths. The same round exercised notification-queue pressure (12 attempts, 7
+  queued, 5 queue-full). Evidence:
+  `local-docs/results/x4-att-5-rx31/`, summary in
+  [X4 results](local-docs/research/ch585-x4-att-results.md).
+- [x] **Encrypted PDUs above the legacy 27 octets (2026-11-13).** An Android
+  Central without DLE sent 28-octet encrypted data PDUs (24 plaintext + MIC);
+  the LL refused them at four hardcoded 27-byte limits and, because the refusal
+  happened before any TX, never acknowledged them. The peer retransmitted until
+  the 5 s supervision timeout killed the link. The ceiling is now
+  `ll::enc::MAX_ENCRYPTED` (27 plaintext + MIC) everywhere, and a refused PDU
+  is recorded in `SEC_DIAG[63]`; the X4 runner fails on any such sample.
+  Evidence: `local-docs/results/x4-att-3-badpdu/` (`0x001c1201` = header
+  `0x12`, length 28), `x4-att-4-rx31/`, `x4-att-5-rx31/`.
+- [ ] **Burst drops are silent by design.** `try_notify_raw` returns
+  `OutOfMemory` when the 8-deep notification queue is full; the X4 fixture
+  counts it and moves on rather than waiting or retrying. This proves the
+  pressure path but is not a flow-control policy; a profile needing lossless
+  notification must add credit/backpressure semantics at the application layer.
+- [ ] **Long writes depend on the peer's queued-write implementation.** The
+  Android result relies on AOSP splitting a `WRITE_TYPE_DEFAULT` value larger
+  than MTU-3 into Prepare/Execute writes. Other stacks may truncate or fail
+  instead; the acceptance evidence is for CPH2411/AOSP only.
 - [ ] **UART flow and throughput stress:** bursts beyond the Host credit window,
   backpressure with large payloads, and sustained bidirectional throughput are
   not tested. The current echo accepts at most 20 bytes per write at MTU 23.
@@ -266,17 +289,94 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   read error instead of trying the other, and treats a version mismatch as
   empty; `save()` reads back only the 24-byte header, not the payload. Fix
   together with a mock flash that completes but corrupts a payload byte.
-- [ ] **Bonded CCCD persistence.** `PersistedBond` does not store client ATT
-  state, so a bonded peer's CCCD subscription disappears on reboot (Core 5.4
-  Vol 3 Part G §3.3.3.3). The pinned Host exposes
-  `get/set_client_att_table`; without this, #7's HID keyboard can resume
-  encryption after reboot with notifications still disabled.
+- [ ] **Bonded CCCD persistence — do immediately after the HID keyboard PR (#7) merges.**
+  `PersistedBond` does not store client ATT state, so a bonded peer's CCCD
+  subscription disappears on reboot (Core 5.4 Vol 3 Part G §3.3.3.3). The pinned
+  Host exposes `get/set_client_att_table`; without this the HID keyboard resumes
+  encryption after reboot with notifications still disabled, which is not a
+  normal bonded keyboard reconnect. This is the first follow-up after #7, not a
+  later option; the #7 review treats it as a P1 profile gap.
+- [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
+  `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
+  `host.rs`/`main.rs` duplicate the secure session and control-characteristic
+  handling. The unauthenticated `DEL!/WIPE/FALT` exposure, the delete/wipe race
+  and the CCM ordering guard therefore each have two copies to fix. Extract the
+  bond store (and ideally the session pump) once both examples' acceptance is
+  stable; keep the per-example policy out of the shared layer.
 - [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).
 
+## X4b HID (encrypted-link keyboard)
+
+- [x] **Android system-HID round executed (2026-11-12).** With the 360 s
+  image, the pair helper plus the system HID host produced `reports_sent=354`,
+  `subscription_edges=1`, `HOST security=3`, `SECURE active=1` and a
+  `wch585-hid` keyboard in `dumpsys input` (`local-docs/results/x4b-android-1/`).
+  Human-visible typing was not observed; the helper app's own summary is
+  `timeout` because it targets the P5 vendor service.
+- [x] **App-level HID recognition on Android (2026-11-12).** The helper app's
+  `hid` mode discovers `0x1812` (8 characteristics, two `0x2A4D` reports),
+  records the platform gate (`SecurityException: Need BLUETOOTH PRIVILEGED
+  permission` on the first read) and then observes the OS input device
+  (`input_device`: sources `0x101`, keyboard type 2) in `InputManager` and
+  `dumpsys input` (`local-docs/results/x4b-android-5/`). Driven by
+  `tools/android_hid_run.py --expect app`.
+- [ ] **Stock Android blocks third-party HID-service GATT access.** Unprivileged
+  clients cannot read or subscribe to `0x1812`; byte-level HOGP assertions must
+  come from the system HID host (or a privileged/system app). Recorded, not
+  worked around.
+- [ ] **A bonded Android host with a cached layout does not resubscribe.** After
+  a first discovery, the system HID host keeps the cached service layout and
+  never writes the report CCCD again, so a same-bond run shows
+  `subscription_edges=0`. The first attach after a reboot does a full
+  discovery and subscribes (`x4b-android-9`: `reports_sent=49`).
+- [ ] **The Android HID host needs an explicit connect trigger.** A bonded peer
+  gets no background connection after a reboot, and an adapter cycle did not
+  bring the HID host back. Tapping the paired keyboard in Bluetooth Settings
+  is deterministic; the runner automates it with `--settings-connect`
+  (`uiautomator` bounds, ROM-localised labels avoided).
+- [ ] **Bond store is keyed by peer address only.** Reusing the store from an
+  image with a different local identity makes SMP fail: the phone has no bond
+  for the new address while the Host still returns the old LTK. Pairing only
+  worked after `DEL!`. Key the record by local identity too, or clear the store
+  when the identity changes.
+- [ ] **LESC key agreement can starve the RF pump past the peer's supervision
+  timeout (2026-11-14).** On the macOS gate run the firmware answered the
+  protected CCCD write with Insufficient Encryption (0x0F) after 3.8 s; the
+  client then saw the link die with "connection has timed out unexpectedly".
+  Firmware: `supervision=1`, `host_poll_overrun=2`, `max_host_poll_us=1222635`,
+  `missed=5`, and `Host security=0` because the 10 s Security Request had not
+  fired yet (`local-docs/results/x4b-macos-review2-20261114/`). The 1.22 s
+  block is the documented non-preemptible LESC key agreement; the pump cannot
+  transmit while it runs, so a peer that starts pairing right after a 0x0F can
+  drop the link even though the example steps over its own missed events.
+  A repeat with the first protected access held past the 10 s Security Request
+  recorded SMP `PairingRequest`/`PairingResponse`/`PairingFailed` with one
+  1.22 s poll and `supervision=0` (`x4b-macos-review3-20261114`), so the
+  failure depends on when the peer's pairing lands relative to the connection
+  events. Android's pairing survived the same build. Fix direction: move key
+  agreement off the pump's critical path (precompute, or a preemptible crypto
+  task), or guarantee the peer pairs before the first protected access.
+- [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
+  third-party discovery (Apple Accessory Design Guidelines, GATT Server
+  section) and bluetoothd checks an unsigned CLI in with
+  `fProgrammaticPairing 0`, so no pairing dialog or encrypted access is
+  possible. The diagnostic mirror and client support a bonded host, but that
+  path was never exercised on macOS.
+- [ ] **Only a keyboard Report Map is implemented.** Consumer-control and mouse
+  collections, output reports beyond the LED byte, and multiple Report IDs are
+  absent.
+- [ ] **Encrypted ATT is not decodable in captures.** The sniffer sees SMP and
+  LL encryption but cannot read reports without the stored LTK; the
+  `--sc-ltk-key` path was not wired into the runner.
+- [ ] **The example duplicates the ~2100-line P4/P5 pump.** Extraction belongs
+  to L0; the copied example is a validation artefact, not a second driver.
+
 ## Explicitly outside this milestone
 
-Pairing/encryption, multiple connections, DLE, 2M, CSA2, long attributes and
-product profiles are not implemented or accepted by the current peripheral or
-central examples. They are future scope decisions, not compatibility claims.
+Multiple connections, DLE, 2M, CSA2 and product profiles beyond HOGP are not
+implemented or accepted by the current peripheral or central examples. They are
+future scope decisions, not compatibility claims. Pairing/encryption (S2/S3)
+and long attributes (X4a) have since moved out of this list with the evidence
+above.

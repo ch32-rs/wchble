@@ -167,6 +167,21 @@ const DIAG_HCI_LOG_LEN: usize = 49;
 /// `0xE000_0000 | opcode << 8 | status` (Complete), `0xF000_0000 | ...` (Status).
 const DIAG_HCI_SENT: usize = 50;
 const DIAG_HCI_SENT_LEN: usize = 58;
+/// Received air frames whose declared length exceeds the firmware's 40-byte
+/// capture buffer; a peer that sends one PDU larger than this can never be
+/// acknowledged, so these PDUs stall the link instead of failing loudly.
+const DIAG_RX_OVERSIZE: usize = 59;
+/// Longest declared air-frame length seen this run.
+const DIAG_RX_MAX_FRAME: usize = 60;
+/// Bit `opcode` set for every LL control opcode seen (0x00..=0x1f).
+const DIAG_LL_CONTROL_MASK: usize = 61;
+/// Most recent LL control opcode.
+const DIAG_LL_CONTROL_LAST: usize = 62;
+/// First connection PDU the link layer refused this run, packed as
+/// `1 | header << 8 | length << 16` (zero when every PDU was accepted).
+/// A refused PDU is never acknowledged, so the peer retransmits it until the
+/// supervision timeout; this word names the frame that starts that stall.
+const DIAG_BAD_PDU: usize = 63;
 const DIAG_WORDS: usize = 64;
 
 /// Static random address advertised this boot as two little-endian words
@@ -260,6 +275,26 @@ fn diag_acl(rx: bool, llid: u8, payload: &[u8]) {
         | (u32::from(cid) << 8)
         | u32::from(opcode);
     diag_put(base + (seq as usize & 0x0f), entry);
+}
+
+fn diag_control_opcode(opcode: u8) {
+    diag_put(DIAG_LL_CONTROL_LAST, u32::from(opcode));
+    diag_put(
+        DIAG_LL_CONTROL_MASK,
+        diag_get(DIAG_LL_CONTROL_MASK) | (1u32 << (opcode & 0x1f)),
+    );
+}
+
+/// Record the first connection PDU this run refused. A refused PDU is never
+/// acknowledged, so the peer retransmits it until supervision fails; keeping
+/// the whole header and length names the frame that starts the stall.
+fn note_bad_pdu(header: u8, len: usize) {
+    if diag_get(DIAG_BAD_PDU) == 0 {
+        diag_put(
+            DIAG_BAD_PDU,
+            1 | (u32::from(header) << 8) | ((len as u32) << 16),
+        );
+    }
 }
 
 fn diag_disconnect(reason: u8) {
@@ -416,7 +451,15 @@ fn receive(
         return None;
     }
     let len = usize::from(rx.0[1]) + 2;
+    let longest = diag_get(DIAG_RX_MAX_FRAME);
+    if len as u32 > longest {
+        diag_put(DIAG_RX_MAX_FRAME, len as u32);
+    }
     if len > 40 {
+        diag_put(
+            DIAG_RX_OVERSIZE,
+            diag_get(DIAG_RX_OVERSIZE).wrapping_add(1),
+        );
         inc(9);
         return None;
     }
@@ -633,17 +676,19 @@ fn connection_event(
         };
         let header = rx.0[0];
         let payload = &rx.0[2..packet.len];
+        let llid = header & 3;
         if payload.len() > MAX_ENCRYPTED {
+            note_bad_pdu(header, payload.len());
             inc(9);
             break;
         }
-        let llid = header & 3;
         // After our plaintext LL_START_ENC_REQ, the Central's next non-empty
         // PDU is its encrypted LL_START_ENC_RSP (the link's first encrypted
         // PDU); empty PDUs stay plaintext.
         let ciphertext = s.rx_encrypted && !(llid == 1 && payload.is_empty());
         let capacity = if ciphertext {
-            // The bridge stores plaintext: drop the MIC before admission.
+            // The bridge stores plaintext, so reserve room for the fragment
+            // without the MIC, not for the on-air ciphertext.
             let plain_len = payload.len().saturating_sub(BLE_MIC_LEN);
             s.deferred_rx.is_none()
                 && match llid {
@@ -665,6 +710,7 @@ fn connection_event(
         };
         let outcome = s.link.on_rx(header, payload, true, capacity);
         if outcome.status == RxStatus::Invalid {
+            note_bad_pdu(header, payload.len());
             inc(9);
             break;
         }
@@ -699,7 +745,9 @@ fn connection_event(
         match outcome.status {
             RxStatus::Accepted => {
                 inc(41);
-                if matches!(llid, 1 | 2) {
+                // Ciphertext has no readable L2CAP/ATT header; the deferred
+                // path counts those opcodes after decryption instead.
+                if matches!(llid, 1 | 2) && !ciphertext {
                     diag_acl(true, llid, payload);
                 }
                 if ciphertext {
@@ -747,6 +795,7 @@ fn connection_event(
                             sec_inc(SEC_START_REQ);
                         }
                         _ => {
+                            diag_control_opcode(payload[0]);
                             let local = LocalVersion {
                                 version: 0x0d,
                                 company_id: 0xffff,
@@ -1131,6 +1180,7 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
     match llid {
         3 => {
             put(38, u32::from(plain[0]));
+            diag_control_opcode(plain[0]);
             let local = LocalVersion {
                 version: 0x0d,
                 company_id: 0xffff,
@@ -1156,6 +1206,9 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
             None
         }
         1 | 2 => {
+            // Count ATT/SMP opcodes from the decrypted start fragment: the
+            // pre-decryption call site only sees ciphertext on this link.
+            diag_acl(true, llid, &plain[..len]);
             if soft.bridge.receive_acl(llid, &plain[..len]).is_err() {
                 inc(63);
                 Some(0x1f)

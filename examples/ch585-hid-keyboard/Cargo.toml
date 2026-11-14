@@ -1,0 +1,60 @@
+[workspace]
+
+[package]
+name = "ch585-hid-keyboard"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+long-run = []
+# S2: LE Secure Connections Just Works through Trouble's security feature.
+# The RustCrypto backend supplies AES-128 ECB/CMAC and P-256 ECDH; the RNG
+# driver is provided by this example and seeded from measured ADC noise.
+secure = [
+    "trouble-host/security",
+    "dep:embassy-crypto",
+    "dep:embassy-crypto-rustcrypto",
+]
+# S3 acceptance control characteristic (`DEL!`, `WIPE`, `FALT`). Non-default
+# and never part of a product image: it lets any peer in range erase bonds.
+accept-control = ["secure"]
+# S3 acceptance: `FALT` truncates the next save so the dual-copy fallback can
+# be tested on hardware.
+bond-fault = ["accept-control", "wchble/storage-fault"]
+# Test-only: ask the central for a fixed connection interval over L2CAP.
+conn-params-30 = []
+conn-params-48 = []
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }
+wchble = { path = "../..", features = ["ch585", "controller"] }
+qingke-rt = { version = "0.8.4", features = ["highcode"] }
+panic-halt = "1.0"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+# Local Trouble checkout: 3aa6fd27b89cd5fc35f5c9b4f0c7f66795a14f70 (bt-hci 0.11).
+# A 27-byte pool cannot hold SMP's 65-byte P-256 public key: reassembly fails
+# and the drop-out continuation makes the Host close the link as if the peer
+# had disconnected. Every packet in this example is <= 65 L2CAP bytes, so 128
+# is the smallest pool with room for LESC.
+trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-128"] }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", default-features = false, features = ["tick-hz-1_000_000"] }
+# The HID report tick uses embassy-time in every build.
+embassy-time-driver = { version = "0.2" }
+heapless = "0.9"
+# Same pinned Embassy revision as the local Trouble checkout (bt-hci 0.11).
+embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", optional = true }
+embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", optional = true, features = [
+    "embassy-crypto-aes128-ecb",
+    "embassy-crypto-aes128-cmac",
+    "embassy-crypto-p256-ecdh",
+] }
+
+[profile.release]
+strip = false
+lto = true
+opt-level = 3

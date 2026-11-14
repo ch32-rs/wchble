@@ -144,7 +144,9 @@ The echo is driven only by writes; there is no periodic traffic or UART
 flow-control protocol. `HOST_STATS[12..14]` record UART writes, echo
 notifications queued, and the last accepted byte count. Standard reads and the
 UART pipe stay in the Host/application layer; the radio hot path is unchanged.
-ATT MTU remains 23, and the default packet pool stays at 27-byte chunks.
+The link starts at ATT MTU 23; a client may exchange MTU up to 124 (the
+128-byte packet pool limit, see X4 below). The UART echo still accepts at most
+20 bytes per Write Request at MTU 23 because it does not split writes.
 
 Validation: the native fixture discovers and reads all three DIS fields, then
 subscribes to TX, writes `hi` to RX and requires exactly one matching echo
@@ -153,8 +155,9 @@ three DIS fields per cycle and echoed `p5-1`..`p5-3`; firmware recorded three
 connections/terminations, zero missed events, retries, supervision, TX/RX/stop,
 Host or bridge errors, and smoke restoration/discovery passed. Three earlier
 client attempts failed on Swift-side discovery/callback ordering before a clean
-run; they are retained in the local experiment records. MTU exchange, long data,
-and sustained UART throughput remain unverified.
+run; they are retained in the local experiment records. MTU exchange and long
+data are covered by the X4 round below; sustained UART throughput remains
+unverified.
 
 A separate macOS client wrote the six-byte UTF-8 sequence for "中文"
 (`e4 b8 ad e6 96 87`) to RX with TX notifications enabled. The write was
@@ -178,13 +181,61 @@ acknowledged; only the longer UART notification was not. The two iPhone links in
 that window performed discovery only, so an OS-specific cause is not yet proven;
 the same echo passes on macOS and in the native fixture.
 
+## X4: ATT MTU, long data and queue pressure
+
+The vendor service `00001000-...` adds three fixtures on top of the P4/P5
+characteristics, all with the same access level as the value characteristic
+(`EncryptionRequired` in the `secure` build, open otherwise):
+
+- Bulk `00001005-...`: Read + Write, 200-byte value. The server fills it with a
+  fixed pattern (`index * 7 + 3`); a client overwrite is verified against the
+  frozen copy inside the Host poll.
+- Burst `00001006-...`: Read + Notify, 121 bytes (`MTU - 3` at MTU 124, so each
+  notification is one full ATT PDU).
+- X4 control `00001007-...`: Write, 4 bytes. Writing `BST!` queues twelve
+  back-to-back burst notifications in the same Host poll with
+  `try_notify_raw`; the application never blocks, waits, or retries.
+
+`X4_STATS[16]` (exported symbol) records magic `0x58340001`, version, the
+negotiated MTU, bulk read/write counters, the stored length and checksum, the
+read-back comparison result, and burst attempts/queued/queue-full counts. The
+acceptance criteria live in `tools/secure_run.py` (`att` mode): MTU above 23,
+`ReadBlobReq/Rsp` and `PrepareWriteReq/Rsp` + `ExecuteWriteReq/Rsp` on air, a
+200-byte read-back match, at least one queued and one queue-full burst
+notification, and the usual security/clean-stop checks.
+
+The packet pool is 128 bytes (`default-packet-pool-mtu-128`), so the server
+cannot promise more than MTU 124. A 200-byte attribute therefore needs Read Blob
+for the read and Prepare/Execute queued writes for the write; both are counted
+by `SEC_OPCODES`, so platform behaviour is proven on air rather than inferred
+from the app.
+
+Android result (CPH2411, 2026-11-13): MTU 124, `ReadReq` 2 + `ReadBlobReq` 2,
+`PrepareWriteReq` 2 + `ExecuteWriteReq` 1, 200-byte write read back identical,
+and a 12-attempt burst that queued 7 notifications and hit a full queue 5 times;
+the app received all 7 × 121 bytes. Firmware reported no refused PDU. Details
+and the earlier failed rounds are in
+[`local-docs/research/ch585-x4-att-results.md`](../../local-docs/research/ch585-x4-att-results.md)
+(local experiment records).
+
+That investigation found a real link-layer defect: an Android Central sends
+28-octet encrypted PDUs (24 plaintext + MIC) even without DLE, and the LL used
+to refuse anything above the legacy 27-octet size. A refused PDU was not
+acknowledged at all, so the peer retransmitted until supervision timeout. The
+fix is `ll::enc::MAX_ENCRYPTED` (27 plaintext + MIC) as the one ceiling used by
+`ll::acl`, `ll::conn`, `ll::central` and the firmware receive gate. The gate
+also stores the first refused PDU header/length in `SEC_DIAG[63]`
+(`1 | header << 8 | len << 16`); the `att` gate fails the run if any sample
+appears.
+
 ## GATT contract
 
 - Complete local name: `wch585-p4`.
-- Static random address: `C1:FF:EE:00:00:15` (changed from `...:14` when the P5
-  service database was added, because iOS caches a peer's GATT layout by address).
-  The `secure` build replaces the least-significant octet with a byte from the
-  measured entropy seed, so each boot is a new device (see S2 below).
+- Static random address: `C1:FF:EE:00:00:18` (changed from `...:16` for X4,
+  because iOS caches a peer's GATT layout by address and a stale bond/cache
+  must not be reused).
+  Since S3 the address is fixed across boots so a peer can reuse its bond (see
+  S3 below); only a GATT database change moves it.
 - GAP service `1800`: Device Name `2A00` and Appearance `2A01` (unknown, zero).
 - GATT service `1801`.
 - Custom service: `00001000-b0cd-11ec-871f-d45ddf138840`.
@@ -267,20 +318,23 @@ What the image does differently:
 - Seeds the controller DRBG and a separate Host RNG stream from measured ADC
   temperature noise, and refuses to advertise when the health check fails.
 - Advertises LE Encryption with the legacy HCI ACL buffer of 27 plaintext
-  octets; encryption adds the 4-octet MIC for a 31-octet on-air payload.
+  octets; encryption adds the 4-octet MIC for a 31-octet on-air payload. A
+  peer without DLE can legitimately send 28-octet encrypted PDUs (see X4).
 - Owns `LL_ENC_REQ`/`LL_ENC_RSP`, the Host's `LE LTK Request` reply, the
   plaintext `LL_START_ENC_REQ`, and the encrypted `LL_START_ENC_RSP`. All
   AES-CCM runs outside the connection event: TX is encrypted before the
   event, RX is decrypted after it. The CH585 AES block shares registers with
   the RF IP, so the engine reloads the key before every CCM operation.
-- Uses a fixed static random address (`C1:FF:EE:00:00:16`,
+- Uses a fixed static random address (`C1:FF:EE:00:00:18`,
   `host::RANDOM_ADDRESS`) so a peer can find the bond it saved on an earlier
-  boot. S2 rotated the address because it had no bond store; a phone that
-  bonded a rotation-era address must forget it once.
+  boot. S2 rotated the address because it had no bond store; X4 moved it again
+  because the GATT database changed. A phone that bonded an older address must
+  forget it once.
 - Exposes `SECURE_STATS[16]` (ENC_REQ/RSP, LTK request/reply, START_ENC
   request/response, encrypted TX/RX, active, MIC failures, errors, entropy
-  flags) and `SEC_DIAG` with the packed ACL ring and the last HCI commands
-  and command responses.
+  flags) and `SEC_DIAG` with the packed ACL ring, the last HCI commands and
+  command responses, and word 63 = the first refused data PDU
+  (`1 | header << 8 | len << 16`, zero when none was refused).
 
 Acceptance (Just Works, no MITM protection): the phone must report
 `BOND_BONDED` and then complete an encrypted read/write/read-back; the Host
@@ -289,7 +343,7 @@ SMP exchange, `ENC_REQ`/`ENC_RSP`/`START_ENC_REQ`, and no decodable ATT PDU
 after the encryption start. Connecting without encryption is not acceptance.
 
 `tools/secure_run.py` drives the Android client (`tools/android-pair`) and
-takes `--mode pair|reconnect|delete|wipe|fault` plus `--reject` (expect the
+takes `--mode pair|reconnect|delete|wipe|fault|att` plus `--reject` (expect the
 reconnect to be refused). `tools/secure_capture.py` wraps it with the sniffer;
 its `--mode` also gates the pcap (reconnect/fault forbid new SMP frames,
 delete/reject require `LL_REJECT_IND`). The capture wrapper starts the sniffer
@@ -378,6 +432,7 @@ python3 examples/ch585-trouble-gatt/tools/test_run.py
 python3 examples/ch585-trouble-gatt/tools/test_capture.py
 python3 examples/ch585-trouble-gatt/tools/test_bond_accept.py
 python3 examples/ch585-trouble-gatt/tools/test_secure_run.py
+python3 examples/ch585-trouble-gatt/tools/test_secure_att.py
 swiftc -typecheck examples/ch585-trouble-gatt/tools/central.swift
 swiftc -typecheck examples/ch585-trouble-gatt/tools/p5_uart.swift
 ```
@@ -426,8 +481,20 @@ python3 tools/secure_capture.py \
 The pairing dialog on Android needs one manual confirmation; the runner taps
 it and records the action. Use a new output directory for every attempt.
 
+The X4 MTU/long-data round uses the `att` mode of the same runner (from the
+example directory, after `cargo build --release --features secure`):
+
+```sh
+python3 -I tools/secure_run.py --mode att --run-seconds 60 --timeout 55 \
+  --out local-docs/results/x4-att-<unique>
+```
+
+It requires a bonded peer, negotiates MTU, drives the 200-byte read/write and
+the `BST!` burst, and fails on a malformed transcript, a missing air opcode,
+`burst_queue_full=0`, or any refused-PDU sample in `SEC_DIAG[63]`.
+
 The runner does not start the optional nRF Sniffer itself. `tools/capture.py`
-wraps the same safe runner with capture of `C1:FF:EE:00:00:15 random`. Confirm the
+wraps the same safe runner with capture of `C1:FF:EE:00:00:18 random`. Confirm the
 sniffer's USB serial and current port before using it; the following paths are
 local installed-tool examples, not fresh-machine installation instructions:
 

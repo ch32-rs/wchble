@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "wchble-hid-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The fixture compiles the Host module without any of the firmware's optional
+# features. Declaring them empty keeps `cfg(feature = ...)` checks valid.
+[features]
+default = []
+secure = []
+accept-control = []
+bond-fault = []
+
+[dependencies]
+wchble = { path = "../..", features = ["ch585", "controller"] }
+# Same local Trouble revision and Host feature set as ch585-hid-keyboard.
+trouble-host = { path = "../../../trouble/host", default-features = false, features = ["peripheral", "gatt", "default-packet-pool", "default-packet-pool-mtu-27"] }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = "0.1"
+# The HID report tick is driven by a manually advanced embassy-time clock.
+embassy-time = { version = "0.5", default-features = false, features = ["tick-hz-1_000_000"] }
+# Same bare driver pattern as the firmware: no executor/queue integration.
+embassy-time-driver = "0.2"
+heapless = "0.9"
+critical-section = { version = "1", features = ["std"] }
+portable-atomic = { version = "1.11", features = ["critical-section"] }
