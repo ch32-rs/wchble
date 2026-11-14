@@ -433,7 +433,7 @@ mod tests {
         // 0xFFFF for it; a walk must stop there without overflowing.
         let groups = fixture.discover_groups();
         let uuids: Vec<u16> = groups.iter().map(|(_, _, uuid)| *uuid).collect();
-        assert_eq!(uuids, vec![0x1800, 0x1801, 0x180a, 0x1812]);
+        assert_eq!(uuids, vec![0x1800, 0x1801, 0x180a, 0x180f, 0x1812]);
         assert_eq!(groups[0].0, 1, "first service starts at handle 1");
         for window in groups.windows(2) {
             assert_eq!(window[1].0, window[0].1 + 1, "service groups must be contiguous");
@@ -460,7 +460,11 @@ mod tests {
         assert_eq!(props(0x2a4c), 0x04, "HID Control Point: Write Without Response");
         assert_eq!(props(0x2a4e), 0x06, "Protocol Mode: Read + Write Without Response");
         assert_eq!(props(0x2a22), 0x12, "Boot Keyboard Input: Read + Notify");
-        assert_eq!(props(0x2a32), 0x0a, "Boot Keyboard Output: Read + Write");
+        assert_eq!(
+            props(0x2a32),
+            0x0e,
+            "Boot Keyboard Output: Read + Write + Write Without Response"
+        );
 
         let hid_info = value_of(&chars, 0x2a4a);
         let report_map = value_of(&chars, 0x2a4b);
@@ -478,11 +482,26 @@ mod tests {
         assert!(input_report < output_report);
 
         // Fixed values, read over the same ATT path a host uses.
-        assert_eq!(fixture.read(hid_info), [0x11, 0x01, 0x00, 0x01]);
+        assert_eq!(fixture.read(hid_info), [0x11, 0x01, 0x00, 0x00]);
         assert_eq!(fixture.long_read(report_map), EXPECTED_MAP);
         assert_eq!(fixture.read(protocol_mode), [0x01]);
         assert!(hid(host::HID_INFO_READS) >= 1);
         assert!(hid(host::HID_REPORT_MAP_READS) >= 1);
+
+        // HOGP requires the PnP ID in DIS and a Battery Service; a Report Host
+        // reads both while identifying the keyboard.
+        let (dis_start, dis_end) = fixture.find_service(0x180a);
+        let dis_chars = fixture.declarations(dis_start, dis_end);
+        let pnp_id = value_of(&dis_chars, 0x2a50);
+        assert_eq!(
+            fixture.read(pnp_id),
+            [0x02, 0x09, 0x12, 0x50, 0x58, 0x00, 0x01]
+        );
+        let (battery_start, battery_end) = fixture.find_service(0x180f);
+        let battery_chars = fixture.declarations(battery_start, battery_end);
+        assert_eq!(battery_chars.len(), 1, "one Battery Level characteristic");
+        let battery_level = value_of(&battery_chars, 0x2a19);
+        assert_eq!(fixture.read(battery_level), [100]);
 
         // Report Reference descriptors identify the two 0x2A4D values.
         let info = fixture.find_information(start, end);

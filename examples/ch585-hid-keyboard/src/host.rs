@@ -40,13 +40,15 @@ const HID_PERMISSION: PermissionLevel = PermissionLevel::EncryptionRequired;
 #[cfg(not(feature = "secure"))]
 const HID_PERMISSION: PermissionLevel = PermissionLevel::Allowed;
 
-/// Vendor control characteristic carrying the S3 bond commands (`DEL!`,
-/// `WIPE`, `FALT`). Separate UUID from the P4/P5 vendor service so a phone
-/// never confuses the two GATT layouts.
+/// Vendor service holding the diagnostic mirror and, in acceptance images,
+/// the S3 bond commands (`DEL!`, `WIPE`, `FALT`). Separate UUID from the
+/// P4/P5 vendor service so a phone never confuses the two GATT layouts.
 #[cfg(feature = "secure")]
 pub const CONTROL_SERVICE_UUID: Uuid =
     Uuid::new_long(0x00001a00_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
-#[cfg(feature = "secure")]
+/// Bond-command characteristic. Non-default `accept-control` only: an
+/// unauthenticated peer in range can erase every bond through it.
+#[cfg(feature = "accept-control")]
 pub const BOND_CONTROL_UUID: Uuid =
     Uuid::new_long(0x00001a01_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
 /// Diagnostic mirror of the HID input report. Apple's Accessory Design
@@ -58,8 +60,10 @@ pub const BOND_CONTROL_UUID: Uuid =
 pub const MIRROR_UUID: Uuid =
     Uuid::new_long(0x00001a02_b0cd_11ec_871f_d45ddf138840u128.to_le_bytes());
 
-// HID Information: bcdHID 0x0111, country code 0, remote wake supported.
-const HID_INFORMATION: [u8; 4] = [0x11, 0x01, 0x00, 0x01];
+// HID Information: bcdHID 0x0111, country code 0. The flags byte stays zero:
+// this firmware has no suspend/wake path, so it must not advertise RemoteWake
+// (HOGP 1.1 §3.3.1: bit 0 is RemoteWake).
+const HID_INFORMATION: [u8; 4] = [0x11, 0x01, 0x00, 0x00];
 
 // Boot keyboard report map from the vendor `HID_Keyboard` example
 // (CH585EVT/EXAM/BLE/HID_Keyboard/Profile/hidkbdservice.c): 8 modifier bits,
@@ -288,7 +292,7 @@ pub async fn run(
     }
     // Remove every in-memory bond; the RF owner erases the flash copy after
     // the Host has dropped them.
-    #[cfg(feature = "secure")]
+    #[cfg(feature = "accept-control")]
     let remove_all_bonds = || {
         let identities = stack.with_bond_information(|bonds| {
             let mut list = heapless::Vec::<Identity, BOND_CAPACITY>::new();
@@ -313,10 +317,14 @@ pub async fn run(
     let mut output_storage = [0u8; 1];
     let mut boot_input_storage = [0u8; 8];
     let mut boot_output_storage = [0u8; 1];
-    #[cfg(feature = "secure")]
+    #[cfg(feature = "accept-control")]
     let mut bond_control_storage = [0u8; 4];
     #[cfg(feature = "secure")]
     let mut mirror_storage = [0u8; 8];
+    // Sample PnP identity and a fixed battery level. The attribute table
+    // borrows these values, so they must outlive it.
+    let pnp_id = [0x02u8, 0x09, 0x12, 0x50, 0x58, 0x00, 0x01];
+    let battery_level = [100u8];
     // GAP + GATT + DIS + HID + vendor control. `AttributeTable::push` panics
     // on overflow at the first poll, so the capacity is stated once here and
     // mirrored by the server's const generic below.
@@ -333,15 +341,32 @@ pub async fn run(
     info.add_characteristic_ro(0x2a29u16, "wchble");
     info.add_characteristic_ro(0x2a24u16, "ch585-hid-keyboard");
     info.add_characteristic_ro(0x2a26u16, "x4b-0.1");
+    // HOGP 1.1 §3.3.2 requires the PnP ID (0x2A50); a Report Host reads it on
+    // the first connection to choose a driver. The values are a sample
+    // identity (USB-IF source, the pid.codes open-source vendor ID), not a
+    // product claim; a product build needs its own assigned ID.
+    info.add_characteristic_ro(0x2a50u16, &pnp_id);
     info.build();
+
+    // HOGP 1.1 Table 3.1 marks the Battery Service (0x180F) mandatory. A
+    // read-only Battery Level is enough for the profile; this example has no
+    // battery measurement, so it reports a fixed sample value and no CCCD.
+    let mut battery = table.add_service(Service::new(0x180Fu16));
+    battery.add_characteristic_ro(0x2a19u16, &battery_level);
+    battery.build();
 
     // Standard HID service. Info/Map/Control Point/Protocol Mode are shared by
     // report and boot protocols; the two 0x2A4D characteristics are told apart
     // by their Report Reference descriptors.
     let mut hid = table.add_service(Service::new(0x1812u16));
-    // HID Information and the Report Map carry no secret: HOGP hosts read
-    // them while bonding, and a host that claims the HID service internally
-    // (Apple) otherwise stalls its discovery on Insufficient Authentication.
+    // HID Information and the Report Map stay readable without encryption even
+    // in secure builds. This deviates from HOGP §7.1 for host interop: the
+    // macOS system HID stack reads both during discovery, and gating them
+    // behind Insufficient Authentication delayed discovery from 0.14 s to 30 s
+    // in our local runs. Apple's Accessory Design Guidelines say an accessory
+    // should not require pairing, authentication or encryption to discover
+    // services and characteristics; they do not name these two values. Report
+    // values and CCCDs remain encryption-required.
     let hid_info: Characteristic<[u8; 4]> = hid
         .add_characteristic_ro(0x2a4au16, &HID_INFORMATION)
         .read_permission(PermissionLevel::Allowed)
@@ -410,10 +435,16 @@ pub async fn run(
         .read_permission(HID_PERMISSION)
         .cccd_permission(HID_PERMISSION)
         .build();
+    // HOGP lists Read, Write and Write Without Response for the Boot Keyboard
+    // Output Report: a host may drive the LEDs with a Write Command.
     let boot_output: Characteristic<[u8; 1]> = hid
         .add_characteristic(
             0x2a32u16,
-            &[CharacteristicProp::Read, CharacteristicProp::Write],
+            &[
+                CharacteristicProp::Read,
+                CharacteristicProp::Write,
+                CharacteristicProp::WriteWithoutResponse,
+            ],
             [0u8; 1],
             &mut boot_output_storage,
         )
@@ -422,33 +453,34 @@ pub async fn run(
         .build();
     hid.build();
 
-    // Secure-only bond control: `DEL!` removes the bond and writes a tombstone,
-    // `WIPE` erases both slots, `FALT` truncates the next save. Deliberately
-    // unauthenticated: the peer has to be able to erase a bond it cannot use.
+    // Vendor service. The mirror is diagnostic; the bond commands are a test
+    // control, not part of a product profile: an unauthenticated peer must be
+    // able to clear a bond it cannot use, so `DEL!`/`WIPE`/`FALT` only exist
+    // in images built with the non-default `accept-control` feature.
     #[cfg(feature = "secure")]
-    let (bond_control, mirror): (Characteristic<[u8; 4]>, Characteristic<[u8; 8]>) = {
-        let mut control = table.add_service(Service::new(CONTROL_SERVICE_UUID));
-        let characteristic = control
-            .add_characteristic(
-                BOND_CONTROL_UUID,
-                &[CharacteristicProp::Write],
-                [0u8; 4],
-                &mut bond_control_storage,
-            )
-            .build();
-        let channel = control
-            .add_characteristic(
-                MIRROR_UUID,
-                &[CharacteristicProp::Read, CharacteristicProp::Notify],
-                [0u8; 8],
-                &mut mirror_storage,
-            )
-            .read_permission(HID_PERMISSION)
-            .cccd_permission(HID_PERMISSION)
-            .build();
-        control.build();
-        (characteristic, channel)
-    };
+    let mut control_service = table.add_service(Service::new(CONTROL_SERVICE_UUID));
+    #[cfg(feature = "accept-control")]
+    let bond_control: Characteristic<[u8; 4]> = control_service
+        .add_characteristic(
+            BOND_CONTROL_UUID,
+            &[CharacteristicProp::Write],
+            [0u8; 4],
+            &mut bond_control_storage,
+        )
+        .build();
+    #[cfg(feature = "secure")]
+    let mirror: Characteristic<[u8; 8]> = control_service
+        .add_characteristic(
+            MIRROR_UUID,
+            &[CharacteristicProp::Read, CharacteristicProp::Notify],
+            [0u8; 8],
+            &mut mirror_storage,
+        )
+        .read_permission(HID_PERMISSION)
+        .cccd_permission(HID_PERMISSION)
+        .build();
+    #[cfg(feature = "secure")]
+    control_service.build();
     let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 64, 1>::new(table);
 
     let runner_task = async {
@@ -541,10 +573,11 @@ pub async fn run(
                 if Instant::now() >= next_report_at {
                     next_report_at = Instant::now() + Duration::from_millis(REPORT_INTERVAL_MS);
                     #[cfg(feature = "secure")]
-                    let encrypted = matches!(
-                        connection.raw().security_level(),
-                        Ok(SecurityLevel::Encrypted)
-                    );
+                    let encrypted = connection
+                        .raw()
+                        .security_level()
+                        .map(|level| level.encrypted())
+                        .unwrap_or(false);
                     #[cfg(not(feature = "secure"))]
                     let encrypted = true;
                     // Diagnostic only: with encryption-required CCCDs a
@@ -660,7 +693,7 @@ pub async fn run(
                         let mut wrote_boot_output = false;
                         let mut wrote_control_point = false;
                         let mut wrote_protocol = false;
-                        #[cfg(feature = "secure")]
+                        #[cfg(feature = "accept-control")]
                         let mut wrote_bond_control = false;
                         match &event {
                             GattEvent::Read(event) if event.handle() == hid_info.handle => {
@@ -681,7 +714,7 @@ pub async fn run(
                             GattEvent::Write(event) if event.handle() == protocol_mode.handle => {
                                 wrote_protocol = true;
                             }
-                            #[cfg(feature = "secure")]
+                            #[cfg(feature = "accept-control")]
                             GattEvent::Write(event) if event.handle() == bond_control.handle => {
                                 wrote_bond_control = true;
                             }
@@ -727,7 +760,7 @@ pub async fn run(
                             hid_inc(HID_PROTOCOL_MODE_WRITES);
                             hid_put(HID_PROTOCOL_MODE, u32::from(mode));
                         }
-                        #[cfg(feature = "secure")]
+                        #[cfg(feature = "accept-control")]
                         if wrote_bond_control {
                             let command = match connection.get(&bond_control) {
                                 Ok(command) => command,
@@ -738,10 +771,14 @@ pub async fn run(
                                 b"DEL!" => {
                                     crate::bond::bump(crate::bond::STAT_CLEAR_REQUESTS);
                                     remove_all_bonds();
+                                    // A snapshot queued before this command must
+                                    // not be written after the tombstone.
+                                    crate::bond::signals().discard_pending();
                                     crate::bond::signals().delete.set(true);
                                 }
                                 b"WIPE" => {
                                     remove_all_bonds();
+                                    crate::bond::signals().discard_pending();
                                     crate::bond::signals().wipe.set(true);
                                 }
                                 b"FALT" => crate::bond::signals().fault.set(true),

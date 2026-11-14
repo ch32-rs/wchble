@@ -16,10 +16,15 @@ scope. Android is driven automatically through the shared `android-pair` helper
 
 ```sh
 cd examples/ch585-hid-keyboard
-cargo build --release --features secure              # acceptance image, RUN_SECONDS=60
-cargo build --release --features secure,long-run     # 360 s manual window
-cargo build --release                                # plain link, HID table only
+cargo build --release --features secure                    # acceptance image, RUN_SECONDS=60
+cargo build --release --features secure,long-run           # 360 s manual window
+cargo build --release --features secure,accept-control     # adds DEL!/WIPE/FALT
+cargo build --release                                      # plain link, HID table only
 ```
+
+`accept-control` adds the vendor bond-command characteristic used by the
+acceptance tools. It is non-default and must never be part of a product image:
+any peer in range can erase every bond through it.
 
 `--locked` reproduces the pinned Trouble (`3aa6fd27…`, `bt-hci` 0.11) and
 `uuid` 1.17.0 dependency graph. Do not regenerate the lockfile for normal
@@ -36,15 +41,17 @@ dependency.
 | --- | --- | --- | --- | --- |
 | GAP | Device Name / Appearance | `2A00` / `2A01` | Read | `wch585-hid` / `0x03C1` |
 | DIS | Manufacturer / Model / FW | `2A29` / `2A24` / `2A26` | Read | `wchble` / `ch585-hid-keyboard` / `x4b-0.1` |
-| HID | HID Information | `2A4A` | Read (no encryption) | `11 01 00 01` |
+| DIS | PnP ID | `2A50` | Read | sample USB-IF / pid.codes identity |
+| Battery | Battery Level | `2A19` | Read | fixed `100` |
+| HID | HID Information | `2A4A` | Read (no encryption) | `11 01 00 00` |
 | HID | Report Map | `2A4B` | Read (no encryption) | 63-byte boot keyboard map |
 | HID | HID Control Point | `2A4C` | Write Without Response | `0x00`/`0x01` recorded |
 | HID | Protocol Mode | `2A4E` | Read + Write Without Response | `1` report, `0` boot |
 | HID | Report (keyboard input) | `2A4D` | Read + Notify, `2908=[0,1]` | 8 bytes |
 | HID | Report (LED output) | `2A4D` | Read + Write + Write Without Response, `2908=[0,2]` | 1 byte |
 | HID | Boot Keyboard Input | `2A22` | Read + Notify | 8 bytes |
-| HID | Boot Keyboard Output | `2A32` | Read + Write | 1 byte |
-| vendor | Bond control | `00001a01-…` | Write | `DEL!` / `WIPE` / `FALT` |
+| HID | Boot Keyboard Output | `2A32` | Read + Write + Write Without Response | 1 byte |
+| vendor | Bond control (only `accept-control`) | `00001a01-…` | Write | `DEL!` / `WIPE` / `FALT` |
 | vendor | Report mirror | `00001a02-…` | Read + Notify | diagnostic copy of the 8-byte HID input report |
 
 The 63-byte report map is the vendor `HID_Keyboard` map
@@ -52,12 +59,27 @@ The 63-byte report map is the vendor `HID_Keyboard` map
 reserved byte, five LED bits plus padding, six key bytes. There is no boot
 keyboard control point: `0x2A34` is Glucose Measurement Context, not HID.
 
+The Battery Service and the DIS PnP ID are required by HOGP 1.1 (§3 Table 3.1
+and §3.3.2). The PnP values identify this as a sample (USB-IF source, the
+pid.codes open-source vendor ID); a product build needs its own assigned ID.
+The battery level is a fixed sample because this example has no measurement.
+
 Under `secure`, every report value and CCCD write requires encryption. HID
 Information, the Report Map and the two `0x2908` Report Reference descriptors
-stay readable without one: they carry no secret, a HOGP host reads them while
-bonding, and a host that claims the HID service internally (Apple) otherwise
-stalls its discovery on Insufficient Authentication. Reports never leave the
-device before encryption is active.
+stay readable without one. That is a deliberate deviation from HOGP §7.1 for
+host interoperability: on macOS the system HID stack reads both values
+during discovery, and gating them behind Insufficient Authentication delayed
+discovery from 0.14 s to 30 s in local runs (x4b run8/run11). Apple's Accessory
+Design Guidelines say an accessory should not require pairing, authentication
+or encryption to discover services and characteristics, but they do not name
+these two values, so this is an observed platform boundary rather than a
+documented Apple requirement. Reports never leave the device before encryption
+is active.
+
+The bond store persists keys and peer identity, not the client ATT table. A
+bonded host's report CCCD subscription is therefore lost across a reboot; this
+is tracked as the first follow-up after the keyboard PR (`BACKLOG.md`, "Bonded
+CCCD persistence"). The encrypted link itself resumes.
 
 The report mirror exists because Apple's Accessory Design Guidelines filter the
 BLE HID service out of CoreBluetooth discovery: a macOS app never sees
@@ -161,6 +183,10 @@ python3 tools/android_hid_run.py --out local-docs/results/x4b-android-app \
 python3 tools/android_hid_run.py --out local-docs/results/x4b-android-payload \
     --expect payload --wipe-bond --pair-tap 786,2121
 ```
+
+`--wipe-bond` writes `DEL!` to the vendor bond-control characteristic, so the
+flashed image must be built with `secure,accept-control`; the runner refuses
+the option when the ELF lacks the marker. The other rounds use plain `secure`.
 
 `--settings-connect` opens Bluetooth Settings and taps the paired keyboard
 once: Android's HID host only opens its own GATT client when Settings (or a

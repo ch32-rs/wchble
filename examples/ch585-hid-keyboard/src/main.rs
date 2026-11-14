@@ -1229,6 +1229,8 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
         }
     }
     if signals.wipe.take() {
+        // Erasing the store also drops any snapshot captured before the wipe.
+        signals.discard_pending();
         let started = clock.now_us();
         bond::bump(bond::STAT_CLEAR_REQUESTS);
         match store.erase_all() {
@@ -1242,6 +1244,7 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
         return;
     }
     if signals.delete.take() {
+        signals.discard_pending();
         let started = clock.now_us();
         bond::bump(bond::STAT_CLEAR_REQUESTS);
         match store.clear() {
