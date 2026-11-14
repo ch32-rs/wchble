@@ -81,8 +81,8 @@ The bond store persists keys and peer identity; a second dual-copy store
 CCCD subscription survives a reboot and the Host applies it when the peer
 reconnects (`CATT_STATS[16]`, `--expect restored` in
 `tools/android_hid_run.py`). The encrypted link itself resumes either way. A
-table stored by a build with a different GATT layout is rejected by the
-read-back check rather than applied partially.
+table stored by a build with a different GATT layout fails the read-back and
+is rolled back, so it cannot enable a notification through a recycled handle.
 
 The report mirror exists because Apple's Accessory Design Guidelines filter the
 BLE HID service out of CoreBluetooth discovery: a macOS app never sees

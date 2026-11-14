@@ -409,7 +409,9 @@ The secure image keeps its bonds across resets and power loss.
   no-op) and snapshots after an accepted CCCD write or on disconnect. `DEL!`
   and `WIPE` clear both stores, one flash operation per flush call.
   `CATT_STATS[16]` reports load/restore/snapshot/save outcomes; a table whose
-  bytes do not read back unchanged is counted invalid and not applied.
+  bytes do not read back unchanged is counted invalid and rolled back to the
+  previous table, so a layout change cannot enable a notification through a
+  recycled handle.
 - The CH585 backend (`Ch585DataFlash`) uses the DataFlash command path
   (`0x81` erase, `0x02` program, `0x0B` read) from `.highcode` RAM with
   interrupts masked; the safe-access window is only a few system clocks.

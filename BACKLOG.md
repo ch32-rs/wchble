@@ -352,8 +352,9 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   across a reboot without writing the CCCD again. Snapshots happen after an
   accepted CCCD write and on disconnect; the disconnect snapshot never creates
   a first record, so a peer that never subscribed costs no flash write. `DEL!`
-  and `WIPE` clear both stores. A table stored under a different GATT layout is
-  rejected by the read-back check instead of being applied partially.
+  and `WIPE` clear both stores. A table stored under a different GATT layout
+  fails the read-back check and is rolled back, so it cannot enable a
+  notification through a recycled handle.
 - [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
   `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
   `host.rs`/`main.rs` duplicate the secure session and control-characteristic

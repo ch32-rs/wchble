@@ -172,25 +172,30 @@ pub fn restore<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX:
         return;
     };
     let raw = &record.raw[..record.raw_len as usize];
-    match ClientAttTableView::try_from_raw(raw) {
-        Ok(view) => {
-            server.set_client_att_table(connection.raw(), &view);
-            // `set_*` keys on the peer identity and silently does nothing when
-            // the slot does not match; read back to tell the two apart.
-            let applied = server
-                .get_client_att_table(connection.raw())
-                .is_some_and(|table| table.raw() == raw);
-            if applied {
-                bump(STAT_RESTORE_OK);
-            } else {
-                bump(STAT_RESTORE_INVALID);
-                set(STAT_LAST_ERROR, 2);
-            }
+    let Ok(view) = ClientAttTableView::try_from_raw(raw) else {
+        bump(STAT_RESTORE_INVALID);
+        set(STAT_LAST_ERROR, 1);
+        return;
+    };
+    // `set_values` copies matching handles immediately and zeroes the rest, so
+    // keep the current table to roll back. A record from a build with another
+    // GATT layout must not leave notifications enabled on whatever now
+    // occupies those handles.
+    let previous = server.get_client_att_table(connection.raw());
+    server.set_client_att_table(connection.raw(), &view);
+    // `set_*` keys on the peer identity and silently does nothing when the
+    // slot does not match; read back to tell the two apart.
+    let applied = server
+        .get_client_att_table(connection.raw())
+        .is_some_and(|table| table.raw() == raw);
+    if applied {
+        bump(STAT_RESTORE_OK);
+    } else {
+        if let Some(previous) = previous.as_ref() {
+            server.set_client_att_table(connection.raw(), &previous.view());
         }
-        Err(_) => {
-            bump(STAT_RESTORE_INVALID);
-            set(STAT_LAST_ERROR, 1);
-        }
+        bump(STAT_RESTORE_INVALID);
+        set(STAT_LAST_ERROR, 2);
     }
 }
 

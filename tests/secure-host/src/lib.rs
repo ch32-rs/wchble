@@ -560,6 +560,70 @@ mod tests {
         assert_eq!(fixture.read_cccd(cccd), [0x01, 0x00]);
     }
 
+    /// A stored table from another GATT layout must not change any CCCD.
+    ///
+    /// `set_client_att_table` copies matching handles before the read-back can
+    /// notice the mismatch, so `restore` has to roll the table back.
+    #[test]
+    fn incompatible_att_table_is_rejected_without_effect() {
+        use trouble_host::prelude::{Address, Identity};
+
+        let _guard = serialize();
+        seed_rng();
+        fixture_start();
+
+        // Learn the value CCCD handle with a real connection.
+        let (records, cccd) = capture_cccd_record();
+
+        // Same value, different table shape: a single index entry at the value
+        // CCCD's handle.
+        let mut stored = records[0];
+        let mut raw = [0u8; 10];
+        raw[0] = 1; // attribute count
+        raw[2] = 2; // value bytes
+        raw[4..6].copy_from_slice(&cccd.to_le_bytes());
+        raw[8..10].copy_from_slice(&[0x01, 0x00]);
+        assert!(stored.set_raw(&raw));
+        let mut list = client_att::ClientAttSnapshot::new();
+        let _ = list.push(stored);
+        client_att::set_boot_records(&list);
+        preload_bond(Identity {
+            addr: Address::random(PEER),
+            irk: None,
+        });
+
+        let restored = client_att::value(client_att::STAT_RESTORE_OK);
+        let invalid = client_att::value(client_att::STAT_RESTORE_INVALID);
+
+        let stats = host::HostStats::new();
+        let controller = SoftRunner::new();
+        let mut future = pin!(host::run(
+            wchble::hci::new(),
+            &stats,
+            host::RANDOM_ADDRESS
+        ));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+            disconnect: None,
+        };
+        fixture.start();
+        fixture.connect(PEER);
+        fixture.pump_quiet(16);
+
+        assert_eq!(client_att::value(client_att::STAT_RESTORE_OK), restored);
+        assert_eq!(
+            client_att::value(client_att::STAT_RESTORE_INVALID) - invalid,
+            1
+        );
+        assert_eq!(
+            fixture.read_cccd(cccd),
+            [0x00, 0x00],
+            "a rejected table must not leave the CCCD enabled"
+        );
+    }
+
     /// A record keyed to another peer is never applied, even when the connected
     /// peer is bonded.
     #[test]
