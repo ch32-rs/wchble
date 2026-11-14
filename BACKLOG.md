@@ -376,6 +376,12 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   events. Android's pairing survived the same build. Fix direction: move key
   agreement off the pump's critical path (precompute, or a preemptible crypto
   task), or guarantee the peer pairs before the first protected access.
+- [ ] **macOS `bond_wipe.swift` stalls on the HID control image.** On
+  2026-11-14 the helper connected, received `didConnect`, and then sent no ATT
+  or SMP traffic at all for 19.5 s; the firmware TRACE shows only its own
+  `LL_VERSION_IND`/`LL_FEATURE_REQ` before the 20 s supervision drop
+  (`x1-hid-review-7`/`x1-hid-review-9`). The phone-driven `DEL!`/`WIPE` write is
+  the working path; pinning the host-side cause needs a macOS HCI/packet log.
 - [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
   third-party discovery (Apple Accessory Design Guidelines, GATT Server
   section) and bluetoothd checks an unsigned CLI in with
