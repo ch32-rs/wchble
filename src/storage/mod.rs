@@ -381,8 +381,12 @@ impl<R: FlashRegion> DualCopyStore<R> {
     /// valid copy: when the newest header carries a corrupt payload and the
     /// other slot is still valid, `active` is the valid slot, so the write goes
     /// into the corrupt one. The sequence is always taken from the newest
-    /// header, valid or not, so a corrupt record is never resurrected over.
-    /// If a header itself cannot be read, refuse to write blind.
+    /// readable header, valid or not, so a corrupt record is never resurrected
+    /// over.
+    ///
+    /// If no slot proved valid and a header read failed, refuse to write blind:
+    /// the unreadable slot may hold the only good copy, and `save` erases its
+    /// target before programming.
     fn locate(&mut self) -> Result<(), StoreError> {
         if self.active.is_some() || self.seq != 0 {
             return Ok(());
@@ -419,16 +423,23 @@ impl<R: FlashRegion> DualCopyStore<R> {
             }
         }
         let seq = newest.map_or(0, |(_, header)| header.seq);
-        match newest_valid.or(newest) {
+        if let Some((slot, _)) = newest_valid {
+            self.active = Some(slot);
+            self.seq = seq;
+            return Ok(());
+        }
+        // No slot proved valid. A failed header read may hide the only good
+        // copy, so refuse to pick a write target instead of erasing it blind.
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        match newest {
             Some((slot, _)) => {
                 self.active = Some(slot);
                 self.seq = seq;
                 Ok(())
             }
-            None => match first_error {
-                Some(error) => Err(error),
-                None => Ok(()),
-            },
+            None => Ok(()),
         }
     }
 
@@ -709,6 +720,32 @@ mod tests {
         let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
         next.region.corrupt_next_payload = true;
         assert!(next.save(b"next").is_err());
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
+    fn unreadable_header_blocks_a_blind_save() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        // The newest header stays readable but its payload is damaged, so no
+        // slot validates; the older slot still holds the only good record.
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        // Slot 0's header cannot be read, so `locate` must not pick slot 1 as
+        // the write target: `save` erases the target first.
+        next.region.fail_read = Some(0);
+        next.region.corrupt_next_payload = true;
+        let before = next.region.data;
+        assert!(next.save(b"next").is_err());
+        assert_eq!(next.region.data, before);
+
+        // Once the header is readable again the old record is still there.
+        next.region.fail_read = None;
         let mut out = [0u8; 16];
         assert_eq!(next.load(&mut out), Ok(Some(3)));
         assert_eq!(&out[..3], b"old");
