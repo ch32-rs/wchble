@@ -40,6 +40,9 @@ STORE_MAGIC = 0x3344_4E42
 HOST_SECURITY = 15  # HOST_STATS.reserved_15 carries the Host security state
 LL_REJECT_UNKNOWN_KEY = 0x06
 PHASES = ('wipe', 'pair', 'reconnect', 'delete', 'repair', 'fault', 'powercycle')
+STORE_VERSION = 2
+LOCAL_IDENTITY_LEN = 7
+BOND_HEADER_LEN = LOCAL_IDENTITY_LEN + 1
 
 
 def run_logged(args, out, prefix, timeout=240):
@@ -68,18 +71,31 @@ def parse_dump(path):
         page = data[index * PAGE:(index + 1) * PAGE]
         magic, version, flags, seq, length, _reserved, payload_crc, header_crc = \
             struct.unpack_from('<IHHIHHII', page)
-        header_ok = (magic == STORE_MAGIC and version == 1
+        header_ok = (magic == STORE_MAGIC and version == STORE_VERSION
                      and header_crc == zlib.crc32(page[:20]))
         payload_ok = header_ok and payload_crc == zlib.crc32(page[24:24 + length])
+        record = None
+        local = None
+        count = 0
+        if header_ok and length > BOND_HEADER_LEN:
+            payload = page[24:24 + length]
+            local = payload[:LOCAL_IDENTITY_LEN].hex()
+            count = payload[LOCAL_IDENTITY_LEN]
+            if count:
+                start = BOND_HEADER_LEN
+                record = payload[start:start + 52].hex()
         slots.append({
             'slot': index,
             'magic': f'{magic:#010x}',
+            'version': version,
             'seq': seq,
             'length': length,
             'header_ok': header_ok,
             'payload_ok': payload_ok,
             'tombstone': header_ok and length == 0,
-            'record': page[24:24 + 1 + 52].hex() if header_ok and length > 1 else None,
+            'local': local,
+            'count': count,
+            'record': record,
         })
     return slots
 
@@ -176,12 +192,18 @@ def dump_matches_echo(slots, echo):
     if len(valid) != 1:
         return [f'expected one valid stored copy, saw {len(valid)}']
     record = bytes.fromhex(valid[0]['record'] or '')
-    if len(record) < 1 + 52:
+    if len(record) < 52:
         return ['stored record is too short']
     if not echo.get('present'):
         return ['the Host never recorded a bond to compare against']
-    if record[1:17].hex() != echo['ltk']:
+    if record[0:16].hex() != echo['ltk']:
         return ['stored LTK differs from the key the Host used']
+    if echo.get('local_present'):
+        expected = bytes([echo['local_address_kind']]) + bytes.fromhex(
+            echo['local_address'].replace(':', ''))
+        if valid[0].get('local') != expected.hex():
+            return [f'stored local identity {valid[0].get("local")} differs from '
+                    f'the advertised one {expected.hex()}']
     return []
 
 

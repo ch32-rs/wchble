@@ -1708,7 +1708,7 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
         count += 1;
     }
     let mut payload = [0u8; MAX_PAYLOAD];
-    let len = match encode_bonds(&records[..count], &mut payload) {
+    let len = match encode_bonds(&bond::local_identity(), &records[..count], &mut payload) {
         Ok(len) => len,
         Err(_) => {
             bond::bump(bond::STAT_SAVE_FAIL);
@@ -1875,13 +1875,24 @@ fn main() -> ! {
         let mut payload = [0u8; MAX_PAYLOAD];
         let read_started = clock.now_us();
         match store.load(&mut payload) {
-            Ok(Some(len)) => match decode_bonds(&payload[..len], &mut boot_bonds) {
-                Ok(count) => {
+            Ok(Some(len)) => match decode_bonds(
+                &payload[..len],
+                &bond::local_identity(),
+                &mut boot_bonds,
+            ) {
+                Ok(Some(count)) => {
                     bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_VALID);
                     bond::set(bond::STAT_RECORDS_LOADED, count as u32);
                     bond::set(bond::STAT_WINNER_SLOT, store.active_slot().unwrap_or(0) as u32);
                     bond::set(bond::STAT_WINNER_SEQ, store.seq());
                     bond::set_boot_bonds(&boot_bonds[..count]);
+                }
+                // Written by an image that advertised another address. The
+                // peer paired with that identity, so these keys must not be
+                // offered here and the slot must not be erased either.
+                Ok(None) => {
+                    bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_FOREIGN);
+                    bond::bump(bond::STAT_IDENTITY_MISMATCH);
                 }
                 Err(_) => bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_CORRUPT),
             },

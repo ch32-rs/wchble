@@ -15,6 +15,7 @@ secure = bond.secure
 
 LTK = bytes(range(16))
 ADDRESS = bytes([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+LOCAL = bytes([1]) + ADDRESS
 
 
 def record(ltk=LTK):
@@ -23,12 +24,12 @@ def record(ltk=LTK):
 
 
 def payload(count=1, ltk=LTK):
-    return bytes([count]) + record(ltk) * count
+    return LOCAL + bytes([count]) + record(ltk) * count
 
 
 def page(seq, body, flags=0):
-    header = struct.pack('<IHHIHHI', bond.STORE_MAGIC, 1, flags, seq, len(body), 0,
-                         zlib.crc32(body))
+    header = struct.pack('<IHHIHHI', bond.STORE_MAGIC, bond.STORE_VERSION, flags, seq,
+                         len(body), 0, zlib.crc32(body))
     header += struct.pack('<I', zlib.crc32(header))
     return header + body + b'\xff' * (bond.PAGE - len(header) - len(body))
 
@@ -145,6 +146,16 @@ class DumpTests(unittest.TestCase):
         self.assertTrue(bond.dump_matches_echo(slots, echo_for(bytes(16))))
         self.assertTrue(bond.dump_matches_echo(slots, {'present': False}))
         self.assertTrue(bond.dump_matches_echo([], echo_for()))
+
+    def test_dump_checks_the_local_identity(self):
+        slots = dumped(page(1, payload()), erased())
+        echo = echo_for()
+        echo.update({'local_present': True, 'local_address': 'aa:bb:cc:dd:ee:ff',
+                     'local_address_kind': 1})
+        self.assertEqual(bond.dump_matches_echo(slots, echo), [])
+        echo['local_address'] = 'aa:bb:cc:dd:ee:00'
+        self.assertTrue(any('local identity' in error
+                            for error in bond.dump_matches_echo(slots, echo)))
 
 
 class CheckTests(unittest.TestCase):

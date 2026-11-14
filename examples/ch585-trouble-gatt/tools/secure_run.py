@@ -43,7 +43,7 @@ BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
     clear_requests clear_ok clear_fail fault_injected last_error max_save_us
     last_save_us boot_read_us pairs_complete pairs_without_bond in_memory_removed
     control_writes malformed_control_writes add_bond_ok add_bond_fail
-    reserved0 reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
+    identity_mismatch reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
 BOND_MAGIC = 0x4233_5330
 X4_MAGIC = 0x5834_0001
 X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match
@@ -511,6 +511,7 @@ def decode_bond_echo(words):
         return {'present': False}
     address = words[2].to_bytes(4, 'big') + bytes([words[3] >> 24, (words[3] >> 16) & 0xFF])
     ltk = b''.join(word.to_bytes(4, 'little') for word in words[4:8])
+    local = words[9].to_bytes(4, 'big') + bytes([words[10] >> 24, (words[10] >> 16) & 0xFF])
     return {
         'present': True,
         'count': words[1],
@@ -521,6 +522,9 @@ def decode_bond_echo(words):
         'security_level': (words[8] >> 8) & 0xFF,
         'has_irk': bool((words[8] >> 16) & 1),
         'key_len': (words[8] >> 24) & 0xFF,
+        'local_address': ':'.join(f'{byte:02x}' for byte in local),
+        'local_address_kind': (words[10] >> 8) & 0xFF,
+        'local_present': bool(words[10] & 0xFF),
     }
 
 
