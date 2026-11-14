@@ -108,7 +108,8 @@ class Sources(unittest.TestCase):
 
     def test_phase_order(self):
         self.assertEqual(runner.PHASES[0], 'positive')
-        self.assertEqual(runner.PHASES[-1], 'negative-bogus-peer')
+        self.assertIn('negative-bogus-peer', runner.PHASES)
+        self.assertEqual(runner.PHASES[-1], 'peer-vanish')
         self.assertEqual(len(runner.PHASES), len(set(runner.PHASES)))
 
     def test_stat_names_complete(self):
