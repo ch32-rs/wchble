@@ -551,6 +551,9 @@ struct Session {
     length_rsp_tx: u32,
     length_req_rx: u32,
     length_rsp_rx: u32,
+    /// First DLE failure: 0x14 = peer answered LL_UNKNOWN_RSP to our
+    /// LL_LENGTH_REQ, 0x1e = malformed or rejected length parameters.
+    x1_last_error: u32,
     deferred_rx: Option<DeferredRx>,
     /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
     /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
@@ -624,6 +627,7 @@ impl Session {
             length_rsp_tx: 0,
             length_req_rx: 0,
             length_rsp_rx: 0,
+            x1_last_error: 0,
             deferred_rx: None,
             enc_rsp_random,
             enc_rsp_payload,
@@ -662,10 +666,11 @@ impl Session {
 
     /// True while no encryption exchange or queued PDU owns the link.
     fn encryption_idle(&self) -> bool {
+        // `rx_encrypted` and `enc_rsp_sent` are link state, not procedure
+        // ownership: after START_ENC they stay true for the rest of the
+        // connection, so they must not keep DLE out once it completed.
         matches!(self.start.stage(), StartStage::Idle | StartStage::Active)
-            && !self.rx_encrypted
             && !self.enc_rsp_queued
-            && !self.enc_rsp_sent
             && !self.enc_change_pending
             && self.pending_control.is_none()
             && self.pending_enc_control.is_none()
@@ -865,7 +870,7 @@ fn connection_event(
                                 company_id: 0xffff,
                                 subversion: 1,
                             };
-                            note_control_rx(s, payload[0]);
+                            note_control_rx(s, payload);
                             match s.control.on_pdu(&mut s.conn, payload, local) {
                                 Ok(action) => {
                                     // DLE takes effect once the request or
@@ -895,10 +900,15 @@ fn connection_event(
                                         }
                                     }
                                 }
-                                Err(error) => s.request_terminate(
-                                    wchble::ll::ctrl::termination_reason(error),
-                                    packet.end,
-                                ),
+                                Err(error) => {
+                                    if matches!(payload.first(), Some(0x14) | Some(0x15)) {
+                                        s.x1_last_error = 0x1e;
+                                    }
+                                    s.request_terminate(
+                                        wchble::ll::ctrl::termination_reason(error),
+                                        packet.end,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1211,10 +1221,16 @@ fn queue_next_host_fragment(soft: &mut SoftRunner, s: &mut Session) {
 }
 
 /// Count DLE opcodes seen in a received LL control PDU.
-fn note_control_rx(s: &mut Session, opcode: u8) {
-    match opcode {
-        0x14 => s.length_req_rx += 1,
-        0x15 => s.length_rsp_rx += 1,
+fn note_control_rx(s: &mut Session, payload: &[u8]) {
+    match payload.first() {
+        Some(0x14) => s.length_req_rx += 1,
+        Some(0x15) => s.length_rsp_rx += 1,
+        // The peer rejected our LL_LENGTH_REQ.
+        Some(0x07) if payload.len() >= 2 && matches!(payload[1], 0x14 | 0x15) => {
+            if s.x1_last_error == 0 {
+                s.x1_last_error = 0x14;
+            }
+        }
         _ => {}
     }
 }
@@ -1246,6 +1262,7 @@ fn publish_x1(s: &Session) {
         X1_LENGTH_REQ_TX, X1_LENGTH_RSP_RX, X1_LENGTH_RSP_TX, X1_MAGIC, X1_MAGIC_INDEX,
         X1_MAX_RX_PDU, X1_MAX_TX_PDU, X1_RX_OCTETS, X1_RX_OVER_27, X1_RX_PDUS, X1_RX_TIME,
         X1_TX_OCTETS, X1_TX_OVER_27, X1_TX_PDUS, X1_TX_TIME, X1_VERSION, X1_VERSION_INDEX,
+        X1_LAST_ERROR,
     };
     let data_length = &s.control.data_length;
     x1_put(X1_MAGIC_INDEX, X1_MAGIC);
@@ -1286,6 +1303,7 @@ fn publish_x1(s: &Session) {
         X1_FEATURE_EXCHANGE,
         u32::from(s.control.peer_features.is_some() || data_length.negotiated()),
     );
+    x1_put(X1_LAST_ERROR, s.x1_last_error);
 }
 
 /// Start DLE from the peripheral side. Android Centrals have been observed
@@ -1297,7 +1315,7 @@ fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
     }
     let requested = soft.take_data_length_request();
     if let Some((octets, time)) = requested {
-        s.control.data_length.set_local(octets, time);
+        s.control.data_length.set_local_tx(octets, time);
         let pdu = s.control.length_request();
         s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
         s.length_req_tx += 1;
@@ -1482,7 +1500,7 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                 company_id: 0xffff,
                 subversion: 1,
             };
-            note_control_rx(s, plain[0]);
+            note_control_rx(s, &plain);
             match s.control.on_pdu(&mut s.conn, &plain[..len], local) {
                 Ok(action) => {
                     // DLE takes effect once the request or response has been
@@ -1510,6 +1528,9 @@ fn finish_deferred(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
                     }
                 }
                 Err(error) => {
+                    if matches!(plain.first(), Some(0x14) | Some(0x15)) {
+                        s.x1_last_error = 0x1e;
+                    }
                     s.request_terminate(wchble::ll::ctrl::termination_reason(error), rx.end)
                 }
             }
@@ -2070,13 +2091,16 @@ fn main() -> ! {
                         put(48, u32::from(params.channel_map[4]));
                         let mut enc_rsp_random = [0u8; 12];
                         soft.fill_random(&mut enc_rsp_random);
-                        let s = Session::new(
+                        let mut s = Session::new(
                             params,
                             soft.ll.adv.chsel,
                             packet.end,
                             clock.now_us(),
                             enc_rsp_random,
                         );
+                        if let Some((octets, time)) = soft.suggested_data_length_explicit() {
+                            s.control.data_length.set_suggested_tx(octets, time);
+                        }
                         put(49, s.conn.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(s.conn.channel()));

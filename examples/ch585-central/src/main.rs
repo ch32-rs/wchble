@@ -675,7 +675,7 @@ fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
         return None;
     }
     if let Some((octets, time)) = soft.take_data_length_request() {
-        s.control.data_length.set_local(octets, time);
+        s.control.data_length.set_local_tx(octets, time);
         let pdu = s.control.length_request();
         s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
         return None;
@@ -1069,7 +1069,11 @@ fn start_connection(
         55,
         u32::from(params.win_size) | (u32::from(params.win_offset) << 8),
     );
-    Session::new(params, connect_done_us, clock.now_us())
+    let mut session = Session::new(params, connect_done_us, clock.now_us());
+    if let Some((octets, time)) = soft.suggested_data_length_explicit() {
+        session.control.data_length.set_suggested_tx(octets, time);
+    }
+    session
 }
 
 /// Bring-up evidence for the 36-byte TX path: alternate a short advertising
