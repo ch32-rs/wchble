@@ -111,10 +111,12 @@ pub struct SoftRunner {
     drbg: ChaCha20Drbg,
     /// True once a HAL supplied a measured entropy seed.
     entropy_seeded: bool,
-    /// Pending `LE Enable Encryption` for the RF owner (Central role).
-    pending_encryption: Option<EnableEncryption>,
-    /// Host answer waiting for the RF owner (Peripheral role).
-    ltk_reply: Option<LtkReply>,
+    /// Pending `LE Enable Encryption` for the RF owner (Central role), tagged
+    /// with the connection epoch that created it.
+    pending_encryption: Option<(u32, EnableEncryption)>,
+    /// Host answer waiting for the RF owner (Peripheral role), tagged with the
+    /// connection epoch that requested it.
+    ltk_reply: Option<(u32, LtkReply)>,
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
     /// Host's `LE Write Suggested Default Data Length` values.
@@ -313,13 +315,19 @@ impl SoftRunner {
     }
 
     /// Take the pending `LE Enable Encryption` request (Central role).
+    ///
+    /// A request queued on an earlier connection is discarded: every link uses
+    /// handle 1, so without the epoch check the RF owner would start encryption
+    /// on the new link with the old key material.
     pub fn take_encryption_request(&mut self) -> Option<EnableEncryption> {
-        self.pending_encryption.take()
+        let (epoch, request) = self.pending_encryption.take()?;
+        (epoch == self.bridge.epoch()).then_some(request)
     }
 
     /// Take the Host's answer to an `LE LTK Request` (Peripheral role).
     pub fn take_ltk_reply(&mut self) -> Option<LtkReply> {
-        self.ltk_reply.take()
+        let (epoch, reply) = self.ltk_reply.take()?;
+        (epoch == self.bridge.epoch()).then_some(reply)
     }
 
     /// Drop encryption state when the link is gone or Reset is processed.
@@ -872,7 +880,7 @@ impl SoftRunner {
                 } else {
                     let mut ltk = [0u8; 16];
                     ltk.copy_from_slice(&params[2..18]);
-                    self.ltk_reply = Some(LtkReply::Key(ltk));
+                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Key(ltk)));
                     Ok(&params[..2])
                 }
             }
@@ -881,7 +889,7 @@ impl SoftRunner {
                 if self.bridge.handle() != Some(le16_from(params)) {
                     Err(HCI_UNKNOWN_CONNECTION)
                 } else {
-                    self.ltk_reply = Some(LtkReply::Rejected);
+                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Rejected));
                     Ok(&params[..2])
                 }
             }
@@ -1032,19 +1040,27 @@ impl SoftRunner {
         if self.bridge.role() != Some(crate::ll::Role::Central) {
             return HCI_COMMAND_DISALLOWED;
         }
-        if self.pending_encryption.is_some() {
+        // A request left over from an earlier connection must not block this
+        // one; overwrite it with the current epoch.
+        if self
+            .pending_encryption
+            .is_some_and(|(epoch, _)| epoch == self.bridge.epoch())
+        {
             return HCI_COMMAND_DISALLOWED;
         }
         let mut rand = [0u8; 8];
         rand.copy_from_slice(&params[2..10]);
         let mut ltk = [0u8; 16];
         ltk.copy_from_slice(&params[12..28]);
-        self.pending_encryption = Some(EnableEncryption {
-            handle,
-            rand,
-            ediv: u16::from_le_bytes([params[10], params[11]]),
-            ltk,
-        });
+        self.pending_encryption = Some((
+            self.bridge.epoch(),
+            EnableEncryption {
+                handle,
+                rand,
+                ediv: u16::from_le_bytes([params[10], params[11]]),
+                ltk,
+            },
+        ));
         HCI_SUCCESS
     }
 }
@@ -2051,6 +2067,91 @@ mod tests {
             runner.serve_one().await;
             expect_command_complete(0x201b, HCI_UNKNOWN_CONNECTION, &[]);
         });
+    }
+
+    /// Drain every queued controller event, including the lifecycle pair a
+    /// disconnect/reconnect produces, so the next command sees an idle channel.
+    fn drain_controller(runner: &mut SoftRunner) {
+        while runner.pump_once() {
+            while transport::try_receive_controller_packet().is_some() {}
+        }
+        while transport::try_receive_controller_packet().is_some() {}
+    }
+
+    #[test]
+    fn ltk_reply_does_not_survive_disconnect_and_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x33; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x201a, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+        });
+
+        // The reply was queued for the first link; every link uses handle 1, so
+        // the epoch is the only thing that can reject it after a reconnect.
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(connection_info()).unwrap();
+        drain_controller(&mut runner);
+        assert!(runner.take_ltk_reply().is_none());
+
+        // A fresh reply on the new link still reaches the RF owner.
+        pollster::block_on(async {
+            inject_cmd(0x201a, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+        });
+        assert_eq!(runner.take_ltk_reply(), Some(LtkReply::Key([0x33; 16])));
+    }
+
+    #[test]
+    fn enable_encryption_does_not_survive_disconnect_and_reconnect() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        drain_controller(&mut runner);
+
+        let mut params = [0u8; 28];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[12..28].copy_from_slice(&[0x5a; 16]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_SUCCESS);
+        });
+
+        runner.bridge.disconnected(0x13);
+        runner.bridge.connected(info).unwrap();
+        drain_controller(&mut runner);
+        assert!(runner.take_encryption_request().is_none());
+
+        // A stale entry must not make the new link look busy.
+        pollster::block_on(async {
+            inject_cmd(0x2019, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2019, HCI_SUCCESS);
+        });
+        assert_eq!(
+            runner.take_encryption_request(),
+            Some(EnableEncryption {
+                handle: 1,
+                rand: [0; 8],
+                ediv: 0,
+                ltk: [0x5a; 16],
+            })
+        );
     }
 
     #[test]

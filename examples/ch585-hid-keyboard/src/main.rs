@@ -2018,6 +2018,9 @@ fn main() -> ! {
                 if soft.bridge.is_connected() {
                     soft.bridge.disconnected(reason);
                 }
+                // Drop key material queued for the link that just ended; the
+                // epoch guards the next take, this also clears RAM early.
+                soft.clear_encryption();
                 session = None;
                 put(2, 2);
                 next_adv = clock.now_us();
