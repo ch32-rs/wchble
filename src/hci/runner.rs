@@ -2054,6 +2054,26 @@ mod tests {
     }
 
     #[test]
+    fn security_events_keep_the_disconnect_slot() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        // Fill the event queue down to the lifecycle reserve.
+        while runner.bridge.connection_updated(30, 1, 300).is_ok() {}
+        // Only the reserved disconnect slot is left; security events must not
+        // take it.
+        assert_eq!(runner.bridge.encryption_change(1, 0, 1), Err(BridgeError::Full));
+        assert_eq!(
+            runner.bridge.ltk_request(1, [0; 8], 0),
+            Err(BridgeError::Full)
+        );
+        // Disconnection still finds its slot instead of panicking.
+        runner.bridge.disconnected(0x13);
+        assert!(!runner.bridge.is_connected());
+    }
+
+    #[test]
     fn ltk_request_and_encryption_change_events() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
