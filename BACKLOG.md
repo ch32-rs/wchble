@@ -352,9 +352,19 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   across a reboot without writing the CCCD again. Snapshots happen after an
   accepted CCCD write and on disconnect; the disconnect snapshot never creates
   a first record, so a peer that never subscribed costs no flash write. `DEL!`
-  and `WIPE` clear both stores. A table stored under a different GATT layout
-  fails the read-back check and is rolled back, so it cannot enable a
-  notification through a recycled handle.
+  and `WIPE` clear both stores. The restore read-back proves the stored bytes
+  landed on the same handles, not that those handles still host the same
+  characteristics; see the GATT database fingerprint item below.
+- [ ] **GATT database fingerprint for client ATT records.** Restore compares
+  the read-back table byte for byte. A layout change that moves or resizes a
+  CCCD, or changes a subscription value, is detected and rolled back, but a
+  build that keeps the same handles and values under different characteristic
+  UUIDs is byte-identical and can enable a notification through a handle that
+  now belongs to another characteristic. Store the Core GATT database hash
+  (`AttributeTable::hash()`: AES-CMAC over declaration handles and UUIDs) next
+  to each client ATT record, bump the client ATT payload format, and refuse a
+  record whose hash differs before `set_client_att_table` applies anything.
+  Needs a hardware round: firmware layout change plus same-handle CCCD rename.
 - [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
   `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
   `host.rs`/`main.rs` duplicate the secure session and control-characteristic
