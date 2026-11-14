@@ -27,6 +27,40 @@ See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
+## Issue #9 audit follow-ups (2026-11-14)
+
+- [ ] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
+  a raw DMA pointer after returning. Needs an interface spec before code: either
+  `unsafe` with a completion contract, or a leak-safe ownership token. Deferred
+  by decision on 2026-11-14; refactor once the spec exists.
+- [ ] **B2 — pending security work has no connection epoch.** A queued LTK reply
+  survives disconnect and is returned for the next connection with handle 1.
+  Bind `ltk_reply`/`enable_encryption` to the connection generation.
+- [ ] **B3 — Instant boundaries.** `validate_instant(0, 32767)` accepts a
+  past Instant and rejects a legal same-instant update; applying a current-instant
+  update needs immediate re-anchoring, not just a predicate change.
+- [ ] **B4 — CRC-failed packet vs establishment/supervision.** Core §4.5 lets any
+  received data-channel packet establish the link (and §4.5.5 uses the first
+  received packet as the Peripheral anchor) even on a CRC error, while payload
+  acceptance and supervision refresh need a valid packet. The current Central RX
+  path conflates the two and drops the anchor of a CRC-failed packet.
+- [ ] **B5 — Central supervision timer at connection-update instants.** The timer
+  should restart at the instant/transmit window; it currently keeps the old base.
+- [ ] **B6 — scan/filter policy application.** Filter_Duplicates, basic filtered
+  policy 1 (with an accept list) and directed-ADV target filtering are accepted
+  but not applied; initiator policy 1 ignores Peer_Address.
+- [ ] **B7 — HCI state restrictions.** Set Random Address / Set Scan Parameters
+  are accepted while scanning or advertising; they must return Command Disallowed.
+- [ ] **B8 — Own address selection per procedure.** A public-address Create
+  Connection can be initiated with the default zero/random address.
+- [ ] **B9 — HCI command-response contracts.** Create Connection Cancel without a
+  pending initiation returns Command Status instead of Command Complete; Host
+  Number Of Completed Packets answers with Command Complete in an idle state.
+- [ ] **TX timeout quiescence / hardware ownership single-instance audit** and
+  the advertising `advDelay` distribution check — need evidence first.
+
+A2 (TX frame extent) and B1 (lifecycle slot reserve) are fixed in PR #10.
+
 ## Resolved: safe pre-flash stop
 
 - [x] **Single-session preflight (`tools/ch585-preflight`).** Standalone
