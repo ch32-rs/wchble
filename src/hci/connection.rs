@@ -165,6 +165,7 @@ impl ConnectionBridge {
             return Err(BridgeError::Full);
         }
         self.epoch = self.epoch.wrapping_add(1);
+        transport::set_host_epoch(self.epoch);
         self.info = Some(info);
         self.disconnecting = false;
         if self.le_event_enabled(1) {
@@ -542,6 +543,7 @@ impl ConnectionBridge {
 
     fn clear_data(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        transport::set_host_epoch(self.epoch);
         self.tx = [None; ACL_CREDITS];
         self.rx = [None; RX_CAPACITY];
         self.completed = 0;
