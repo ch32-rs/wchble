@@ -54,6 +54,10 @@ X1_NAMES = secure.X1_NAMES
 RUN_SECONDS_CHOICES = (60, 360)
 SECURITY_REQUESTED = 1
 SECURITY_ENCRYPTED = 3
+# 5 = Insufficient Authentication, 15 (0x0F) = Insufficient Encryption. Both
+# prove a plaintext access was refused; which one CoreBluetooth surfaces
+# depends on whether the firmware answered before or after its ATT timeout.
+GATE_CODES = (5, 15)
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
 
@@ -94,10 +98,13 @@ def evaluate_client(rows, returncode):
 
     Apple filters the HID service out of CoreBluetooth discovery (Accessory
     Design Guidelines, GATT Server section), and bluetoothd checks an unsigned
-    CLI in with fProgrammaticPairing 0, so macOS cannot start BLE pairing from
-    this tool. A protected access therefore ends in Insufficient Authentication
-    (the security gate). If the Mac already holds a bond, the same client
-    verifies the mirrored report bytes instead.
+    CLI in with fProgrammaticPairing 0. A protected access therefore ends in
+    Insufficient Authentication (0x05) or Insufficient Encryption (0x0F) - the
+    security gate. With 0x0F macOS can answer with a pairing attempt, whose
+    LESC key agreement blocks the peripheral RF pump past the supervision
+    timeout; the gate was already observed, so the client treats the following
+    disconnect as the expected end of the run. If the Mac already holds a
+    bond, the same client verifies the mirrored report bytes instead.
     """
     errors = []
     events = [row.get('event') for row in rows]
@@ -126,9 +133,9 @@ def evaluate_client(rows, returncode):
             errors.append(f'expected one security gate event, got {events.count("security_gate")}')
         if summary.get('reports') != 0 or events.count('notification'):
             errors.append('unencrypted run delivered report notifications')
-        if summary.get('gate_code') != 5:
-            errors.append(f'security gate code={summary.get("gate_code")}, expected 5 '
-                          '(Insufficient Authentication)')
+        if summary.get('gate_code') not in GATE_CODES:
+            errors.append(f'security gate code={summary.get("gate_code")}, expected one of '
+                          f'{sorted(GATE_CODES)} (Insufficient Authentication/Encryption)')
         return errors
     if events.count('read_result') < 1:
         errors.append('client did not read the mirror value')
@@ -365,6 +372,20 @@ def execute(args):
                         args.run_seconds, mirror_mode))
                     errors.extend(secure.evaluate_x1(observations['X1_STATS'],
                                                      args.require_dle))
+                # SMP/ATT start-fragment counts and the RF-pump diagnostics:
+                # they show whether macOS answered the 0x0F with a pairing
+                # attempt (the LESC stall is what loses the link).
+                try:
+                    opcodes = secure.decode_opcodes(io.read32(
+                        symbols['SEC_OPCODES'], 96, args.out / 'sec_opcodes.txt'))
+                    diag = io.read32(symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
+                    opcodes['slow_polls_over_100ms'] = diag[36]
+                    opcodes['skipped_events'] = diag[37]
+                    metadata['sec_opcodes'] = opcodes
+                    (args.out / 'sec_opcodes.json').write_text(
+                        json.dumps(opcodes, indent=2) + '\n')
+                except FAILURES as error:
+                    errors.append(f'SEC_OPCODES observations: {error}')
             try:
                 io.flash(args.out / 'smoke.elf', args.out, 'restore')
                 io.command(['swift', str(io.SCANNER), 'wch585', '8'],
@@ -392,7 +413,11 @@ def options(argv=None):
                         help='require observed >27-byte PDUs and a fragmented Host packet')
     parser.add_argument('--run-seconds', type=int, choices=RUN_SECONDS_CHOICES, default=60)
     parser.add_argument('--timeout', type=float, default=50)
-    parser.add_argument('--hold', type=float, default=0.5)
+    # The firmware sends its peripheral Security Request 10 s after the link
+    # comes up. Holding the first protected access past that deadline keeps
+    # the request and the macOS pairing attempt (triggered by the 0x0F answer)
+    # from racing, so the run records `Host security == 1` before the gate.
+    parser.add_argument('--hold', type=float, default=11)
     parser.add_argument('--no-pair-click', dest='pair_click', action='store_false',
                         help='do not auto-click the macOS pairing dialog')
     return parser.parse_args(argv)

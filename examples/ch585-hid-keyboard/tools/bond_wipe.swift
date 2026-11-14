@@ -5,7 +5,9 @@ import CoreBluetooth
 // `DEL!` so the firmware drops every stored bond. The control value is readable
 // and writable on a plaintext link, which is exactly why it can repair the
 // state where the Host still holds an LTK for a peer that has none (see
-// local-docs/research/ch585-hid-results.md). One pass, JSONL, no retries.
+// local-docs/research/ch585-hid-results.md). The flashed image must be built
+// with `--features secure,accept-control`; otherwise the characteristic does
+// not exist and this tool reports `control_missing`. One pass, JSONL, no retries.
 let targetName = "wch585-hid"
 let serviceID = CBUUID(string: "00001A00-B0CD-11EC-871F-D45DDF138840")
 let controlID = CBUUID(string: "00001A01-B0CD-11EC-871F-D45DDF138840")

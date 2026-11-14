@@ -110,6 +110,10 @@ class ClientTests(unittest.TestCase):
 
     def test_security_gate_transcript_passes(self):
         self.assertEqual(hid.evaluate_client(client_rows(gate=True), 0), [])
+        # 0x0F is the firmware's EncryptionRequired answer; macOS surfaces it
+        # directly when the reply arrives before its own ATT timeout.
+        self.assertEqual(hid.evaluate_client(
+            client_rows(gate=True, **{'gate_code': 15}), 0), [])
 
     def test_failures_are_reported(self):
         cases = [
@@ -118,7 +122,7 @@ class ClientTests(unittest.TestCase):
             (client_rows(**{'reason': 'hid_reports_ok'}), 0),
             (client_rows(**{'reports': 7}), 0),
             (client_rows(**{'hid_service_visible': True}), 0),
-            (client_rows(gate=True, **{'gate_code': 15}), 0),
+            (client_rows(gate=True, **{'gate_code': 4}), 0),
             (client_rows(gate=True, reports=1), 0),
         ]
         for rows, code in cases:

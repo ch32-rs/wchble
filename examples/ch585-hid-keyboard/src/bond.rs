@@ -90,6 +90,13 @@ pub const STAT_ADD_BOND_FAIL: usize = 25;
 #[no_mangle]
 pub static BOND_FAULT_BUILD: u32 = 1;
 
+/// Marker for the non-default bond-control characteristic, so a runner can
+/// refuse `--wipe-bond` against a product-shaped image before flashing.
+#[cfg(feature = "accept-control")]
+#[used]
+#[no_mangle]
+pub static BOND_ACCEPT_CONTROL_BUILD: u32 = 1;
+
 /// Counters and requests shared between the Host future and the RF owner.
 #[no_mangle]
 pub static mut BOND_STATS: [u32; BOND_STATS_WORDS] = [0; BOND_STATS_WORDS];
@@ -168,6 +175,12 @@ impl BondSignals {
 
     pub fn take_pending(&self) -> Option<BondSnapshot> {
         self.pending.take()
+    }
+
+    /// Drop a queued snapshot. A delete/wipe must not be undone by a snapshot
+    /// captured before it.
+    pub fn discard_pending(&self) {
+        self.pending.set(None);
     }
 }
 

@@ -282,6 +282,18 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   `add_bond` returns `OutOfMemory` before `PairingComplete`, so a fifth peer
   fails at DHKeyCheck until a slot is freed. Define eviction/admission before
   insertion rather than evicting a trusted peer on an arbitrary attempt.
+- [ ] **Bond records are keyed only by the peer identity.** A record stores the
+  peer identity and IRK but not the local advertised identity, and DataFlash
+  survives reflashes. A record written by an image that advertised a different
+  address (the secure build once rotated the low octet from entropy) is loaded
+  and offered to the same phone, so a fresh pairing fails at DHKeyCheck
+  (`SMP_DHKEY_CHK_FAIL`, phone reports `BOND_REJECTED`) until the store is
+  wiped. Observed 2026-11-14: the `...16` image loaded a record left by an
+  earlier rotating-address boot (`records_loaded=1`), and `--mode wipe` cleared
+  it (`load_result=0`, both slots `0xFFFFFFFF`) before a clean pairing
+  (`pairs_complete=1`, `save_ok=1`). Test images sharing one board and one
+  phone hit this repeatedly; wipe before a fresh-pair round and decide whether
+  records should carry the local identity.
 - [ ] **Bond write scheduling and durability policy.** A save takes ~22 ms; the
   deferral guard is `max(observed + 2 ms, 8 ms)`, so at intervals <= 24 ms
   nothing is persisted while connected (only on disconnect), and `WIPE`'s
@@ -295,17 +307,20 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   read error instead of trying the other, and treats a version mismatch as
   empty; `save()` reads back only the 24-byte header, not the payload. Fix
   together with a mock flash that completes but corrupts a payload byte.
-- [ ] **Bonded CCCD persistence.** `PersistedBond` does not store client ATT
-  state, so a bonded peer's CCCD subscription disappears on reboot (Core 5.4
-  Vol 3 Part G §3.3.3.3). The pinned Host exposes
-  `get/set_client_att_table`; without this, #7's HID keyboard can resume
-  encryption after reboot with notifications still disabled.
-- [ ] **Bond record has no local identity.** The record stores only the peer
-  identity, so a bond written by the trouble-gatt image (`...18`) is loaded by
-  the HID image (`...17`) and breaks its next fresh pairing with
-  `SMP_DHKEY_CHK_FAIL`. Until the record carries (and filters on) the local
-  identity, wipe between example families. Also open: after the phone unpairs,
-  our retained record blocks re-pairing until the store is erased.
+- [ ] **Bonded CCCD persistence — do immediately after the HID keyboard PR (#7) merges.**
+  `PersistedBond` does not store client ATT state, so a bonded peer's CCCD
+  subscription disappears on reboot (Core 5.4 Vol 3 Part G §3.3.3.3). The pinned
+  Host exposes `get/set_client_att_table`; without this the HID keyboard resumes
+  encryption after reboot with notifications still disabled, which is not a
+  normal bonded keyboard reconnect. This is the first follow-up after #7, not a
+  later option; the #7 review treats it as a P1 profile gap.
+- [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
+  `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
+  `host.rs`/`main.rs` duplicate the secure session and control-characteristic
+  handling. The unauthenticated `DEL!/WIPE/FALT` exposure, the delete/wipe race
+  and the CCM ordering guard therefore each have two copies to fix. Extract the
+  bond store (and ideally the session pump) once both examples' acceptance is
+  stable; keep the per-example policy out of the shared layer.
 - [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).
@@ -344,6 +359,23 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   for the new address while the Host still returns the old LTK. Pairing only
   worked after `DEL!`. Key the record by local identity too, or clear the store
   when the identity changes.
+- [ ] **LESC key agreement can starve the RF pump past the peer's supervision
+  timeout (2026-11-14).** On the macOS gate run the firmware answered the
+  protected CCCD write with Insufficient Encryption (0x0F) after 3.8 s; the
+  client then saw the link die with "connection has timed out unexpectedly".
+  Firmware: `supervision=1`, `host_poll_overrun=2`, `max_host_poll_us=1222635`,
+  `missed=5`, and `Host security=0` because the 10 s Security Request had not
+  fired yet (`local-docs/results/x4b-macos-review2-20261114/`). The 1.22 s
+  block is the documented non-preemptible LESC key agreement; the pump cannot
+  transmit while it runs, so a peer that starts pairing right after a 0x0F can
+  drop the link even though the example steps over its own missed events.
+  A repeat with the first protected access held past the 10 s Security Request
+  recorded SMP `PairingRequest`/`PairingResponse`/`PairingFailed` with one
+  1.22 s poll and `supervision=0` (`x4b-macos-review3-20261114`), so the
+  failure depends on when the peer's pairing lands relative to the connection
+  events. Android's pairing survived the same build. Fix direction: move key
+  agreement off the pump's critical path (precompute, or a preemptible crypto
+  task), or guarantee the peer pairs before the first protected access.
 - [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
   third-party discovery (Apple Accessory Design Guidelines, GATT Server
   section) and bluetoothd checks an unsigned CLI in with

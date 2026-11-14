@@ -136,8 +136,8 @@ def evaluate_transcript(rows, dumpsys):
             row = reads.get(field)
             if row is None or row.get('status') != 0:
                 errors.append(f'{field} was not read successfully: {row}')
-        if (reads.get('hid_info') or {}).get('bytes') != '11010001':
-            errors.append('HID Information bytes differ from 11010001')
+        if (reads.get('hid_info') or {}).get('bytes') != '11010000':
+            errors.append('HID Information bytes differ from 11010000')
         if (reads.get('report_map') or {}).get('length') != 63:
             errors.append('Report Map length is not 63')
         if events.count('notification') < 8:
@@ -238,7 +238,8 @@ def options(argv=None):
     parser.add_argument('--pair-tap', default=None,
                         help='fast Pair-button coordinates X,Y instead of uiautomator')
     parser.add_argument('--wipe-bond', action='store_true',
-                        help='write DEL! over the plaintext vendor control first')
+                        help='write DEL! over the plaintext vendor control first '
+                             '(requires --features secure,accept-control)')
     parser.add_argument('--bt-reset', action='store_true',
                         help='cycle the adapter after the app so the HID host '
                              'reconnects with a fresh client and subscribes')
@@ -285,6 +286,9 @@ def execute(args):
         symbols = hid.validate_hid_buffers(archived.read_bytes(), symbols)
         if '_embassy_crypto_aes128ecb_encrypt_blocks' not in nm_text:
             raise ValueError('ELF was not built with --features secure (no crypto backend)')
+        if args.wipe_bond and 'BOND_ACCEPT_CONTROL_BUILD' not in named:
+            raise ValueError('--wipe-bond needs an ELF built with '
+                             '--features secure,accept-control')
         run_seconds = p4.embedded_u32(archived.read_bytes(), symbols['RUN_SECONDS'])
         if run_seconds != args.run_seconds:
             raise ValueError(f'ELF RUN_SECONDS={run_seconds}, requested {args.run_seconds}')

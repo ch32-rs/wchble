@@ -6,6 +6,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# The fixture compiles the Host module without any of the firmware's optional
+# features. Declaring them empty keeps `cfg(feature = ...)` checks valid.
+[features]
+default = []
+secure = []
+accept-control = []
+bond-fault = []
+
 [dependencies]
 wchble = { path = "../..", features = ["ch585", "controller"] }
 # Same local Trouble revision and Host feature set as ch585-hid-keyboard.

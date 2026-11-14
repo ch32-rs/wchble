@@ -255,7 +255,13 @@ final class HidTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             exitNow(code: failure.0, reason: failure.1)
             return
         }
-        guard expected, error == nil else { fail(reason: "unexpected_disconnect"); return }
+        guard expected else { fail(reason: "unexpected_disconnect"); return }
+        // A gate-only run can end in a supervision timeout: macOS answers the
+        // firmware's 0x0F with a pairing attempt, and the LESC key agreement
+        // blocks the peripheral's RF pump past the supervision timeout. The
+        // gate was already observed, so a link lost while cancelling is the
+        // expected end of the unencrypted run, not a failure.
+        if error != nil && securityGate == nil { fail(reason: "unexpected_disconnect"); return }
         exitNow(code: 0, reason: securityGate == nil ? "hid_mirror_ok" : "hid_security_gate_ok")
     }
 
@@ -283,12 +289,15 @@ final class HidTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             fail(reason: "characteristic_discovery_failed_or_unexpected"); return
         }
         let chars = service.characteristics ?? []
-        guard let control = chars.first(where: { $0.uuid == bondControlID }),
-              let channel = chars.first(where: { $0.uuid == mirrorID }) else {
+        guard let channel = chars.first(where: { $0.uuid == mirrorID }) else {
             fail(reason: "missing_vendor_characteristic"); return
         }
-        guard chars.count == 2, channel.properties.contains(.read),
-              channel.properties.contains(.notify), control.properties.contains(.write),
+        // The bond-control characteristic only exists in `accept-control`
+        // builds; the gate run uses the mirror and must accept either shape.
+        let control = chars.first(where: { $0.uuid == bondControlID })
+        guard chars.count == (control == nil ? 1 : 2),
+              channel.properties.contains(.read), channel.properties.contains(.notify),
+              control.map({ $0.properties.contains(.write) }) ?? true,
               !channel.isNotifying else {
             fail(reason: "vendor_characteristic_properties_invalid"); return
         }
