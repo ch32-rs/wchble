@@ -2068,9 +2068,27 @@ mod tests {
             runner.bridge.ltk_request(1, [0; 8], 0),
             Err(BridgeError::Full)
         );
-        // Disconnection still finds its slot instead of panicking.
+        // Disconnection still finds its slot instead of panicking, and the
+        // queued event survives the full queue intact.
         runner.bridge.disconnected(0x13);
         assert!(!runner.bridge.is_connected());
+        let mut disconnect = None;
+        while runner.pump_once() {
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                let payload = packet.payload();
+                if payload.first() == Some(&0x05) {
+                    disconnect = Some(payload[1..].to_vec());
+                }
+            }
+        }
+        while let Some(packet) = transport::try_receive_controller_packet() {
+            let payload = packet.payload();
+            if payload.first() == Some(&0x05) {
+                disconnect = Some(payload[1..].to_vec());
+            }
+        }
+        // [code 0x05][param len 4][status 0][handle 1][reason 0x13]
+        assert_eq!(disconnect.as_deref(), Some(&[4, 0, 1, 0, 0x13][..]));
     }
 
     #[test]
