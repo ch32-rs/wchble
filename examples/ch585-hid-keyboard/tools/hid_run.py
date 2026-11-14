@@ -64,7 +64,7 @@ FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, Keyboa
 def validate_hid_buffers(image, symbols):
     """Shared observation-buffer checks plus the HID evidence buffer."""
     symbols = secure.validate_observation_buffers(
-        image, symbols, extra=(('X1_STATS', 24), ('CATT_STATS', 16)))
+        image, symbols, extra=(('X1_STATS', 24),))
     sections = p4.p3.elf_sections(image)
     address, size = symbols['HID_STATS'], 16 * 4
     if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
@@ -355,7 +355,8 @@ def execute(args):
                                            ('HID_STATS', 16, HID_NAMES),
                                            ('SECURE_STATS', 16, SEC_NAMES),
                                            ('X1_STATS', 24, X1_NAMES),
-                                           ('CATT_STATS', 16, secure.CATT_NAMES)):
+                                           ('CATT_STATS', 16, secure.CATT_NAMES),
+                                           ('BOND_STATS', 32, secure.BOND_NAMES)):
                     try:
                         words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
                         observations[name] = words

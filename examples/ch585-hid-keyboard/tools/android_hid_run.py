@@ -404,7 +404,8 @@ def execute(args):
                                    ('HOST_STATS', 16, hid.HOST_NAMES),
                                    ('HID_STATS', 16, hid.HID_NAMES),
                                    ('SECURE_STATS', 16, hid.SEC_NAMES),
-                                   ('CATT_STATS', 16, secure.CATT_NAMES)):
+                                   ('CATT_STATS', 16, secure.CATT_NAMES),
+                                   ('BOND_STATS', 32, secure.BOND_NAMES)):
             words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
             observations[name] = words
             metadata[name.lower()] = dict(zip(names, words))
@@ -421,10 +422,10 @@ def execute(args):
             # restores the CCCD table it stored before the reboot, and input
             # reports flow without the peer rewriting its subscription.
             catt = metadata.get('catt_stats') or {}
-            restored = catt.get('restored', 0)
+            restored = catt.get('restore_ok', 0)
             if restored < 1:
-                errors.append(f'CATT restores={restored}; expected the stored table '
-                              'to be applied to the bonded peer')
+                errors.append(f'CATT restore_ok={restored}; expected the stored '
+                              'table to be applied to the bonded peer')
             reports = metadata.get('hid_stats', {}).get('reports_sent', 0)
             if reports < 1:
                 errors.append(f'HID reports_sent={reports}; expected reports after '

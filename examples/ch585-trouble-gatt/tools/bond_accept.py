@@ -56,13 +56,17 @@ def reset(out):
                 '--protocol', 'jtag', '--reset'], out, 'reset')
 
 
-def dump(out, address, length, prefix='dataflash'):
+def dump_path(out, address, length, prefix='dataflash'):
     path = out / f'{prefix}.bin'
     run_logged([str(io.PREFLIGHT), '--probe', PROBE, '--chip', 'CH585',
                 '--protocol', 'jtag', '--dump-dataflash', str(path),
                 '--dataflash-addr', hex(address), '--dataflash-len', str(length)],
                out, prefix)
-    return parse_dump(path)
+    return path
+
+
+def dump(out, address, length, prefix='dataflash'):
+    return parse_dump(dump_path(out, address, length, prefix))
 
 
 def parse_dump(path):
@@ -152,7 +156,7 @@ def parse_att_dump(path):
 
 
 def dump_att(out, address, length):
-    return parse_att_dump(dump(out, address, length, prefix='client-att'))
+    return parse_att_dump(dump_path(out, address, length, 'client-att'))
 
 
 def start_app(args, mode):
