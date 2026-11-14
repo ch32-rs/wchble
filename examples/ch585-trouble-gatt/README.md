@@ -409,10 +409,14 @@ The secure image keeps its bonds across resets and power loss.
   no-op), snapshots after an accepted CCCD write, after `PairingComplete` when
   the peer subscribed before bonding, and on disconnect. `DEL!` and `WIPE`
   clear both stores and the RAM shadow, one flash operation per flush call.
-  `CATT_STATS[16]` reports load/restore/snapshot/save outcomes (the last word
-  is the shadow's record count); a table whose bytes do not read back
-  unchanged is counted invalid and rolled back to the previous table, so a
-  layout change cannot enable a notification through a recycled handle.
+  The shadow holds one record per bond (four). A record only consumes the
+  bytes its table actually serializes to, and the total is still checked
+  against the 232-byte slot payload, so an oversized combination is counted
+  as overflow instead of failing at save time. `CATT_STATS[16]` reports
+  load/restore/snapshot/save outcomes (the last word is the shadow's record
+  count); a table whose bytes do not read back unchanged is counted invalid
+  and rolled back to the previous table, so a layout change cannot enable a
+  notification through a recycled handle.
 - The CH585 backend (`Ch585DataFlash`) uses the DataFlash command path
   (`0x81` erase, `0x02` program, `0x0B` read) from `.highcode` RAM with
   interrupts masked; the safe-access window is only a few system clocks.

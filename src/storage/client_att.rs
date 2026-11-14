@@ -11,7 +11,11 @@
 use super::{LocalIdentity, StoreError, LOCAL_IDENTITY_LEN};
 
 /// Client ATT tables one slot holds.
-pub const MAX_CLIENT_ATT: usize = 3;
+///
+/// Matches [`bond::MAX_BONDS`](super::bond::MAX_BONDS): every bonded peer can
+/// keep a subscription. Four *maximum-size* raw tables do not fit one slot, so
+/// [`encode_client_att`] still rejects an oversized combination by length.
+pub const MAX_CLIENT_ATT: usize = 4;
 
 /// Largest raw table the pinned Host can produce (`CLIENT_ATT_TABLE_SIZE`).
 pub const RAW_MAX: usize = 64;
@@ -22,8 +26,10 @@ pub const RECORD_OVERHEAD: usize = 8;
 /// Header before the records: local identity plus count.
 pub const HEADER_LEN: usize = LOCAL_IDENTITY_LEN + 1;
 
-/// Largest payload [`encode_client_att`] can produce.
-pub const MAX_PAYLOAD: usize = HEADER_LEN + MAX_CLIENT_ATT * (RECORD_OVERHEAD + RAW_MAX);
+/// Largest payload one slot can hold: a 256-byte store page minus the
+/// dual-copy header. [`encode_client_att`] rejects a longer combination, which
+/// four maximum-size raw tables would produce.
+pub const MAX_PAYLOAD: usize = 256 - super::HEADER_LEN;
 
 /// One peer's opaque client ATT table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,15 @@ impl ClientAttRecord {
     }
 }
 
+/// Encoded payload length of `records`, header included.
+pub fn encoded_len(records: &[ClientAttRecord]) -> usize {
+    HEADER_LEN
+        + records
+            .iter()
+            .map(|record| RECORD_OVERHEAD + record.raw_len as usize)
+            .sum::<usize>()
+}
+
 /// Encode the client ATT list; returns the payload length.
 pub fn encode_client_att(
     local: &LocalIdentity,
@@ -73,11 +88,7 @@ pub fn encode_client_att(
             max: MAX_CLIENT_ATT,
         });
     }
-    let len = HEADER_LEN
-        + records
-            .iter()
-            .map(|record| RECORD_OVERHEAD + record.raw_len as usize)
-            .sum::<usize>();
+    let len = encoded_len(records);
     if len > out.len() || len > MAX_PAYLOAD {
         return Err(StoreError::PayloadTooLarge {
             len,
@@ -189,16 +200,39 @@ mod tests {
     }
 
     #[test]
-    fn maximum_capacity_fits_one_slot() {
-        let records = [
-            record(1, &[0x11; RAW_MAX]),
-            record(2, &[0x22; RAW_MAX]),
-            record(3, &[0x33; RAW_MAX]),
-        ];
+    fn one_record_per_bond_fits_one_slot() {
+        // A real table is far smaller than RAW_MAX: three CCCD entries are
+        // `4 + 4 * 3 + 2 * 3 = 22` bytes, so four peers take 8 + 4 * 30.
+        let raw = [0u8; 22];
+        let records = [record(1, &raw), record(2, &raw), record(3, &raw), record(4, &raw)];
+        assert_eq!(MAX_CLIENT_ATT, super::super::bond::MAX_BONDS);
+        assert!(MAX_PAYLOAD <= 256 - super::super::HEADER_LEN);
+        assert_eq!(encoded_len(&records), 128);
+
         let mut payload = [0u8; MAX_PAYLOAD];
         let len = encode_client_att(&local(), &records, &mut payload).unwrap();
-        assert_eq!(len, MAX_PAYLOAD);
-        assert!(MAX_PAYLOAD <= 256 - super::super::HEADER_LEN);
+        let mut decoded = [ClientAttRecord::empty(); MAX_CLIENT_ATT];
+        assert_eq!(
+            decode_client_att(&payload[..len], &local(), &mut decoded),
+            Ok(Some(4))
+        );
+        assert_eq!(&decoded[..4], &records);
+    }
+
+    #[test]
+    fn four_maximum_raw_tables_are_rejected() {
+        // Capacity is a payload-length property, not just a count: four
+        // worst-case tables do not fit and must be refused up front.
+        let records = [record(1, &[0x11; RAW_MAX]); MAX_CLIENT_ATT];
+        let mut payload = [0u8; MAX_PAYLOAD];
+        assert!(encoded_len(&records) > MAX_PAYLOAD);
+        assert_eq!(
+            encode_client_att(&local(), &records, &mut payload),
+            Err(StoreError::PayloadTooLarge {
+                len: encoded_len(&records),
+                max: MAX_PAYLOAD,
+            })
+        );
     }
 
     #[test]

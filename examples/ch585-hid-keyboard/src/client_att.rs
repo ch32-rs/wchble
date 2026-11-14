@@ -11,7 +11,8 @@ use embassy_sync::blocking_mutex::raw::RawMutex;
 use heapless::Vec;
 use trouble_host::prelude::*;
 pub use wchble::storage::client_att::{
-    decode_client_att, encode_client_att, ClientAttRecord, MAX_CLIENT_ATT, MAX_PAYLOAD,
+    decode_client_att, encode_client_att, encoded_len, ClientAttRecord, MAX_CLIENT_ATT, MAX_PAYLOAD,
+    RECORD_OVERHEAD,
 };
 
 static mut BOOT_RECORDS: [ClientAttRecord; MAX_CLIENT_ATT] =
@@ -249,6 +250,19 @@ pub fn snapshot<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX
         None => true,
     };
     if !changed {
+        return;
+    }
+    // One record per bond fits a slot, but four maximum-size tables do not.
+    // Reject the update here with a counted overflow instead of queueing a
+    // snapshot the flush path can only fail to encode.
+    let mut len = encoded_len(shadow);
+    if let Some(record) = existing {
+        len -= RECORD_OVERHEAD + record.raw_len as usize;
+    }
+    len += RECORD_OVERHEAD + raw.len();
+    if len > MAX_PAYLOAD {
+        bump(STAT_OVERFLOW);
+        set(STAT_LAST_ERROR, 6);
         return;
     }
     let mut record = ClientAttRecord {

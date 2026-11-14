@@ -81,14 +81,23 @@ mod tests {
 
     /// Install a boot bond exactly as a stored record would be restored.
     fn preload_bond(identity: trouble_host::prelude::Identity) {
+        preload_bonds(&[identity]);
+    }
+
+    /// Install a full boot-bond list, one record per identity.
+    fn preload_bonds(identities: &[trouble_host::prelude::Identity]) {
         use trouble_host::prelude::*;
-        let bond = BondInformation::new(
-            identity,
-            LongTermKey::from_le_bytes([7; 16]),
-            SecurityLevel::Encrypted,
-            true,
-        );
-        bond::set_boot_bonds(&[bond::from_bond(&bond)]);
+        let mut persisted = [bond::PersistedBond::empty(); bond::MAX_BONDS];
+        for (slot, identity) in persisted.iter_mut().zip(identities) {
+            let bond = BondInformation::new(
+                *identity,
+                LongTermKey::from_le_bytes([7; 16]),
+                SecurityLevel::Encrypted,
+                true,
+            );
+            *slot = bond::from_bond(&bond);
+        }
+        bond::set_boot_bonds(&persisted[..identities.len()]);
     }
 
     /// 64-byte P-256 public key captured from the Android Central
@@ -744,5 +753,84 @@ mod tests {
             0,
             "a deleted bond must not survive in the shadow"
         );
+    }
+
+    /// Every bond can keep a subscription: the ATT shadow holds as many
+    /// records as the bond store, so a fourth peer's CCCD is not dropped.
+    #[test]
+    fn fourth_bonded_peer_keeps_its_cccd() {
+        use trouble_host::prelude::{Address, Identity};
+
+        const PEERS: [[u8; 6]; 4] = [
+            PEER,
+            [0x31, 0x45, 0x87, 0xf3, 0xe5, 0x57],
+            [0x32, 0x45, 0x87, 0xf3, 0xe5, 0x57],
+            [0x33, 0x45, 0x87, 0xf3, 0xe5, 0x57],
+        ];
+
+        let _guard = serialize();
+        seed_rng();
+        fixture_start();
+
+        let identities: [Identity; 4] = PEERS.map(|addr| Identity {
+            addr: Address::random(addr),
+            irk: None,
+        });
+        preload_bonds(&identities);
+
+        // Three peers already left a table. They never connect here; the
+        // records only need to occupy the shadow.
+        let mut records = client_att::ClientAttSnapshot::new();
+        for identity in &identities[..3] {
+            let (kind, address) = client_att::identity_parts(identity);
+            let mut record = client_att::ClientAttRecord {
+                address_kind: kind,
+                address,
+                ..client_att::ClientAttRecord::empty()
+            };
+            assert!(record.set_raw(&[0, 0, 0, 0]));
+            records.push(record).unwrap();
+        }
+        client_att::set_boot_records(&records);
+
+        let overflow = client_att::value(client_att::STAT_OVERFLOW);
+
+        let stats = host::HostStats::new();
+        let controller = SoftRunner::new();
+        let mut future = pin!(host::run(
+            wchble::hci::new(),
+            &stats,
+            host::RANDOM_ADDRESS
+        ));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+            disconnect: None,
+        };
+        fixture.start();
+        fixture.connect(PEERS[3]);
+        fixture.pump_quiet(16);
+
+        let cccd = fixture.cccd_handle(&host::VALUE_UUID);
+        let mut subscribe = [0x12, 0, 0, 0x01, 0x00];
+        subscribe[1..3].copy_from_slice(&cccd.to_le_bytes());
+        assert_eq!(fixture.att_request(&subscribe).as_slice(), &[0x13]);
+        fixture.pump_quiet(4);
+
+        assert_eq!(
+            client_att::value(client_att::STAT_OVERFLOW),
+            overflow,
+            "the fourth record must not overflow the shadow"
+        );
+        let pending = client_att::signals()
+            .take_pending()
+            .expect("the fourth subscription must be queued");
+        assert_eq!(pending.len(), 4);
+        assert_eq!(client_att::value(client_att::STAT_SHADOW_RECORDS), 4);
+        let (kind, address) = client_att::identity_parts(&identities[3]);
+        assert!(pending
+            .iter()
+            .any(|record| record.address_kind == kind && record.address == address));
     }
 }
