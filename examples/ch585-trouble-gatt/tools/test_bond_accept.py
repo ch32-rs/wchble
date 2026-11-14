@@ -45,6 +45,19 @@ def dumped(*pages):
         return bond.parse_dump(path)
 
 
+def att_dumped(*pages):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'att.bin'
+        path.write_bytes(b''.join(pages))
+        return bond.parse_att_dump(path)
+
+
+def att_payload(count=1):
+    raw = b'\x00\x00\x00\x00'
+    record = bytes([1]) + bytes.fromhex('a1b2c3d4e5f6') + bytes([len(raw)]) + raw
+    return bytes([1]) + bytes(6) + bytes([count]) + record * count
+
+
 def echo_for(ltk=LTK):
     return {'present': True, 'ltk': ltk.hex()}
 
@@ -172,54 +185,102 @@ class CheckTests(unittest.TestCase):
         named, raw = observations({'load_result': 0, 'pairs_complete': 1, 'save_ok': 1,
                                    'add_bond_ok': 1})
         slots = dumped(page(1, payload()), erased())
-        errors = bond.checks_pair(named, raw, echo_for(), summary(), slots, 60)
+        att = att_dumped(erased(), erased())
+        errors = bond.checks_pair(named, raw, echo_for(), summary(), slots, 60, att)
         self.assertEqual(errors, [])
+        # This app did not subscribe, so `loaded` must reject the round.
+        self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60,
+                                         att, 'loaded'))
+
+    def test_pair_accepts_a_saved_client_att_record(self):
+        named, raw = observations({'load_result': 0, 'pairs_complete': 1, 'save_ok': 1,
+                                   'add_bond_ok': 1},
+                                  catt={'snapshots': 1, 'save_ok': 1})
+        slots = dumped(page(1, payload()), erased())
+        att = att_dumped(page(1, att_payload()), erased())
+        self.assertEqual(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60,
+                                          att, 'loaded'), [])
+        # A save counter without a record in flash must not pass.
+        self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60,
+                                         att_dumped(erased(), erased()), 'loaded'))
+        named, raw = observations({'load_result': 0, 'pairs_complete': 1, 'save_ok': 1},
+                                  catt={'save_fail': 1})
+        self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60,
+                                         att_dumped(erased(), erased())))
 
     def test_pair_rejects_a_stale_store_or_missing_save(self):
         slots = dumped(page(1, payload()), erased())
+        att = att_dumped(erased(), erased())
         for bonds in ({'load_result': 1, 'pairs_complete': 1, 'save_ok': 1},
                       {'load_result': 0, 'pairs_complete': 1},
                       {'load_result': 0, 'pairs_complete': 1, 'save_ok': 1, 'save_fail': 1}):
             named, raw = observations(bonds)
             with self.subTest(bonds=bonds):
                 self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(),
-                                                 slots, 60))
+                                                 slots, 60, att))
 
     def test_pair_rejects_a_dump_with_another_key(self):
         named, raw = observations({'load_result': 0, 'pairs_complete': 1, 'save_ok': 1,
                                    'add_bond_ok': 1})
         slots = dumped(page(1, payload(ltk=bytes(16))), erased())
-        self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60))
+        att = att_dumped(erased(), erased())
+        self.assertTrue(bond.checks_pair(named, raw, echo_for(), summary(), slots, 60, att))
 
     def test_reconnect_requires_the_stored_key_and_no_new_save(self):
-        named, raw = observations({'load_result': 1, 'records_loaded': 1,
-                                   'add_bond_ok': 1})
+        bonds = {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1}
+        catt = {'records_loaded': 1, 'restore_ok': 1}
+        named, raw = observations(bonds, catt=catt)
         rows = summary('reconnect_encrypted_read_write_ok')
-        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60), [])
+        att = att_dumped(page(1, att_payload()), erased())
+        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60, att), [])
         for bonds in ({'load_result': 0, 'records_loaded': 1, 'add_bond_ok': 1},
                       {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1,
                        'pairs_complete': 1},
                       {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1,
                        'save_attempts': 1},
                       {'load_result': 1, 'records_loaded': 1}):
-            named, raw = observations(bonds)
+            named, raw = observations(bonds, catt=catt)
             with self.subTest(bonds=bonds):
-                self.assertTrue(bond.checks_reconnect(named, raw, rows, 60))
+                self.assertTrue(bond.checks_reconnect(named, raw, rows, 60, att))
 
     def test_reconnect_requires_the_client_att_restore(self):
         rows = summary('reconnect_encrypted_read_write_ok')
-        named, raw = observations({'load_result': 1, 'records_loaded': 1,
-                                   'add_bond_ok': 1},
-                                  catt={'records_loaded': 1, 'restore_ok': 1})
-        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60), [])
-        for catt in ({'records_loaded': 1},
+        bonds = {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1}
+        att = att_dumped(page(1, att_payload()), erased())
+        named, raw = observations(bonds, catt={'records_loaded': 1, 'restore_ok': 1})
+        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60, att), [])
+        for catt in ({'restore_ok': 1, 'restore_no_record': 1},
+                     {'records_loaded': 1, 'restore_ok': 1, 'save_fail': 1},
                      {'restore_invalid': 1},
                      {'restore_ok': 1},
                      {'restore_attempts': 0}):
-            named, raw = observations({'load_result': 1, 'records_loaded': 1,
-                                       'add_bond_ok': 1}, catt=catt)
+            named, raw = observations(bonds, catt=catt)
             with self.subTest(catt=catt):
-                self.assertTrue(bond.checks_reconnect(named, raw, rows, 60))
+                self.assertTrue(bond.checks_reconnect(named, raw, rows, 60, att))
+        # A stored record that the dump cannot see is not proof either.
+        named, raw = observations(bonds, catt={'records_loaded': 1, 'restore_ok': 1})
+        self.assertTrue(bond.checks_reconnect(
+            named, raw, rows, 60, att_dumped(erased(), erased())))
+
+    def test_expect_att_decides_whether_a_round_proves_persistence(self):
+        rows = summary('reconnect_encrypted_read_write_ok')
+        bonds = {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1}
+        empty_att = att_dumped(erased(), erased())
+        empty_catt = {'restore_attempts': 1}
+        named, raw = observations(bonds, catt=empty_catt)
+        # Self-consistent but nothing persisted: only the default passes.
+        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60, empty_att), [])
+        self.assertTrue(bond.checks_reconnect(named, raw, rows, 60, empty_att, 'loaded'))
+        self.assertEqual(
+            bond.checks_reconnect(named, raw, rows, 60, empty_att, 'empty'), [])
+
+        full_att = att_dumped(page(1, att_payload()), erased())
+        named, raw = observations(
+            bonds, catt={'records_loaded': 1, 'restore_ok': 1})
+        self.assertEqual(
+            bond.checks_reconnect(named, raw, rows, 60, full_att, 'loaded'), [])
+        self.assertTrue(
+            bond.checks_reconnect(named, raw, rows, 60, full_att, 'empty'))
 
     def test_att_dump_decodes_the_stored_table(self):
         record = bytes([1]) + bytes.fromhex('a1b2c3d4e5f6') + bytes([4, 0, 0, 0, 0])
@@ -234,20 +295,25 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(slots[0]['records'][0]['address'], 'a1b2c3d4e5f6')
 
     def test_reconnect_requires_an_ltk_request(self):
-        named, raw = observations({'load_result': 1, 'records_loaded': 1},
-                                  sec=secure_stats(ltk_request=0))
+        named, raw = observations({'load_result': 1, 'records_loaded': 1,
+                                   'add_bond_ok': 1},
+                                  sec=secure_stats(ltk_request=0),
+                                  catt={'records_loaded': 1, 'restore_ok': 1})
+        att = att_dumped(page(1, att_payload()), erased())
         errors = bond.checks_reconnect(named, raw,
-                                       summary('reconnect_encrypted_read_write_ok'), 60)
+                                       summary('reconnect_encrypted_read_write_ok'),
+                                       60, att)
         self.assertTrue(any('ltk' in error.lower() for error in errors))
 
     def test_delete_requires_a_tombstone_and_a_rejection(self):
         named, raw = observations({'clear_requests': 1, 'clear_ok': 1,
                                    'in_memory_removed': 1})
         slots = dumped(page(2, b''), erased())
+        att = att_dumped(page(2, b''), erased())
         reject_named, _ = observations({'load_result': 0})
         set_sec(reject_named, ltk_request=1, start_req=0, last_error=6)
         errors = bond.checks_delete(named, raw, summary('bond_delete_ok'), slots,
-                                    reject_named,
+                                    att, reject_named,
                                     summary('reconnect_encrypted_read_write_ok', False),
                                     60)
         self.assertEqual(errors, [])
@@ -255,41 +321,70 @@ class CheckTests(unittest.TestCase):
     def test_delete_rejects_a_second_encryption_or_a_missing_tombstone(self):
         named, raw = observations({'clear_requests': 1, 'clear_ok': 1,
                                    'in_memory_removed': 1})
+        att = att_dumped(page(2, b''), erased())
         reject_named, _ = observations()
         set_sec(reject_named, ltk_request=1, last_error=6)
         errors = bond.checks_delete(named, raw, summary('bond_delete_ok'),
-                                    dumped(page(2, b''), erased()), reject_named,
+                                    dumped(page(2, b''), erased()), att, reject_named,
                                     summary('reconnect_encrypted_read_write_ok', False),
                                     60)
         self.assertTrue(any('encryption started' in error for error in errors))
         errors = bond.checks_delete(named, raw, summary('bond_delete_ok'),
-                                    dumped(page(2, b''), erased()), reject_named,
+                                    dumped(page(2, b''), erased()), att, reject_named,
                                     summary('reconnect_encrypted_read_write_ok'), 60)
         self.assertTrue(any('unexpectedly passed' in error for error in errors))
 
+    def test_delete_requires_the_client_att_clear(self):
+        named, raw = observations({'clear_requests': 1, 'clear_ok': 1,
+                                   'in_memory_removed': 1})
+        reject_named, _ = observations()
+        set_sec(reject_named, ltk_request=1, last_error=6)
+        slots = dumped(page(2, b''), erased())
+        # The ATT store still holds the deleted peer's subscription.
+        att = att_dumped(page(1, att_payload()), erased())
+        errors = bond.checks_delete(named, raw, summary('bond_delete_ok'), slots,
+                                    att, reject_named,
+                                    summary('reconnect_encrypted_read_write_ok', False),
+                                    60)
+        self.assertTrue(any('client ATT record survived' in error for error in errors))
+        # A failed ATT flash operation must fail the phase even if the dump
+        # looks clean.
+        named, raw = observations({'clear_requests': 1, 'clear_ok': 1,
+                                   'in_memory_removed': 1}, catt={'save_fail': 1})
+        errors = bond.checks_delete(named, raw, summary('bond_delete_ok'), slots,
+                                    att_dumped(page(2, b''), erased()), reject_named,
+                                    summary('reconnect_encrypted_read_write_ok', False),
+                                    60)
+        self.assertTrue(any('client ATT flash' in error for error in errors))
+
     def test_wipe_requires_both_slots_empty(self):
         named, _ = observations({'clear_requests': 1, 'clear_ok': 1})
+        att = att_dumped(erased(), erased())
         self.assertEqual(bond.checks_wipe(named, summary('bond_wipe_ok'),
-                                          dumped(erased(), erased())), [])
+                                          dumped(erased(), erased()), att), [])
         self.assertTrue(bond.checks_wipe(named, summary('bond_wipe_ok'),
-                                         dumped(page(1, payload()), erased())))
+                                         dumped(page(1, payload()), erased()), att))
+        self.assertTrue(bond.checks_wipe(
+            named, summary('bond_wipe_ok'), dumped(erased(), erased()),
+            att_dumped(page(1, att_payload()), erased())))
 
     def test_fault_keeps_the_previous_copy(self):
         named, _ = observations({'fault_injected': 1})
         truncated = bytearray(page(2, payload()))
         truncated[24 + 20] ^= 0x01  # damage the payload, keep the header
         slots = dumped(page(1, payload()), bytes(truncated))
-        reconnect_named, reconnect_raw = observations({'load_result': 1,
-                                                       'records_loaded': 1,
-                                                       'add_bond_ok': 1})
+        reconnect_named, reconnect_raw = observations(
+            {'load_result': 1, 'records_loaded': 1, 'add_bond_ok': 1},
+            catt={'records_loaded': 1, 'restore_ok': 1})
+        att = att_dumped(page(1, att_payload()), erased())
         errors = bond.checks_fault(
             named, summary('fault_injected_ok'), slots, reconnect_named, reconnect_raw,
-            summary('reconnect_encrypted_read_write_ok'), 60)
+            summary('reconnect_encrypted_read_write_ok'), 60, att)
         self.assertEqual(errors, [])
         self.assertTrue(bond.checks_fault(
             named, summary('fault_injected_ok'), dumped(erased(), erased()),
             reconnect_named, reconnect_raw,
-            summary('reconnect_encrypted_read_write_ok'), 60))
+            summary('reconnect_encrypted_read_write_ok'), 60, att))
 
 
 class TranscriptTests(unittest.TestCase):
