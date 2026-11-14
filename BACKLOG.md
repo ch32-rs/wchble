@@ -58,6 +58,14 @@ Raw captures and experiment records remain local; they are not required to build
 - [ ] **B9 — HCI command-response contracts.** Create Connection Cancel without a
   pending initiation returns Command Status instead of Command Complete; Host
   Number Of Completed Packets answers with Command Complete in an idle state.
+- [ ] **B10 — Host→Controller queue has no enqueue epoch.** A Host command still
+  in the one-slot `HOST_TO_CONTROLLER` channel when the link drops is parsed
+  after reconnect and attributed to the new connection (`pending_input` reads
+  the epoch on dequeue). `c40c008` stamped the packet at enqueue, but adding a
+  field to `Packet` broke first pairing on hardware, so it was removed. Fix
+  without growing `Packet`: keep connection-scoped metadata beside the queue
+  (valid only while capacity is 1), or make the packet carry it explicitly.
+  See `local-docs/results/bond-session-20261115.md`.
 - [ ] **TX timeout quiescence / hardware ownership single-instance audit** and
   the advertising `advDelay` distribution check — need evidence first.
 
