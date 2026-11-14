@@ -329,6 +329,23 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   for the new address while the Host still returns the old LTK. Pairing only
   worked after `DEL!`. Key the record by local identity too, or clear the store
   when the identity changes.
+- [ ] **LESC key agreement can starve the RF pump past the peer's supervision
+  timeout (2026-11-14).** On the macOS gate run the firmware answered the
+  protected CCCD write with Insufficient Encryption (0x0F) after 3.8 s; the
+  client then saw the link die with "connection has timed out unexpectedly".
+  Firmware: `supervision=1`, `host_poll_overrun=2`, `max_host_poll_us=1222635`,
+  `missed=5`, and `Host security=0` because the 10 s Security Request had not
+  fired yet (`local-docs/results/x4b-macos-review2-20261114/`). The 1.22 s
+  block is the documented non-preemptible LESC key agreement; the pump cannot
+  transmit while it runs, so a peer that starts pairing right after a 0x0F can
+  drop the link even though the example steps over its own missed events.
+  A repeat with the first protected access held past the 10 s Security Request
+  recorded SMP `PairingRequest`/`PairingResponse`/`PairingFailed` with one
+  1.22 s poll and `supervision=0` (`x4b-macos-review3-20261114`), so the
+  failure depends on when the peer's pairing lands relative to the connection
+  events. Android's pairing survived the same build. Fix direction: move key
+  agreement off the pump's critical path (precompute, or a preemptible crypto
+  task), or guarantee the peer pairs before the first protected access.
 - [ ] **macOS cannot audit HID bytes.** CoreBluetooth filters `0x1812` from
   third-party discovery (Apple Accessory Design Guidelines, GATT Server
   section) and bluetoothd checks an unsigned CLI in with

@@ -92,8 +92,13 @@ panics at the first poll on overflow).
 Advertising data: Flags, complete 16-bit service list `0x1812`, Appearance
 (`0x19`), complete local name. Android only reliably receives `ADV_IND`, so the
 name and service UUID are in the advertising data itself. Static random address
-`C1:FF:EE:00:00:17`, fixed across boots so the S3 bond store can answer the
-peer's stored LTK.
+`C1:FF:EE:00:00:21` (`…:31` for `accept-control`, whose table adds `1A01`),
+fixed across boots so the S3 bond store can answer the peer's stored LTK. macOS
+and Android cache a peer's GATT layout by address, so a table change needs a
+new address — including the acceptance-only `1A01` characteristic, otherwise a
+wipe tool reuses the gate image's cache and reports `control_missing`. Moving
+the identity also requires wiping the bond store before pairing (the acceptance
+tools do this).
 
 ## Reports
 
@@ -134,20 +139,36 @@ Two Apple platform constraints shape this run:
   client cannot read HID values or subscribe to `0x2A4D`, even when asking for
   the UUID explicitly (Apple Accessory Design Guidelines, GATT Server
   section).
-- bluetoothd checks an unsigned CLI in with `fProgrammaticPairing 0`, so macOS
-  never starts BLE pairing for this tool and every protected access ends in
-  Insufficient Authentication (0x05) after the 30 s ATT timeout. No pairing
-  dialog appears; the entitlements needed are not available to a test tool.
+- bluetoothd checks an unsigned CLI in with `fProgrammaticPairing 0`, so no
+  pairing dialog is possible. On a protected access macOS still starts SMP
+  (Pairing Request), the firmware answers, and pairing ends in `PairingFailed`
+  because the user cannot confirm; the daemon then reports Insufficient
+  Authentication (`0x05`) after its 30 s ATT timeout. When the firmware's
+  `EncryptionRequired` answer arrives first, CoreBluetooth can surface
+  Insufficient Encryption (`0x0F`, code 15) instead; the runner accepts both.
+
+The LESC key agreement is a single non-preemptible Host poll of about 1.2 s.
+If macOS starts pairing immediately after a fast `0x0F`, the RF pump can miss
+the peer's supervision window and the link drops with "connection has timed
+out unexpectedly" (`x4b-macos-review2-20261114`: `supervision=1`,
+`max_host_poll_us=1222635`). The client therefore holds the first protected
+access for 11 s: the firmware's peripheral Security Request (sent 10 s after
+connect) is recorded first, and with the request preceding the gate the same
+pairing attempt completed without losing the link
+(`x4b-macos-review3-20261114`: SMP `PairingRequest`/`PairingResponse`/
+`PairingFailed`, one 1.22 s poll, `supervision=0`). A link lost while
+cancelling after the gate was observed is the expected end of the run.
 
 The automated macOS run therefore asserts: the vendor service is visible,
 `0x1812` is hidden (a run where it becomes visible fails on purpose), the
 firmware read HID Information and the Report Map for the system HID stack, and
 the encrypted mirror access was refused. Firmware counters must show no report
 on the plain link (`reports_sent == 0`, `blocked_unencrypted > 0`), the
-peripheral Security Request (`Host security == 1`) and no SMP. The exact byte
-contract is covered by `tests/hid-host`; a bonded host (for example after the
-Android check) exercises the mirror path instead, and the same client then
-verifies the eight mirrored report bytes byte-for-byte.
+peripheral Security Request (`Host security == 1`), and no encryption became
+active (`SECURE enc_*/start_*/active == 0`). The exact byte contract is covered
+by `tests/hid-host`; a bonded host (for example after the Android check)
+exercises the mirror path instead, and the same client then verifies the eight
+mirrored report bytes byte-for-byte.
 
 Offline gates before any hardware session:
 
@@ -187,6 +208,14 @@ python3 tools/android_hid_run.py --out local-docs/results/x4b-android-payload \
 `--wipe-bond` writes `DEL!` to the vendor bond-control characteristic, so the
 flashed image must be built with `secure,accept-control`; the runner refuses
 the option when the ELF lacks the marker. The other rounds use plain `secure`.
+
+A fresh-bond round needs **both** sides clean. `--wipe-bond` only clears the
+DataFlash; the phone also has to forget `wch585-hid` (Settings → Bluetooth →
+gear → Unpair, then close Settings). The helper app connects to a bonded peer
+whose *name* matches before it scans, so a stale phone bond makes it dial the
+old address and fail with `disconnected` even when the board advertises the
+new one. adb has no unpair command and `pm clear` does not touch the Bluetooth
+store.
 
 `--settings-connect` opens Bluetooth Settings and taps the paired keyboard
 once: Android's HID host only opens its own GATT client when Settings (or a
