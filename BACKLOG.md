@@ -277,11 +277,20 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   read error instead of trying the other, and treats a version mismatch as
   empty; `save()` reads back only the 24-byte header, not the payload. Fix
   together with a mock flash that completes but corrupts a payload byte.
-- [ ] **Bonded CCCD persistence.** `PersistedBond` does not store client ATT
-  state, so a bonded peer's CCCD subscription disappears on reboot (Core 5.4
-  Vol 3 Part G §3.3.3.3). The pinned Host exposes
-  `get/set_client_att_table`; without this, #7's HID keyboard can resume
-  encryption after reboot with notifications still disabled.
+- [ ] **Bonded CCCD persistence — do immediately after the HID keyboard PR (#7) merges.**
+  `PersistedBond` does not store client ATT state, so a bonded peer's CCCD
+  subscription disappears on reboot (Core 5.4 Vol 3 Part G §3.3.3.3). The pinned
+  Host exposes `get/set_client_att_table`; without this the HID keyboard resumes
+  encryption after reboot with notifications still disabled, which is not a
+  normal bonded keyboard reconnect. This is the first follow-up after #7, not a
+  later option; the #7 review treats it as a P1 profile gap.
+- [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
+  `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
+  `host.rs`/`main.rs` duplicate the secure session and control-characteristic
+  handling. The unauthenticated `DEL!/WIPE/FALT` exposure, the delete/wipe race
+  and the CCM ordering guard therefore each have two copies to fix. Extract the
+  bond store (and ideally the session pump) once both examples' acceptance is
+  stable; keep the per-example policy out of the shared layer.
 - [ ] **Bond record security at rest.** The LTK is stored in plain DataFlash;
   SWD/probe reads it. Acceptable for bring-up, not claimed as tamper-resistant
   (security spec §2).
