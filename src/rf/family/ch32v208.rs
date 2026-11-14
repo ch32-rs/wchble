@@ -22,7 +22,7 @@ use crate::rf::regs::{
     self, autocfg, bb, bb_irq, lle, lle_cmd, lle_irq, lle_mode, rfctrl, rfend, rssi, rxcfg,
 };
 use crate::rf::timing::{self, v208_rx_capture_reload_half_us, v208_tx_window_half_us};
-use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
+use crate::rf::txrx::{tx_frame_valid, DmaBuf, MAX_PDU, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
 use crate::time::InstantUs;
 use crate::{Error, Result};
@@ -760,7 +760,7 @@ impl Radio for Ch32v208Radio {
         _timeout_half_us: u32,
         start_cputime: Option<u32>,
     ) -> Result<()> {
-        if frame.len() < 2 || frame.len() > MAX_PDU {
+        if !tx_frame_valid(frame) {
             return Err(Error::InvalidState);
         }
         if self.channel > 39 {
