@@ -300,7 +300,9 @@ impl ConnectionBridge {
         if !self.event_enabled(0x08) {
             return Ok(());
         }
-        if self.events.iter().all(Option::is_some) {
+        // Keep the lifecycle reserve: Disconnection Complete must always find
+        // a slot, and `disconnected()` queues it without a capacity check.
+        if self.events.iter().filter(|slot| slot.is_none()).count() < LIFECYCLE_RESERVE {
             return Err(BridgeError::Full);
         }
         let [lo, hi] = handle.to_le_bytes();
@@ -323,7 +325,8 @@ impl ConnectionBridge {
         if !self.le_event_enabled(5) {
             return Err(BridgeError::Disabled);
         }
-        if self.events.iter().all(Option::is_some) {
+        // Keep the lifecycle reserve (see `encryption_change`).
+        if self.events.iter().filter(|slot| slot.is_none()).count() < LIFECYCLE_RESERVE {
             return Err(BridgeError::Full);
         }
         let [lo, hi] = handle.to_le_bytes();

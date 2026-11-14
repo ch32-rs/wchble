@@ -2054,6 +2054,44 @@ mod tests {
     }
 
     #[test]
+    fn security_events_keep_the_disconnect_slot() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        // Fill the event queue down to the lifecycle reserve.
+        while runner.bridge.connection_updated(30, 1, 300).is_ok() {}
+        // Only the reserved disconnect slot is left; security events must not
+        // take it.
+        assert_eq!(runner.bridge.encryption_change(1, 0, 1), Err(BridgeError::Full));
+        assert_eq!(
+            runner.bridge.ltk_request(1, [0; 8], 0),
+            Err(BridgeError::Full)
+        );
+        // Disconnection still finds its slot instead of panicking, and the
+        // queued event survives the full queue intact.
+        runner.bridge.disconnected(0x13);
+        assert!(!runner.bridge.is_connected());
+        let mut disconnect = None;
+        while runner.pump_once() {
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                let payload = packet.payload();
+                if payload.first() == Some(&0x05) {
+                    disconnect = Some(payload[1..].to_vec());
+                }
+            }
+        }
+        while let Some(packet) = transport::try_receive_controller_packet() {
+            let payload = packet.payload();
+            if payload.first() == Some(&0x05) {
+                disconnect = Some(payload[1..].to_vec());
+            }
+        }
+        // [code 0x05][param len 4][status 0][handle 1][reason 0x13]
+        assert_eq!(disconnect.as_deref(), Some(&[4, 0, 1, 0, 0x13][..]));
+    }
+
+    #[test]
     fn ltk_request_and_encryption_change_events() {
         let _guard = test_lock();
         transport::drain_channels_for_test();

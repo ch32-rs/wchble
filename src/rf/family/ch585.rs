@@ -33,7 +33,7 @@ use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, Rfend
 use crate::rf::isr::IsrState;
 use crate::rf::regs::{self, bb, bb_irq, lle, rfend};
 use crate::rf::timing::{v208_rx_capture_reload_half_us, v208_tx_window_half_us};
-use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
+use crate::rf::txrx::{tx_frame_valid, DmaBuf, MAX_PDU, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback, RfEvent};
 use crate::storage::FlashError;
 use crate::time::InstantUs;
@@ -538,7 +538,9 @@ impl Ch585Radio {
     #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     #[inline(never)]
     pub fn initiate_tx<T: InstantUs>(&mut self, clock: &T, frame: &[u8]) -> Result<u32> {
-        if frame.len() < 2 || frame.len() > MAX_PDU || self.channel > 39 {
+        // The LLE sends the extent implied by `frame[1]`; a slice that does
+        // not match it would make the DMA read stale or out-of-bounds memory.
+        if !tx_frame_valid(frame) || self.channel > 39 {
             return Err(Error::InvalidState);
         }
         let tx_ptr = if frame.as_ptr() as usize & 0x3 == 0 {
@@ -619,7 +621,7 @@ ch58x_common! {
         _timeout_half_us: u32,
         start_cputime: Option<u32>,
     ) -> Result<()> {
-        if frame.len() < 2 || frame.len() > MAX_PDU {
+        if !tx_frame_valid(frame) {
             return Err(Error::InvalidState);
         }
         if self.channel > 39 {
