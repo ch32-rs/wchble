@@ -27,6 +27,7 @@ pub enum LlCtrlOpcode {
     PauseEncRsp = 0x0b,
     VersionInd = 0x0c,
     RejectInd = 0x0d,
+    PeripheralFeatureReq = 0x0e,
     ConnectionParamReq = 0x0f,
     ConnectionParamRsp = 0x10,
     RejectExtInd = 0x11,
@@ -102,8 +103,24 @@ impl ControlPdu {
         ])
     }
 
-    pub fn feature_req() -> Self {
+    /// `LL_FEATURE_REQ` (central role) and `LL_PERIPHERAL_FEATURE_REQ`
+    /// (peripheral role). Both carry the sender's own FeatureSet; the opcode
+    /// is role-specific (Core 5.4 Vol 6 Part B 5.1.4).
+    pub fn feature_req(features: [u8; 8]) -> Self {
         Self::new(&[LlCtrlOpcode::FeatureReq as u8])
+            .with_features(features)
+    }
+
+    pub fn peripheral_feature_req(features: [u8; 8]) -> Self {
+        Self::new(&[LlCtrlOpcode::PeripheralFeatureReq as u8])
+            .with_features(features)
+    }
+
+    fn with_features(self, features: [u8; 8]) -> Self {
+        let mut bytes = [0; 9];
+        bytes[0] = self.bytes[0];
+        bytes[1..9].copy_from_slice(&features);
+        Self::new(&bytes)
     }
 
     pub fn feature_rsp(features: [u8; 8]) -> Self {
@@ -288,14 +305,20 @@ impl ControlState {
         }
     }
 
-    /// Queue `LL_FEATURE_REQ` once, but only while the peer's feature set is
-    /// still unknown. Terminal responses are recorded in `on_pdu`.
-    pub fn feature_request(&mut self) -> Option<ControlPdu> {
+    /// Queue the role-appropriate feature request once, but only while the
+    /// peer's feature set is still unknown. `peripheral` selects
+    /// `LL_PERIPHERAL_FEATURE_REQ` (0x0e) over `LL_FEATURE_REQ` (0x08).
+    /// Terminal responses are recorded in `on_pdu`.
+    pub fn feature_request(&mut self, peripheral: bool) -> Option<ControlPdu> {
         if self.peer_features.is_some() || self.feature_req_sent {
             return None;
         }
         self.feature_req_sent = true;
-        Some(ControlPdu::feature_req())
+        Some(if peripheral {
+            ControlPdu::peripheral_feature_req(self.local_features)
+        } else {
+            ControlPdu::feature_req(self.local_features)
+        })
     }
 
     /// Send one `LL_LENGTH_REQ` with the current local limits.
@@ -381,7 +404,7 @@ impl ControlState {
                 exact_len(payload, 2)?;
                 return Ok(ControlAction::None);
             }
-            0x08 | 0x09 => {
+            0x08 | 0x09 | 0x0e => {
                 exact_len(payload, 9)?;
                 let mut features = [0; 8];
                 features.copy_from_slice(&payload[1..9]);
@@ -667,7 +690,9 @@ mod tests {
             rsp.as_bytes(),
             &[0x15, 0xf7, 0, 0x48, 0x08, 0xf7, 0, 0x48, 0x08]
         );
-        assert_eq!(ctrl.data_length.rx_octets(true), 251);
+        // The peer's 1 us time field is clamped to the 328 us floor, which
+        // admits 31 octets on air; the 247-octet grant cannot widen that.
+        assert_eq!(ctrl.data_length.rx_octets(true), 31);
         let mut ctrl = ControlState::new();
         ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
         assert_eq!(ctrl.on_pdu(&mut c, &[0x14], LOCAL), Err(ConnError::Length));
@@ -700,9 +725,10 @@ mod tests {
         let mut ctrl = ControlState::new();
         ctrl.local_features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION]);
         assert_eq!(ctrl.request_length_if_supported(), None);
-        let feature_req = ctrl.feature_request().unwrap();
-        assert_eq!(feature_req.as_bytes(), &[0x08]);
-        assert_eq!(ctrl.feature_request(), None);
+        let feature_req = ctrl.feature_request(true).unwrap();
+        assert_eq!(feature_req.as_bytes()[0], 0x0e);
+        assert_eq!(&feature_req.as_bytes()[1..], &[0x20, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ctrl.feature_request(true), None);
         // Peer answers without DLE.
         ctrl.on_pdu(&mut c, &[9, 0, 0, 0, 0, 0, 0, 0, 0], LOCAL)
             .unwrap();

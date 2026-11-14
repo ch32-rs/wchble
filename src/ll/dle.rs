@@ -30,6 +30,13 @@ pub const fn air_time_us(octets: u16) -> u16 {
     80 + octets * 8
 }
 
+/// Largest payload field (MIC excluded) whose LE 1M PDU fits `time_us`.
+/// `MaxRxTime`/`MaxTxTime` bound the whole PDU, so a peer may grant many
+/// octets but a short time; both constraints apply (§4.5.10).
+fn payload_for_time(time_us: u16, encrypted: bool) -> u16 {
+    (time_us.saturating_sub(80) / 8).saturating_sub(mic_octets(encrypted))
+}
+
 /// The four fields of `LL_LENGTH_REQ`/`LL_LENGTH_RSP` in wire order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -232,16 +239,22 @@ impl DataLength {
     }
 
     /// Effective TX payload on air: the negotiated payload plus the MIC when
-    /// the link is encrypted.
+    /// the link is encrypted, capped by the negotiated PDU time.
     pub fn tx_octets(&self, encrypted: bool) -> u16 {
-        self.tx_payload() + mic_octets(encrypted)
+        let mic = mic_octets(encrypted);
+        let octets = self.tx_payload() + mic;
+        octets.min(payload_for_time(self.tx_time_us(), encrypted) + mic)
     }
 
     /// Effective RX ceiling on air. 31 until the peer reports what it will
     /// send, which keeps the observed 28-octet Android PDU valid.
     pub fn rx_octets(&self, encrypted: bool) -> u16 {
         match self.peer_tx_octets {
-            Some(_) => self.rx_payload() + mic_octets(encrypted),
+            Some(_) => {
+                let mic = mic_octets(encrypted);
+                let octets = self.rx_payload() + mic;
+                octets.min(payload_for_time(self.rx_time_us(), encrypted) + mic)
+            }
             None => LL_DEFAULT_RX_PAYLOAD,
         }
     }
@@ -392,7 +405,10 @@ mod tests {
             max_tx_time: 1120,
         });
         assert_eq!(dle.rx_payload(), 128);
-        assert_eq!(dle.rx_octets(true), 132);
+        // The peer grants 128 octets but only 1120 us, which admits 130 octets
+        // on air (80 + 130 * 8); the MIC comes out of that, so 126 payload
+        // plus MIC. The octet field alone would have allowed 132.
+        assert_eq!(dle.rx_octets(true), 130);
         assert_eq!(dle.rx_octets(false), 128);
         assert_eq!(dle.tx_octets(true), 251);
     }
@@ -420,6 +436,32 @@ mod tests {
         assert_eq!(dle.rx_time_us(), 1120);
         assert_eq!(dle.local_params().max_rx_octets, 247);
         assert_eq!(dle.local_params().max_tx_octets, 27);
+    }
+
+    #[test]
+    fn time_bounds_cap_the_octet_limit() {
+        // 247 octets in 328 us is impossible: a peer may grant the octets
+        // and the short time together, and both constraints apply.
+        let mut dle = DataLength::new();
+        dle.on_peer_length(LengthParams {
+            max_rx_octets: 247,
+            max_rx_time: 328,
+            max_tx_octets: 247,
+            max_tx_time: 328,
+        });
+        assert_eq!(dle.tx_octets(false), 31);
+        assert_eq!(dle.tx_octets(true), 31);
+        assert_eq!(dle.rx_octets(false), 31);
+        assert_eq!(dle.rx_octets(true), 31);
+        // 2120 us admits 255 octets on air, so the octet field decides.
+        dle.on_peer_length(LengthParams {
+            max_rx_octets: 247,
+            max_rx_time: 2120,
+            max_tx_octets: 247,
+            max_tx_time: 2120,
+        });
+        assert_eq!(dle.tx_octets(false), 247);
+        assert_eq!(dle.tx_octets(true), 251);
     }
 
     #[test]
