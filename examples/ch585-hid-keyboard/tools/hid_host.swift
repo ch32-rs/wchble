@@ -283,12 +283,15 @@ final class HidTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             fail(reason: "characteristic_discovery_failed_or_unexpected"); return
         }
         let chars = service.characteristics ?? []
-        guard let control = chars.first(where: { $0.uuid == bondControlID }),
-              let channel = chars.first(where: { $0.uuid == mirrorID }) else {
+        guard let channel = chars.first(where: { $0.uuid == mirrorID }) else {
             fail(reason: "missing_vendor_characteristic"); return
         }
-        guard chars.count == 2, channel.properties.contains(.read),
-              channel.properties.contains(.notify), control.properties.contains(.write),
+        // The bond-control characteristic only exists in `accept-control`
+        // builds; the gate run uses the mirror and must accept either shape.
+        let control = chars.first(where: { $0.uuid == bondControlID })
+        guard chars.count == (control == nil ? 1 : 2),
+              channel.properties.contains(.read), channel.properties.contains(.notify),
+              control.map({ $0.properties.contains(.write) }) ?? true,
               !channel.isNotifying else {
             fail(reason: "vendor_characteristic_properties_invalid"); return
         }
