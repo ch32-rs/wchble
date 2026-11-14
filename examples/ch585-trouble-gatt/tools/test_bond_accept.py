@@ -88,9 +88,18 @@ def stats_block(seconds=60):
     return stats
 
 
-def observations(bonds=None, sec=None, host=None, seconds=60):
+def catt_stats(**overrides):
+    catt = dict.fromkeys(secure.CATT_NAMES, 0)
+    catt['magic'] = bond.CATT_MAGIC
+    catt['restore_attempts'] = 1
+    catt.update(overrides)
+    return catt
+
+
+def observations(bonds=None, sec=None, host=None, seconds=60, catt=None):
     named = {
         'BOND_STATS': bond_stats(**(bonds or {})),
+        'CATT_STATS': catt_stats(**(catt or {})),
         'SECURE_STATS': dict(zip(secure.SEC_NAMES, sec or secure_stats())),
         'HOST_STATS': dict(zip(secure.HOST_NAMES, host or host_stats())),
         'STATS': dict(zip(secure.STAT_NAMES, stats_block(seconds))),
@@ -196,6 +205,33 @@ class CheckTests(unittest.TestCase):
             named, raw = observations(bonds)
             with self.subTest(bonds=bonds):
                 self.assertTrue(bond.checks_reconnect(named, raw, rows, 60))
+
+    def test_reconnect_requires_the_client_att_restore(self):
+        rows = summary('reconnect_encrypted_read_write_ok')
+        named, raw = observations({'load_result': 1, 'records_loaded': 1,
+                                   'add_bond_ok': 1},
+                                  catt={'records_loaded': 1, 'restore_ok': 1})
+        self.assertEqual(bond.checks_reconnect(named, raw, rows, 60), [])
+        for catt in ({'records_loaded': 1},
+                     {'restore_invalid': 1},
+                     {'restore_ok': 1},
+                     {'restore_attempts': 0}):
+            named, raw = observations({'load_result': 1, 'records_loaded': 1,
+                                       'add_bond_ok': 1}, catt=catt)
+            with self.subTest(catt=catt):
+                self.assertTrue(bond.checks_reconnect(named, raw, rows, 60))
+
+    def test_att_dump_decodes_the_stored_table(self):
+        record = bytes([1]) + bytes.fromhex('a1b2c3d4e5f6') + bytes([4, 0, 0, 0, 0])
+        payload = bytes([1]) + bytes(6) + bytes([1]) + record
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'att.bin'
+            path.write_bytes(page(3, payload) + erased())
+            slots = bond.parse_att_dump(path)
+        self.assertEqual(len(bond.valid_slots(slots)), 1)
+        self.assertEqual(slots[0]['count'], 1)
+        self.assertEqual(slots[0]['records'][0]['raw'], '00000000')
+        self.assertEqual(slots[0]['records'][0]['address'], 'a1b2c3d4e5f6')
 
     def test_reconnect_requires_an_ltk_request(self):
         named, raw = observations({'load_result': 1, 'records_loaded': 1},

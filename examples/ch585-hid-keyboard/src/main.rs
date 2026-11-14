@@ -43,6 +43,8 @@ mod host;
 #[cfg(feature = "secure")]
 mod bond;
 #[cfg(feature = "secure")]
+mod client_att;
+#[cfg(feature = "secure")]
 mod rng;
 // HID needs embassy-time in both builds: the report tick is a Timer even when
 // the link is not encrypted, so the driver must always be installed.
@@ -1601,13 +1603,48 @@ fn record_save_time(clock: &Clock, started: u32) {
 /// Persist pending bond changes. `deadline` is the next RX prepare time when a
 /// connection is active; the save is deferred instead of running into an event.
 #[cfg(feature = "secure")]
-fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadline: Option<u32>) {
+fn flush_bonds(
+    store: &mut DualCopyStore<Ch585DataFlash>,
+    att_store: &mut DualCopyStore<Ch585DataFlash>,
+    clock: &Clock,
+    deadline: Option<u32>,
+) {
     let signals = bond::signals();
+    let att_signals = client_att::signals();
     if let Some(deadline) = deadline {
         if reached(clock.now_us().wrapping_add(save_guard_us()), deadline) {
             bond::bump(bond::STAT_DEFERRED);
             return;
         }
+    }
+    // One flash operation per call: a second 22 ms save in the same window
+    // would miss connection events. Clear requests set for the ATT store are
+    // handled on the next idle call.
+    if att_signals.wipe.take() {
+        att_signals.discard_pending();
+        let started = clock.now_us();
+        match att_store.erase_all() {
+            Ok(()) => client_att::bump(client_att::STAT_SAVE_OK),
+            Err(_) => {
+                client_att::bump(client_att::STAT_SAVE_FAIL);
+                client_att::set(client_att::STAT_LAST_ERROR, 1);
+            }
+        }
+        record_save_time(clock, started);
+        return;
+    }
+    if att_signals.delete.take() {
+        att_signals.discard_pending();
+        let started = clock.now_us();
+        match att_store.clear() {
+            Ok(()) => client_att::bump(client_att::STAT_SAVE_OK),
+            Err(_) => {
+                client_att::bump(client_att::STAT_SAVE_FAIL);
+                client_att::set(client_att::STAT_LAST_ERROR, 2);
+            }
+        }
+        record_save_time(clock, started);
+        return;
     }
     if signals.wipe.take() {
         // Erasing the store also drops any snapshot captured before the wipe.
@@ -1622,6 +1659,7 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
             }
         }
         record_save_time(clock, started);
+        att_signals.wipe.set(true);
         return;
     }
     if signals.delete.take() {
@@ -1636,6 +1674,7 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
             }
         }
         record_save_time(clock, started);
+        att_signals.delete.set(true);
         return;
     }
     if signals.fault.take() {
@@ -1665,39 +1704,74 @@ fn flush_bonds(store: &mut DualCopyStore<Ch585DataFlash>, clock: &Clock, deadlin
         bond::bump(bond::STAT_SAVE_FAIL);
         return;
     }
-    let Some(snapshot) = signals.take_pending() else {
+    if let Some(snapshot) = signals.take_pending() {
+        let mut records = [PersistedBond::empty(); MAX_BONDS];
+        let mut count = 0usize;
+        for entry in &snapshot {
+            if count == MAX_BONDS {
+                break;
+            }
+            records[count] = bond::from_bond(entry);
+            count += 1;
+        }
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let len = match encode_bonds(&bond::local_identity(), &records[..count], &mut payload) {
+            Ok(len) => len,
+            Err(_) => {
+                bond::bump(bond::STAT_SAVE_FAIL);
+                bond::set(bond::STAT_LAST_ERROR, 2);
+                return;
+            }
+        };
+        bond::bump(bond::STAT_SAVE_ATTEMPTS);
+        let started = clock.now_us();
+        match store.save(&payload[..len]) {
+            Ok(()) => {
+                bond::bump(bond::STAT_SAVE_OK);
+                if deadline.is_none() {
+                    bond::bump(bond::STAT_SAVE_ON_DISCONNECT);
+                }
+            }
+            Err(_) => {
+                bond::bump(bond::STAT_SAVE_FAIL);
+                bond::set(bond::STAT_LAST_ERROR, 3);
+            }
+        }
+        record_save_time(clock, started);
+        return;
+    }
+    let Some(snapshot) = att_signals.take_pending() else {
         return;
     };
-    let mut records = [PersistedBond::empty(); MAX_BONDS];
+    let mut records = [client_att::ClientAttRecord::empty(); client_att::MAX_CLIENT_ATT];
     let mut count = 0usize;
-    for entry in &snapshot {
-        if count == MAX_BONDS {
+    for record in &snapshot {
+        if count == client_att::MAX_CLIENT_ATT {
             break;
         }
-        records[count] = bond::from_bond(entry);
+        records[count] = *record;
         count += 1;
     }
-    let mut payload = [0u8; MAX_PAYLOAD];
-    let len = match encode_bonds(&bond::local_identity(), &records[..count], &mut payload) {
+    let mut payload = [0u8; client_att::MAX_PAYLOAD];
+    let len = match client_att::encode_client_att(
+        &bond::local_identity(),
+        &records[..count],
+        &mut payload,
+    ) {
         Ok(len) => len,
         Err(_) => {
-            bond::bump(bond::STAT_SAVE_FAIL);
-            bond::set(bond::STAT_LAST_ERROR, 2);
+            client_att::bump(client_att::STAT_SAVE_FAIL);
+            client_att::set(client_att::STAT_LAST_ERROR, 3);
             return;
         }
     };
-    bond::bump(bond::STAT_SAVE_ATTEMPTS);
+    client_att::bump(client_att::STAT_SAVE_ATTEMPTS);
     let started = clock.now_us();
-    match store.save(&payload[..len]) {
-        Ok(()) => {
-            bond::bump(bond::STAT_SAVE_OK);
-            if deadline.is_none() {
-                bond::bump(bond::STAT_SAVE_ON_DISCONNECT);
-            }
-        }
+    match att_store.save(&payload[..len]) {
+        Ok(()) => client_att::bump(client_att::STAT_SAVE_OK),
         Err(_) => {
-            bond::bump(bond::STAT_SAVE_FAIL);
-            bond::set(bond::STAT_LAST_ERROR, 3);
+            client_att::bump(client_att::STAT_SAVE_FAIL);
+            client_att::set(client_att::STAT_LAST_ERROR, 4);
         }
     }
     record_save_time(clock, started);
@@ -1837,9 +1911,13 @@ fn main() -> ! {
     #[cfg(feature = "secure")]
     let mut store = DualCopyStore::new(Ch585DataFlash, Ch585DataFlash::BOND_SLOTS);
     #[cfg(feature = "secure")]
+    let mut att_store = DualCopyStore::new(Ch585DataFlash, Ch585DataFlash::CLIENT_ATT_SLOTS);
+    #[cfg(feature = "secure")]
     {
         bond::set(0, bond::BOND_MAGIC);
         bond::set(1, 1);
+        client_att::set(client_att::STAT_MAGIC, client_att::CATT_MAGIC);
+        client_att::set(client_att::STAT_VERSION, client_att::CATT_VERSION);
         let mut boot_bonds = [PersistedBond::empty(); MAX_BONDS];
         let mut payload = [0u8; MAX_PAYLOAD];
         let read_started = clock.now_us();
@@ -1869,6 +1947,31 @@ fn main() -> ! {
             Err(_) => {
                 bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_IO);
                 bond::set(bond::STAT_LAST_ERROR, 4);
+            }
+        }
+        let mut boot_att = [client_att::ClientAttRecord::empty(); client_att::MAX_CLIENT_ATT];
+        let mut att_payload = [0u8; client_att::MAX_PAYLOAD];
+        match att_store.load(&mut att_payload) {
+            Ok(Some(len)) => match client_att::decode_client_att(
+                &att_payload[..len],
+                &bond::local_identity(),
+                &mut boot_att,
+            ) {
+                Ok(Some(count)) => {
+                    client_att::set(client_att::STAT_LOAD_RESULT, client_att::LOAD_VALID);
+                    client_att::set(client_att::STAT_RECORDS_LOADED, count as u32);
+                    client_att::set_boot_records(&boot_att[..count]);
+                }
+                Ok(None) => {
+                    client_att::set(client_att::STAT_LOAD_RESULT, client_att::LOAD_FOREIGN);
+                    client_att::bump(client_att::STAT_IDENTITY_MISMATCH);
+                }
+                Err(_) => client_att::set(client_att::STAT_LOAD_RESULT, client_att::LOAD_CORRUPT),
+            },
+            Ok(None) => client_att::set(client_att::STAT_LOAD_RESULT, client_att::LOAD_NONE),
+            Err(_) => {
+                client_att::set(client_att::STAT_LOAD_RESULT, client_att::LOAD_IO);
+                client_att::set(client_att::STAT_LAST_ERROR, 5);
             }
         }
         bond::set(
@@ -1985,7 +2088,7 @@ fn main() -> ! {
             }
             if reason.is_none() && !reached(clock.now_us().wrapping_add(2000), prepare) {
                 #[cfg(feature = "secure")]
-                flush_bonds(&mut store, &clock, Some(prepare));
+                flush_bonds(&mut store, &mut att_store, &clock, Some(prepare));
                 let mut until = earlier(prepare, earlier(finish, s.conn.supervision_deadline_us()));
                 if let Some(end) = s.control.termination_deadline_us() {
                     until = earlier(until, end);
@@ -2036,13 +2139,13 @@ fn main() -> ! {
                 put(2, 2);
                 next_adv = clock.now_us();
                 #[cfg(feature = "secure")]
-                flush_bonds(&mut store, &clock, None);
+                flush_bonds(&mut store, &mut att_store, &clock, None);
             }
             continue;
         }
         let now = clock.now_us();
         #[cfg(feature = "secure")]
-        flush_bonds(&mut store, &clock, None);
+        flush_bonds(&mut store, &mut att_store, &clock, None);
         let idle_until = if soft.adv_enabled() && !reached(now, next_adv) {
             next_adv
         } else {
@@ -2176,7 +2279,7 @@ fn main() -> ! {
     stop(&mut radio, &clock);
     // A pairing that completed in the last event may still be pending.
     #[cfg(feature = "secure")]
-    flush_bonds(&mut store, &clock, None);
+    flush_bonds(&mut store, &mut att_store, &clock, None);
     host_snapshot(&app_stats);
     put(32, clock.now_us().wrapping_sub(started));
     put(33, reg(LLE_BASE, lle::CMD));

@@ -180,9 +180,10 @@ impl BondSignals {
     }
 
     /// Drop a queued snapshot. A delete/wipe must not be undone by a snapshot
-    /// captured before it.
+    /// captured before it, for either store.
     pub fn discard_pending(&self) {
         self.pending.set(None);
+        crate::client_att::signals().discard_pending();
     }
 }
 

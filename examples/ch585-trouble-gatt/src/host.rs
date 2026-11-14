@@ -542,6 +542,9 @@ pub async fn run(
             Err(_) => fatal(stats, 3).await,
         };
 
+        // Per-peer client ATT shadow, seeded from the records read at boot.
+        #[cfg(feature = "secure")]
+        let mut att_shadow = crate::client_att::shadow_from_boot();
         loop {
             stats.phase(PHASE_ADVERTISING);
             stats.inc(STAT_ADVERTISE_ATTEMPTS);
@@ -573,6 +576,10 @@ pub async fn run(
                 Ok(connection) => connection,
                 Err(_) => fatal(stats, 6).await,
             };
+            // Restore the bonded peer's CCCD state now that the Host has
+            // allocated this connection's client-table slot.
+            #[cfg(feature = "secure")]
+            crate::client_att::restore(&server, &connection, &att_shadow);
             stats.inc(STAT_CONNECTIONS);
             stats.phase(PHASE_CONNECTED);
             stats.set(STAT_SUBSCRIBED, 0);
@@ -625,6 +632,11 @@ pub async fn run(
                 };
                 match event {
                     GattConnectionEvent::Disconnected { .. } => {
+                        // The GattConnection and its client table are still
+                        // alive here; capture the final CCCD state before the
+                        // drop clears it for non-bonded peers.
+                        #[cfg(feature = "secure")]
+                        crate::client_att::snapshot(&server, &connection, &mut att_shadow, false);
                         stats.inc(STAT_DISCONNECTS);
                         stats.set(STAT_SUBSCRIBED, 0);
                         break;
@@ -667,10 +679,25 @@ pub async fn run(
                             }
                             _ => stats.inc(STAT_OTHER),
                         }
+                        // A CCCD write is the only GATT event that changes the
+                        // client ATT table we persist.
+                        #[cfg(feature = "secure")]
+                        let wrote_cccd = match &event {
+                            GattEvent::Write(event) => {
+                                value.cccd_handle == Some(event.handle())
+                                    || burst.cccd_handle == Some(event.handle())
+                                    || uart_tx.cccd_handle == Some(event.handle())
+                            }
+                            _ => false,
+                        };
                         // Discovery, MTU exchange and CCCD events also need replies.
                         match event.accept() {
                             Ok(reply) => reply.send().await,
                             Err(_) => fatal(stats, 7).await,
+                        }
+                        #[cfg(feature = "secure")]
+                        if wrote_cccd {
+                            crate::client_att::snapshot(&server, &connection, &mut att_shadow, true);
                         }
                         #[cfg(feature = "accept-control")]
                         if wrote_control {

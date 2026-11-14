@@ -49,7 +49,7 @@ HOST_NAMES = '''phase connections disconnects security errors last_error
     reserved_12 reserved_13 reserved_14 reserved_15'''.split()
 REQUIRED_SYMBOLS = ('STATS', 'HOST_STATS', 'HID_STATS', 'SECURE_STATS', 'SEC_DIAG',
                     'SEC_OPCODES', 'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO',
-                    'PERIPHERAL_ADDRESS', 'TRACE', 'X1_STATS')
+                    'CATT_STATS', 'PERIPHERAL_ADDRESS', 'TRACE', 'X1_STATS')
 X1_NAMES = secure.X1_NAMES
 RUN_SECONDS_CHOICES = (60, 360)
 SECURITY_REQUESTED = 1
@@ -64,7 +64,7 @@ FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, Keyboa
 def validate_hid_buffers(image, symbols):
     """Shared observation-buffer checks plus the HID evidence buffer."""
     symbols = secure.validate_observation_buffers(
-        image, symbols, extra=(('X1_STATS', 24),))
+        image, symbols, extra=(('X1_STATS', 24), ('CATT_STATS', 16)))
     sections = p4.p3.elf_sections(image)
     address, size = symbols['HID_STATS'], 16 * 4
     if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
@@ -354,7 +354,8 @@ def execute(args):
                                            ('HOST_STATS', 16, HOST_NAMES),
                                            ('HID_STATS', 16, HID_NAMES),
                                            ('SECURE_STATS', 16, SEC_NAMES),
-                                           ('X1_STATS', 24, X1_NAMES)):
+                                           ('X1_STATS', 24, X1_NAMES),
+                                           ('CATT_STATS', 16, secure.CATT_NAMES)):
                     try:
                         words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
                         observations[name] = words

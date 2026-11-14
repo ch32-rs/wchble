@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "wchble-secure-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The example's `secure` feature gates the SMP/bond code in host.rs; the test
+# crate declares the same gate so the same source compiles here.
+[features]
+secure = []
+
+[dependencies]
+wchble = { path = "../..", features = ["ch585", "controller"] }
+trouble-host = { path = "../../../trouble/host", default-features = false, features = [
+    "peripheral",
+    "gatt",
+    "default-packet-pool",
+    "default-packet-pool-mtu-128",
+    "att-queued-writes",
+    "security",
+    "log",
+] }
+embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c" }
+embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", features = [
+    "embassy-crypto-aes128-ecb",
+    "embassy-crypto-aes128-cmac",
+    "embassy-crypto-p256-ecdh",
+] }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+heapless = "0.9"
+critical-section = { version = "1", features = ["std"] }
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+log = "0.4"
+env_logger = "0.11"
