@@ -525,7 +525,10 @@ impl<R: FlashRegion> DualCopyStore<R> {
     ///
     /// A tombstone is written first; the old record's page is erased next and
     /// the tombstone page last. If power is lost during the wipe, the tombstone
-    /// still wins on sequence order, so no record can reappear.
+    /// still wins on sequence order, so no record can reappear. Both pages are
+    /// erased even when `locate` recognises no current record, so data from a
+    /// build this one cannot decode (for example version-1 bonds) does not
+    /// survive a wipe.
     pub fn erase_all(&mut self) -> Result<(), StoreError> {
         self.locate()?;
         let previous = self.active;
@@ -536,10 +539,12 @@ impl<R: FlashRegion> DualCopyStore<R> {
         let seq = self.seq.wrapping_add(1);
         self.write_record(target, seq, &[])?;
         let mut first_error = None;
-        if let Some(previous) = previous {
-            if let Err(error) = self.region.erase(self.slots[previous]) {
-                first_error = Some(error);
-            }
+        // Without an active record (`locate` found none) the other page is
+        // still erased: it can hold a record this build cannot decode, such
+        // as a version-1 bond that a downgrade would load again.
+        let other = 1 - target;
+        if let Err(error) = self.region.erase(self.slots[other]) {
+            first_error = Some(error);
         }
         // Keep the tombstone intact when the old copy could not be erased.
         if first_error.is_none() {
@@ -955,6 +960,36 @@ mod tests {
         store.region.fail_erase = None;
         let mut out = [0u8; 16];
         assert_eq!(store.load(&mut out), Ok(None));
+    }
+
+    /// Two structurally valid but version-1 headers are invisible to
+    /// `locate`; a wipe must still erase both pages, or an old bond survives
+    /// for a downgraded firmware to load.
+    #[test]
+    fn erase_all_erases_both_slots_without_a_recognized_record() {
+        let mut store = store();
+        for slot in 0..2 {
+            let mut header = [0u8; HEADER_LEN];
+            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+            header[4..6].copy_from_slice(&1u16.to_le_bytes());
+            header[8..12].copy_from_slice(&(slot as u32 + 1).to_le_bytes());
+            header[12..14].copy_from_slice(&4u16.to_le_bytes());
+            let crc = crc32(&header[..20]);
+            header[20..24].copy_from_slice(&crc.to_le_bytes());
+            let offset = slot * PAGE;
+            store.region.data[offset..offset + HEADER_LEN].copy_from_slice(&header);
+            store.region.data[offset + HEADER_LEN..offset + HEADER_LEN + 4]
+                .copy_from_slice(b"old!");
+        }
+
+        let mut out = [0u8; 8];
+        assert_eq!(store.load(&mut out), Ok(None));
+        assert_eq!(store.active_slot(), None);
+        assert_eq!(store.erase_all(), Ok(()));
+        assert!(
+            store.region.data.iter().all(|byte| *byte == 0xFF),
+            "both slots must be erased"
+        );
     }
 
     #[test]
