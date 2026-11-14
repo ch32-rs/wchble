@@ -33,9 +33,11 @@ Raw captures and experiment records remain local; they are not required to build
   a raw DMA pointer after returning. Needs an interface spec before code: either
   `unsafe` with a completion contract, or a leak-safe ownership token. Deferred
   by decision on 2026-11-14; refactor once the spec exists.
-- [ ] **B2 — pending security work has no connection epoch.** A queued LTK reply
-  survives disconnect and is returned for the next connection with handle 1.
-  Bind `ltk_reply`/`enable_encryption` to the connection generation.
+- [x] **B2 — pending security work has no connection epoch.** A queued LTK reply
+  survived disconnect and was returned for the next connection with handle 1.
+  `SoftRunner` now stores both requests with the bridge epoch and drops them on
+  disconnect/reset; a repeated Enable Encryption is no longer blocked by a stale
+  entry.
 - [ ] **B3 — Instant boundaries.** `validate_instant(0, 32767)` accepts a
   past Instant and rejects a legal same-instant update; applying a current-instant
   update needs immediate re-anchoring, not just a predicate change.
@@ -59,7 +61,9 @@ Raw captures and experiment records remain local; they are not required to build
 - [ ] **TX timeout quiescence / hardware ownership single-instance audit** and
   the advertising `advDelay` distribution check — need evidence first.
 
-A2 (TX frame extent) and B1 (lifecycle slot reserve) are fixed in PR #10.
+A2 (TX frame extent) and B1 (lifecycle slot reserve) are fixed in PR #10. B2,
+the store hardening and the bond-identity/CCCD work below are fixed on the
+`ch585-bond-session-correctness` branch.
 
 ## Resolved: safe pre-flash stop
 
@@ -334,20 +338,22 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   ~35 ms erase raises the guard for the rest of the boot. A cap at
   `interval/2` cannot make a 22 ms synchronous flash operation fit a 7.5 ms
   budget; the policy needs an explicit scheduling/durability decision.
-- [ ] **Store hardening from the S3 review.** `erase_all()` erases slot 0
-  before slot 1 (unlike the tombstone-first `clear()`); `new()` + `save()`
-  without `load()` can resurrect an older higher-sequence record; `load()`
-  computes the payload CRC through the caller buffer, aborts on one slot's
-  read error instead of trying the other, and treats a version mismatch as
-  empty; `save()` reads back only the 24-byte header, not the payload. Fix
-  together with a mock flash that completes but corrupts a payload byte.
-- [ ] **Bonded CCCD persistence — do immediately after the HID keyboard PR (#7) merges.**
-  `PersistedBond` does not store client ATT state, so a bonded peer's CCCD
-  subscription disappears on reboot (Core 5.4 Vol 3 Part G §3.3.3.3). The pinned
-  Host exposes `get/set_client_att_table`; without this the HID keyboard resumes
-  encryption after reboot with notifications still disabled, which is not a
-  normal bonded keyboard reconnect. This is the first follow-up after #7, not a
-  later option; the #7 review treats it as a P1 profile gap.
+- [x] **Store hardening from the S3 review.** `erase_all()` writes a tombstone
+  before erasing and keeps the tombstone page until the old page is gone;
+  `save()` seeds the sequence from slot headers when `load()` never ran;
+  `load()` streams the payload CRC through a bounded scratch and keeps trying
+  the other slot after one read error; `save()` reads the whole payload back.
+  Covered by the mock flash's read-failure and payload-corruption injection.
+- [x] **Bonded CCCD persistence.** Both secure examples now keep the raw
+  `ClientAttTable` per peer in a second dual-copy store
+  (`0x7C00`/`0x7D00`), keyed by the resolved peer identity and the local
+  identity that wrote it, and apply it right after `with_attribute_server`
+  (Core 5.4 Vol 3 Part G §3.3.3.3). A bonded peer resumes its subscriptions
+  across a reboot without writing the CCCD again. Snapshots happen after an
+  accepted CCCD write and on disconnect; the disconnect snapshot never creates
+  a first record, so a peer that never subscribed costs no flash write. `DEL!`
+  and `WIPE` clear both stores. A table stored under a different GATT layout is
+  rejected by the read-back check instead of being applied partially.
 - [ ] **Shared bond-store and session module (after #7).** `bond.rs` in
   `examples/ch585-hid-keyboard` is a copy of the S3 example's file, and its
   `host.rs`/`main.rs` duplicate the secure session and control-characteristic
@@ -378,21 +384,23 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   clients cannot read or subscribe to `0x1812`; byte-level HOGP assertions must
   come from the system HID host (or a privileged/system app). Recorded, not
   worked around.
-- [ ] **A bonded Android host with a cached layout does not resubscribe.** After
+- [x] **A bonded Android host with a cached layout does not resubscribe.** After
   a first discovery, the system HID host keeps the cached service layout and
-  never writes the report CCCD again, so a same-bond run shows
-  `subscription_edges=0`. The first attach after a reboot does a full
-  discovery and subscribes (`x4b-android-9`: `reports_sent=49`).
+  never writes the report CCCD again, so a same-bond run showed
+  `subscription_edges=0`. The firmware now restores the stored client ATT table
+  itself, so reports flow without a new CCCD write; `android_hid_run.py
+  --expect restored` gates that phase on `CATT_STATS.restored` plus sent
+  reports (hardware run pending).
 - [ ] **The Android HID host needs an explicit connect trigger.** A bonded peer
   gets no background connection after a reboot, and an adapter cycle did not
   bring the HID host back. Tapping the paired keyboard in Bluetooth Settings
   is deterministic; the runner automates it with `--settings-connect`
   (`uiautomator` bounds, ROM-localised labels avoided).
-- [ ] **Bond store is keyed by peer address only.** Reusing the store from an
-  image with a different local identity makes SMP fail: the phone has no bond
-  for the new address while the Host still returns the old LTK. Pairing only
-  worked after `DEL!`. Key the record by local identity too, or clear the store
-  when the identity changes.
+- [x] **Bond store is keyed by peer address only.** Reusing the store from an
+  image with a different local identity made SMP fail: the phone had no bond
+  for the new address while the Host still returned the old LTK. The bond and
+  client ATT payloads now start with the local identity; a foreign record is
+  ignored (`load_result=foreign`) and left in place rather than erased.
 - [ ] **LESC key agreement can starve the RF pump past the peer's supervision
   timeout (2026-11-14).** On the macOS gate run the firmware answered the
   protected CCCD write with Insufficient Encryption (0x0F) after 3.8 s; the
