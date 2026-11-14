@@ -9,6 +9,7 @@ use core::cell::Cell;
 use heapless::Vec;
 use trouble_host::prelude::*;
 pub use wchble::storage::bond::{PersistedBond, MAX_BONDS};
+pub use wchble::storage::LocalIdentity;
 
 static mut SIGNALS: BondSignals = BondSignals::new();
 static mut BOOT_BONDS: [PersistedBond; MAX_BONDS] = [PersistedBond::empty(); MAX_BONDS];
@@ -56,6 +57,13 @@ pub const LOAD_NONE: u32 = 0;
 pub const LOAD_VALID: u32 = 1;
 pub const LOAD_CORRUPT: u32 = 2;
 pub const LOAD_IO: u32 = 3;
+pub const LOAD_FOREIGN: u32 = 4;
+
+/// Identity advertised by this image; records from another identity are
+/// ignored at boot.
+pub fn local_identity() -> LocalIdentity {
+    LocalIdentity::random(crate::host::RANDOM_ADDRESS)
+}
 
 pub const STAT_LOAD_RESULT: usize = 2;
 pub const STAT_RECORDS_LOADED: usize = 3;
@@ -82,6 +90,7 @@ pub const STAT_CONTROL_WRITES: usize = 22;
 pub const STAT_MALFORMED_CONTROL_WRITES: usize = 23;
 pub const STAT_ADD_BOND_OK: usize = 24;
 pub const STAT_ADD_BOND_FAIL: usize = 25;
+pub const STAT_IDENTITY_MISMATCH: usize = 26;
 
 /// Marker the acceptance runner reads to refuse a `fault` phase against an
 /// image built without the injection feature.
@@ -171,9 +180,10 @@ impl BondSignals {
     }
 
     /// Drop a queued snapshot. A delete/wipe must not be undone by a snapshot
-    /// captured before it.
+    /// captured before it, for either store.
     pub fn discard_pending(&self) {
         self.pending.set(None);
+        crate::client_att::signals().discard_pending();
     }
 }
 
@@ -239,8 +249,24 @@ pub fn echo(bond: &BondInformation) {
         (u32::from(record.security_level) << 8)
             | (u32::from(record.irk.is_some()) << 16)
             | (u32::from(record.key_len) << 24),
-        0,
-        0,
+        // Local identity the record was written under, so the runner can compare
+        // the stored prefix with the advertised address.
+        {
+            let local = local_identity();
+            u32::from_be_bytes([
+                local.address[0],
+                local.address[1],
+                local.address[2],
+                local.address[3],
+            ])
+        },
+        {
+            let local = local_identity();
+            (u32::from(local.address[4]) << 24)
+                | (u32::from(local.address[5]) << 16)
+                | (u32::from(local.address_kind) << 8)
+                | 1
+        },
         0,
         0,
         0,

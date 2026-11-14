@@ -246,7 +246,7 @@ def options(argv=None):
     parser.add_argument('--settings-connect', action='store_true',
                         help='tap the paired keyboard in Bluetooth Settings so '
                              'the system HID host opens its own GATT client')
-    parser.add_argument('--expect', choices=('app', 'payload'), default='app',
+    parser.add_argument('--expect', choices=('app', 'payload', 'restored'), default='app',
                         help='app: OS input-device recognition (bonded peer); '
                              'payload: encrypted report flow on a fresh bond')
     parser.add_argument('--settle-seconds', type=float, default=15,
@@ -279,7 +279,7 @@ def execute(args):
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = named[name][0]
         for name in ('SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR', 'BOND_STATS',
-                     'BOND_ECHO', 'PERIPHERAL_ADDRESS', 'TRACE'):
+                     'BOND_ECHO', 'CATT_STATS', 'PERIPHERAL_ADDRESS', 'TRACE'):
             if len(named.get(name, [])) != 1:
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = named[name][0]
@@ -403,7 +403,9 @@ def execute(args):
         for name, count, names in (('STATS', 64, hid.STAT_NAMES),
                                    ('HOST_STATS', 16, hid.HOST_NAMES),
                                    ('HID_STATS', 16, hid.HID_NAMES),
-                                   ('SECURE_STATS', 16, hid.SEC_NAMES)):
+                                   ('SECURE_STATS', 16, hid.SEC_NAMES),
+                                   ('CATT_STATS', 16, secure.CATT_NAMES),
+                                   ('BOND_STATS', 32, secure.BOND_NAMES)):
             words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
             observations[name] = words
             metadata[name.lower()] = dict(zip(names, words))
@@ -415,6 +417,19 @@ def execute(args):
                 observations['HID_STATS'], observations['HOST_STATS'],
                 observations['SECURE_STATS'], observations['STATS'], run_seconds,
                 args.expect))
+        if args.expect == 'restored':
+            # Reboot phase: the peer comes back to a bonded image, the Host
+            # restores the CCCD table it stored before the reboot, and input
+            # reports flow without the peer rewriting its subscription.
+            catt = metadata.get('catt_stats') or {}
+            restored = catt.get('restore_ok', 0)
+            if restored < 1:
+                errors.append(f'CATT restore_ok={restored}; expected the stored '
+                              'table to be applied to the bonded peer')
+            reports = metadata.get('hid_stats', {}).get('reports_sent', 0)
+            if reports < 1:
+                errors.append(f'HID reports_sent={reports}; expected reports after '
+                              'the restore')
     except FAILURES as error:
         errors.append(f'{type(error).__name__}: {error}')
     finally:

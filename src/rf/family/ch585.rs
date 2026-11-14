@@ -1045,6 +1045,12 @@ impl Ch585DataFlash {
     /// Offset of the two bond slots: the last two DataFlash pages, away from
     /// the vendor bond block at offset `0x7000`.
     pub const BOND_SLOTS: [u32; 2] = [0x7E00, 0x7F00];
+
+    /// Offset of the two client-ATT slots. Kept separate from the bond list so
+    /// per-peer CCCD state does not reduce bond capacity; both pairs live in
+    /// the last four pages, and this firmware does not use the vendor BLE
+    /// library that owns `0x7000`.
+    pub const CLIENT_ATT_SLOTS: [u32; 2] = [0x7C00, 0x7D00];
 }
 
 impl crate::storage::FlashRegion for Ch585DataFlash {

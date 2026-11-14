@@ -12,6 +12,7 @@
 //! depends on a Host stack.
 
 pub mod bond;
+pub mod client_att;
 
 /// Size of the record header in front of every payload.
 pub const HEADER_LEN: usize = 24;
@@ -19,11 +20,62 @@ pub const HEADER_LEN: usize = 24;
 /// Header magic. ASCII "BND3" read as a little-endian word.
 const MAGIC: u32 = 0x3344_4e42;
 
-/// Format revision written by this module.
-const FORMAT_VERSION: u16 = 1;
+/// Format revision written by this module. Version 2 adds the local identity
+/// to the bond and client-ATT payloads; version-1 slots are ignored once.
+const FORMAT_VERSION: u16 = 2;
 
 /// Record flags: the stored payload is a zero-length tombstone.
 const FLAG_TOMBSTONE: u16 = 1 << 0;
+
+/// Encoded local identity length: kind byte plus six address bytes.
+pub const LOCAL_IDENTITY_LEN: usize = 7;
+
+/// Local advertised identity stored with every bond and client-ATT payload.
+///
+/// A record written by an image that advertised a different address is ignored,
+/// because the peer paired with that other identity and its LTK must not be
+/// offered by this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LocalIdentity {
+    /// 0 public, 1 random.
+    pub address_kind: u8,
+    /// Display order (most significant byte first), as `Address::to_bytes()`.
+    pub address: [u8; 6],
+}
+
+impl LocalIdentity {
+    pub const fn new(address_kind: u8, address: [u8; 6]) -> Self {
+        Self {
+            address_kind,
+            address,
+        }
+    }
+
+    /// Build from an HCI random address in little-endian wire order.
+    pub fn random(hci_address: [u8; 6]) -> Self {
+        let mut address = hci_address;
+        address.reverse();
+        Self::new(1, address)
+    }
+
+    pub fn encode(&self) -> [u8; LOCAL_IDENTITY_LEN] {
+        let mut out = [0u8; LOCAL_IDENTITY_LEN];
+        out[0] = self.address_kind;
+        out[1..].copy_from_slice(&self.address);
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Option<Self> {
+        if input.len() < LOCAL_IDENTITY_LEN {
+            return None;
+        }
+        Some(Self {
+            address_kind: input[0],
+            address: input[1..LOCAL_IDENTITY_LEN].try_into().ok()?,
+        })
+    }
+}
 
 /// Platform flash failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +127,11 @@ pub trait FlashRegion {
 
 /// Reflected CRC32 (IEEE 802.3), bitwise to keep the code small.
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+    !crc32_update(0xFFFF_FFFF, data)
+}
+
+/// Continue a reflected CRC32; the caller passes the un-inverted state.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
@@ -83,7 +139,7 @@ pub fn crc32(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,25 +239,68 @@ impl<R: FlashRegion> DualCopyStore<R> {
         Ok(Header::decode(&raw))
     }
 
-    fn payload_crc_ok(
-        &mut self,
-        slot: usize,
-        header: &Header,
-        scratch: &mut [u8],
-    ) -> Result<bool, StoreError> {
+    /// Compare the stored payload CRC without borrowing the caller's buffer.
+    ///
+    /// The read is chunked so a caller with a tiny `out` slice, or a payload
+    /// larger than any stack scratch, still gets CRC validation of both slots.
+    fn payload_crc_ok(&mut self, slot: usize, header: &Header) -> Result<bool, StoreError> {
+        const CHUNK: usize = 32;
         let len = header.payload_len as usize;
         if len == 0 {
             return Ok(header.payload_crc == 0);
         }
-        if scratch.len() < len {
-            return Err(StoreError::BufferTooSmall {
-                len,
-                needed: len,
-            });
+        let mut crc = 0xFFFF_FFFFu32;
+        let mut scratch = [0u8; CHUNK];
+        let base = self.slots[slot] + HEADER_LEN as u32;
+        let mut offset = 0usize;
+        while offset < len {
+            let count = (len - offset).min(CHUNK);
+            self.region
+                .read(base + offset as u32, &mut scratch[..count])?;
+            crc = crc32_update(crc, &scratch[..count]);
+            offset += count;
         }
-        self.region
-            .read(self.slots[slot] + HEADER_LEN as u32, &mut scratch[..len])?;
-        Ok(crc32(&scratch[..len]) == header.payload_crc)
+        Ok(!crc == header.payload_crc)
+    }
+
+    /// Find the newest slot whose header and payload CRC are valid.
+    ///
+    /// A read failure on one slot is remembered but does not abandon the other
+    /// slot; it is only returned when neither slot yielded a valid record.
+    fn scan(&mut self) -> Result<Option<(usize, Header)>, StoreError> {
+        let mut best: Option<(usize, Header)> = None;
+        let mut first_error = None;
+        for slot in 0..2 {
+            let header = match self.read_header(slot) {
+                Ok(Some(header)) => header,
+                Ok(None) => continue,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if header.payload_len as usize > self.max_payload() {
+                continue;
+            }
+            match self.payload_crc_ok(slot, &header) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            }
+            if best.is_none_or(|(_, current)| seq_after(header.seq, current.seq)) {
+                best = Some((slot, header));
+            }
+        }
+        match best {
+            Some(entry) => Ok(Some(entry)),
+            None => match first_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            },
+        }
     }
 
     /// Load the newest valid record into `out`.
@@ -210,22 +309,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
     /// newest record is a tombstone. A page with a bad header or payload CRC is
     /// treated as absent, so an interrupted save falls back to the older copy.
     pub fn load(&mut self, out: &mut [u8]) -> Result<Option<usize>, StoreError> {
-        let mut best: Option<(usize, Header)> = None;
-        for slot in 0..2 {
-            let Some(header) = self.read_header(slot)? else {
-                continue;
-            };
-            if header.payload_len as usize > self.max_payload() {
-                continue;
-            }
-            if !self.payload_crc_ok(slot, &header, out)? {
-                continue;
-            }
-            if best.is_none_or(|(_, current)| seq_after(header.seq, current.seq)) {
-                best = Some((slot, header));
-            }
-        }
-        match best {
+        match self.scan()? {
             None => {
                 self.active = None;
                 self.seq = 0;
@@ -271,7 +355,92 @@ impl<R: FlashRegion> DualCopyStore<R> {
         if check != raw {
             return Err(StoreError::Flash(FlashError::Verify));
         }
+        if !payload.is_empty() {
+            const CHUNK: usize = 32;
+            let mut scratch = [0u8; CHUNK];
+            let base = offset + HEADER_LEN as u32;
+            let mut done = 0usize;
+            while done < payload.len() {
+                let count = (payload.len() - done).min(CHUNK);
+                self.region
+                    .read(base + done as u32, &mut scratch[..count])?;
+                if scratch[..count] != payload[done..done + count] {
+                    return Err(StoreError::Flash(FlashError::Verify));
+                }
+                done += count;
+            }
+        }
         Ok(())
+    }
+
+    /// Discover the on-flash sequence before a write when the caller did not
+    /// call [`load`](Self::load) first.
+    ///
+    /// Without this, `new() + save()` writes sequence 1 and an older slot with
+    /// sequence 5 wins on the next load. The next write must not erase the only
+    /// valid copy: when the newest header carries a corrupt payload and the
+    /// other slot is still valid, `active` is the valid slot, so the write goes
+    /// into the corrupt one. The sequence is always taken from the newest
+    /// readable header, valid or not, so a corrupt record is never resurrected
+    /// over.
+    ///
+    /// If no slot proved valid and a header read failed, refuse to write blind:
+    /// the unreadable slot may hold the only good copy, and `save` erases its
+    /// target before programming.
+    fn locate(&mut self) -> Result<(), StoreError> {
+        if self.active.is_some() || self.seq != 0 {
+            return Ok(());
+        }
+        let mut newest: Option<(usize, Header)> = None;
+        let mut newest_valid: Option<(usize, Header)> = None;
+        let mut first_error = None;
+        for slot in 0..2 {
+            let header = match self.read_header(slot) {
+                Ok(Some(header)) => header,
+                Ok(None) => continue,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            if newest.is_none_or(|(_, current)| seq_after(header.seq, current.seq)) {
+                newest = Some((slot, header));
+            }
+            if header.payload_len as usize <= self.max_payload() {
+                match self.payload_crc_ok(slot, &header) {
+                    Ok(true) => {
+                        if newest_valid
+                            .is_none_or(|(_, current)| seq_after(header.seq, current.seq))
+                        {
+                            newest_valid = Some((slot, header));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        let seq = newest.map_or(0, |(_, header)| header.seq);
+        if let Some((slot, _)) = newest_valid {
+            self.active = Some(slot);
+            self.seq = seq;
+            return Ok(());
+        }
+        // No slot proved valid. A failed header read may hide the only good
+        // copy, so refuse to pick a write target instead of erasing it blind.
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        match newest {
+            Some((slot, _)) => {
+                self.active = Some(slot);
+                self.seq = seq;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Write `payload` to the inactive slot and make it current.
@@ -285,6 +454,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
                 max: self.max_payload(),
             });
         }
+        self.locate()?;
         let target = match self.active {
             Some(active) => 1 - active,
             None => 0,
@@ -306,6 +476,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
                 max: self.max_payload(),
             });
         }
+        self.locate()?;
         let target = match self.active {
             Some(active) => 1 - active,
             None => 0,
@@ -334,6 +505,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
     /// only afterwards, so a power cut during deletion leaves the bond, never a
     /// half-restored one.
     pub fn clear(&mut self) -> Result<(), StoreError> {
+        self.locate()?;
         let target = match self.active {
             Some(active) => 1 - active,
             None => 0,
@@ -350,13 +522,42 @@ impl<R: FlashRegion> DualCopyStore<R> {
     }
 
     /// Erase both slots (test setup).
+    ///
+    /// A tombstone is written first; the old record's page is erased next and
+    /// the tombstone page last. If power is lost during the wipe, the tombstone
+    /// still wins on sequence order, so no record can reappear. Both pages are
+    /// erased even when `locate` recognises no current record, so data from a
+    /// build this one cannot decode (for example version-1 bonds) does not
+    /// survive a wipe.
     pub fn erase_all(&mut self) -> Result<(), StoreError> {
-        for slot in 0..2 {
-            self.region.erase(self.slots[slot])?;
+        self.locate()?;
+        let previous = self.active;
+        let target = match previous {
+            Some(active) => 1 - active,
+            None => 0,
+        };
+        let seq = self.seq.wrapping_add(1);
+        self.write_record(target, seq, &[])?;
+        let mut first_error = None;
+        // Without an active record (`locate` found none) the other page is
+        // still erased: it can hold a record this build cannot decode, such
+        // as a version-1 bond that a downgrade would load again.
+        let other = 1 - target;
+        if let Err(error) = self.region.erase(self.slots[other]) {
+            first_error = Some(error);
+        }
+        // Keep the tombstone intact when the old copy could not be erased.
+        if first_error.is_none() {
+            if let Err(error) = self.region.erase(self.slots[target]) {
+                first_error = Some(error);
+            }
         }
         self.active = None;
         self.seq = 0;
-        Ok(())
+        match first_error {
+            Some(error) => Err(StoreError::Flash(error)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -369,6 +570,9 @@ mod tests {
     struct FakeFlash {
         data: [u8; PAGE * 2],
         fail_erase: Option<usize>,
+        fail_read: Option<usize>,
+        fail_read_all: bool,
+        corrupt_next_payload: bool,
         programs: u32,
     }
 
@@ -377,6 +581,9 @@ mod tests {
             Self {
                 data: [0xFF; PAGE * 2],
                 fail_erase: None,
+                fail_read: None,
+                fail_read_all: false,
+                corrupt_next_payload: false,
                 programs: 0,
             }
         }
@@ -392,6 +599,9 @@ mod tests {
             let end = start + out.len();
             if end > self.data.len() {
                 return Err(FlashError::OutOfRange);
+            }
+            if self.fail_read_all || self.fail_read == Some(start / PAGE) {
+                return Err(FlashError::Busy);
             }
             out.copy_from_slice(&self.data[start..end]);
             Ok(())
@@ -416,6 +626,12 @@ mod tests {
             }
             for (slot, byte) in self.data[start..end].iter_mut().zip(data) {
                 *slot &= *byte;
+            }
+            // Model a cell that programs but reads back wrong. Only payload
+            // writes consume the flag, so the header stays valid.
+            if self.corrupt_next_payload && start % PAGE >= HEADER_LEN && !data.is_empty() {
+                self.data[end - 1] ^= 0x01;
+                self.corrupt_next_payload = false;
             }
             Ok(())
         }
@@ -475,6 +691,72 @@ mod tests {
     }
 
     #[test]
+    fn save_without_load_does_not_erase_the_only_valid_copy() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        // The newest header stays valid; only its payload is damaged.
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        // A fresh store that never calls `load()` must write into the damaged
+        // slot, not erase the older valid copy.
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        next.save(b"next").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(4)));
+        assert_eq!(&out[..4], b"next");
+
+        // The previous record still backs up the new one.
+        let current = next.active_slot().unwrap();
+        next.region.data[current * PAGE + HEADER_LEN + 2] ^= 0x80;
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
+    fn failed_save_without_load_keeps_the_only_valid_copy() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        next.region.corrupt_next_payload = true;
+        assert!(next.save(b"next").is_err());
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
+    fn unreadable_header_blocks_a_blind_save() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        // The newest header stays readable but its payload is damaged, so no
+        // slot validates; the older slot still holds the only good record.
+        store.region.data[newest * PAGE + HEADER_LEN + 1] ^= 0x40;
+
+        let mut next = DualCopyStore::new(store.region, [0, PAGE as u32]);
+        // Slot 0's header cannot be read, so `locate` must not pick slot 1 as
+        // the write target: `save` erases the target first.
+        next.region.fail_read = Some(0);
+        next.region.corrupt_next_payload = true;
+        let before = next.region.data;
+        assert!(next.save(b"next").is_err());
+        assert_eq!(next.region.data, before);
+
+        // Once the header is readable again the old record is still there.
+        next.region.fail_read = None;
+        let mut out = [0u8; 16];
+        assert_eq!(next.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+    }
+
+    #[test]
     fn corrupt_newest_header_ignores_slot() {
         let mut store = store();
         store.save(b"old").unwrap();
@@ -491,7 +773,7 @@ mod tests {
         let mut store = store();
         store.save(b"data").unwrap();
         let slot = store.active_slot().unwrap();
-        store.region.data[slot * PAGE + 4] = 2;
+        store.region.data[slot * PAGE + 4] = 3;
         let mut out = [0u8; 16];
         assert_eq!(store.load(&mut out), Ok(None));
     }
@@ -592,5 +874,137 @@ mod tests {
             Err(StoreError::Flash(FlashError::Busy))
         );
         assert_eq!(store.active_slot(), None);
+    }
+
+    #[test]
+    fn load_falls_back_when_newest_slot_read_fails() {
+        let mut store = store();
+        store.save(b"old").unwrap();
+        store.save(b"new").unwrap();
+        let newest = store.active_slot().unwrap();
+        store.region.fail_read = Some(newest);
+        let mut out = [0u8; 16];
+        assert_eq!(store.load(&mut out), Ok(Some(3)));
+        assert_eq!(&out[..3], b"old");
+        store.region.fail_read = None;
+    }
+
+    #[test]
+    fn load_returns_io_when_both_slots_fail() {
+        let mut store = store();
+        store.save(b"bond").unwrap();
+        store.region.fail_read_all = true;
+        let mut out = [0u8; 16];
+        assert_eq!(
+            store.load(&mut out),
+            Err(StoreError::Flash(FlashError::Busy))
+        );
+    }
+
+    #[test]
+    fn save_verifies_the_payload_read_back() {
+        let mut store = store();
+        store.region.corrupt_next_payload = true;
+        assert_eq!(
+            store.save(b"payload"),
+            Err(StoreError::Flash(FlashError::Verify))
+        );
+        assert_eq!(store.active_slot(), None);
+        assert_eq!(store.seq(), 0);
+        let mut out = [0u8; 16];
+        assert_eq!(store.load(&mut out), Ok(None));
+    }
+
+    /// A caller that writes without loading must still write above whatever the
+    /// two slots already hold.
+    fn copy_store(source: &DualCopyStore<FakeFlash>) -> DualCopyStore<FakeFlash> {
+        let mut region = FakeFlash::new();
+        region.data.copy_from_slice(&source.region.data);
+        DualCopyStore::new(region, [0, PAGE as u32])
+    }
+
+    #[test]
+    fn save_without_load_seeds_the_stored_sequence() {
+        let mut source = store();
+        source.save(b"one").unwrap();
+        source.save(b"two").unwrap();
+        let mut fresh = copy_store(&source);
+        fresh.save(b"three").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(fresh.load(&mut out), Ok(Some(5)));
+        assert_eq!(&out[..5], b"three");
+    }
+
+    #[test]
+    fn clear_without_load_does_not_resurrect_an_older_record() {
+        let mut source = store();
+        source.save(b"one").unwrap();
+        source.save(b"two").unwrap();
+        let mut fresh = copy_store(&source);
+        fresh.clear().unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(fresh.load(&mut out), Ok(None));
+    }
+
+    #[test]
+    fn erase_all_survives_an_erase_failure() {
+        let mut store = store();
+        store.save(b"bond").unwrap();
+        let active = store.active_slot().unwrap();
+        // The old record's page cannot be erased, so the tombstone must stay.
+        store.region.fail_erase = Some(active);
+        assert_eq!(
+            store.erase_all(),
+            Err(StoreError::Flash(FlashError::Busy))
+        );
+        store.region.fail_erase = None;
+        let mut out = [0u8; 16];
+        assert_eq!(store.load(&mut out), Ok(None));
+    }
+
+    /// Two structurally valid but version-1 headers are invisible to
+    /// `locate`; a wipe must still erase both pages, or an old bond survives
+    /// for a downgraded firmware to load.
+    #[test]
+    fn erase_all_erases_both_slots_without_a_recognized_record() {
+        let mut store = store();
+        for slot in 0..2 {
+            let mut header = [0u8; HEADER_LEN];
+            header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+            header[4..6].copy_from_slice(&1u16.to_le_bytes());
+            header[8..12].copy_from_slice(&(slot as u32 + 1).to_le_bytes());
+            header[12..14].copy_from_slice(&4u16.to_le_bytes());
+            let crc = crc32(&header[..20]);
+            header[20..24].copy_from_slice(&crc.to_le_bytes());
+            let offset = slot * PAGE;
+            store.region.data[offset..offset + HEADER_LEN].copy_from_slice(&header);
+            store.region.data[offset + HEADER_LEN..offset + HEADER_LEN + 4]
+                .copy_from_slice(b"old!");
+        }
+
+        let mut out = [0u8; 8];
+        assert_eq!(store.load(&mut out), Ok(None));
+        assert_eq!(store.active_slot(), None);
+        assert_eq!(store.erase_all(), Ok(()));
+        assert!(
+            store.region.data.iter().all(|byte| *byte == 0xFF),
+            "both slots must be erased"
+        );
+    }
+
+    #[test]
+    fn crc_covers_payloads_larger_than_the_scratch_chunk() {
+        let mut store = store();
+        let mut old = [0u8; 100];
+        let mut new = [0u8; 100];
+        old.fill(0x11);
+        new.fill(0x22);
+        store.save(&old).unwrap();
+        store.save(&new).unwrap();
+        let newest = store.active_slot().unwrap();
+        store.region.data[newest * PAGE + HEADER_LEN + 50] ^= 0x01;
+        let mut out = [0u8; 100];
+        assert_eq!(store.load(&mut out), Ok(Some(100)));
+        assert_eq!(out, old);
     }
 }
