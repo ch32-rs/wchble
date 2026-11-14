@@ -10,6 +10,8 @@ publish = false
 # crate declares the same gate so the same source compiles here.
 [features]
 secure = []
+# Compiles the example's S3 acceptance control characteristic (`DEL!`).
+accept-control = ["secure"]
 
 [dependencies]
 wchble = { path = "../..", features = ["ch585", "controller"] }

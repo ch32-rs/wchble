@@ -545,6 +545,11 @@ pub async fn run(
         // Per-peer client ATT shadow, seeded from the records read at boot.
         #[cfg(feature = "secure")]
         let mut att_shadow = crate::client_att::shadow_from_boot();
+        #[cfg(feature = "secure")]
+        crate::client_att::set(
+            crate::client_att::STAT_SHADOW_RECORDS,
+            att_shadow.len() as u32,
+        );
         loop {
             stats.phase(PHASE_ADVERTISING);
             stats.inc(STAT_ADVERTISE_ATTEMPTS);
@@ -593,6 +598,11 @@ pub async fn run(
             #[cfg(feature = "secure")]
             let mut security_deadline =
                 Some(Instant::now() + Duration::from_millis(SECURITY_REQUEST_DELAY_MS));
+            // CCCD descriptors accept writes before the peer bonds, so a
+            // subscription can exist while `snapshot` still refuses to record
+            // it. Remember the write and persist it once pairing completes.
+            #[cfg(feature = "secure")]
+            let mut cccd_written = false;
 
             loop {
                 #[cfg(feature = "secure")]
@@ -634,9 +644,16 @@ pub async fn run(
                     GattConnectionEvent::Disconnected { .. } => {
                         // The GattConnection and its client table are still
                         // alive here; capture the final CCCD state before the
-                        // drop clears it for non-bonded peers.
+                        // drop clears it for non-bonded peers. A subscription
+                        // written before pairing completed may only be
+                        // recordable now that the peer is bonded.
                         #[cfg(feature = "secure")]
-                        crate::client_att::snapshot(&server, &connection, &mut att_shadow, false);
+                        crate::client_att::snapshot(
+                            &server,
+                            &connection,
+                            &mut att_shadow,
+                            cccd_written,
+                        );
                         stats.inc(STAT_DISCONNECTS);
                         stats.set(STAT_SUBSCRIBED, 0);
                         break;
@@ -697,6 +714,7 @@ pub async fn run(
                         }
                         #[cfg(feature = "secure")]
                         if wrote_cccd {
+                            cccd_written = true;
                             crate::client_att::snapshot(&server, &connection, &mut att_shadow, true);
                         }
                         #[cfg(feature = "accept-control")]
@@ -711,13 +729,17 @@ pub async fn run(
                                     crate::bond::bump(crate::bond::STAT_CLEAR_REQUESTS);
                                     remove_all_bonds();
                                     // A snapshot queued before this command must
-                                    // not be written after the tombstone.
+                                    // not be written after the tombstone, and
+                                    // the shadow must not resurrect the deleted
+                                    // peers on the next snapshot.
                                     crate::bond::signals().discard_pending();
+                                    crate::client_att::clear_shadow(&mut att_shadow);
                                     crate::bond::signals().delete.set(true);
                                 }
                                 b"WIPE" => {
                                     remove_all_bonds();
                                     crate::bond::signals().discard_pending();
+                                    crate::client_att::clear_shadow(&mut att_shadow);
                                     crate::bond::signals().wipe.set(true);
                                 }
                                 b"FALT" => crate::bond::signals().fault.set(true),
@@ -865,6 +887,17 @@ pub async fn run(
                                 list
                             });
                             crate::bond::signals().set_pending(snapshot);
+                            // The peer may have subscribed before it bonded;
+                            // snapshot() refused that write while the peer was
+                            // not bonded, so fold it into the shadow now.
+                            if cccd_written {
+                                crate::client_att::snapshot(
+                                    &server,
+                                    &connection,
+                                    &mut att_shadow,
+                                    true,
+                                );
+                            }
                         } else {
                             crate::bond::bump(crate::bond::STAT_PAIRS_WITHOUT_BOND);
                         }

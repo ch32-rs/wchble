@@ -59,7 +59,9 @@ pub const STAT_RESTORE_NO_RECORD: usize = 11;
 pub const STAT_RESTORE_INVALID: usize = 12;
 pub const STAT_OVERFLOW: usize = 13;
 pub const STAT_LAST_ERROR: usize = 14;
-pub const STAT_RESERVED: usize = 15;
+/// Records currently held in the Host's in-memory shadow (including the ones
+/// already persisted). Zero after `DEL!`/`WIPE` until the next snapshot.
+pub const STAT_SHADOW_RECORDS: usize = 15;
 
 pub const LOAD_NONE: u32 = 0;
 pub const LOAD_VALID: u32 = 1;
@@ -199,6 +201,15 @@ pub fn restore<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX:
     }
 }
 
+/// Drop every in-memory record after a bond delete or wipe.
+///
+/// `discard_pending` only drops the queued copy; the shadow itself would
+/// otherwise resurrect the deleted peers on the next bonded CCCD snapshot.
+pub fn clear_shadow(shadow: &mut ClientAttSnapshot) {
+    shadow.clear();
+    set(STAT_SHADOW_RECORDS, 0);
+}
+
 /// Copy this peer's table into the shadow and queue it for persistence.
 ///
 /// Only called for bonded peers and only after the table changed, so a normal
@@ -261,5 +272,6 @@ pub fn snapshot<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX
         return;
     }
     signals().set_pending(shadow.clone());
+    set(STAT_SHADOW_RECORDS, shadow.len() as u32);
     bump(STAT_SNAPSHOTS);
 }

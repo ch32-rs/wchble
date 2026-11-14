@@ -47,7 +47,7 @@ BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
 BOND_MAGIC = 0x4233_5330
 CATT_NAMES = '''magic version load_result records_loaded identity_mismatch
     save_attempts save_ok save_fail snapshots restore_attempts restore_ok
-    restore_no_record restore_invalid overflow last_error reserved'''.split()
+    restore_no_record restore_invalid overflow last_error shadow_records'''.split()
 CATT_MAGIC = 0x4333_4130
 X4_MAGIC = 0x5834_0001
 X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match

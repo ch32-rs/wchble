@@ -10,6 +10,8 @@
 //!
 //! Run from the repository root:
 //! `cargo test --manifest-path tests/secure-host/Cargo.toml --features secure`
+//! and, for the `DEL!` shadow case,
+//! `cargo test --manifest-path tests/secure-host/Cargo.toml --features secure,accept-control`
 
 extern crate alloc;
 
@@ -195,8 +197,8 @@ mod tests {
             panic!("no ATT reply to {request:?}");
         }
 
-        /// Find a characteristic's CCCD handle with Read By Type (0x2803).
-        fn cccd_handle(&mut self, uuid: &trouble_host::prelude::Uuid) -> u16 {
+        /// Find a characteristic's value handle with Read By Type (0x2803).
+        fn value_handle(&mut self, uuid: &trouble_host::prelude::Uuid) -> u16 {
             let mut start = 0x0001u16;
             for _ in 0..64 {
                 let mut request = [0x08, 0, 0, 0xff, 0xff, 0x03, 0x28];
@@ -218,12 +220,16 @@ mod tests {
                 let value_handle = u16::from_le_bytes([entry[3], entry[4]]);
                 // The tail is the UUID: two bytes (0x2803) or sixteen.
                 if entry[5..] == *uuid.as_raw() {
-                    // The CCCD is the value's first descriptor.
-                    return value_handle + 1;
+                    return value_handle;
                 }
                 start = declaration + 1;
             }
             panic!("characteristic {:?} not found", uuid.as_raw());
+        }
+
+        /// Find a characteristic's CCCD handle: its value's first descriptor.
+        fn cccd_handle(&mut self, uuid: &trouble_host::prelude::Uuid) -> u16 {
+            self.value_handle(uuid) + 1
         }
 
         /// Start the Host and wait until it advertises.
@@ -682,5 +688,61 @@ mod tests {
         assert_eq!(client_att::value(client_att::STAT_RESTORE_OK), restored);
         let cccd = fixture.cccd_handle(&host::VALUE_UUID);
         assert_eq!(fixture.read_cccd(cccd), [0x00, 0x00]);
+    }
+
+    /// `DEL!` deletes the bonds; the RAM shadow must be dropped with them, or
+    /// the next bonded CCCD snapshot would write the deleted peers back.
+    #[cfg(feature = "accept-control")]
+    #[test]
+    fn delete_clears_the_in_memory_shadow() {
+        use trouble_host::prelude::{Address, Identity};
+
+        let _guard = serialize();
+        seed_rng();
+        fixture_start();
+
+        preload_bond(Identity {
+            addr: Address::random(PEER),
+            irk: None,
+        });
+        client_att::set_boot_records(&[]);
+
+        let stats = host::HostStats::new();
+        let controller = SoftRunner::new();
+        let mut future = pin!(host::run(
+            wchble::hci::new(),
+            &stats,
+            host::RANDOM_ADDRESS
+        ));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+            disconnect: None,
+        };
+        fixture.start();
+        fixture.connect(PEER);
+        fixture.pump_quiet(16);
+
+        let cccd = fixture.cccd_handle(&host::VALUE_UUID);
+        let mut subscribe = [0x12, 0, 0, 0x01, 0x00];
+        subscribe[1..3].copy_from_slice(&cccd.to_le_bytes());
+        assert_eq!(fixture.att_request(&subscribe).as_slice(), &[0x13]);
+        fixture.pump_quiet(4);
+        assert_eq!(client_att::value(client_att::STAT_SHADOW_RECORDS), 1);
+
+        let clears = bond::value(bond::STAT_CLEAR_REQUESTS);
+        let control = fixture.value_handle(&host::BOND_CONTROL_UUID);
+        let mut delete = [0x12, 0, 0, b'D', b'E', b'L', b'!'];
+        delete[1..3].copy_from_slice(&control.to_le_bytes());
+        assert_eq!(fixture.att_request(&delete).as_slice(), &[0x13]);
+        fixture.pump_quiet(4);
+
+        assert_eq!(bond::value(bond::STAT_CLEAR_REQUESTS) - clears, 1);
+        assert_eq!(
+            client_att::value(client_att::STAT_SHADOW_RECORDS),
+            0,
+            "a deleted bond must not survive in the shadow"
+        );
     }
 }
