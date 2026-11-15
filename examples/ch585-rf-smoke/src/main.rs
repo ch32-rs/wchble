@@ -189,7 +189,9 @@ fn tx_burst(radio: &mut Ch585Radio, clock: &UsClock, out: &mut Log, frame: &[u8]
         }
         for i in 0u32..2 {
             let t0 = clock.now_us();
-            match radio.tx_basic(clock, frame, 0, None) {
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; `frame` only has to live for the call.
+            match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => {
                     let us = clock.now_us().wrapping_sub(t0);
                     let st = mmio(LLE_BASE, lle::IRQSTAT);
@@ -227,7 +229,9 @@ fn rx_once(
     // Clear the sticky CRC-fail latch before arming so the flag read after
     // RX_DONE belongs to this packet.
     unsafe { regs::write(BB_BASE, bb::IRQSTAT, BB_CRC_ERR) };
-    if radio.rx_basic(clock, rxbuf, window_half_us).is_err() {
+    // SAFETY: this window is polled to completion and stopped before the
+    // caller can reuse `rxbuf`.
+    if unsafe { radio.rx_basic(clock, rxbuf, window_half_us) }.is_err() {
         return None;
     }
 
@@ -596,7 +600,9 @@ fn main() -> ! {
         // The vendor runs AES while the RF window is active; arm a long RX
         // window (1 s) so the block has its clock while the KAT runs.
         let _ = radio.set_channel(37);
-        match radio.rx_basic(&clock, &mut rx_listen_buf.0[..], 2_000_000) {
+        // SAFETY: the listen buffer is static and the window is stopped by
+        // `radio.shut()` in both arms below.
+        match unsafe { radio.rx_basic(&clock, &mut rx_listen_buf.0[..], 2_000_000) } {
             Ok(()) => {
                 let _ = writeln!(out, "aes kat entered");
                 aes_kat(&mut out, &clock);
@@ -643,7 +649,7 @@ fn main() -> ! {
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
             if radio.set_channel(ch).is_ok() {
-                if let Err(e) = radio.tx_basic(&clock, &frame[..n], 0, None) {
+                if let Err(e) = unsafe { radio.tx_basic(&clock, &frame[..n], 0, None) } {
                     let _ = writeln!(out, "adv tx ch{} err {:?}", ch, e);
                 }
             }
@@ -653,7 +659,7 @@ fn main() -> ! {
         radio.set_aa_crc(0x7176_4129, 0x55_5555);
         if radio.set_channel(39).is_ok() {
             let rf_frame = [0x00u8, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
-            let _ = radio.tx_basic(&clock, &rf_frame, 0, None);
+            let _ = unsafe { radio.tx_basic(&clock, &rf_frame, 0, None) };
         }
 
         // Periodically prove the RX path on silicon while the loop runs.

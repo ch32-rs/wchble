@@ -166,10 +166,12 @@ fn main() -> ! {
     }
     record(2, 3);
     let tx_started = clock.now_us();
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+    // the engine on error; `tx` only has to live for the call.
     let tx_result = if PASSIVE {
         Ok(())
     } else {
-        radio.tx_basic(&clock, &tx.0[..len], 0, None)
+        unsafe { radio.tx_basic(&clock, &tx.0[..len], 0, None) }
     };
     // Keep RAM instrumentation out of the TX -> RX gap. This remains the
     // blocking TX + scanner RX path, not a verified advertiser turnaround.
@@ -184,7 +186,8 @@ fn main() -> ! {
     }
     // Match the smoke's pre-arm CRC-latch clear; do not interpret it as CRC.
     unsafe { regs::write(BB_BASE, bb::IRQSTAT, 0x20) };
-    let result = radio.rx_basic(&clock, &mut rx.0, 10_000);
+    // SAFETY: the window is stopped below before `rx` is read or reused.
+    let result = unsafe { radio.rx_basic(&clock, &mut rx.0, 10_000) };
     let started = clock.now_us();
     record(3, if PASSIVE { 0 } else { 1 });
     record(11, cmd);

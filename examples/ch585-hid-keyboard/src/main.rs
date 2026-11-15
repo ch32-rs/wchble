@@ -408,7 +408,9 @@ fn receive(
     // `until` allows packet completion, not just its latest preamble start.
     // The hardware WINDOW and software no-capture timeout must agree.
     let window = until.wrapping_sub(now).saturating_mul(2);
-    if radio.rx_basic(clock, &mut rx.0, window).is_err() {
+    // SAFETY: `rx` is a static DMA buffer and every path below stops the
+    // engine before returning, so no window outlives this call.
+    if unsafe { radio.rx_basic(clock, &mut rx.0, window) }.is_err() {
         inc(21);
         stop(radio, clock);
         return None;
@@ -461,7 +463,10 @@ fn receive(
 fn transmit(radio: &mut Ch585Radio, clock: &Clock, frame: &[u8], end: u32) -> bool {
     put(56, clock.now_us().wrapping_sub(end));
     // Preserve the P3 command deadline; it is not calibrated air IFS.
-    let result = radio.tx_basic(clock, frame, 0, Some(end.wrapping_add(120)));
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or
+    // stops the engine on a failed send (including timeout); `frame` only has
+    // to live for the call.
+    let result = unsafe { radio.tx_basic(clock, frame, 0, Some(end.wrapping_add(120))) };
     put(57, clock.now_us().wrapping_sub(end));
     match result {
         Ok(()) => inc(18),
@@ -2178,10 +2183,9 @@ fn main() -> ! {
             }
             radio.set_channel(channel).unwrap();
             inc(3);
-            if radio
-                .tx_basic(&clock, &adv_buf.0[..adv_len], 0, None)
-                .is_err()
-            {
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+            // the engine on error; the frame only has to live for the call.
+            if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
                 inc(5);
                 stop(&mut radio, &clock);
                 continue;
@@ -2201,12 +2205,16 @@ fn main() -> ! {
             let pdu = &rx.0[..packet.len];
             if soft.ll.adv.validate_scan_req(pdu, true) {
                 inc(10);
-                match radio.tx_basic(
-                    &clock,
-                    &rsp_buf.0[..rsp_len],
-                    0,
-                    Some(packet.end.wrapping_add(120)),
-                ) {
+                // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                // engine on error; the response frame only has to live for the call.
+                match unsafe {
+                    radio.tx_basic(
+                        &clock,
+                        &rsp_buf.0[..rsp_len],
+                        0,
+                        Some(packet.end.wrapping_add(120)),
+                    )
+                } {
                     Ok(()) => inc(11),
                     Err(wchble::Error::Late) => inc(12),
                     Err(_) => inc(5),

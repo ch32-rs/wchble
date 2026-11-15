@@ -68,7 +68,22 @@ pub trait Radio {
     fn set_callback(&mut self, cb: Option<RfCallback>);
 
     /// Blocking/basic TX; `start_cputime` is an optional absolute µs deadline base.
-    fn tx_basic<T: InstantUs>(
+    ///
+    /// # Safety
+    ///
+    /// The LLE DMAs `frame` while the transmission is in flight, so the
+    /// caller must keep it valid and unmodified for the whole call.
+    ///
+    /// - `Ok`: the DMA has completed.
+    /// - `Err(Late)`: no transmission was started; there is no DMA in
+    ///   flight, but `TXBUFPTR` may still name `frame` until the next call.
+    /// - Any other error: the implementation requests an engine stop and
+    ///   waits a bounded time (debug-asserted) for the LLE to report idle
+    ///   before returning. A controller that does not idle within that
+    ///   bound is already unusable; the call still returns.
+    ///
+    /// Once the call returns, the borrow may end.
+    unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
         frame: &[u8],
@@ -77,7 +92,20 @@ pub trait Radio {
     ) -> Result<()>;
 
     /// Arm RX for `window_half_us`; completion via callback / ISR.
-    fn rx_basic<T: InstantUs>(
+    ///
+    /// # Safety
+    ///
+    /// The LLE DMAs into `rxbuf` after this call returns. The caller must keep
+    /// `rxbuf` valid and exclusively owned until the window has completed (the
+    /// ISR observes `RX_DONE`/`CLEAR_ARM`) or the engine has been shut down.
+    ///
+    /// Re-arming while a window is still armed is allowed only while the old
+    /// buffer is still live: the implementation force-stops the old window,
+    /// waits for the LLE to report idle, and only then points `RXBUFPTR` at
+    /// the new buffer. If the engine does not idle within the bound it
+    /// returns `Err(Busy)` without touching `RXBUFPTR`, so the old buffer's
+    /// obligation is unchanged.
+    unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
         rxbuf: &mut [u8],
@@ -117,7 +145,7 @@ impl Radio for UnselectedRadio {
     fn set_encrypt(&mut self, _enabled: bool) {}
     fn set_callback(&mut self, _cb: Option<RfCallback>) {}
 
-    fn tx_basic<T: InstantUs>(
+    unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         _clock: &T,
         _frame: &[u8],
@@ -127,7 +155,7 @@ impl Radio for UnselectedRadio {
         Err(Error::Unsupported)
     }
 
-    fn rx_basic<T: InstantUs>(
+    unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         _clock: &T,
         _rxbuf: &mut [u8],

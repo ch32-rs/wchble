@@ -171,7 +171,9 @@ fn tx_burst_on_channels(radio: &mut Ch32v208Radio, clock: &UsClock, frame: &[u8]
             continue;
         }
         for i in 0u32..2 {
-            match radio.tx_basic(clock, frame, 0, None) {
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; `frame` only has to live for the call.
+            match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => println!("tx ch{} ok #{}", ch, i),
                 Err(e) => println!("tx ch{} err {:?} #{}", ch, e, i),
             }
@@ -187,7 +189,9 @@ fn rx_listen_poll(radio: &mut Ch32v208Radio, clock: &UsClock, rxbuf: &mut [u8]) 
         println!("rx set_channel err {:?}", e);
         return;
     }
-    match radio.rx_basic(clock, rxbuf, WINDOW_HALF_US) {
+    // SAFETY: the window is polled to completion and stopped before `rxbuf`
+    // is reused by the caller.
+    match unsafe { radio.rx_basic(clock, rxbuf, WINDOW_HALF_US) } {
         Ok(()) => println!("rx armed"),
         Err(e) => {
             println!("rx arm err {:?}", e);
@@ -250,7 +254,9 @@ fn soft_adv_tx(radio: &mut Ch32v208Radio, clock: &UsClock) {
             println!("soft set_channel {} err {:?}", ch, e);
             continue;
         }
-        match radio.tx_basic(clock, &pdu[..n], 0, None) {
+        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+        // engine on error; `frame` only has to live for the call.
+        match unsafe { radio.tx_basic(clock, &pdu[..n], 0, None) } {
             Ok(()) => println!("soft tx ch{} ok", ch),
             Err(e) => println!("soft tx ch{} err {:?}", ch, e),
         }

@@ -753,7 +753,7 @@ impl Radio for Ch32v208Radio {
         self.isr.callback = cb;
     }
 
-    fn tx_basic<T: InstantUs>(
+    unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
         frame: &[u8],
@@ -855,6 +855,22 @@ impl Radio for Ch32v208Radio {
             }
         }
 
+        if rc.is_err() {
+            // The LLE may still be draining `frame`; stop it before the
+            // caller's borrow ends.
+            self.engine_stop();
+            let stopped = clock.now_us();
+            while unsafe { regs::read(LLE_BASE, lle::CMD) } & lle_cmd::BUSY_MASK != 0 {
+                if clock.now_us().wrapping_sub(stopped) > 50 {
+                    break;
+                }
+            }
+            debug_assert_eq!(
+                unsafe { regs::read(LLE_BASE, lle::CMD) } & lle_cmd::BUSY_MASK,
+                0,
+                "LLE still busy after a timed-out TX"
+            );
+        }
         self.guard_exit(saved);
         unsafe {
             // Acknowledge the completion we just consumed so the next call
@@ -864,9 +880,9 @@ impl Radio for Ch32v208Radio {
         rc
     }
 
-    fn rx_basic<T: InstantUs>(
+    unsafe fn rx_basic<T: InstantUs>(
         &mut self,
-        _clock: &T,
+        clock: &T,
         rxbuf: &mut [u8],
         window_half_us: u32,
     ) -> Result<()> {
@@ -880,12 +896,35 @@ impl Radio for Ch32v208Radio {
 
         let saved = self.guard_enter();
 
+        // A previous window that was never observed (the caller skipped
+        // `shut()`) still DMAs through `rx_active`. Stop it and wait for the
+        // LLE to report idle before re-pointing: the stop only requests it.
+        let mut stopped = false;
+        if self.isr.rx_armed {
+            self.engine_stop();
+            stopped = true;
+        }
+
         let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
         if busy != 0 {
             unsafe {
                 regs::rmw(LLE_BASE, lle::MODE, lle_mode::DIR_MASK, 0);
                 regs::rmw(LLE_BASE, lle::CMD, 0, lle_cmd::FORCE_STOP);
             }
+            stopped = true;
+        }
+        if stopped {
+            let t0 = clock.now_us();
+            while unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
+                if clock.now_us().wrapping_sub(t0) > 50 {
+                    // The old window may still DMA. Leave `rx_armed` set so
+                    // the ISR can still report its result, and do not re-point
+                    // RXBUFPTR at the new buffer.
+                    self.guard_exit(saved);
+                    return Err(Error::Busy);
+                }
+            }
+            self.isr.clear_rx_flags();
         }
 
         unsafe {

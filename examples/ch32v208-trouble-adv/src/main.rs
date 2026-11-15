@@ -128,7 +128,10 @@ async fn controller_task(
                         // One-shot airtime probe: a real 1M frame of this
                         // length takes ~250-380 us from start to TX_DONE.
                         let t0 = clock.now_us();
-                        let ok = radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None).is_ok();
+                        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                        // engine on error; `frame` only has to live for the call.
+                        let ok = unsafe { radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None) }
+                            .is_ok();
                         println!(
                             "tx0 ch{} us={} ok={}",
                             ch,
@@ -137,7 +140,7 @@ async fn controller_task(
                         );
                         ok
                     } else {
-                        radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None).is_ok()
+                        unsafe { radio.tx_basic(clock, &pdu.0[..pdu_len], 0, None) }.is_ok()
                     };
                     if ok {
                         TX_OK.fetch_add(1, Ordering::Relaxed);
