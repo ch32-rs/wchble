@@ -92,8 +92,9 @@ Raw captures and experiment records remain local; they are not required to build
 B3/B7/B8/B9 are offline-verified on `ch585-b3-b9-hci-correctness` (210 lib
 tests per chip feature, `tests/{secure,trouble,hid}-host`) and built into all
 12 examples. Hardware on freshly rebuilt images: P3 PASS (`cae2eb91…`), C1
-PASS (`e889b449…`) and P4 PASS after the late-TX fix below (`4ef3ab07…`,
-`tx_late=0`, handler 11 us, tx entry 26 us, GATT cycle counters complete).
+PASS (`5d004331…`, re-run against merged ch5xx-hal main after the HCI review
+fix; the earlier `e889b449…` predates it) and P4 PASS after the late-TX fix
+below (`85fc661a…`, `tx_late=0`, no retries, GATT cycle counters complete).
 - [ ] **B10 — Host→Controller queue has no enqueue epoch.** A Host command still
   in the one-slot `HOST_TO_CONTROLLER` channel when the link drops is parsed
   after reconnect and attributed to the new connection (`pending_input` reads
