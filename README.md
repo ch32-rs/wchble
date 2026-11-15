@@ -162,6 +162,15 @@ bridge errors, then restored smoke. ATT MTU remains 23, so long-data/MTU
 negotiation and UART flow stress are not yet validated. See
 [`BACKLOG.md`](BACKLOG.md).
 
+**CH585 OTA slot-A layout** (2026-11-15):
+[`ch585-ota-layout`](examples/ch585-ota-layout) links the app at `0x4000`
+(slot A, 216 KiB) and leaves a four-byte jump at the reset vector `0x0`, so one
+non-secure release ELF both resets into the slot and runs from it. After reset
+the image advertised `wch585-ota` to a macOS CoreBluetooth scan (75
+observations), and the board was restored to the smoke image. The stub stands
+in for the real boot manager: an update still rewrites the whole image. Secure
+builds of the trouble-host examples exceed one slot.
+
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.
