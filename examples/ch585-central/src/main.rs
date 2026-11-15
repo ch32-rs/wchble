@@ -972,8 +972,8 @@ fn connection_event(
                         let ack = s.link.tx_pdu();
                         let frame = ack.as_bytes();
                         tx.0[..frame.len()].copy_from_slice(frame);
-                        // SAFETY: the ACK frame only has to live for the call;
-                        // `tx_basic` stops the LLE before returning.
+                        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                        // engine on error; the ACK frame only has to live for the call.
                         if unsafe {
                             radio.tx_basic(
                                 clock,

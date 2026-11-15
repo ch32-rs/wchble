@@ -224,8 +224,8 @@ fn main() -> ! {
             put(2, 5);
             let deadline = end.wrapping_add(RESPONSE_DELAY_US);
             put(29, clock.now_us().wrapping_sub(end));
-            // SAFETY: the response frame only has to live for the call;
-            // `tx_basic` stops the LLE before returning.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; the response frame only has to live for the call.
             match unsafe { radio.tx_basic(&clock, &rsp_buf.0[..rsp_len], 0, Some(deadline)) } {
                 Ok(()) => {
                     inc(12);

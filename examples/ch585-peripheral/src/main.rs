@@ -592,8 +592,8 @@ fn main() -> ! {
             let pdu = &rx.0[..packet.len];
             if adv.validate_scan_req(pdu, true) {
                 inc(10);
-                // SAFETY: the response frame only has to live for the call;
-                // `tx_basic` stops the LLE before returning.
+                // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                // engine on error; the response frame only has to live for the call.
                 match unsafe {
                     radio.tx_basic(
                         &clock,
