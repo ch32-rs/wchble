@@ -10,14 +10,19 @@
 //! larger than one slot, so this layout example stays on the plain image.
 //! It only advertises; connection handling belongs to the app, not the layout.
 //!
-//! Build, flash as one ELF with the single-session preflight runner, then scan
-//! for the name (commands run from the repository root):
+//! Build in this directory:
 //!
 //! ```console
 //! cargo build --release --target riscv32imc-unknown-none-elf
+//! ```
+//!
+//! Flash the one ELF with the single-session preflight runner and scan for the
+//! name from the repository root:
+//!
+//! ```console
 //! tools/ch585-preflight/target/release/ch585-preflight --probe <SERIAL> \
 //!     --chip CH585 --protocol jtag --verify \
-//!     target/riscv32imc-unknown-none-elf/release/ch585-ota-layout
+//!     examples/ch585-ota-layout/target/riscv32imc-unknown-none-elf/release/ch585-ota-layout
 //! swift examples/ch585-rf-smoke/tools/scan_ch585.swift wch585-ota 8
 //! ```
 
@@ -149,7 +154,8 @@ fn main() -> ! {
     }
 }
 
-/// Feed the watchdog so a reset cannot clear the observation words.
+/// Park a failed init; feed the watchdog in case one is enabled, so it cannot
+/// reboot the core in a loop.
 fn halt() -> ! {
     loop {
         hal::pac::SYS
