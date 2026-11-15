@@ -283,7 +283,7 @@ macro_rules! ch58x_common {
 
             unsafe fn rx_basic<T: InstantUs>(
                 &mut self,
-                _clock: &T,
+                clock: &T,
                 rxbuf: &mut [u8],
                 window_half_us: u32,
             ) -> Result<()> {
@@ -295,17 +295,32 @@ macro_rules! ch58x_common {
                 }
 
                 // A previous window that was never observed (the caller skipped
-                // `shut()`) still DMAs through `rx_active`. Force-stop it before
-                // re-pointing RXBUFPTR at the new buffer.
+                // `shut()`) still DMAs through `rx_active`. Force-stop it and
+                // wait for the LLE to report idle before re-pointing:
+                // `engine_shut` only requests the stop.
+                let mut stopped = false;
                 if self.isr.rx_armed {
                     self.engine_shut();
-                    self.isr.clear_rx_flags();
+                    stopped = true;
                 }
 
                 // `LL_ScanSetRF` starts with `phy_status_clear(6)`: force-stop a
                 // stale LLE command before re-arming.
                 if unsafe { regs::read(LLE_BASE, lle::CMD) & 0x3 } != 0 {
                     self.engine_shut();
+                    stopped = true;
+                }
+                if stopped {
+                    let t0 = clock.now_us();
+                    while unsafe { regs::read(LLE_BASE, lle::CMD) & 0x3 } != 0 {
+                        if clock.now_us().wrapping_sub(t0) > 50 {
+                            // The old window may still DMA. Leave `rx_armed`
+                            // set so the ISR can still report its result, and
+                            // do not re-point RXBUFPTR at the new buffer.
+                            return Err(Error::Busy);
+                        }
+                    }
+                    self.isr.clear_rx_flags();
                 }
 
                 // Follow `LL_ScanSetRF` (the BLE-stack scanner): AA/CRC,
@@ -326,22 +341,27 @@ macro_rules! ch58x_common {
                 }
 
                 let rx_ptr = rxbuf.as_mut_ptr();
-                self.rx_active = rx_ptr;
-                self.isr.rx_armed = true;
-                self.isr.rx_captured = false;
 
                 // `LL_ScanSetRF` clears `LLE+0x64` and W1C bit 17 before
                 // arming; the arm-clear needs the guard toggle, the rest is
-                // plain W1C.
+                // plain W1C. Clear before publishing the arm: a sticky
+                // `RX_DONE` must not be taken as this window's completion.
                 self.irq_clear_guarded(
                     lle5_irq::RX_DONE | lle5_irq::TX_DONE | lle5_irq::CLEAR_ARM,
                 );
 
+                self.rx_active = rx_ptr;
                 unsafe {
                     regs::write(LLE_BASE, lle::WINDOW, 0);
                     regs::write(LLE_BASE, lle5::RXBUFPTR, rx_ptr as u32);
                     regs::write(LLE_BASE, lle::MODE, lle5_mode::RX);
                     regs::rmw(RFEND_BASE, rfend5::FECTRL, 0, rfend::FECTRL_RF_ON);
+                }
+                self.isr.rx_captured = false;
+                // Publish the arm only after `RXBUFPTR` names the buffer; the
+                // ISR reads `rx_active` when it sees `RX_DONE`.
+                self.isr.rx_armed = true;
+                unsafe {
                     regs::write(LLE_BASE, lle::CMD, 1);
                     if window_half_us != 0 {
                         regs::write(LLE_BASE, lle::WINDOW, window_half_us);

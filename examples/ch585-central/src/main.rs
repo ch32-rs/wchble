@@ -783,8 +783,8 @@ fn connection_event(
         put(49, margin);
     }
     inc(20);
-    // SAFETY: `tx_basic` stops the LLE before returning; the frame is a
-    // static buffer that outlives the call anyway.
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+    // engine on error; the frame is a static buffer that outlives the call.
     let sent = unsafe { radio.tx_basic(clock, &tx.0[..frame.len()], 0, Some(deadline)) };
     let tx_return = clock.now_us();
     trace(
@@ -1187,8 +1187,8 @@ fn tx_probe(radio: &mut Ch585Radio, clock: &Clock) {
             1 => (&long[..], 1),
             _ => (&big.0 .0[..big_len], 2),
         };
-        // SAFETY: the probe frame outlives this call and `tx_basic` stops the
-        // LLE before returning, including on timeout.
+        // SAFETY: the probe frame outlives this call; `tx_basic` starts no DMA on `Late`
+        // and force-stops the engine on timeout.
         let result = unsafe { radio.tx_basic(clock, frame, 0, None) };
         unsafe {
             let stats = core::ptr::addr_of_mut!(PROBE_STATS).cast::<u32>();

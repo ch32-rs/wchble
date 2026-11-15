@@ -189,7 +189,8 @@ fn tx_burst(radio: &mut Ch585Radio, clock: &UsClock, out: &mut Log, frame: &[u8]
         }
         for i in 0u32..2 {
             let t0 = clock.now_us();
-            // SAFETY: `tx_basic` stops the LLE before returning.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; `frame` only has to live for the call.
             match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => {
                     let us = clock.now_us().wrapping_sub(t0);

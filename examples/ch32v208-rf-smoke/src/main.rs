@@ -171,7 +171,8 @@ fn tx_burst_on_channels(radio: &mut Ch32v208Radio, clock: &UsClock, frame: &[u8]
             continue;
         }
         for i in 0u32..2 {
-            // SAFETY: `tx_basic` stops the LLE before returning.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; `frame` only has to live for the call.
             match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => println!("tx ch{} ok #{}", ch, i),
                 Err(e) => println!("tx ch{} err {:?} #{}", ch, e, i),
@@ -253,7 +254,8 @@ fn soft_adv_tx(radio: &mut Ch32v208Radio, clock: &UsClock) {
             println!("soft set_channel {} err {:?}", ch, e);
             continue;
         }
-        // SAFETY: `tx_basic` stops the LLE before returning.
+        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+        // engine on error; `frame` only has to live for the call.
         match unsafe { radio.tx_basic(clock, &pdu[..n], 0, None) } {
             Ok(()) => println!("soft tx ch{} ok", ch),
             Err(e) => println!("soft tx ch{} err {:?}", ch, e),

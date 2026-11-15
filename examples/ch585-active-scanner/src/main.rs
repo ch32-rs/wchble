@@ -481,8 +481,8 @@ fn answer(
     // deadline; all STATS bookkeeping is deferred until after TX_DONE.
     let deadline = adv_end_us.wrapping_add(SCAN_REQ_START_AFTER_RX_DONE_US);
     let entry = clock.now_us();
-    // SAFETY: `tx_basic` stops the LLE before returning, including the
-    // `Late`/timeout paths, so the frame only has to live for the call.
+    // SAFETY: `Late` starts no DMA, a timeout force-stops the engine, and the
+    // frame only has to live for the call.
     let result = unsafe { radio.tx_basic(clock, &tx.0[..len], 0, Some(deadline)) };
     let tx_done = clock.now_us();
     let entry_delta = entry.wrapping_sub(adv_end_us);

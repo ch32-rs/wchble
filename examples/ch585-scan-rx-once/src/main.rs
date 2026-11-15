@@ -166,8 +166,8 @@ fn main() -> ! {
     }
     record(2, 3);
     let tx_started = clock.now_us();
-    // SAFETY: `tx_basic` stops the LLE before returning, so `tx` only has to
-    // live for the call.
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+    // the engine on error; `tx` only has to live for the call.
     let tx_result = if PASSIVE {
         Ok(())
     } else {

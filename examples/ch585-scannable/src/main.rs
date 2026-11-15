@@ -139,8 +139,8 @@ fn main() -> ! {
             radio.set_channel(ch).unwrap();
             inc(3);
             put(2, 3);
-            // SAFETY: `tx_basic` stops the LLE before returning, so the
-            // advertising frame only has to live for the call.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+            // the engine on error; the frame only has to live for the call.
             if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
                 inc(5);
                 if !stop(&mut radio, &clock) {

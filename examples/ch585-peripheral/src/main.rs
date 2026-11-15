@@ -212,8 +212,9 @@ fn receive(
 fn transmit(radio: &mut Ch585Radio, clock: &Clock, frame: &[u8], end: u32) -> bool {
     // P2 starting point, NOT an independent measurement of air IFS.
     put(56, clock.now_us().wrapping_sub(end));
-    // SAFETY: `tx_basic` force-stops the LLE before returning (including on
-    // timeout), so `frame` only has to live for the call.
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or
+    // stops the engine on a failed send (including timeout); `frame` only has
+    // to live for the call.
     let result = unsafe { radio.tx_basic(clock, frame, 0, Some(end.wrapping_add(120))) };
     put(57, clock.now_us().wrapping_sub(end));
     match result {
@@ -571,8 +572,8 @@ fn main() -> ! {
             }
             radio.set_channel(channel).unwrap();
             inc(3);
-            // SAFETY: `tx_basic` stops the LLE before returning, so the
-            // advertising frame only has to live for the call.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+            // the engine on error; the frame only has to live for the call.
             if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
                 inc(5);
                 stop(&mut radio, &clock);

@@ -139,7 +139,8 @@ fn tx_burst(radio: &mut Ch592Radio, clock: &UsClock, out: &mut SDIPrint, frame: 
             continue;
         }
         for i in 0u32..2 {
-            // SAFETY: `tx_basic` stops the LLE before returning.
+            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+            // engine on error; `frame` only has to live for the call.
             match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => {
                     let _ = writeln!(out, "tx ch{} ok #{}", ch, i);
