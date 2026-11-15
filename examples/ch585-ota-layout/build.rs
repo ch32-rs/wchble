@@ -1,6 +1,6 @@
 fn main() {
-    // Put this crate's `memory.x` ahead of the one metapac emits, then let
-    // qingke-rt's `link.x` INCLUDE it.
+    // `link.x` looks for `memory.x` on the link search path; the HAL's
+    // `memory-x` feature stays off so this file is the only candidate.
     println!(
         "cargo:rustc-link-search={}",
         std::env::var("CARGO_MANIFEST_DIR").unwrap()

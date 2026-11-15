@@ -166,7 +166,7 @@ negotiation and UART flow stress are not yet validated. See
 [`ch585-ota-layout`](examples/ch585-ota-layout) links the app at `0x4000`
 (slot A, 216 KiB) and leaves a four-byte jump at the reset vector `0x0`, so one
 non-secure release ELF both resets into the slot and runs from it. After reset
-the image advertised `wch585-ota` to a macOS CoreBluetooth scan (75
+the image advertised `wch585-ota` to a macOS CoreBluetooth scan (69
 observations), and the board was restored to the smoke image. The stub stands
 in for the real boot manager: an update still rewrites the whole image. Secure
 builds of the trouble-host examples exceed one slot.

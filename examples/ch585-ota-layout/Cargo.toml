@@ -7,10 +7,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# No `memory-x`: metapac would emit a competing 0x0 script, and a missing
+# local `memory.x` would then link a normal image instead of failing.
 ch5xx-hal = { path = "../../../ch5xx-hal", features = [
     "ch585",
     "rt",
-    "memory-x",
 ], default-features = false }
 wchble = { path = "../..", features = ["ch585", "controller"] }
 qingke-rt = "0.8.4"

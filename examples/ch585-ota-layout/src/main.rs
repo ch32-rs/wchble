@@ -1,19 +1,23 @@
 //! OTA slot-A layout: the app links at 0x4000, 0x0 holds a 4-byte jump.
 //!
 //! The reset vector sits at 0x0, so the one image contains both the stub and
-//! the app: `.boot_entry` jumps to slot A and the app's own `.init` takes over.
-//! Everything else links into `0x4000..0x3A000` (216 KiB), leaving the rest of
-//! the 448 KiB code flash to a second slot and the DataFlash OTA metadata.
+//! the app: `.boot_entry` jumps to slot A and the app's `_start` (the first
+//! vector-table word) takes over. Everything else links into
+//! `0x4000..0x3A000` (216 KiB), leaving `0x3A000..0x70000` as slot B; the
+//! DataFlash at `0x70000` carries the OTA metadata.
 //!
 //! Non-secure release only: a secure build of the trouble-host examples is
 //! larger than one slot, so this layout example stays on the plain image.
 //! It only advertises; connection handling belongs to the app, not the layout.
 //!
 //! Build, flash as one ELF with the single-session preflight runner, then scan
-//! for the name:
+//! for the name (commands run from the repository root):
 //!
 //! ```console
 //! cargo build --release --target riscv32imc-unknown-none-elf
+//! tools/ch585-preflight/target/release/ch585-preflight --probe <SERIAL> \
+//!     --chip CH585 --protocol jtag --verify \
+//!     target/riscv32imc-unknown-none-elf/release/ch585-ota-layout
 //! swift examples/ch585-rf-smoke/tools/scan_ch585.swift wch585-ota 8
 //! ```
 
