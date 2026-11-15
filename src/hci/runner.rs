@@ -675,30 +675,28 @@ impl SoftRunner {
             0x0c31 => Err(HCI_INVALID_PARAMETERS),
             // Host Buffer Size — accept and ignore (no C→H flow control).
             0x0c33 if params.len() == 7 => Ok(&[][..]),
-            // Host Number Of Completed Packets — no C→H flow control. The
-            // controller ignores an unknown Connection_Handle and generates
-            // no event (Core 5.4 Vol 4 Part E §7.3.40); a malformed parameter
-            // list is still an error response.
+            // Host Number Of Completed Packets — no C→H flow control, so a
+            // well-formed list never gets an event, whatever handles it names
+            // (Core 5.4 Vol 4 Part E §7.3.40). Only an invalid parameter list
+            // returns Command Complete; Number_Of_Handles is 0…255, so an
+            // empty list is well-formed too.
             0x0c35 => {
                 let handles = usize::from(params.first().copied().unwrap_or(0));
-                if handles == 0 || params.len() != 1 + 4 * handles {
-                    self.log_command(opcode, HCI_INVALID_PARAMETERS);
+                let malformed = params.is_empty() || params.len() != 1 + 4 * handles;
+                self.log_command(
+                    opcode,
+                    if malformed {
+                        HCI_INVALID_PARAMETERS
+                    } else {
+                        HCI_SUCCESS
+                    },
+                );
+                if malformed {
                     self.pending_reply = Some(transport::command_complete_packet(
                         opcode,
                         HCI_INVALID_PARAMETERS,
                         &[],
                     ));
-                    return;
-                }
-                let known = self.bridge.handle().is_some_and(|handle| {
-                    params[1..].chunks_exact(4).all(|entry| {
-                        u16::from_le_bytes([entry[0], entry[1]]) & 0x0fff == handle
-                    })
-                });
-                if known {
-                    self.log_command(opcode, HCI_SUCCESS);
-                    self.pending_reply =
-                        Some(transport::command_complete_packet(opcode, HCI_SUCCESS, &[]));
                 }
                 return;
             }
@@ -1982,13 +1980,27 @@ mod tests {
     }
 
     #[test]
-    fn completed_packets_ignores_unknown_connection() {
+    fn completed_packets_is_silent_unless_malformed() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
 
         // Well-formed, but no connection exists: no event at all.
         inject_cmd(0x0c35, &[1, 0x01, 0x00, 0x00, 0x00]);
+        assert!(runner.pump_once());
+        assert!(transport::try_receive_controller_packet().is_none());
+
+        // Connected, and the handle matches: still no event on success, so
+        // the Host cannot mistake the reply for a completed command.
+        runner.bridge.connected(connection_info()).unwrap();
+        assert!(runner.pump_once()); // flush the queued LE Connection Complete
+        transport::drain_channels_for_test();
+        inject_cmd(0x0c35, &[1, 0x01, 0x00, 0x00, 0x00]);
+        assert!(runner.pump_once());
+        assert!(transport::try_receive_controller_packet().is_none());
+
+        // An empty list is well-formed (Number_Of_Handles is 0…255).
+        inject_cmd(0x0c35, &[0]);
         assert!(runner.pump_once());
         assert!(transport::try_receive_controller_packet().is_none());
 
