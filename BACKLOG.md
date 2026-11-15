@@ -29,10 +29,20 @@ Raw captures and experiment records remain local; they are not required to build
 
 ## Issue #9 audit follow-ups (2026-11-14)
 
-- [ ] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
-  a raw DMA pointer after returning. Needs an interface spec before code: either
-  `unsafe` with a completion contract, or a leak-safe ownership token. Deferred
-  by decision on 2026-11-14; refactor once the spec exists.
+- [x] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
+  a raw DMA pointer after returning. Implemented on `ch585-a1-dma-lifetime` as
+  `unsafe` + completion-contract variant (spec:
+  `local-docs/research/ch585-a1-dma-lifetime-spec.md`): TX force-stops the LLE
+  on timeout before returning, RX refuses to re-point the DMA while a window is
+  still armed, and every call site carries the contract. Offline: 201 lib tests
+  per chip feature, host fixtures 7/1/1, 12 examples build. Hardware on the
+  final images: P2 PASS (`adv=1053/1053`, restore scan), P3 PASS, P4/S2
+  wipe/pair/reconnect PASS (`pairs_complete=1 save_ok=1`,
+  `load_result=1 records_loaded=1`), C1 PASS on the same-image recheck (the
+  first C1 run lost one CONNECT_IND and then hit a supervision timeout with
+  unchanged timing counters, and is filed as RF loss, not a regression). The
+  ownership-token variant stays the follow-up for X3/X5 or an interrupt-driven
+  RX.
 - [x] **B2 — pending security work has no connection epoch.** A queued LTK reply
   survived disconnect and was returned for the next connection with handle 1.
   `SoftRunner` now stores both requests with the bridge epoch and drops them on
