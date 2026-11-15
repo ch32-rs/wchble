@@ -540,7 +540,7 @@ impl Ch592Radio {
 
 ch58x_common! {
     Ch592Radio,
-    fn tx_basic<T: InstantUs>(
+    unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
         frame: &[u8],
@@ -664,6 +664,22 @@ ch58x_common! {
 
         unsafe {
             regs::write(LLE_BASE, lle::IRQSTAT, lle5_irq::TX_DONE);
+        }
+        if rc.is_err() {
+            // The LLE may still be draining `frame`; force-stop it before the
+            // caller's borrow ends (vendor `phy_status_clear`).
+            self.engine_shut();
+            let stopped = clock.now_us();
+            while unsafe { regs::read(LLE_BASE, lle::CMD) } & 0x3 != 0 {
+                if clock.now_us().wrapping_sub(stopped) > 50 {
+                    break;
+                }
+            }
+            debug_assert_eq!(
+                unsafe { regs::read(LLE_BASE, lle::CMD) } & 0x3,
+                0,
+                "LLE still busy after a timed-out TX"
+            );
         }
         rc
     }

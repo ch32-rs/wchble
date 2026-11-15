@@ -139,10 +139,9 @@ fn main() -> ! {
             radio.set_channel(ch).unwrap();
             inc(3);
             put(2, 3);
-            if radio
-                .tx_basic(&clock, &adv_buf.0[..adv_len], 0, None)
-                .is_err()
-            {
+            // SAFETY: `tx_basic` stops the LLE before returning, so the
+            // advertising frame only has to live for the call.
+            if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
                 inc(5);
                 if !stop(&mut radio, &clock) {
                     park();
@@ -153,7 +152,8 @@ fn main() -> ! {
             unsafe {
                 regs::write(BB_BASE, bb::IRQSTAT, 0xf0);
             }
-            if radio.rx_basic(&clock, &mut rx.0, 1_000).is_err() {
+            // SAFETY: every path below stops the engine before returning.
+            if unsafe { radio.rx_basic(&clock, &mut rx.0, 1_000) }.is_err() {
                 inc(15);
                 if !stop(&mut radio, &clock) {
                     park();
@@ -224,7 +224,9 @@ fn main() -> ! {
             put(2, 5);
             let deadline = end.wrapping_add(RESPONSE_DELAY_US);
             put(29, clock.now_us().wrapping_sub(end));
-            match radio.tx_basic(&clock, &rsp_buf.0[..rsp_len], 0, Some(deadline)) {
+            // SAFETY: the response frame only has to live for the call;
+            // `tx_basic` stops the LLE before returning.
+            match unsafe { radio.tx_basic(&clock, &rsp_buf.0[..rsp_len], 0, Some(deadline)) } {
                 Ok(()) => {
                     inc(12);
                 }

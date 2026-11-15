@@ -281,7 +281,7 @@ macro_rules! ch58x_common {
                 self.isr.callback = cb;
             }
 
-            fn rx_basic<T: InstantUs>(
+            unsafe fn rx_basic<T: InstantUs>(
                 &mut self,
                 _clock: &T,
                 rxbuf: &mut [u8],
@@ -292,6 +292,14 @@ macro_rules! ch58x_common {
                 }
                 if self.channel > 39 {
                     return Err(Error::InvalidState);
+                }
+
+                // A previous window that was never observed (the caller skipped
+                // `shut()`) still DMAs through `rx_active`. Force-stop it before
+                // re-pointing RXBUFPTR at the new buffer.
+                if self.isr.rx_armed {
+                    self.engine_shut();
+                    self.isr.clear_rx_flags();
                 }
 
                 // `LL_ScanSetRF` starts with `phy_status_clear(6)`: force-stop a

@@ -753,7 +753,7 @@ impl Radio for Ch32v208Radio {
         self.isr.callback = cb;
     }
 
-    fn tx_basic<T: InstantUs>(
+    unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
         frame: &[u8],
@@ -855,6 +855,22 @@ impl Radio for Ch32v208Radio {
             }
         }
 
+        if rc.is_err() {
+            // The LLE may still be draining `frame`; stop it before the
+            // caller's borrow ends.
+            self.engine_stop();
+            let stopped = clock.now_us();
+            while unsafe { regs::read(LLE_BASE, lle::CMD) } & lle_cmd::BUSY_MASK != 0 {
+                if clock.now_us().wrapping_sub(stopped) > 50 {
+                    break;
+                }
+            }
+            debug_assert_eq!(
+                unsafe { regs::read(LLE_BASE, lle::CMD) } & lle_cmd::BUSY_MASK,
+                0,
+                "LLE still busy after a timed-out TX"
+            );
+        }
         self.guard_exit(saved);
         unsafe {
             // Acknowledge the completion we just consumed so the next call
@@ -864,7 +880,7 @@ impl Radio for Ch32v208Radio {
         rc
     }
 
-    fn rx_basic<T: InstantUs>(
+    unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         _clock: &T,
         rxbuf: &mut [u8],
@@ -879,6 +895,14 @@ impl Radio for Ch32v208Radio {
         }
 
         let saved = self.guard_enter();
+
+        // A previous window that was never observed (the caller skipped
+        // `shut()`) still DMAs through `rx_active`. Stop it before re-pointing
+        // RXBUFPTR at the new buffer.
+        if self.isr.rx_armed {
+            self.engine_stop();
+            self.isr.clear_rx_flags();
+        }
 
         let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
         if busy != 0 {

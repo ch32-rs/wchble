@@ -300,7 +300,9 @@ fn receive_scan(
     }
     let window = until.wrapping_sub(now).saturating_mul(2);
     inc(5);
-    if radio.rx_basic(clock, &mut rx.0, window).is_err() {
+    // SAFETY: `rx` is a static DMA buffer and every path below stops the
+    // engine before returning, so no window outlives this call.
+    if unsafe { radio.rx_basic(clock, &mut rx.0, window) }.is_err() {
         inc(7);
         stop(radio, clock);
         return None;
@@ -425,7 +427,8 @@ fn receive_response(
         return None;
     }
     let window = until.wrapping_sub(now).saturating_mul(2);
-    if radio.rx_basic(clock, &mut rx.0, window).is_err() {
+    // SAFETY: every path below stops the engine before returning.
+    if unsafe { radio.rx_basic(clock, &mut rx.0, window) }.is_err() {
         stop(radio, clock);
         return None;
     }
@@ -780,7 +783,9 @@ fn connection_event(
         put(49, margin);
     }
     inc(20);
-    let sent = radio.tx_basic(clock, &tx.0[..frame.len()], 0, Some(deadline));
+    // SAFETY: `tx_basic` stops the LLE before returning; the frame is a
+    // static buffer that outlives the call anyway.
+    let sent = unsafe { radio.tx_basic(clock, &tx.0[..frame.len()], 0, Some(deadline)) };
     let tx_return = clock.now_us();
     trace(
         clock,
@@ -967,14 +972,17 @@ fn connection_event(
                         let ack = s.link.tx_pdu();
                         let frame = ack.as_bytes();
                         tx.0[..frame.len()].copy_from_slice(frame);
-                        if radio
-                            .tx_basic(
+                        // SAFETY: the ACK frame only has to live for the call;
+                        // `tx_basic` stops the LLE before returning.
+                        if unsafe {
+                            radio.tx_basic(
                                 clock,
                                 &tx.0[..frame.len()],
                                 0,
                                 Some(clock.now_us().wrapping_add(120)),
                             )
-                            .is_ok()
+                        }
+                        .is_ok()
                         {
                             inc(27);
                         }
@@ -1179,7 +1187,9 @@ fn tx_probe(radio: &mut Ch585Radio, clock: &Clock) {
             1 => (&long[..], 1),
             _ => (&big.0 .0[..big_len], 2),
         };
-        let result = radio.tx_basic(clock, frame, 0, None);
+        // SAFETY: the probe frame outlives this call and `tx_basic` stops the
+        // LLE before returning, including on timeout.
+        let result = unsafe { radio.tx_basic(clock, frame, 0, None) };
         unsafe {
             let stats = core::ptr::addr_of_mut!(PROBE_STATS).cast::<u32>();
             let slot = stats.add(kind);

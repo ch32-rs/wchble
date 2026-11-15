@@ -197,10 +197,9 @@ fn read_window(
         inc(ARM_ERRORS);
         return None;
     }
-    if radio
-        .rx_basic(clock, &mut rx.0, WINDOW_HALF_US)
-        .is_err()
-    {
+    // SAFETY: the window is stopped on every path below (including `park()`),
+    // so the static DMA buffer is never reused while armed.
+    if unsafe { radio.rx_basic(clock, &mut rx.0, WINDOW_HALF_US) }.is_err() {
         inc(ARM_ERRORS);
         if !stop(radio, clock) {
             park();

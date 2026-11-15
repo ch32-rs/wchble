@@ -238,7 +238,9 @@ fn read_window(
         inc(ARM_ERRORS);
         return None;
     }
-    if radio.rx_basic(clock, &mut rx.0, WINDOW_HALF_US).is_err() {
+    // SAFETY: every path below stops the engine before returning, so the
+    // static DMA buffer is finalized before it can be reused.
+    if unsafe { radio.rx_basic(clock, &mut rx.0, WINDOW_HALF_US) }.is_err() {
         inc(ARM_ERRORS);
         if !stop(radio, clock) {
             park();
@@ -479,7 +481,9 @@ fn answer(
     // deadline; all STATS bookkeeping is deferred until after TX_DONE.
     let deadline = adv_end_us.wrapping_add(SCAN_REQ_START_AFTER_RX_DONE_US);
     let entry = clock.now_us();
-    let result = radio.tx_basic(clock, &tx.0[..len], 0, Some(deadline));
+    // SAFETY: `tx_basic` stops the LLE before returning, including the
+    // `Late`/timeout paths, so the frame only has to live for the call.
+    let result = unsafe { radio.tx_basic(clock, &tx.0[..len], 0, Some(deadline)) };
     let tx_done = clock.now_us();
     let entry_delta = entry.wrapping_sub(adv_end_us);
     let ret_delta = tx_done.wrapping_sub(adv_end_us);
@@ -528,10 +532,8 @@ fn answer(
     unsafe {
         regs::write(BB_BASE, bb::IRQSTAT, 0xf0);
     }
-    if radio
-        .rx_basic(clock, &mut rx_rsp.0, RSP_WINDOW_HALF_US)
-        .is_err()
-    {
+    // SAFETY: as above, the response window is stopped on every path.
+    if unsafe { radio.rx_basic(clock, &mut rx_rsp.0, RSP_WINDOW_HALF_US) }.is_err() {
         inc(RSP_ARM_ERRORS);
         if !stop(radio, clock) {
             park();

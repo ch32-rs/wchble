@@ -110,7 +110,7 @@ macro_rules! stub_radio {
                 self.isr.callback = cb;
             }
 
-            fn tx_basic<T: InstantUs>(
+            unsafe fn tx_basic<T: InstantUs>(
                 &mut self,
                 _clock: &T,
                 frame: &[u8],
@@ -124,7 +124,7 @@ macro_rules! stub_radio {
                 Err(Error::Unsupported)
             }
 
-            fn rx_basic<T: InstantUs>(
+            unsafe fn rx_basic<T: InstantUs>(
                 &mut self,
                 _clock: &T,
                 rxbuf: &mut [u8],

@@ -139,7 +139,8 @@ fn tx_burst(radio: &mut Ch592Radio, clock: &UsClock, out: &mut SDIPrint, frame: 
             continue;
         }
         for i in 0u32..2 {
-            match radio.tx_basic(clock, frame, 0, None) {
+            // SAFETY: `tx_basic` stops the LLE before returning.
+            match unsafe { radio.tx_basic(clock, frame, 0, None) } {
                 Ok(()) => {
                     let _ = writeln!(out, "tx ch{} ok #{}", ch, i);
                 }
@@ -170,7 +171,9 @@ fn rx_once(
     // Clear the sticky CRC-fail latch before arming so the flag read after
     // RX_DONE belongs to this packet.
     unsafe { regs::write(BB_BASE, bb::IRQSTAT, BB_CRC_ERR) };
-    if radio.rx_basic(clock, rxbuf, window_half_us).is_err() {
+    // SAFETY: this window is polled to completion and stopped before the
+    // caller can reuse `rxbuf`.
+    if unsafe { radio.rx_basic(clock, rxbuf, window_half_us) }.is_err() {
         return None;
     }
 
@@ -277,7 +280,7 @@ fn main() -> ! {
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
             if radio.set_channel(ch).is_ok() {
-                if let Err(e) = radio.tx_basic(&clock, &frame[..n], 0, None) {
+                if let Err(e) = unsafe { radio.tx_basic(&clock, &frame[..n], 0, None) } {
                     let _ = writeln!(out, "adv tx ch{} err {:?}", ch, e);
                 }
             }
@@ -287,7 +290,7 @@ fn main() -> ! {
         radio.set_aa_crc(0x7176_4129, 0x55_5555);
         if radio.set_channel(39).is_ok() {
             let rf_frame = [0x00u8, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
-            let _ = radio.tx_basic(&clock, &rf_frame, 0, None);
+            let _ = unsafe { radio.tx_basic(&clock, &rf_frame, 0, None) };
         }
 
         // Periodically prove the RX path on silicon while the loop runs.
