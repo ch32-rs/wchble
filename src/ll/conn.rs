@@ -447,9 +447,13 @@ pub fn time_reached(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) as i32 >= 0
 }
 
+/// Core 5.4 Vol 6 Part B §5.5.1: a modulo distance of at least 32767 means
+/// the Instant is in the past. Distance zero is legal: §5.1.1 lets a procedure
+/// first arrive at its own Instant, in which case the carrying packet is the
+/// new anchor and the caller applies the change immediately.
 pub fn validate_instant(current: u16, instant: u16) -> Result<(), ConnError> {
     let distance = instant.wrapping_sub(current);
-    if distance == 0 || distance >= 0x8000 {
+    if distance >= 0x7fff {
         Err(ConnError::InstantPassed)
     } else {
         Ok(())
@@ -617,7 +621,12 @@ impl PeripheralConnection {
         if self.pending_map.is_some() {
             return Err(ConnError::ProcedureCollision);
         }
-        self.pending_map = Some((instant, map));
+        if instant == self.event_counter {
+            self.csa.set_map(map)?;
+            self.params.channel_map = map;
+        } else {
+            self.pending_map = Some((instant, map));
+        }
         Ok(())
     }
 
@@ -627,7 +636,16 @@ impl PeripheralConnection {
         if self.pending_update.is_some() {
             return Err(ConnError::ProcedureCollision);
         }
-        self.pending_update = Some(update);
+        if update.instant == self.event_counter {
+            // First received at the instant itself (§5.1.1): the packet that
+            // carried the PDU is the anchor (`on_rx_anchor` has already set
+            // it) and WinSize/WinOffset do not apply.
+            self.params.interval = update.interval;
+            self.params.latency = update.latency;
+            self.params.timeout = update.timeout;
+        } else {
+            self.pending_update = Some(update);
+        }
         Ok(())
     }
 
@@ -1177,7 +1195,7 @@ mod tests {
         c.event_counter = 0xfffe;
         assert_eq!(validate_instant(0xfffe, 1), Ok(()));
         assert_eq!(validate_instant(1, 0xfffe), Err(ConnError::InstantPassed));
-        assert_eq!(validate_instant(1, 1), Err(ConnError::InstantPassed));
+        assert_eq!(validate_instant(1, 1), Ok(()));
         c.schedule_channel_map([1, 0, 0, 0, 0x10], 0).unwrap();
         let update = ConnectionUpdate {
             win_size: 1,
@@ -1202,5 +1220,56 @@ mod tests {
         assert_eq!(c.params.interval, 40);
         c.next_event().unwrap();
         assert_eq!(c.event_start_us(), 1250 + 60_000 + 2500 + 50_000);
+    }
+
+    #[test]
+    fn instant_distance_32767_is_past_and_zero_is_legal() {
+        // §5.5.1: modulo distance >= 32767 is in the past.
+        assert_eq!(validate_instant(0, 0x7ffe), Ok(()));
+        assert_eq!(validate_instant(0, 0x7fff), Err(ConnError::InstantPassed));
+        assert_eq!(validate_instant(0, 0x8000), Err(ConnError::InstantPassed));
+        // §5.1.1: first receiving the procedure at its own Instant is legal.
+        assert_eq!(validate_instant(0, 0), Ok(()));
+    }
+
+    #[test]
+    fn same_instant_update_uses_the_packet_as_anchor() {
+        let mut c = PeripheralConnection::new(params(), 0, false);
+        // First packet of event 0: the control PDU that carries the update.
+        assert!(c.on_rx_anchor(1_000, 12));
+        let anchor = 1_000 - (80 + 12 * 8);
+        assert_eq!(c.event_start_us(), anchor);
+        let old = c.params.clone();
+        let update = ConnectionUpdate {
+            win_size: 8,
+            win_offset: 20,
+            interval: 40,
+            latency: 2,
+            timeout: 300,
+            instant: 0,
+        };
+        assert_eq!(c.schedule_update(update), Ok(()));
+        // New parameters apply now...
+        assert_eq!(c.params.interval, 40);
+        assert_eq!(c.params.latency, 2);
+        assert_eq!(c.params.timeout, 300);
+        // ...WinOffset/WinSize do not, and the packet anchor is unchanged.
+        assert_eq!(c.params.win_size, old.win_size);
+        assert_eq!(c.params.win_offset, old.win_offset);
+        assert_eq!(c.event_start_us(), anchor);
+        // The update is not left pending for a later (or wrapped) instant.
+        c.next_event().unwrap();
+        assert_eq!(c.event_counter(), 1);
+        assert_eq!(c.event_start_us(), anchor + 40 * 1250);
+        assert_eq!(c.params.interval, 40);
+    }
+
+    #[test]
+    fn same_instant_channel_map_applies_now() {
+        let mut c = PeripheralConnection::new(params(), 0, false);
+        let map = [1, 0, 0, 0, 0x10];
+        assert_eq!(c.schedule_channel_map(map, 0), Ok(()));
+        assert_eq!(c.params.channel_map, map);
+        assert!(c.pending_map.is_none());
     }
 }

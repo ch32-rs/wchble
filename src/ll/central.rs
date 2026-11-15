@@ -151,7 +151,12 @@ impl CentralConnection {
         if self.pending_map.is_some() {
             return Err(ConnError::ProcedureCollision);
         }
-        self.pending_map = Some((instant, map));
+        if instant == self.event_counter {
+            self.csa.set_map(map)?;
+            self.params.channel_map = map;
+        } else {
+            self.pending_map = Some((instant, map));
+        }
         Ok(())
     }
 
@@ -161,7 +166,15 @@ impl CentralConnection {
         if self.pending_update.is_some() {
             return Err(ConnError::ProcedureCollision);
         }
-        self.pending_update = Some(update);
+        if update.instant == self.event_counter {
+            // A same-instant update takes effect now; the central's own
+            // anchor is unchanged and WinOffset/WinSize do not apply.
+            self.params.interval = update.interval;
+            self.params.latency = update.latency;
+            self.params.timeout = update.timeout;
+        } else {
+            self.pending_update = Some(update);
+        }
         Ok(())
     }
 
@@ -353,15 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_instant_is_rejected() {
+    fn past_instant_is_rejected_but_same_instant_applies() {
         let mut conn = CentralConnection::new(params(), 0);
         assert_eq!(
-            conn.schedule_channel_map([0xff, 0xff, 0xff, 0xff, 0x1f], 0),
+            conn.schedule_channel_map([1, 0, 0, 0, 0x10], 0xffff),
             Err(ConnError::InstantPassed)
         );
-        assert_eq!(
-            conn.schedule_channel_map([0xff, 0xff, 0xff, 0xff, 0x1f], 0xffff),
-            Err(ConnError::InstantPassed)
-        );
+        // Same instant: legal and applied immediately (§5.1.1).
+        assert_eq!(conn.schedule_channel_map([1, 0, 0, 0, 0x10], 0), Ok(()));
+        assert_eq!(conn.params.channel_map, [1, 0, 0, 0, 0x10]);
     }
 }

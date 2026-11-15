@@ -69,9 +69,12 @@ def flash(elf, out, prefix, check_idle=True):
     # the core between those steps, so this helper replaces the old sequence.
     if not PREFLIGHT.is_file():
         raise RuntimeError(f'preflight helper missing: {PREFLIGHT}; run cargo build --release in tools/ch585-preflight')
+    # A verified download of a ~296 KB image measured 39 s on this link, which
+    # the generic 40 s command timeout cuts off as the image grows. Keep this a
+    # transport guard, separate from the finite-run and acceptance budgets.
     command([str(PREFLIGHT), '--probe', '1a86:8010:F93D8F067E10', '--chip', 'CH585',
              '--protocol', 'jtag', '--verify', str(elf)],
-            out / f'{prefix}-flash.log')
+            out / f'{prefix}-flash.log', timeout=120)
 
 
 def evaluate_stats(obs, scan_result):
