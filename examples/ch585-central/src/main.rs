@@ -519,7 +519,7 @@ fn prepare_initiator(
         hop: CONNECT_HOP,
         sca: CONNECT_SCA,
     };
-    let (own_addr, own_random) = soft.own_addr();
+    let (own_addr, own_random) = soft.initiator_addr(&request);
     let Some(ind_len) = params.build_connect_ind(&mut conn_buf.0 .0, own_addr, own_random) else {
         inc(17);
         let _ = soft.bridge.connection_failed(0x12);

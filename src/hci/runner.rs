@@ -426,9 +426,22 @@ impl SoftRunner {
         self.pending_connect = None;
     }
 
-    /// Currently selected own address and whether it is random.
+    /// Currently selected own address and whether it is random (advertising).
     pub fn own_addr(&self) -> ([u8; 6], bool) {
         (self.ll.adv.own_addr, self.ll.adv.random_addr)
+    }
+
+    /// Own address for a pending create-connection request, selected by the
+    /// request's Own_Address_Type rather than by advertising state
+    /// (Core 5.4 Vol 4 Part E §7.8.12).
+    pub fn initiator_addr(&self, request: &CreateConnRequest) -> ([u8; 6], bool) {
+        if request.own_random {
+            // `create_connection` rejects this selection without a random
+            // address, so the fallback is unreachable in practice.
+            (self.random_addr.unwrap_or([0; 6]), true)
+        } else {
+            (self.bd_addr, false)
+        }
     }
 
     pub fn adv_reports_dropped(&self) -> u32 {
@@ -577,9 +590,9 @@ impl SoftRunner {
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
         self.suggested_tx_time = LL_LEGACY_TIME_US;
         self.suggested_tx_explicit = false;
-        if self.random_addr.is_some() {
-            self.sync_adv_addr();
-        }
+        // `LinkLayer::new` resets AdvA to a zero random address; restore the
+        // selected own address even when only a public BD_ADDR is known.
+        self.sync_adv_addr();
         self.pending_reply = Some(transport::command_complete_packet(0x0c03, HCI_SUCCESS, &[]));
     }
 
@@ -662,8 +675,33 @@ impl SoftRunner {
             0x0c31 => Err(HCI_INVALID_PARAMETERS),
             // Host Buffer Size — accept and ignore (no C→H flow control).
             0x0c33 if params.len() == 7 => Ok(&[][..]),
-            // Host Number Of Completed Packets — accept empty work.
-            0x0c35 => Ok(&[][..]),
+            // Host Number Of Completed Packets — no C→H flow control. The
+            // controller ignores an unknown Connection_Handle and generates
+            // no event (Core 5.4 Vol 4 Part E §7.3.40); a malformed parameter
+            // list is still an error response.
+            0x0c35 => {
+                let handles = usize::from(params.first().copied().unwrap_or(0));
+                if handles == 0 || params.len() != 1 + 4 * handles {
+                    self.log_command(opcode, HCI_INVALID_PARAMETERS);
+                    self.pending_reply = Some(transport::command_complete_packet(
+                        opcode,
+                        HCI_INVALID_PARAMETERS,
+                        &[],
+                    ));
+                    return;
+                }
+                let known = self.bridge.handle().is_some_and(|handle| {
+                    params[1..].chunks_exact(4).all(|entry| {
+                        u16::from_le_bytes([entry[0], entry[1]]) & 0x0fff == handle
+                    })
+                });
+                if known {
+                    self.log_command(opcode, HCI_SUCCESS);
+                    self.pending_reply =
+                        Some(transport::command_complete_packet(opcode, HCI_SUCCESS, &[]));
+                }
+                return;
+            }
             // Read BD_ADDR
             0x1009 if params.is_empty() => Ok(&bd_addr[..]),
             // Read RSSI — no connection; disallowed until Phase C.
@@ -761,9 +799,10 @@ impl SoftRunner {
                 ));
                 return;
             }
-            // LE Set Random Address
+            // LE Set Random Address — disallowed while advertising, scanning
+            // or initiating (Core 5.4 Vol 4 Part E §7.8.4).
             0x2005 if params.len() == 6 => {
-                if self.ll.adv.enabled {
+                if self.ll.adv.enabled || self.scan.enabled || self.pending_connect.is_some() {
                     Err(HCI_COMMAND_DISALLOWED)
                 } else {
                     self.set_random_addr(params.try_into().unwrap());
@@ -803,8 +842,15 @@ impl SoftRunner {
                 self.ll.adv.enabled = enable;
                 Ok(&[][..])
             }
-            // LE Set Scan Parameters — passive only.
-            0x200b if params.len() == 7 => self.set_scan_params(params),
+            // LE Set Scan Parameters — passive only; disallowed while scanning
+            // (Core 5.4 Vol 4 Part E §7.8.10).
+            0x200b if params.len() == 7 => {
+                if self.scan.enabled {
+                    Err(HCI_COMMAND_DISALLOWED)
+                } else {
+                    self.set_scan_params(params)
+                }
+            }
             // LE Set Scan Enable
             0x200c if params.len() == 2 && params.iter().all(|value| *value <= 1) => {
                 let enable = params[0] != 0;
@@ -819,10 +865,17 @@ impl SoftRunner {
                 self.scan.filter_duplicates = params[1] != 0;
                 Ok(&[][..])
             }
-            // LE Create Connection Cancel
+            // LE Create Connection Cancel — no pending initiation is a
+            // synchronous Command Complete with Command Disallowed
+            // (Core 5.4 Vol 4 Part E §7.8.13), not Command Status.
             0x200e if params.is_empty() => {
                 if self.pending_connect.take().is_none() {
-                    self.reply_status(opcode, HCI_COMMAND_DISALLOWED);
+                    self.log_command(opcode, HCI_COMMAND_DISALLOWED);
+                    self.pending_reply = Some(transport::command_complete_packet(
+                        opcode,
+                        HCI_COMMAND_DISALLOWED,
+                        &[],
+                    ));
                     return;
                 }
                 let _ = self.bridge.connection_failed(0x02);
@@ -1004,6 +1057,11 @@ impl SoftRunner {
                 <= 2 * u32::from(latency + 1) * u32::from(interval_max) * 1250
         {
             return HCI_INVALID_PARAMETERS;
+        }
+        if own_kind == 1 && self.random_addr.is_none() {
+            // §7.8.12: Random own address requires an initialized random
+            // address; otherwise the command is disallowed.
+            return HCI_COMMAND_DISALLOWED;
         }
         let mut peer_addr = [0; 6];
         peer_addr.copy_from_slice(&params[6..12]);
@@ -1803,6 +1861,10 @@ mod tests {
             runner.own_addr(),
             ([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21], true)
         );
+        assert_eq!(
+            runner.initiator_addr(&request),
+            ([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21], true)
+        );
 
         pollster::block_on(async {
             inject_cmd(0x200e, &[]);
@@ -1816,6 +1878,124 @@ mod tests {
         assert_eq!(payload[0], 0x3e);
         assert_eq!(payload[2], 0x01); // LE Connection Complete
         assert_eq!(payload[3], 0x02); // Unknown Connection Identifier
+    }
+
+    #[test]
+    fn cancel_without_pending_is_command_complete() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x200e, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x200e, HCI_COMMAND_DISALLOWED, &[]);
+        });
+    }
+
+    #[test]
+    fn scan_state_rejects_address_and_scan_parameter_changes() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0x21, 0x00, 0x00, 0xEE, 0xFF, 0xC1]);
+
+        pollster::block_on(async {
+            inject_cmd(0x200b, &scan_params());
+            runner.serve_one().await;
+            expect_command_complete(0x200b, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x200c, &[1, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_SUCCESS, &[]);
+
+            // While scanning: neither the scan parameters nor the random
+            // address may change (§7.8.4, §7.8.10).
+            inject_cmd(0x200b, &scan_params());
+            runner.serve_one().await;
+            expect_command_complete(0x200b, HCI_COMMAND_DISALLOWED, &[]);
+
+            inject_cmd(0x2005, &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x22]);
+            runner.serve_one().await;
+            expect_command_complete(0x2005, HCI_COMMAND_DISALLOWED, &[]);
+        });
+    }
+
+    #[test]
+    fn random_address_is_rejected_while_initiating() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0x21, 0x00, 0x00, 0xEE, 0xFF, 0xC1]);
+
+        pollster::block_on(async {
+            inject_cmd(0x200d, &create_params([1, 2, 3, 4, 5, 6]));
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_SUCCESS);
+
+            inject_cmd(0x2005, &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x22]);
+            runner.serve_one().await;
+            expect_command_complete(0x2005, HCI_COMMAND_DISALLOWED, &[]);
+        });
+    }
+
+    #[test]
+    fn public_own_address_survives_reset_and_selects_initiator_addr() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let public = [9, 8, 7, 6, 5, 4];
+        runner.set_bd_addr(public);
+
+        pollster::block_on(async {
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+        });
+        assert_eq!(runner.own_addr(), (public, false));
+
+        let mut params = create_params([1, 2, 3, 4, 5, 6]);
+        params[12] = 0; // Own_Address_Type = Public
+        pollster::block_on(async {
+            inject_cmd(0x200d, &params);
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_SUCCESS);
+        });
+        let request = runner.pending_connect().unwrap();
+        assert!(!request.own_random);
+        assert_eq!(runner.initiator_addr(&request), (public, false));
+    }
+
+    #[test]
+    fn random_own_address_requires_an_initialized_random_address() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            // `create_params` selects Own_Address_Type = Random (1).
+            inject_cmd(0x200d, &create_params([1, 2, 3, 4, 5, 6]));
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_COMMAND_DISALLOWED);
+        });
+        assert!(runner.pending_connect().is_none());
+    }
+
+    #[test]
+    fn completed_packets_ignores_unknown_connection() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        // Well-formed, but no connection exists: no event at all.
+        inject_cmd(0x0c35, &[1, 0x01, 0x00, 0x00, 0x00]);
+        assert!(runner.pump_once());
+        assert!(transport::try_receive_controller_packet().is_none());
+
+        // A malformed parameter list still gets an error response.
+        inject_cmd(0x0c35, &[2, 0x01, 0x00, 0x00, 0x00]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x0c35, HCI_INVALID_PARAMETERS, &[]);
     }
 
     #[test]
