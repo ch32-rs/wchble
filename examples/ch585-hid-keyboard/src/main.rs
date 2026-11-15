@@ -506,6 +506,14 @@ struct DeferredControl {
     bytes: [u8; 27],
 }
 
+/// Control PDUs that carry no Instant and may be answered one event later.
+/// Parsing them in the post-event gap keeps the connection-event path short
+/// on a cold flash fetch: the first LL_FEATURE_REQ alone measured 95 us
+/// before TX and missed the 120 us start deadline.
+fn deferrable_control(opcode: u8) -> bool {
+    matches!(opcode, 0x08 | 0x09 | 0x0c | 0x14 | 0x15)
+}
+
 /// A received encrypted PDU held until after the event, when AES-CCM can run
 /// outside the 150 us response deadline.
 struct DeferredRx {
@@ -912,13 +920,13 @@ fn connection_event(
                                 subversion: 1,
                             };
                             note_control_rx(s, payload);
-                            // DLE has no Instant and its reply is sent in a
-                            // later event either way, so parse it in the
-                            // post-event idle gap. A cold `on_pdu` +
-                            // `apply_data_length` measured 86 us here and
-                            // pushed the first LL_LENGTH_REQ response past
-                            // its 120 us transmit start.
-                            if matches!(payload[0], 0x14 | 0x15)
+                            // These procedures have no Instant and tolerate a
+                            // reply one event later, so parse them in the
+                            // post-event idle gap rather than inside the
+                            // window. A cold LL_LENGTH_REQ or LL_FEATURE_REQ
+                            // measured 86…95 us here and pushed the first
+                            // response past its 120 us transmit start.
+                            if deferrable_control(payload[0])
                                 && s.deferred_control.is_none()
                                 && payload.len() <= 27
                             {
@@ -1115,6 +1123,14 @@ fn connection_event(
             // Trouble then sees a continuation with no reassembly in progress,
             // returns `InvalidState`, and closes the link with 0x13. Deliver
             // it even though the response is late.
+            //
+            // The Host must see the link before any ACL data, and a Late first
+            // response does not make the link less real: report it here too,
+            // or the Host refuses every ACL PDU for backpressure until the
+            // peer's supervision timeout.
+            if let Some(reason) = report_connection(soft, s) {
+                return Some(reason);
+            }
             if deliver_acl && soft.bridge.receive_acl(llid, payload).is_err() {
                 inc(63);
                 return Some(0x1f);
@@ -1123,29 +1139,8 @@ fn connection_event(
         }
         // Serialize HCI output only after the time-critical radio response.
         // No Host poll can consume the RX reservation in this interval.
-        //
-        // Report the link whenever the Host has not seen it yet, not only on
-        // the first received PDU: when that PDU's response is `Late` the
-        // `!sent` branch returns above, and `on_rx_anchor` has already set
-        // `established`, so a `first`-only gate would never report at all and
-        // the Host would answer every ACL PDU with backpressure until the
-        // peer's supervision timeout.
-        if !soft.bridge.is_connected() {
-            let p = s.conn.params;
-            let info = ConnectionInfo {
-                handle: 1,
-                role: wchble::ll::Role::Peripheral,
-                peer_address_type: u8::from(p.peer_random),
-                peer_address: p.peer_addr,
-                interval: p.interval,
-                latency: p.latency,
-                supervision_timeout: p.timeout,
-                master_clock_accuracy: p.sca,
-            };
-            if soft.bridge.connected(info).is_err() {
-                inc(63);
-                return Some(0x1f);
-            }
+        if let Some(reason) = report_connection(soft, s) {
+            return Some(reason);
         }
         if let Some(tag) = acknowledged_acl {
             if !soft.bridge.ack_tx(tag) {
@@ -1192,6 +1187,32 @@ fn connection_event(
         ));
     }
     s.expiration(clock.now_us())
+}
+
+/// Report LE Connection Complete once, after the event's time-critical work.
+/// Called both when the response left and when it could not leave (`Late`):
+/// the Host must know about the link before it receives any ACL data, or it
+/// answers every ACL PDU with backpressure until the peer times out.
+fn report_connection(soft: &mut SoftRunner, s: &Session) -> Option<u8> {
+    if soft.bridge.is_connected() {
+        return None;
+    }
+    let p = s.conn.params;
+    let info = ConnectionInfo {
+        handle: 1,
+        role: wchble::ll::Role::Peripheral,
+        peer_address_type: u8::from(p.peer_random),
+        peer_address: p.peer_addr,
+        interval: p.interval,
+        latency: p.latency,
+        supervision_timeout: p.timeout,
+        master_clock_accuracy: p.sca,
+    };
+    if soft.bridge.connected(info).is_err() {
+        inc(63);
+        return Some(0x1f);
+    }
+    None
 }
 
 /// Turn the Host's LTK answer into a session cipher and precompute the
@@ -1425,7 +1446,14 @@ fn service_control(soft: &mut SoftRunner, s: &mut Session, now: u32) -> Option<u
 /// sending LL_FEATURE_REQ without LL_LENGTH_REQ, so the controller asks first
 /// once the peer features are known and the encryption procedure is idle.
 fn service_dle(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
-    if !s.conn.established() || s.link.has_outstanding() || !s.encryption_idle() {
+    // `service_control` may have left a deferred reply in `pending_control`;
+    // it owns the next event's TX slot. Keep the request queued for the gap
+    // after that reply instead of overwriting it.
+    if !s.conn.established()
+        || s.link.has_outstanding()
+        || s.pending_control.is_some()
+        || !s.encryption_idle()
+    {
         return None;
     }
     let requested = soft.take_data_length_request();
