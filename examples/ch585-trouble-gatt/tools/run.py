@@ -41,9 +41,29 @@ def observation_symbols(text, image):
     if len(matches) != 1:
         raise ValueError('missing or ambiguous HOST_STATS symbol')
     symbols['HOST_STATS'] = int(matches[0][0], 16)
+    # HCI command log and failure code, written by the main loop's idle polls.
+    # Optional: older images predate the diag block.
+    matches = [parts for line in text.splitlines()
+               if len(parts := line.split()) == 3 and parts[2] == 'SEC_DIAG']
+    if len(matches) > 1:
+        raise ValueError('ambiguous SEC_DIAG symbol')
+    if matches:
+        symbols['SEC_DIAG'] = int(matches[0][0], 16)
+    # Diagnostic-only timing probes; absent from product images.
+    matches = [parts for line in text.splitlines()
+               if len(parts := line.split()) == 3 and parts[2] == 'DIAG2']
+    if len(matches) > 1:
+        raise ValueError('ambiguous DIAG2 symbol')
+    if matches:
+        symbols['DIAG2'] = int(matches[0][0], 16)
     sections = p3.elf_sections(image)
     ranges = []
-    for name, count in (('STATS', 64), ('HOST_STATS', 16), ('TRACE', 128 * 8)):
+    buffers = [('STATS', 64), ('HOST_STATS', 16), ('TRACE', 128 * 8)]
+    if 'SEC_DIAG' in symbols:
+        buffers.append(('SEC_DIAG', 64))
+    if 'DIAG2' in symbols:
+        buffers.append(('DIAG2', 8))
+    for name, count in buffers:
         address, size = symbols[name], count * 4
         if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000
                 or not any(section['flags'] & 3 == 3 and section['address'] <= address
@@ -248,6 +268,18 @@ def execute(args):
                         (args.out / f'{name.lower()}.json').write_text(json.dumps(metadata[name.lower()], indent=2) + '\n')
                     except FAILURES as error:
                         errors.append(f'{name} observations: {error}')
+                if 'SEC_DIAG' in symbols:
+                    try:
+                        metadata['sec_diag'] = io.read32(
+                            symbols['SEC_DIAG'], 64, args.out / 'sec_diag.txt')
+                    except FAILURES as error:
+                        errors.append(f'SEC_DIAG observations: {error}')
+                if 'DIAG2' in symbols:
+                    try:
+                        metadata['diag2'] = io.read32(
+                            symbols['DIAG2'], 8, args.out / 'diag2.txt')
+                    except FAILURES as error:
+                        errors.append(f'DIAG2 observations: {error}')
                 obs = observations.get('STATS', [])
                 try:
                     # Without STATS, retain the raw full buffer rather than
