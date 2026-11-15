@@ -109,9 +109,11 @@ PASS (`e889b449…`) and P4 PASS after the late-TX fix below (`4ef3ab07…`,
   window. When that TX returned `Late`, `on_rx_anchor` had already set
   `established`, so the report was never sent: the Host stayed in advertising,
   every ACL PDU was refused for backpressure, and the peer reached supervision
-  timeout with no HCI error logged. Both now report whenever
-  `bridge.is_connected()` is false. Offline: `tests/trouble-host`; hardware:
-  P4 trouble-gatt (Host connected and completed the GATT cycle).
+  timeout with no HCI error logged. Both now call one `report_connection`
+  helper whenever `bridge.is_connected()` is false — after a successful
+  response and also on the `Late` path, before any ACL data reaches the Host.
+  Offline: `tests/trouble-host`; hardware: P4 trouble-gatt (Host connected and
+  completed the GATT cycle).
 - [x] **Peripheral late TX under live Host traffic (X1 DLE regression).**
   Introduced by the X1 DLE work, not by A1: bisect with three images shows
   `cd9a186` (11-12) `tx_late=0`, `b2db898` (pre-A1) `tx_late=35`, and the
@@ -121,14 +123,21 @@ PASS (`e889b449…`) and P4 PASS after the late-TX fix below (`4ef3ab07…`,
   LL_LENGTH_REQ handling (`ControlState::on_pdu` 52 us + `apply_data_length`
   55 us; the first request consumed 86 us and entered TX at 119 us against the
   120 us start deadline). Fixes: `.highcode` on `queue_next_host_fragment`,
-  `apply_data_length`, and `ControlState::on_pdu`; DLE (0x14/0x15) parsing
-  deferred to the post-event idle gap (`DeferredControl` / `service_control`)
-  because its reply already leaves one event later. Result 35 -> 3 -> 1 -> 0.
-  Hardware: P4 `4ef3ab07…` PASS (`tx_late=0`, handler 11 us, tx entry 26 us),
-  HID secure `1fe9dd9c…` PASS. Evidence:
-  `local-docs/results/diag-p4-*` and `diag-hid-deferred`.
-  `max_host_poll_us≈2.16 ms` remains just above the 2 ms poll guard but the
-  overrun counter is 0 on both runs (the guard measures the gap, the counter
+  `apply_data_length`, and `ControlState::on_pdu`; control procedures without
+  an Instant (0x08/0x09/0x0c/0x14/0x15) deferred to the post-event idle gap
+  (`DeferredControl` / `service_control`, guarded so it never displaces a
+  reply the encryption procedure or `service_dle` owns) because their reply
+  may leave one event later. Result 35 -> 3 -> 1 -> 0.
+  The review round showed how marginal the cold path was: a helper extraction
+  rerolled code placement and the first LL_FEATURE_REQ then entered TX at
+  95 us (late again), which is why the deferral now covers all Instant-free
+  control procedures rather than DLE alone.
+  Hardware: P4 `85fc661a…` PASS (`tx_late=0`, 61/61 data, no retries) and HID
+  secure `6360c65b…` PASS. Evidence:
+  `local-docs/results/diag-p4-*`, `review-p4-*`, `diag-hid-deferred`,
+  `review-hid-*`.
+  `max_host_poll_us≈1.2…2.16 ms` sits near the 2 ms poll guard on HID while
+  its overrun counter stays 0-1 (the guard measures the gap, the counter
   counts an actual reserved-RX collision).
 - [ ] **TX timeout quiescence / hardware ownership single-instance audit** and
   the advertising `advDelay` distribution check — need evidence first.
