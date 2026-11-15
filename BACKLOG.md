@@ -51,9 +51,15 @@ Raw captures and experiment records remain local; they are not required to build
   `SoftRunner` now stores both requests with the bridge epoch and drops them on
   disconnect/reset; a repeated Enable Encryption is no longer blocked by a stale
   entry.
-- [ ] **B3 — Instant boundaries.** `validate_instant(0, 32767)` accepts a
-  past Instant and rejects a legal same-instant update; applying a current-instant
-  update needs immediate re-anchoring, not just a predicate change.
+- [x] **B3 — Instant boundaries.** `validate_instant` now treats only a modulo
+  distance of at least `0x7fff` as past; distance zero is legal (§5.1.1) and is
+  applied by the receiving event in both roles: the channel map updates CSA and
+  the stored map, a connection update applies interval/latency/timeout only
+  (WinOffset/WinSize do not apply) and keeps the packet as the new anchor.
+  Tests: `instant_distance_32767_is_past_and_zero_is_legal`,
+  `same_instant_update_uses_the_packet_as_anchor`,
+  `same_instant_channel_map_applies_now` and the central-role
+  `past_instant_is_rejected_but_same_instant_applies`.
 - [ ] **B4 — CRC-failed packet vs establishment/supervision.** Core §4.5 lets any
   received data-channel packet establish the link (and §4.5.5 uses the first
   received packet as the Peripheral anchor) even on a CRC error, while payload
@@ -64,13 +70,30 @@ Raw captures and experiment records remain local; they are not required to build
 - [ ] **B6 — scan/filter policy application.** Filter_Duplicates, basic filtered
   policy 1 (with an accept list) and directed-ADV target filtering are accepted
   but not applied; initiator policy 1 ignores Peer_Address.
-- [ ] **B7 — HCI state restrictions.** Set Random Address / Set Scan Parameters
-  are accepted while scanning or advertising; they must return Command Disallowed.
-- [ ] **B8 — Own address selection per procedure.** A public-address Create
-  Connection can be initiated with the default zero/random address.
-- [ ] **B9 — HCI command-response contracts.** Create Connection Cancel without a
-  pending initiation returns Command Status instead of Command Complete; Host
-  Number Of Completed Packets answers with Command Complete in an idle state.
+- [x] **B7 — HCI state restrictions.** Set Random Address now returns Command
+  Disallowed while advertising, scanning or initiating (§7.8.4), and Set Scan
+  Parameters while scanning (§7.8.10). Test:
+  `scan_state_rejects_address_and_scan_parameter_changes` (and
+  `random_address_is_rejected_while_initiating`).
+- [x] **B8 — Own address selection per procedure.** `SoftRunner::initiator_addr`
+  selects the initiator address from the request's Own_Address_Type, not from
+  advertising state, and a random own address without an initialized random
+  address returns Command Disallowed (§7.8.12). `finish_reset` restores the
+  public BD_ADDR too. Tests:
+  `public_own_address_survives_reset_and_selects_initiator_addr`,
+  `random_own_address_requires_an_initialized_random_address`.
+- [x] **B9 — HCI command-response contracts.** Create Connection Cancel without a
+  pending initiation now returns Command Complete/Command Disallowed (§7.8.13);
+  Host Number Of Completed Packets validates its handle list (malformed →
+  Command Complete/Invalid Parameters) and generates no event for unknown
+  handles (§7.3.40). Tests: `cancel_without_pending_is_command_complete`,
+  `completed_packets_ignores_unknown_connection`.
+
+B3/B7/B8/B9 are offline-verified on `ch585-b3-b9-hci-correctness` (210 lib
+tests per chip feature, `tests/{secure,trouble,hid}-host`) and built into all
+12 examples. Hardware on freshly rebuilt images: P3 PASS (`cae2eb91…`), C1
+PASS (`e889b449…`) and P4 PASS after the late-TX fix below (`4ef3ab07…`,
+`tx_late=0`, handler 11 us, tx entry 26 us, GATT cycle counters complete).
 - [ ] **B10 — Host→Controller queue has no enqueue epoch.** A Host command still
   in the one-slot `HOST_TO_CONTROLLER` channel when the link drops is parsed
   after reconnect and attributed to the new connection (`pending_input` reads
@@ -79,6 +102,34 @@ Raw captures and experiment records remain local; they are not required to build
   without growing `Packet`: keep connection-scoped metadata beside the queue
   (valid only while capacity is 1), or make the packet carry it explicitly.
   See `local-docs/results/bond-session-20261115.md`.
+- [x] **Peripheral Host connection report skipped after a late first response.**
+  Found while validating the batch above. Both secure peripheral examples
+  (`ch585-trouble-gatt`, `ch585-hid-keyboard`) reported LE Connection Complete
+  only when the *first* received PDU's response was transmitted inside its
+  window. When that TX returned `Late`, `on_rx_anchor` had already set
+  `established`, so the report was never sent: the Host stayed in advertising,
+  every ACL PDU was refused for backpressure, and the peer reached supervision
+  timeout with no HCI error logged. Both now report whenever
+  `bridge.is_connected()` is false. Offline: `tests/trouble-host`; hardware:
+  P4 trouble-gatt (Host connected and completed the GATT cycle).
+- [x] **Peripheral late TX under live Host traffic (X1 DLE regression).**
+  Introduced by the X1 DLE work, not by A1: bisect with three images shows
+  `cd9a186` (11-12) `tx_late=0`, `b2db898` (pre-A1) `tx_late=35`, and the
+  same pre-A1 image plus probes reproduces it. Two paths moved from
+  `.highcode`-backed work into flash inside the peer's response window:
+  `queue_next_host_fragment` (1124 B, queueing measured up to 103 us) and the
+  LL_LENGTH_REQ handling (`ControlState::on_pdu` 52 us + `apply_data_length`
+  55 us; the first request consumed 86 us and entered TX at 119 us against the
+  120 us start deadline). Fixes: `.highcode` on `queue_next_host_fragment`,
+  `apply_data_length`, and `ControlState::on_pdu`; DLE (0x14/0x15) parsing
+  deferred to the post-event idle gap (`DeferredControl` / `service_control`)
+  because its reply already leaves one event later. Result 35 -> 3 -> 1 -> 0.
+  Hardware: P4 `4ef3ab07…` PASS (`tx_late=0`, handler 11 us, tx entry 26 us),
+  HID secure `1fe9dd9c…` PASS. Evidence:
+  `local-docs/results/diag-p4-*` and `diag-hid-deferred`.
+  `max_host_poll_us≈2.16 ms` remains just above the 2 ms poll guard but the
+  overrun counter is 0 on both runs (the guard measures the gap, the counter
+  counts an actual reserved-RX collision).
 - [ ] **TX timeout quiescence / hardware ownership single-instance audit** and
   the advertising `advDelay` distribution check — need evidence first.
 
