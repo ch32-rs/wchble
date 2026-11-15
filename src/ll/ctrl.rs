@@ -366,6 +366,12 @@ impl ControlState {
     /// Reserve a response slot before accepting the peer's SN. The caller must
     /// retain a reply until `LinkSequence::queue` succeeds (an empty packet may
     /// still be awaiting its acknowledgment).
+    ///
+    /// Called from the connection-event handler before this event's response
+    /// leaves, so it runs inside the peer's response window. From flash a cold
+    /// LL_LENGTH_REQ took 52 us here (ch585-trouble-gatt, tx_late events);
+    /// the crypto/AES paths use the same section for the same reason.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn on_pdu<C: LinkTiming>(
         &mut self,
         conn: &mut C,

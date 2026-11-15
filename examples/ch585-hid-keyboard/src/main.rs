@@ -498,6 +498,14 @@ struct PendingHost {
     fragments: u32,
 }
 
+/// An LL control PDU whose parsing does not depend on the event Instant,
+/// held until after the event so it cannot overrun this event's response
+/// window. The reply was already going out in a later event.
+struct DeferredControl {
+    len: u8,
+    bytes: [u8; 27],
+}
+
 /// A received encrypted PDU held until after the event, when AES-CCM can run
 /// outside the 150 us response deadline.
 struct DeferredRx {
@@ -565,6 +573,7 @@ struct Session {
     /// through `LE Data Length Change`.
     dl_reported: Option<(u16, u16, u16, u16)>,
     deferred_rx: Option<DeferredRx>,
+    deferred_control: Option<DeferredControl>,
     /// SKDs/IVs for `LL_ENC_RSP`, generated before the event that carries the
     /// central's `LL_ENC_REQ`: the DRBG and the response build must not run
     /// inside the 150 us response deadline.
@@ -640,6 +649,7 @@ impl Session {
             x1_last_error: 0,
             dl_reported: None,
             deferred_rx: None,
+            deferred_control: None,
             enc_rsp_random,
             enc_rsp_payload,
             pending_enc_req: None,
@@ -668,6 +678,11 @@ impl Session {
     /// The LL octet fields are payload octets; the MIC rides on top of each
     /// already-encrypted direction, so both limits move when encryption turns
     /// on. A completed negotiation is reported to the Host once per change.
+    ///
+    /// `.highcode`: runs while handling an LL_LENGTH_REQ inside the response
+    /// window; from flash it measured 55 us in trouble-gatt and pushed the
+    /// reply past its transmit deadline.
+    #[link_section = ".highcode"]
     fn apply_data_length(&mut self, bridge: &mut ConnectionBridge) {
         let tx = self.control.data_length.tx_octets(self.enc_active);
         let rx = self.control.data_length.rx_octets(self.rx_encrypted);
@@ -897,43 +912,62 @@ fn connection_event(
                                 subversion: 1,
                             };
                             note_control_rx(s, payload);
-                            match s.control.on_pdu(&mut s.conn, payload, local) {
-                                Ok(action) => {
-                                    // DLE takes effect once the request or
-                                    // response has been received.
-                                    s.apply_data_length(&mut soft.bridge);
-                                    match action {
-                                        ControlAction::Reply(pdu) => {
-                                            if pdu.as_bytes().first() == Some(&7) {
-                                                inc(27);
+                            // DLE has no Instant and its reply is sent in a
+                            // later event either way, so parse it in the
+                            // post-event idle gap. A cold `on_pdu` +
+                            // `apply_data_length` measured 86 us here and
+                            // pushed the first LL_LENGTH_REQ response past
+                            // its 120 us transmit start.
+                            if matches!(payload[0], 0x14 | 0x15)
+                                && s.deferred_control.is_none()
+                                && payload.len() <= 27
+                            {
+                                let mut bytes = [0u8; 27];
+                                bytes[..payload.len()].copy_from_slice(payload);
+                                s.deferred_control = Some(DeferredControl {
+                                    len: payload.len() as u8,
+                                    bytes,
+                                });
+                            } else {
+                                match s.control.on_pdu(&mut s.conn, payload, local) {
+                                    Ok(action) => {
+                                        // DLE takes effect once the request or
+                                        // response has been received.
+                                        s.apply_data_length(&mut soft.bridge);
+                                        match action {
+                                            ControlAction::Reply(pdu) => {
+                                                if pdu.as_bytes().first() == Some(&7) {
+                                                    inc(27);
+                                                }
+                                                if pdu.as_bytes().first() == Some(&0x15) {
+                                                    s.length_rsp_tx += 1;
+                                                }
+                                                s.pending_control =
+                                                    Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
                                             }
-                                            if pdu.as_bytes().first() == Some(&0x15) {
-                                                s.length_rsp_tx += 1;
+                                            ControlAction::Terminate(reason) => {
+                                                remote_terminate = Some(reason)
                                             }
-                                            s.pending_control =
-                                                Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
-                                        }
-                                        ControlAction::Terminate(reason) => {
-                                            remote_terminate = Some(reason)
-                                        }
-                                        ControlAction::None => {
-                                            if payload[0] == 0 && payload.len() == 12 {
-                                                s.update_instant = Some(u16::from_le_bytes([
-                                                    payload[10],
-                                                    payload[11],
-                                                ]));
+                                            ControlAction::None => {
+                                                if payload[0] == 0 && payload.len() == 12 {
+                                                    s.update_instant =
+                                                        Some(u16::from_le_bytes([
+                                                            payload[10],
+                                                            payload[11],
+                                                        ]));
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                Err(error) => {
-                                    if matches!(payload.first(), Some(0x14) | Some(0x15)) {
-                                        s.x1_last_error = 0x1e;
+                                    Err(error) => {
+                                        if matches!(payload.first(), Some(0x14) | Some(0x15)) {
+                                            s.x1_last_error = 0x1e;
+                                        }
+                                        s.request_terminate(
+                                            wchble::ll::ctrl::termination_reason(error),
+                                            packet.end,
+                                        );
                                     }
-                                    s.request_terminate(
-                                        wchble::ll::ctrl::termination_reason(error),
-                                        packet.end,
-                                    );
                                 }
                             }
                         }
@@ -1089,7 +1123,14 @@ fn connection_event(
         }
         // Serialize HCI output only after the time-critical radio response.
         // No Host poll can consume the RX reservation in this interval.
-        if first {
+        //
+        // Report the link whenever the Host has not seen it yet, not only on
+        // the first received PDU: when that PDU's response is `Late` the
+        // `!sent` branch returns above, and `on_rx_anchor` has already set
+        // `established`, so a `first`-only gate would never report at all and
+        // the Host would answer every ACL PDU with backpressure until the
+        // peer's supervision timeout.
+        if !soft.bridge.is_connected() {
             let p = s.conn.params;
             let info = ConnectionInfo {
                 handle: 1,
@@ -1203,6 +1244,13 @@ fn service_encryption(soft: &mut SoftRunner, s: &mut Session) -> Option<u8> {
 /// one from the bridge when needed. Only the fragment that ends the Host
 /// packet owns the HCI tag, so the bridge credit is returned once, after the
 /// LL acknowledges the final fragment.
+///
+/// `.highcode`: this runs between the received PDU and this event's response,
+/// inside the 150 us window. Executed from flash it costs up to ~100 us on a
+/// cold cache (measured in trouble-gatt: queueing max 103 us, `tx_late`
+/// 35/99), which misses the transmit deadline and costs a retransmission per
+/// packet.
+#[link_section = ".highcode"]
 fn queue_next_host_fragment(soft: &mut SoftRunner, s: &mut Session) {
     if s.pending_host.is_none() {
         let Some(acl) = soft.bridge.take_tx_acl() else {
@@ -1330,6 +1378,47 @@ fn publish_x1(s: &Session) {
         u32::from(s.control.peer_features.is_some() || data_length.negotiated()),
     );
     x1_put(X1_LAST_ERROR, s.x1_last_error);
+}
+
+/// Parse a DLE control PDU outside the response window, then queue its reply.
+/// Runs in the idle gap before the next event; the reply leaves in that next
+/// event, one event after the request (legal for DLE, which has no Instant).
+fn service_control(soft: &mut SoftRunner, s: &mut Session, now: u32) -> Option<u8> {
+    // Never displace a reply the encryption procedure already owns; the
+    // deferred request stays pending for the next gap.
+    if s.pending_control.is_some() {
+        return None;
+    }
+    let Some(deferred) = s.deferred_control.take() else {
+        return None;
+    };
+    let payload = &deferred.bytes[..usize::from(deferred.len)];
+    let local = LocalVersion {
+        version: 0x0d,
+        company_id: 0xffff,
+        subversion: 1,
+    };
+    match s.control.on_pdu(&mut s.conn, payload, local) {
+        Ok(action) => {
+            // DLE takes effect once the request or response has been received.
+            s.apply_data_length(&mut soft.bridge);
+            match action {
+                ControlAction::Reply(pdu) => {
+                    if pdu.as_bytes().first() == Some(&0x15) {
+                        s.length_rsp_tx += 1;
+                    }
+                    s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+                }
+                ControlAction::Terminate(reason) => return Some(reason),
+                ControlAction::None => {}
+            }
+        }
+        Err(error) => {
+            s.x1_last_error = 0x1e;
+            s.request_terminate(wchble::ll::ctrl::termination_reason(error), now);
+        }
+    }
+    None
 }
 
 /// Start DLE from the peripheral side. Android Centrals have been observed
@@ -2070,6 +2159,9 @@ fn main() -> ! {
             }
             if reason.is_none() && !reached(clock.now_us().wrapping_add(4000), prepare) {
                 reason = service_encryption(&mut soft, s);
+                if reason.is_none() {
+                    reason = service_control(&mut soft, s, clock.now_us());
+                }
                 if reason.is_none() {
                     reason = service_dle(&mut soft, s);
                 }
