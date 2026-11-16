@@ -95,6 +95,19 @@ def att_after_encryption(att, control):
     return after, first
 
 
+def classify_links(links, rows):
+    """Split CONNECT_IND access addresses into accepted and refused links.
+
+    An initiator retransmits on a refused link but the peripheral never
+    answers, so only a peripheral-origin PDU proves the link exists.
+    """
+    peripheral = {row['btle.access_address'].lower() for row in rows
+                  if row['nordic_ble.direction'] == 'False'}
+    accepted = [aa for aa in links if aa in peripheral]
+    rejected = [aa for aa in links if aa not in peripheral]
+    return accepted, rejected
+
+
 def analyze(rows, out, target, privacy=False):
     """Only the link this firmware opened is evidence; neighbouring BLE traffic
     (the 37/38/39 scan sees plenty) must not be counted or decoded.
@@ -115,6 +128,7 @@ def analyze(rows, out, target, privacy=False):
     link = links[0] if links else None
     good = [row for row in rows if row['nordic_ble.crcok'] == 'True'
             and row['btle.access_address'].lower() in links]
+    accepted_links, rejected_links = classify_links(links, good)
     smp, control, att = [], [], []
     for row in good:
         frame = int(row['frame.number'])
@@ -154,6 +168,7 @@ def analyze(rows, out, target, privacy=False):
                 'connect_addresses': addresses,
                 'rotate_phase': [],
                 'access_address': link, 'access_addresses': links,
+                'rejected_links': rejected_links, 'accepted_links': accepted_links,
                 'smp': smp, 'll_control': control,
                 'att_frames': len(att), 'att_last_frame': att[-1]['frame'] if att else None,
                 'crc_valid_link_pdus': len(good),
@@ -205,6 +220,21 @@ def evaluate(assessed, mode='pair'):
             errors.append('the peer advertised the same address for both links')
         # One link only means the sniffer missed the rotated address; the
         # firmware counters, not the capture, decide rotation.
+    if mode == 'fal':
+        rejected = assessed.get('rejected_links') or []
+        accepted = assessed.get('accepted_links') or []
+        if not rejected:
+            errors.append('capture saw no CONNECT_IND that was refused')
+        if not accepted:
+            errors.append('capture saw no accepted link')
+        encrypted = {entry['aa'] for entry in assessed['ll_control']
+                     if entry['name'] in ('ENC_REQ', 'START_ENC_REQ', 'START_ENC_RSP')}
+        paired = {entry['aa'] for entry in assessed['smp']}
+        for aa in accepted:
+            if aa not in encrypted:
+                errors.append(f'the accepted link {aa} never started encryption')
+            if aa in paired:
+                errors.append(f'the accepted link {aa} ran SMP again')
     if mode in ('delete', 'reject'):
         if not any(entry['name'] == 'REJECT_IND' for entry in assessed['ll_control']):
             errors.append('capture saw no LL_REJECT_IND after the delete command')
@@ -425,7 +455,7 @@ def time_now():
 def assess_pcap(out, tshark, mode='pair'):
     structure = cap.validate_pcap(out / 'capture.pcap')
     assessed = decode(out / 'capture.pcap', out, tshark, run_target(out),
-                      mode == 'privacy')
+                      mode in ('privacy', 'fal'))
     assessed['structure'] = structure
     assessed['mode'] = mode
     assessed['errors'] = evaluate(assessed, mode)
@@ -443,12 +473,12 @@ def options(argv=None):
     parser.add_argument('--nrfutil-home', type=Path, required=True)
     parser.add_argument('--tshark', default='tshark')
     parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject',
-                                           'fault', 'att', 'privacy'),
+                                           'fault', 'att', 'privacy', 'fal'),
                         default='pair')
     parser.add_argument('--serial-timeout-ms', type=int, default=100)
     parser.add_argument('--startup-timeout', type=float, default=10)
     capture, remaining = parser.parse_known_args(argv)
-    if capture.mode == 'privacy':
+    if capture.mode in ('privacy', 'fal'):
         # The advertised address is an RPA from the first frame, so only the
         # advertised name identifies the device.
         capture.follow_by_name = True
