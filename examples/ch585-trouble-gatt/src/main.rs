@@ -1267,6 +1267,9 @@ fn report_connection(soft: &mut SoftRunner, s: &Session, clock: &Clock) -> Optio
         inc(63);
         return Some(0x1f);
     }
+    // The second reported link closes the rotation window.
+    #[cfg(feature = "privacy")]
+    privacy::note_connection(soft);
     None
 }
 
@@ -2481,22 +2484,26 @@ fn main() -> ! {
             };
             let pdu = &rx.0[..packet.len];
             if soft.ll.adv.validate_scan_req(pdu, true) {
-                inc(10);
-                // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
-                // engine on error; the response frame only has to live for the call.
-                match unsafe {
-                    radio.tx_basic(
-                        &clock,
-                        &rsp_buf.0[..rsp_len],
-                        0,
-                        Some(packet.end.wrapping_add(120)),
-                    )
-                } {
-                    Ok(()) => inc(11),
-                    Err(wchble::Error::Late) => inc(12),
-                    Err(_) => inc(5),
+                // Network-mode peers must scan us at an RPA (Vol 6 Part B §6.2.1).
+                let scanner = [pdu[2], pdu[3], pdu[4], pdu[5], pdu[6], pdu[7]];
+                if soft.scan_request_allowed(scanner, pdu[0] & 0x40 != 0) {
+                    inc(10);
+                    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                    // engine on error; the response frame only has to live for the call.
+                    match unsafe {
+                        radio.tx_basic(
+                            &clock,
+                            &rsp_buf.0[..rsp_len],
+                            0,
+                            Some(packet.end.wrapping_add(120)),
+                        )
+                    } {
+                        Ok(()) => inc(11),
+                        Err(wchble::Error::Late) => inc(12),
+                        Err(_) => inc(5),
+                    }
+                    stop(&mut radio, &clock);
                 }
-                stop(&mut radio, &clock);
             } else if pdu[0] & 0x0f == 5 {
                 inc(13);
                 match ConnectParams::parse(pdu, true, soft.ll.adv.own_addr, soft.ll.adv.random_addr)

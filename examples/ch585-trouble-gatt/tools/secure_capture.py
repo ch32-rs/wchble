@@ -220,14 +220,17 @@ def evaluate(assessed, mode='pair'):
         # The first link pairs a fresh bond; the reconnect must only resume
         # encryption. Pairing before the second CONNECT_IND is expected.
         phase = assessed.get('rotate_phase') or []
-        reconnect = phase[1]['frame'] if len(phase) >= 2 else None
-        pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
-                   'PairingDHKeyCheck', 'PairingPublicKey'}
-        seen = [entry['name'] for entry in assessed['smp']
-                if entry['name'] in pairing
-                and (reconnect is None or entry['frame'] > reconnect)]
-        if seen:
-            errors.append(f'capture showed a new pairing during the reconnect: {sorted(set(seen))}')
+        if len(phase) >= 2:
+            pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm',
+                       'PairingRandom', 'PairingDHKeyCheck', 'PairingPublicKey'}
+            reconnect = phase[1]['frame']
+            seen = [entry['name'] for entry in assessed['smp']
+                    if entry['name'] in pairing and entry['frame'] > reconnect]
+            if seen:
+                errors.append('capture showed a new pairing during the reconnect: '
+                              f'{sorted(set(seen))}')
+        # With one captured link the frames cannot be placed; the firmware
+        # counters, not the capture, decide that stage.
     else:
         pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
                    'PairingDHKeyCheck', 'PairingPublicKey'}

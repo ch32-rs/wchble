@@ -8,7 +8,9 @@ use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
 use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
-use crate::ll::privacy::{Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_RESOLVING_LIST};
+use crate::ll::privacy::{
+    is_resolvable, Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_RESOLVING_LIST,
+};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -450,13 +452,18 @@ impl SoftRunner {
         }
     }
 
-    /// Advertising, scanning or initiating: RL edits are disallowed.
+    /// Advertising, scanning or initiating.
     fn roles_active(&self) -> bool {
         self.ll.adv.enabled || self.scan.enabled || self.pending_connect.is_some()
     }
 
+    /// RL edits are only blocked while resolution is enabled (HCI §7.8.38–40).
+    fn resolving_edits_blocked(&self) -> bool {
+        self.privacy.enabled() && self.roles_active()
+    }
+
     fn add_resolving_entry(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
-        if self.roles_active() {
+        if self.resolving_edits_blocked() {
             return Err(HCI_COMMAND_DISALLOWED);
         }
         let mut address = [0u8; 6];
@@ -487,7 +494,7 @@ impl SoftRunner {
     }
 
     fn remove_resolving_entry(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
-        if self.roles_active() {
+        if self.resolving_edits_blocked() {
             return Err(HCI_COMMAND_DISALLOWED);
         }
         let mut address = [0u8; 6];
@@ -503,7 +510,7 @@ impl SoftRunner {
     }
 
     fn clear_resolving_list(&mut self) -> Result<&'static [u8], u8> {
-        if self.roles_active() {
+        if self.resolving_edits_blocked() {
             return Err(HCI_COMMAND_DISALLOWED);
         }
         self.privacy.clear();
@@ -606,6 +613,15 @@ impl SoftRunner {
     /// One CONNECT_IND: policy 0 accepts and defers, policy 2 decides here.
     pub fn admit_connection(&mut self, address: [u8; 6], random: bool) -> bool {
         self.privacy.admit(address, random)
+    }
+
+    /// SCAN_REQ gate: a Network-mode peer may not scan us at its identity
+    /// address (Core 5.4 Vol 6 Part B §6.2.1).
+    pub fn scan_request_allowed(&self, address: [u8; 6], random: bool) -> bool {
+        if random && is_resolvable(address) {
+            return true;
+        }
+        !self.privacy.blocks_identity(u8::from(random), address)
     }
 
     /// Idle path: resolve the address recorded by `admit_connection`.
@@ -1726,6 +1742,7 @@ mod tests {
         });
     }
 
+    #[test]
     fn resolving_list_commands_track_real_entries() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
@@ -1840,8 +1857,11 @@ mod tests {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
-        runner.ll.adv.enabled = true;
         pollster::block_on(async {
+            inject_cmd(0x202d, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x202d, HCI_SUCCESS, &[]);
+            runner.ll.adv.enabled = true;
             for (opcode, params) in [
                 (0x2027, &[0u8; 39][..]),
                 (0x2028, &[0u8; 7][..]),
@@ -1852,6 +1872,53 @@ mod tests {
                 runner.serve_one().await;
                 expect_command_complete(opcode, HCI_COMMAND_DISALLOWED, &[]);
             }
+        });
+    }
+
+    #[test]
+    fn resolving_list_edits_are_allowed_while_resolution_is_off() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.ll.adv.enabled = true;
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+
+        pollster::block_on(async {
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 1);
+
+            inject_cmd(0x2029, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2029, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 0);
+        });
+    }
+
+    #[test]
+    fn scan_request_from_a_network_mode_identity_is_ignored() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+
+        pollster::block_on(async {
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+
+            assert!(!runner.scan_request_allowed([1, 2, 3, 4, 5, 6], false));
+            assert!(runner.scan_request_allowed([9; 6], false));
+            assert!(runner.scan_request_allowed([1, 2, 3, 4, 5, 0x46], true));
         });
     }
 

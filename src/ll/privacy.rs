@@ -503,8 +503,8 @@ impl Privacy {
         None
     }
 
-    /// Network-mode peers may only connect with an RPA from their IRK.
-    fn identity_blocked(&self, kind: u8, address: [u8; 6]) -> bool {
+    /// Network-mode peers may only connect or scan with an RPA from their IRK.
+    pub fn blocks_identity(&self, kind: u8, address: [u8; 6]) -> bool {
         self.find(kind, address).is_some_and(|slot| {
             self.entries[slot].peer_irk != [0; 16] && self.entries[slot].privacy_mode == 0
         })
@@ -517,7 +517,7 @@ impl Privacy {
             // FAL is not used, but a policy value we do not filter on must not
             // silently become "unfiltered" either; values 1/3 are rejected at
             // Set Advertising Parameters.
-            if !rpa && self.identity_blocked(u8::from(random), address) {
+            if !rpa && self.blocks_identity(u8::from(random), address) {
                 self.stats.rejected_mode = self.stats.rejected_mode.wrapping_add(1);
                 self.pending = None;
                 self.cached_identity = None;
@@ -545,7 +545,7 @@ impl Privacy {
             Some(identity) => {
                 if rpa {
                     self.stats.resolve_ok = self.stats.resolve_ok.wrapping_add(1);
-                } else if self.identity_blocked(identity.0, identity.1) {
+                } else if self.blocks_identity(identity.0, identity.1) {
                     self.stats.rejected_mode = self.stats.rejected_mode.wrapping_add(1);
                     self.cached_identity = None;
                     return false;

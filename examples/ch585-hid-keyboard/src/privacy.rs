@@ -6,7 +6,7 @@
 
 use wchble::hci::SoftRunner;
 
-pub const WORDS: usize = 20;
+pub const WORDS: usize = 23;
 pub const MAGIC: u32 = 0x5334_5052;
 
 /// Example-owned bits OR-ed into word 2 above the library's `u8` flags.
@@ -26,6 +26,8 @@ static mut MAX_ADMIT_US: u32 = 0;
 static mut MAX_RESOLVE_US: u32 = 0;
 static mut STAGE: (u32, u32, u32) = (0, 0, 0);
 static mut STAGE_SET: bool = false;
+static mut RECONNECT: (u32, u32, u32) = (0, 0, 0);
+static mut LINKS: u32 = 0;
 
 pub fn set_flag(flag: u32) {
     // SAFETY: single-threaded; written from boot or the Host poll.
@@ -85,13 +87,37 @@ pub fn snapshot(soft: &SoftRunner) {
     }
 }
 
-/// Publish the 20-word block read over SWD after a finite run.
+/// Close the rotation window when the second link is reported, so rotations
+/// after the reconnect cannot be counted as part of it.
+pub fn note_connection(soft: &SoftRunner) {
+    // SAFETY: single-threaded.
+    unsafe {
+        let links = core::ptr::addr_of_mut!(LINKS);
+        let count = links.read_volatile().wrapping_add(1);
+        links.write_volatile(count);
+        if count != 2 {
+            return;
+        }
+    }
+    let stats = soft.privacy_stats();
+    // SAFETY: single-threaded.
+    unsafe {
+        core::ptr::addr_of_mut!(RECONNECT).write_volatile((
+            stats.generations,
+            stats.resolve_ok,
+            stats.rotations,
+        ));
+    }
+}
+
+/// Publish the 23-word block read over SWD after a finite run.
 pub fn publish(soft: &SoftRunner) {
     let stats = soft.privacy_stats();
     // SAFETY: single-threaded.
-    let (stage, max_admit, max_resolve) = unsafe {
+    let (stage, reconnect, max_admit, max_resolve) = unsafe {
         (
             core::ptr::addr_of!(STAGE).read_volatile(),
+            core::ptr::addr_of!(RECONNECT).read_volatile(),
             core::ptr::addr_of!(MAX_ADMIT_US).read_volatile(),
             core::ptr::addr_of!(MAX_RESOLVE_US).read_volatile(),
         )
@@ -133,6 +159,9 @@ pub fn publish(soft: &SoftRunner) {
         stage.0,
         stage.1,
         stage.2,
+        reconnect.0,
+        reconnect.1,
+        reconnect.2,
     ];
     // SAFETY: single-threaded.
     unsafe {

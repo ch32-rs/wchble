@@ -53,7 +53,8 @@ PRIVACY_MAGIC = 0x5334_5052
 PRIVACY_NAMES = '''magic version flags generations rotations resolve_attempts resolve_ok
     resolve_unresolved rejected_not_listed rejected_mode max_admit_us max_resolve_us
     rotated_at_us rpa_lo rpa_hi list_state fingerprint stage_generations stage_resolve_ok
-    stage_rotations'''.split()
+    stage_rotations reconnect_generations reconnect_resolve_ok
+    reconnect_rotations'''.split()
 P_RESOLUTION_ENABLED = 0x01
 P_LOCAL_IRK = 0x02
 P_ADV_USES_RPA = 0x04
@@ -595,7 +596,7 @@ def evaluate_security(sec, host, stats, run_seconds, encryptions=1):
 
 def decode_privacy(words):
     """PRIVACY_STATS: controller counters plus the example's storage facts."""
-    if len(words) != 20 or words[0] != PRIVACY_MAGIC:
+    if len(words) != 23 or words[0] != PRIVACY_MAGIC:
         return {'present': False, 'words': words}
     rpa = words[13].to_bytes(4, 'little') + words[14].to_bytes(4, 'little')[:2]
     return {
@@ -620,6 +621,9 @@ def decode_privacy(words):
         'stage_generations': words[17],
         'stage_resolve_ok': words[18],
         'stage_rotations': words[19],
+        'reconnect_generations': words[20],
+        'reconnect_resolve_ok': words[21],
+        'reconnect_rotations': words[22],
     }
 
 
@@ -662,16 +666,22 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
     if mode == 'privacy':
         if privacy['stage_generations'] < 1:
             errors.append('the disconnect snapshot never ran')
-        if privacy['rotations'] - privacy['stage_rotations'] < 2:
-            errors.append('fewer than two RPA rotations between disconnect and '
-                          f'reconnect: {privacy["rotations"]} - '
-                          f'{privacy["stage_rotations"]}')
-        # The Host can resolve the peer on its own; only a controller-side
-        # success after the disconnect proves the reconnect went through us.
-        if privacy['resolve_ok'] <= privacy['stage_resolve_ok']:
-            errors.append('the reconnect never resolved the peer RPA '
-                          f'({privacy["resolve_ok"]} <= '
-                          f'{privacy["stage_resolve_ok"]})')
+        if privacy['reconnect_generations'] < 1:
+            errors.append('the reconnect was never reported')
+        else:
+            # Both bounds come from link events, so rotations after the
+            # reconnect cannot be counted as part of the rotation window.
+            if privacy['reconnect_rotations'] - privacy['stage_rotations'] < 2:
+                errors.append('fewer than two RPA rotations between the disconnect '
+                              'and the reconnect: '
+                              f'{privacy["reconnect_rotations"]} - '
+                              f'{privacy["stage_rotations"]}')
+            # The Host can resolve the peer on its own; only a controller-side
+            # success between the two links proves the reconnect went through us.
+            if privacy['reconnect_resolve_ok'] <= privacy['stage_resolve_ok']:
+                errors.append('the reconnect never resolved the peer RPA '
+                              f'({privacy["reconnect_resolve_ok"]} <= '
+                              f'{privacy["stage_resolve_ok"]})')
     return errors
 
 
@@ -724,7 +734,7 @@ def execute(args):
             symbols[name] = int(matches[0][0], 16)
         extra = [('X4_STATS', 16), ('X1_STATS', 24)]
         if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
-            extra.append(('PRIVACY_STATS', 20))
+            extra.append(('PRIVACY_STATS', 23))
         symbols = validate_observation_buffers(image, symbols, extra=extra)
         # Both feature sets write the same output path, so a plain `cargo
         # build` right after a secure build silently replaces this image.
@@ -828,7 +838,7 @@ def execute(args):
                                             observations.get('STATS', []),
                                             args.run_seconds, links))
         if 'PRIVACY_STATS' in symbols:
-            privacy_words = io.read32(symbols['PRIVACY_STATS'], 20,
+            privacy_words = io.read32(symbols['PRIVACY_STATS'], 23,
                                       args.out / 'privacy_stats.txt')
             metadata['privacy'] = decode_privacy(privacy_words)
             (args.out / 'privacy_stats.json').write_text(

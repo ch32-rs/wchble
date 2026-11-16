@@ -120,17 +120,18 @@ class RejectionTests(unittest.TestCase):
 
 
 def privacy(**values):
-    words = [0] * 20
+    words = [0] * 23
     words[0] = secure.PRIVACY_MAGIC
     words[1] = 1
     words[2] = secure.P_ADV_USES_RPA | secure.P_LOCAL_IRK | secure.P_STAMP_VALID
-    words[3], words[4] = 9, 8
+    words[3], words[4] = 10, 9
     words[5], words[6] = 2, 2
     words[10], words[11] = 3, 132
     words[13] = int.from_bytes(bytes([0x11, 0x22, 0x33, 0x44]), 'little')
     words[14] = int.from_bytes(bytes([0x55, 0x66, 0, 0]), 'little')
     words[16] = 0x00B7_7A90
-    words[17], words[18], words[19] = 1, 1, 5
+    words[17], words[18], words[19] = 1, 1, 0
+    words[20], words[21], words[22] = 6, 2, 5
     for name, value in values.items():
         words[secure.PRIVACY_NAMES.index(name)] = value
     return words
@@ -143,9 +144,21 @@ class PrivacyTests(unittest.TestCase):
 
     def test_attempts_without_a_controller_resolution_fail(self):
         # The Host resolves on its own, so attempts alone prove nothing.
-        stats = secure.decode_privacy(privacy(resolve_ok=1, stage_resolve_ok=1))
+        stats = secure.decode_privacy(
+            privacy(resolve_ok=1, stage_resolve_ok=1, reconnect_resolve_ok=1))
         errors = secure.evaluate_privacy(stats)
         self.assertTrue(any('never resolved' in error for error in errors))
+
+    def test_rotations_after_the_reconnect_do_not_count(self):
+        # Final totals keep rotating while the app holds the second link.
+        stats = secure.decode_privacy(privacy(rotations=12, reconnect_rotations=1))
+        errors = secure.evaluate_privacy(stats)
+        self.assertTrue(any('fewer than two RPA rotations' in error for error in errors))
+
+    def test_missing_reconnect_snapshot_fails(self):
+        stats = secure.decode_privacy(privacy(reconnect_generations=0))
+        errors = secure.evaluate_privacy(stats)
+        self.assertTrue(any('reconnect was never reported' in error for error in errors))
 
     def test_capture_privacy_allows_the_first_pairing_only(self):
         assessed = {'target': capture.TARGET, 'access_address': '0x1',
@@ -160,6 +173,19 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(capture.evaluate(assessed, 'privacy'), [])
         assessed['smp'].append({'frame': 150, 'name': 'PairingRequest'})
         self.assertTrue(capture.evaluate(assessed, 'privacy'))
+
+    def test_capture_privacy_with_one_link_does_not_claim_a_repair(self):
+        # Without the second CONNECT_IND the pairing frames cannot be placed;
+        # the firmware counters, not the capture, decide that stage.
+        assessed = {'target': capture.TARGET, 'access_address': '0x1',
+                    'connect_addresses': ['aa:00:00:00:00:01'],
+                    'rotate_phase': [{'frame': 10, 'address': 'aa:00:00:00:00:01'}],
+                    'smp': [{'frame': 20, 'name': 'PairingRequest'},
+                            {'frame': 30, 'name': 'PairingDHKeyCheck'}],
+                    'smp_opcodes_captured': ['PairingRequest', 'PairingDHKeyCheck'],
+                    'll_control': [], 'encryption_start': {'frame': 40},
+                    'att_after_encryption_start': []}
+        self.assertEqual(capture.evaluate(assessed, 'privacy'), [])
 
 
 if __name__ == '__main__':
