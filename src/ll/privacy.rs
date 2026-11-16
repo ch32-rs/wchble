@@ -199,6 +199,17 @@ impl Default for Privacy {
     }
 }
 
+/// FAL entries are public or static-random identity addresses.
+fn validate_fal_identity(kind: u8, address: [u8; 6]) -> Result<(), PrivacyError> {
+    if kind > 1 {
+        return Err(PrivacyError::InvalidKind);
+    }
+    if kind == 1 && address[5] & 0xc0 != 0xc0 {
+        return Err(PrivacyError::InvalidIdentity);
+    }
+    Ok(())
+}
+
 impl Privacy {
     pub fn new() -> Self {
         Self {
@@ -649,12 +660,7 @@ impl Privacy {
 
     /// Returns true when the member was newly added.
     pub fn fal_add(&mut self, kind: u8, address: [u8; 6]) -> Result<bool, PrivacyError> {
-        if kind > 1 {
-            return Err(PrivacyError::InvalidKind);
-        }
-        if kind == 1 && address[5] & 0xc0 != 0xc0 {
-            return Err(PrivacyError::InvalidIdentity);
-        }
+        validate_fal_identity(kind, address)?;
         if self.fal_contains(kind, address) {
             return Ok(false);
         }
@@ -671,9 +677,7 @@ impl Privacy {
 
     /// Returns true when a member was removed.
     pub fn fal_remove(&mut self, kind: u8, address: [u8; 6]) -> Result<bool, PrivacyError> {
-        if kind > 1 {
-            return Err(PrivacyError::InvalidKind);
-        }
+        validate_fal_identity(kind, address)?;
         let Some(slot) = self
             .fal
             .iter()
@@ -1020,6 +1024,76 @@ mod tests {
         assert!(!p.admit(stranger, true));
         assert_eq!(p.stats().resolve_unresolved, 1);
         assert_eq!(p.stats().rejected_not_listed, 2);
+    }
+
+    #[test]
+    fn policy_two_with_resolution_disabled_rejects_the_rpa() {
+        let mut p = Privacy::new();
+        p.set_filter_policy(2);
+        p.add(ResolvingEntry {
+            peer_kind: 0,
+            peer_address: [1; 6],
+            peer_irk: IRK,
+            local_irk: [0; 16],
+            privacy_mode: 1,
+        })
+        .unwrap();
+        p.fal_add(0, [1; 6]).unwrap();
+        let rpa = rpa_from(&IRK, [0x94, 0x81, 0x70]);
+        assert!(!p.admit(rpa, true));
+        assert_eq!(p.stats().rejected_not_listed, 1);
+        assert_eq!(p.stats().resolve_attempts, 0);
+    }
+
+    #[test]
+    fn policy_two_rejects_a_resolved_identity_outside_the_fal() {
+        let mut p = Privacy::new();
+        p.set_enabled(true);
+        p.set_filter_policy(2);
+        p.add(ResolvingEntry {
+            peer_kind: 0,
+            peer_address: [1; 6],
+            peer_irk: IRK,
+            local_irk: [0; 16],
+            privacy_mode: 1,
+        })
+        .unwrap();
+        p.fal_add(0, [2; 6]).unwrap();
+        let rpa = rpa_from(&IRK, [0x94, 0x81, 0x70]);
+        assert!(!p.admit(rpa, true));
+        assert_eq!(p.stats().resolve_ok, 1);
+        assert_eq!(p.stats().rejected_not_listed, 1);
+        assert_eq!(p.resolve_pending(), None);
+    }
+
+    #[test]
+    fn policy_two_accepts_a_listed_static_random() {
+        let mut p = Privacy::new();
+        p.set_enabled(true);
+        p.set_filter_policy(2);
+        p.fal_add(1, [1, 2, 3, 4, 5, 0xc0]).unwrap();
+        assert!(p.admit([1, 2, 3, 4, 5, 0xc0], true));
+        assert_eq!(p.stats().resolve_attempts, 0);
+    }
+
+    #[test]
+    fn fal_identity_validation_applies_to_add_and_remove() {
+        let mut p = Privacy::new();
+        assert_eq!(p.fal_add(2, [1; 6]), Err(PrivacyError::InvalidKind));
+        assert_eq!(
+            p.fal_add(1, [1, 2, 3, 4, 5, 0x40]),
+            Err(PrivacyError::InvalidIdentity)
+        );
+        assert_eq!(p.fal_add(1, [1, 2, 3, 4, 5, 0xc0]), Ok(true));
+        assert_eq!(
+            p.fal_remove(1, [1, 2, 3, 4, 5, 0x40]),
+            Err(PrivacyError::InvalidIdentity)
+        );
+        assert_eq!(p.fal_remove(1, [1, 2, 3, 4, 5, 0xc0]), Ok(true));
+        assert_eq!(
+            p.fal_remove(1, [1, 2, 3, 4, 5, 0xc0]),
+            Err(PrivacyError::NotFound)
+        );
     }
 
     #[test]
