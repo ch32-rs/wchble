@@ -564,7 +564,8 @@ CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
   cargo build --release --features secure,privacy,fal-filter
 python3 tools/secure_run.py \
   --out local-docs/results/s4b-<unique> \
-  --run-seconds 60 --timeout 40 --mode fal --fal-settle 2 --connect-wait 40
+  --run-seconds 60 --timeout 40 --mode fal --fal-settle 2 \
+  --connect-wait 40 --probe-timeout 45
 ```
 
 The Mac must not know `wch585-p4` in System Settings > Bluetooth, otherwise it
