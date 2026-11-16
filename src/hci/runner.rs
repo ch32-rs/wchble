@@ -8,6 +8,9 @@ use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
 use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
+use crate::ll::privacy::{
+    is_resolvable, Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_RESOLVING_LIST,
+};
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
@@ -24,6 +27,8 @@ const HCI_INVALID_PARAMETERS: u8 = 0x12;
 const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 /// Unknown connection identifier.
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
+/// Memory capacity exceeded (resolving or filter accept list full).
+const HCI_MEMORY_CAPACITY_EXCEEDED: u8 = 0x07;
 
 /// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
@@ -38,6 +43,9 @@ const HCI_MIN_TX_OCTETS: u16 = 27;
 const HCI_MAX_TX_OCTETS: u16 = 251;
 const HCI_MIN_TX_TIME: u16 = 328;
 const HCI_MAX_TX_TIME: u16 = 17040;
+
+/// `adv_own_addr_type` before `LE Set Advertising Parameters` sets it.
+const OWN_ADDR_UNSET: u8 = 0xff;
 
 /// Default public BD_ADDR placeholder (HAL / OTP can override later).
 const DEFAULT_BD_ADDR: [u8; 6] = [0x00, 0x00, 0x00, 0xc1, 0xff, 0xee];
@@ -107,6 +115,10 @@ pub struct SoftRunner {
     bd_addr: [u8; 6],
     /// Address from `LE Set Random Address` / HAL seed; `None` = public BD_ADDR.
     random_addr: Option<[u8; 6]>,
+    /// Own address type selected by `LE Set Advertising Parameters`.
+    adv_own_addr_type: u8,
+    /// Local RPA, peer resolution and filter accept list.
+    privacy: Privacy,
     /// DRBG backing `HCI_LE_Rand` and LL random values.
     drbg: ChaCha20Drbg,
     /// True once a HAL supplied a measured entropy seed.
@@ -161,6 +173,8 @@ impl SoftRunner {
             le_event_mask: 0x1f,
             bd_addr: DEFAULT_BD_ADDR,
             random_addr: None,
+            adv_own_addr_type: OWN_ADDR_UNSET,
+            privacy: Privacy::new(),
             drbg: ChaCha20Drbg::from_seed(&[0u8; 32]),
             entropy_seeded: false,
             pending_encryption: None,
@@ -374,22 +388,267 @@ impl SoftRunner {
     /// the value is re-applied when `Reset` rebuilds the link layer.
     pub fn set_random_addr(&mut self, addr: [u8; 6]) {
         self.random_addr = Some(addr);
-        self.sync_adv_addr();
+        self.sync_adv_addr(false);
     }
 
-    /// Point `AdvState` at the selected own address (random if one was set,
-    /// otherwise the public BD_ADDR).
-    fn sync_adv_addr(&mut self) {
-        match self.random_addr {
-            Some(addr) => {
-                self.ll.adv.own_addr = addr;
-                self.ll.adv.random_addr = true;
-            }
-            None => {
-                self.ll.adv.own_addr = self.bd_addr;
-                self.ll.adv.random_addr = false;
+    /// Selects the local address for the requested own address type
+    /// (Core 5.4 Vol 4 Part E §7.8.5).
+    fn sync_adv_addr(&mut self, for_adv: bool) {
+        let own_type = self.adv_own_addr_type;
+        let mut fallback = false;
+        let mut uses_rpa = false;
+        let (address, random) = match own_type {
+            0 => (self.bd_addr, false),
+            1 => (self.random_addr.unwrap_or([0; 6]), true),
+            2 | 3 => match self.ensure_local_rpa() {
+                Some(rpa) => {
+                    uses_rpa = true;
+                    (rpa, true)
+                }
+                None => {
+                    fallback = true;
+                    if own_type == 2 || self.random_addr.is_none() {
+                        (self.bd_addr, false)
+                    } else {
+                        (self.random_addr.unwrap_or([0; 6]), true)
+                    }
+                }
+            },
+            // Before the Host sets parameters: random if one was seeded.
+            _ => match self.random_addr {
+                Some(addr) => (addr, true),
+                None => (self.bd_addr, false),
+            },
+        };
+        self.ll.adv.own_addr = address;
+        self.ll.adv.random_addr = random;
+        if for_adv {
+            self.privacy.note_adv_address(uses_rpa, fallback);
+        }
+    }
+
+    /// Generates the first local RPA if the selected own type needs one.
+    fn ensure_local_rpa(&mut self) -> Option<[u8; 6]> {
+        if !matches!(self.adv_own_addr_type, 2 | 3) {
+            return None;
+        }
+        for _ in 0..4 {
+            let mut random = [0u8; 3];
+            self.drbg.fill(&mut random);
+            if let Some(rpa) = self.privacy.ensure_rpa(random) {
+                return Some(rpa);
             }
         }
+        None
+    }
+
+    /// True when `LE Set Advertising Enable` can resolve an address.
+    fn adv_address_available(&mut self) -> bool {
+        match self.adv_own_addr_type {
+            0 | 2 => true,
+            1 => self.random_addr.is_some(),
+            3 => self.random_addr.is_some() || self.ensure_local_rpa().is_some(),
+            _ => true,
+        }
+    }
+
+    /// Advertising, scanning or initiating.
+    fn roles_active(&self) -> bool {
+        self.ll.adv.enabled || self.scan.enabled || self.pending_connect.is_some()
+    }
+
+    /// RL edits are only blocked while resolution is enabled (HCI §7.8.38–40).
+    fn resolving_edits_blocked(&self) -> bool {
+        self.privacy.enabled() && self.roles_active()
+    }
+
+    fn add_resolving_entry(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        if self.resolving_edits_blocked() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&params[1..7]);
+        let mut peer_irk = [0u8; 16];
+        peer_irk.copy_from_slice(&params[7..23]);
+        let mut local_irk = [0u8; 16];
+        local_irk.copy_from_slice(&params[23..39]);
+        let privacy_mode = self
+            .privacy
+            .entry(params[0], address)
+            .map_or(0, |entry| entry.privacy_mode);
+        let entry = ResolvingEntry {
+            peer_kind: params[0],
+            peer_address: address,
+            peer_irk,
+            local_irk,
+            privacy_mode,
+        };
+        match self.privacy.add(entry) {
+            Ok(()) => {
+                self.sync_adv_addr(false);
+                Ok(&[][..])
+            }
+            Err(crate::ll::privacy::PrivacyError::NoSpace) => Err(HCI_MEMORY_CAPACITY_EXCEEDED),
+            Err(_) => Err(HCI_INVALID_PARAMETERS),
+        }
+    }
+
+    fn remove_resolving_entry(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        if self.resolving_edits_blocked() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&params[1..7]);
+        match self.privacy.remove(params[0], address) {
+            Ok(()) => {
+                self.sync_adv_addr(false);
+                Ok(&[][..])
+            }
+            Err(crate::ll::privacy::PrivacyError::NotFound) => Err(HCI_UNKNOWN_CONNECTION),
+            Err(_) => Err(HCI_INVALID_PARAMETERS),
+        }
+    }
+
+    fn clear_resolving_list(&mut self) -> Result<&'static [u8], u8> {
+        if self.resolving_edits_blocked() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        self.privacy.clear();
+        self.sync_adv_addr(false);
+        Ok(&[][..])
+    }
+
+    fn set_resolution_enable(&mut self, enable: bool) -> Result<&'static [u8], u8> {
+        if self.roles_active() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        self.privacy.set_enabled(enable);
+        Ok(&[][..])
+    }
+
+    fn set_rpa_timeout(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        // Units are seconds, 1..=0x0E10 (Core 5.4 Vol 4 Part E §7.8.45).
+        let seconds = u16::from_le_bytes([params[0], params[1]]);
+        if !(1..=0x0e10).contains(&seconds) {
+            return Err(HCI_INVALID_PARAMETERS);
+        }
+        self.privacy.set_timeout_us(u32::from(seconds) * 1_000_000);
+        Ok(&[][..])
+    }
+
+    fn set_privacy_mode(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&params[1..7]);
+        match self.privacy.set_mode(params[0], address, params[7]) {
+            Ok(()) => Ok(&[][..]),
+            Err(crate::ll::privacy::PrivacyError::NotFound) => Err(HCI_UNKNOWN_CONNECTION),
+            Err(_) => Err(HCI_INVALID_PARAMETERS),
+        }
+    }
+
+    /// The accept list is in use while a filtered advertisement is running.
+    fn fal_busy(&self) -> bool {
+        self.ll.adv.enabled && self.privacy.filter_policy() != 0
+    }
+
+    fn clear_filter_accept_list(&mut self) -> Result<&'static [u8], u8> {
+        if self.fal_busy() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        self.privacy.fal_clear();
+        Ok(&[][..])
+    }
+
+    fn add_filter_accept(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        if self.fal_busy() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&params[1..7]);
+        match self.privacy.fal_add(params[0], address) {
+            Ok(_) => Ok(&[][..]),
+            Err(crate::ll::privacy::PrivacyError::NoSpace) => Err(HCI_MEMORY_CAPACITY_EXCEEDED),
+            Err(_) => Err(HCI_INVALID_PARAMETERS),
+        }
+    }
+
+    fn remove_filter_accept(&mut self, params: &[u8]) -> Result<&'static [u8], u8> {
+        if self.fal_busy() {
+            return Err(HCI_COMMAND_DISALLOWED);
+        }
+        let mut address = [0u8; 6];
+        address.copy_from_slice(&params[1..7]);
+        match self.privacy.fal_remove(params[0], address) {
+            Ok(_) => Ok(&[][..]),
+            Err(crate::ll::privacy::PrivacyError::NotFound) => Err(HCI_UNKNOWN_CONNECTION),
+            Err(_) => Err(HCI_INVALID_PARAMETERS),
+        }
+    }
+
+    /// RF event boundary: stamp the first RPA and rotate when due.
+    pub fn poll_privacy(&mut self, now_us: u32) -> bool {
+        let mut generated = false;
+        for _ in 0..4 {
+            let mut random = [0u8; 3];
+            self.drbg.fill(&mut random);
+            match self.privacy.poll(now_us, random) {
+                Poll::Generated => {
+                    generated = true;
+                    break;
+                }
+                Poll::Idle => break,
+                Poll::InvalidRandom => {}
+            }
+        }
+        if generated {
+            self.sync_adv_addr(self.ll.adv.enabled);
+        }
+        generated
+    }
+
+    pub fn local_rpa(&self) -> Option<[u8; 6]> {
+        self.privacy.local_rpa()
+    }
+
+    /// One CONNECT_IND: policy 0 accepts and defers, policy 2 decides here.
+    pub fn admit_connection(&mut self, address: [u8; 6], random: bool) -> bool {
+        self.privacy.admit(address, random)
+    }
+
+    /// SCAN_REQ gate: a Network-mode peer may not scan us at its identity
+    /// address (Core 5.4 Vol 6 Part B §6.2.1).
+    pub fn scan_request_allowed(&self, address: [u8; 6], random: bool) -> bool {
+        if random && is_resolvable(address) {
+            return true;
+        }
+        !self.privacy.blocks_identity(u8::from(random), address)
+    }
+
+    /// Idle path: resolve the address recorded by `admit_connection`.
+    pub fn resolve_pending_peer(&mut self) -> Option<(u8, [u8; 6])> {
+        self.privacy.resolve_pending()
+    }
+
+    pub fn clear_pending_peer(&mut self) {
+        self.privacy.clear_pending();
+    }
+
+    /// Diagnostic resolution that also counts against `PrivacyStats`.
+    pub fn resolve_peer(&mut self, address: [u8; 6], random: bool) -> Option<(u8, [u8; 6])> {
+        self.privacy.resolve_peer(address, random)
+    }
+
+    pub fn privacy_stats(&self) -> PrivacyStats {
+        self.privacy.stats()
+    }
+
+    /// True when this identity and peer IRK are loaded in the controller.
+    pub fn privacy_has_peer(&self, kind: u8, address: [u8; 6], peer_irk: &[u8; 16]) -> bool {
+        self.privacy.has_peer(kind, address, peer_irk)
+    }
+
+    pub fn privacy_list_generation(&self) -> u32 {
+        self.privacy.list_generation()
     }
 
     /// True while Host has advertising enabled.
@@ -590,9 +849,13 @@ impl SoftRunner {
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
         self.suggested_tx_time = LL_LEGACY_TIME_US;
         self.suggested_tx_explicit = false;
+        // Revert to the documented defaults: empty resolving and filter accept
+        // lists, resolution disabled, 900 s timeout.
+        self.adv_own_addr_type = OWN_ADDR_UNSET;
+        self.privacy = Privacy::new();
         // `LinkLayer::new` resets AdvA to a zero random address; restore the
         // selected own address even when only a public BD_ADDR is known.
-        self.sync_adv_addr();
+        self.sync_adv_addr(false);
         self.pending_reply = Some(transport::command_complete_packet(0x0c03, HCI_SUCCESS, &[]));
     }
 
@@ -832,13 +1095,17 @@ impl SoftRunner {
             // LE Set Advertise Enable
             0x200a if params.len() == 1 && params[0] <= 1 => {
                 let enable = params[0] != 0;
-                if enable {
-                    // Resolve AdvA right before use; 0x2005 normally did this
-                    // already, but Hosts may skip it.
-                    self.sync_adv_addr();
+                if enable && !self.adv_address_available() {
+                    Err(HCI_INVALID_PARAMETERS)
+                } else {
+                    if enable {
+                        // Resolve AdvA right before use; 0x2005 normally did
+                        // this already, but Hosts may skip it.
+                        self.sync_adv_addr(true);
+                    }
+                    self.ll.adv.enabled = enable;
+                    Ok(&[][..])
                 }
-                self.ll.adv.enabled = enable;
-                Ok(&[][..])
             }
             // LE Set Scan Parameters — passive only; disallowed while scanning
             // (Core 5.4 Vol 4 Part E §7.8.10).
@@ -857,7 +1124,7 @@ impl SoftRunner {
                     return;
                 }
                 if enable {
-                    self.sync_adv_addr();
+                    self.sync_adv_addr(false);
                 }
                 self.scan.enabled = enable;
                 self.scan.filter_duplicates = params[1] != 0;
@@ -879,26 +1146,25 @@ impl SoftRunner {
                 let _ = self.bridge.connection_failed(0x02);
                 Ok(&[][..])
             }
-            // Filter Accept List size / clear / add — report empty list.
-            0x200f if params.is_empty() => Ok(&[0][..]),
-            0x2010 if params.is_empty() => Ok(&[][..]),
-            0x2011 => Err(HCI_COMMAND_DISALLOWED),
-            // Resolving list and privacy: accepted but not implemented.
-            //
-            // The controller never generates or resolves RPAs yet (S4), and
-            // the examples use a static random address. Trouble's `security`
-            // feature still issues the full startup sync, so answer success
-            // while keeping the list logically empty. HCI commands:
-            // 0x2027 add, 0x2028 remove, 0x2029 clear, 0x202A read size,
-            // 0x202D address resolution enable, 0x202E RPA timeout,
-            // 0x204E privacy mode.
-            0x2027 if params.len() == 39 => Ok(&[][..]),
-            0x2028 if params.len() == 7 => Ok(&[][..]),
-            0x2029 if params.is_empty() => Ok(&[][..]),
-            0x202a if params.is_empty() => Ok(&[0][..]),
-            0x202d if params.len() == 1 && params[0] <= 1 => Ok(&[][..]),
-            0x202e if params.len() == 2 => Ok(&[][..]),
-            0x204e if params.len() == 8 => Ok(&[][..]),
+            // Filter Accept List: size / clear / add / remove. Only the
+            // connect filter (policy 2) uses it (S4b).
+            0x200f if params.is_empty() => Ok(&[MAX_RESOLVING_LIST as u8][..]),
+            0x2010 if params.is_empty() => self.clear_filter_accept_list(),
+            0x2011 if params.len() == 7 => self.add_filter_accept(params),
+            0x2012 if params.len() == 7 => self.remove_filter_accept(params),
+            0x2011 | 0x2012 => Err(HCI_INVALID_PARAMETERS),
+            // Resolving list (Core 5.4 Vol 4 Part E §7.8.38-40): add, remove,
+            // clear, read size. Changes are disallowed while a role is active.
+            0x2027 if params.len() == 39 => self.add_resolving_entry(params),
+            0x2028 if params.len() == 7 => self.remove_resolving_entry(params),
+            0x2029 if params.is_empty() => self.clear_resolving_list(),
+            0x202a if params.is_empty() => Ok(&[MAX_RESOLVING_LIST as u8][..]),
+            // Address resolution enable / RPA timeout / privacy mode.
+            0x202d if params.len() == 1 && params[0] <= 1 => {
+                self.set_resolution_enable(params[0] != 0)
+            }
+            0x202e if params.len() == 2 => self.set_rpa_timeout(params),
+            0x204e if params.len() == 8 => self.set_privacy_mode(params),
             0x2027 | 0x2028 | 0x202d | 0x202e | 0x204e => Err(HCI_INVALID_PARAMETERS),
             // LE Encrypt — one AES-128 block, software engine (Host utility;
             // not on the connection timing path).
@@ -981,10 +1247,13 @@ impl SoftRunner {
         if !(0x20..=0x4000).contains(&min) || !(min..=0x4000).contains(&max) {
             return Err(HCI_INVALID_PARAMETERS);
         }
-        // ADV_IND + random own address + channel map only — match rusted-ch5 checks.
+        // ADV_IND, own address type 0..=3, channel map, and only the filter
+        // policies we implement: 0 (unfiltered) and 2 (connect filter).
         if params[4] != 0
-            || params[5] != 1
-            || params[14] != 0
+            || params[5] > 3
+            || params[14] > 3
+            || params[14] == 1
+            || params[14] == 3
             || params[13] == 0
             || params[13] & !7 != 0
         {
@@ -992,6 +1261,10 @@ impl SoftRunner {
         }
         self.ll.adv.interval_slots = min;
         self.ll.adv.channel_map = params[13];
+        self.privacy.set_filter_policy(params[14]);
+        self.adv_own_addr_type = params[5];
+        self.privacy.set_own_addr_type(params[5]);
+        self.sync_adv_addr(false);
         Ok(&[])
     }
 
@@ -1269,6 +1542,9 @@ mod tests {
             latency: 0,
             supervision_timeout: 200,
             master_clock_accuracy: 0,
+            peer_rpa: None,
+            local_rpa: None,
+            peer_identity: None,
         }
     }
 
@@ -1467,34 +1743,274 @@ mod tests {
     }
 
     #[test]
-    fn privacy_commands_are_accepted_without_a_resolving_list() {
+    fn resolving_list_commands_track_real_entries() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
         let mut runner = SoftRunner::new();
 
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+
         pollster::block_on(async {
-            for (opcode, params) in [
-                (0x202d, &[1u8][..]),
-                (0x2029, &[][..]),
-                (0x2027, &[0u8; 39][..]),
-                (0x2028, &[0u8; 7][..]),
-                (0x202e, &[0x10, 0x00][..]),
-                (0x204e, &[0u8; 8][..]),
-            ] {
-                inject_cmd(opcode, params);
-                runner.serve_one().await;
-                expect_command_complete(opcode, HCI_SUCCESS, &[]);
-            }
             inject_cmd(0x202a, &[]);
             runner.serve_one().await;
-            expect_command_complete(0x202a, HCI_SUCCESS, &[0]);
+            expect_command_complete(0x202a, HCI_SUCCESS, &[8]);
 
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 1);
+
+            // Same four parameters: idempotent.
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 1);
+
+            let mut mode = [0u8; 8];
+            mode[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+            mode[7] = 1;
+            inject_cmd(0x204e, &mode);
+            runner.serve_one().await;
+            expect_command_complete(0x204e, HCI_SUCCESS, &[]);
+            mode[7] = 2;
+            inject_cmd(0x204e, &mode);
+            runner.serve_one().await;
+            expect_command_complete(0x204e, HCI_INVALID_PARAMETERS, &[]);
+            mode[1] = 9;
+            mode[7] = 0;
+            inject_cmd(0x204e, &mode);
+            runner.serve_one().await;
+            expect_command_complete(0x204e, HCI_UNKNOWN_CONNECTION, &[]);
+
+            // RPA timeout is in seconds: 16 is the minimum, 0 is invalid.
+            inject_cmd(0x202e, &[0x10, 0x00]);
+            runner.serve_one().await;
+            expect_command_complete(0x202e, HCI_SUCCESS, &[]);
+            inject_cmd(0x202e, &[0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x202e, HCI_INVALID_PARAMETERS, &[]);
+
+            let mut remove = [0u8; 7];
+            remove[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+            inject_cmd(0x2028, &remove);
+            runner.serve_one().await;
+            expect_command_complete(0x2028, HCI_SUCCESS, &[]);
+            inject_cmd(0x2028, &remove);
+            runner.serve_one().await;
+            expect_command_complete(0x2028, HCI_UNKNOWN_CONNECTION, &[]);
+
+            inject_cmd(0x202d, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x202d, HCI_SUCCESS, &[]);
             inject_cmd(0x202d, &[2]);
             runner.serve_one().await;
             expect_command_complete(0x202d, HCI_INVALID_PARAMETERS, &[]);
         });
     }
 
+    #[test]
+    fn reset_clears_privacy_state() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+        let fal = [0, 7, 8, 9, 10, 11, 12];
+
+        pollster::block_on(async {
+            for (opcode, params) in [(0x2027, &add[..]), (0x202d, &[1u8][..]), (0x2011, &fal[..])] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_SUCCESS, &[]);
+            }
+            let before = runner.privacy_stats();
+            assert_eq!(before.list_len, 1);
+            assert_ne!(
+                before.flags & crate::ll::privacy::flags::RESOLUTION_ENABLED,
+                0
+            );
+            assert_ne!(before.flags & crate::ll::privacy::flags::FAL_NONEMPTY, 0);
+
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+
+            let after = runner.privacy_stats();
+            assert_eq!(after.list_len, 0);
+            assert_eq!(
+                after.flags
+                    & (crate::ll::privacy::flags::RESOLUTION_ENABLED
+                        | crate::ll::privacy::flags::FAL_NONEMPTY),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn resolving_list_edits_are_disallowed_while_active() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        pollster::block_on(async {
+            inject_cmd(0x202d, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x202d, HCI_SUCCESS, &[]);
+            runner.ll.adv.enabled = true;
+            for (opcode, params) in [
+                (0x2027, &[0u8; 39][..]),
+                (0x2028, &[0u8; 7][..]),
+                (0x2029, &[][..]),
+                (0x202d, &[0u8][..]),
+            ] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_COMMAND_DISALLOWED, &[]);
+            }
+        });
+    }
+
+    #[test]
+    fn resolving_list_edits_are_allowed_while_resolution_is_off() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.ll.adv.enabled = true;
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+
+        pollster::block_on(async {
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 1);
+
+            inject_cmd(0x2029, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2029, HCI_SUCCESS, &[]);
+            assert_eq!(runner.privacy_stats().list_len, 0);
+        });
+    }
+
+    #[test]
+    fn scan_request_from_a_network_mode_identity_is_ignored() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+
+        pollster::block_on(async {
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+
+            assert!(!runner.scan_request_allowed([1, 2, 3, 4, 5, 6], false));
+            assert!(runner.scan_request_allowed([9; 6], false));
+            assert!(runner.scan_request_allowed([1, 2, 3, 4, 5, 0x46], true));
+        });
+    }
+
+    #[test]
+    fn first_advertising_frame_is_the_local_rpa() {
+        // Spec §16.2.11: the offline hard proof is the PDU the RF owner sends,
+        // not a sniffer capture. Own type 2 must already advertise an RPA in
+        // the very first frame, with no identity-address frame in between.
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        // The Host seeds the local IRK through the default resolving-list entry
+        // (zero peer identity), exactly like Trouble's full sync.
+        let mut add = [0u8; 39];
+        add[23..39].fill(0x22);
+
+        let mut params = [0u8; 15];
+        params[0..4].copy_from_slice(&[0x20, 0x00, 0x20, 0x00]);
+        params[5] = 2;
+        params[13] = 0x07;
+        let mut adv = [0u8; 32];
+        adv[0] = 3;
+        adv[1..4].copy_from_slice(&[0x02, 0x01, 0x06]);
+
+        pollster::block_on(async {
+            inject_cmd(0x2027, &add);
+            runner.serve_one().await;
+            expect_command_complete(0x2027, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x2006, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2006, HCI_SUCCESS, &[]);
+            inject_cmd(0x2008, &adv);
+            runner.serve_one().await;
+            expect_command_complete(0x2008, HCI_SUCCESS, &[]);
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+
+            let rpa = runner.local_rpa().expect("own type 2 needs a local RPA");
+            let mut pdu = [0u8; 40];
+            let n = runner.build_adv_pdu(&mut pdu).unwrap();
+            assert_eq!(n, 2 + 6 + 3);
+            assert_eq!(pdu[0], 0x40);
+            assert_eq!(&pdu[2..8], &rpa);
+            assert_eq!(rpa[5] & 0xc0, 0x40, "prand top bits must be 01");
+            assert_eq!(&pdu[8..11], &[0x02, 0x01, 0x06]);
+
+            let stats = runner.privacy_stats();
+            assert_eq!(stats.generations, 1);
+            assert!(stats.flags & crate::ll::privacy::flags::ADV_USES_RPA != 0);
+            assert_eq!(stats.flags & crate::ll::privacy::flags::IDENTITY_FALLBACK, 0);
+        });
+    }
+
+    #[test]
+    fn filter_accept_list_commands_report_real_status() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let mut member = [0u8; 7];
+        member[1..7].copy_from_slice(&[7, 7, 7, 7, 7, 7]);
+
+        pollster::block_on(async {
+            inject_cmd(0x200f, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x200f, HCI_SUCCESS, &[8]);
+
+            inject_cmd(0x2011, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+            // Adding an existing member is not an error.
+            inject_cmd(0x2011, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x2012, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2012, HCI_SUCCESS, &[]);
+            inject_cmd(0x2012, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2012, HCI_UNKNOWN_CONNECTION, &[]);
+
+            inject_cmd(0x2011, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+            inject_cmd(0x2010, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2010, HCI_SUCCESS, &[]);
+        });
+    }
     #[test]
     fn rx_backpressure_pb_mapping_and_empty_control_packets() {
         let _guard = test_lock();

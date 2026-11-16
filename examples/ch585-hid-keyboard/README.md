@@ -16,7 +16,10 @@ scope. Android is driven automatically through the shared `android-pair` helper
 
 ```sh
 cd examples/ch585-hid-keyboard
-cargo build --release --features secure                    # acceptance image, RUN_SECONDS=60
+# S4 acceptance images must be opt-z + ICF; opt-level 3 loses the link at pairing.
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
+  cargo build --release --features secure,privacy,rpa-fast # acceptance image, RUN_SECONDS=60
+cargo build --release --features secure                    # plain secure image
 cargo build --release --features secure,long-run           # 360 s manual window
 cargo build --release --features secure,accept-control     # adds DEL!/WIPE/FALT
 cargo build --release                                      # plain link, HID table only

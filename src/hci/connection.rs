@@ -29,6 +29,12 @@ pub struct ConnectionInfo {
     pub supervision_timeout: u16,
     /// Master clock accuracy (SCA) reported in LE Connection Complete.
     pub master_clock_accuracy: u8,
+    /// RPA received in CONNECT_IND; set even when it was not resolved.
+    pub peer_rpa: Option<[u8; 6]>,
+    /// Local RPA snapshot for this connection.
+    pub local_rpa: Option<[u8; 6]>,
+    /// Identity `(kind, address)` when the controller resolved the peer.
+    pub peer_identity: Option<(u8, [u8; 6])>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +72,79 @@ pub enum RadioRequest {
 struct TxSlot {
     acl: TxAcl,
     in_flight: bool,
+}
+
+/// Enhanced Connection Complete (v1) subevent.
+const ENHANCED_CONNECTION_COMPLETE: u8 = 0x0a;
+/// Legacy Connection Complete subevent.
+const CONNECTION_COMPLETE: u8 = 0x01;
+
+/// Picks the connection-complete event the Host enabled; Enhanced wins.
+fn connection_event_slot_for(mask: u64, event_enabled: bool) -> Option<u8> {
+    if !event_enabled {
+        return None;
+    }
+    if mask & (1u64 << (ENHANCED_CONNECTION_COMPLETE - 1)) != 0 {
+        Some(ENHANCED_CONNECTION_COMPLETE)
+    } else if mask & (1u64 << (CONNECTION_COMPLETE - 1)) != 0 {
+        Some(CONNECTION_COMPLETE)
+    } else {
+        None
+    }
+}
+
+/// Encodes a Connection Complete / Enhanced event body (without the HCI
+/// header). `None` means the attempt failed and every field is zero.
+///
+/// Enhanced layout (Core 5.4 Vol 4 Part E §7.7.65.10): peer address, local RPA,
+/// peer RPA, then the timing fields.
+fn connection_event(
+    info: Option<&ConnectionInfo>,
+    status: u8,
+    enhanced: bool,
+) -> ([u8; 31], usize) {
+    let mut parameters = [0u8; 31];
+    let len = if enhanced { 31 } else { 19 };
+    parameters[0] = if enhanced {
+        ENHANCED_CONNECTION_COMPLETE
+    } else {
+        CONNECTION_COMPLETE
+    };
+    parameters[1] = status;
+    let Some(info) = info else {
+        return (parameters, len);
+    };
+    parameters[2..4].copy_from_slice(&info.handle.to_le_bytes());
+    parameters[4] = match info.role {
+        Role::Central => 0,
+        Role::Peripheral => 1,
+        _ => return (parameters, len),
+    };
+    parameters[5] = info.peer_address_type;
+    parameters[6..12].copy_from_slice(&info.peer_address);
+    if !enhanced {
+        parameters[12..14].copy_from_slice(&info.interval.to_le_bytes());
+        parameters[14..16].copy_from_slice(&info.latency.to_le_bytes());
+        parameters[16..18].copy_from_slice(&info.supervision_timeout.to_le_bytes());
+        parameters[18] = info.master_clock_accuracy;
+        return (parameters, len);
+    }
+    if let Some(rpa) = info.local_rpa {
+        parameters[12..18].copy_from_slice(&rpa);
+    }
+    // Peer_RPA is valid only together with a resolved identity address.
+    if let (Some((kind, address)), Some(rpa)) = (info.peer_identity, info.peer_rpa) {
+        if kind <= 1 {
+            parameters[5] = if kind == 0 { 2 } else { 3 };
+            parameters[6..12].copy_from_slice(&address);
+            parameters[18..24].copy_from_slice(&rpa);
+        }
+    }
+    parameters[24..26].copy_from_slice(&info.interval.to_le_bytes());
+    parameters[26..28].copy_from_slice(&info.latency.to_le_bytes());
+    parameters[28..30].copy_from_slice(&info.supervision_timeout.to_le_bytes());
+    parameters[30] = info.master_clock_accuracy;
+    (parameters, len)
 }
 
 #[derive(Debug)]
@@ -167,22 +246,10 @@ impl ConnectionBridge {
         self.epoch = self.epoch.wrapping_add(1);
         self.info = Some(info);
         self.disconnecting = false;
-        if self.le_event_enabled(1) {
-            let mut parameters = [0; 19];
-            parameters[0] = 1; // LE Connection Complete
-            parameters[2..4].copy_from_slice(&info.handle.to_le_bytes());
-            parameters[4] = match info.role {
-                Role::Central => 0,
-                Role::Peripheral => 1,
-                _ => unreachable!("role checked above"),
-            };
-            parameters[5] = info.peer_address_type;
-            parameters[6..12].copy_from_slice(&info.peer_address);
-            parameters[12..14].copy_from_slice(&info.interval.to_le_bytes());
-            parameters[14..16].copy_from_slice(&info.latency.to_le_bytes());
-            parameters[16..18].copy_from_slice(&info.supervision_timeout.to_le_bytes());
-            parameters[18] = info.master_clock_accuracy;
-            self.push_event(event_packet(0x3e, &parameters));
+        if let Some(subevent) = self.connection_event_slot() {
+            let (parameters, len) =
+                connection_event(Some(&info), 0, subevent == ENHANCED_CONNECTION_COMPLETE);
+            self.push_event(event_packet(0x3e, &parameters[..len]));
         }
         Ok(())
     }
@@ -194,16 +261,17 @@ impl ConnectionBridge {
         if self.info.is_some() || self.resetting {
             return Err(BridgeError::AlreadyConnected);
         }
-        if !self.le_event_enabled(1) {
+        let Some(subevent) = self.connection_event_slot() else {
             return Ok(());
-        }
+        };
         if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
             return Err(BridgeError::Full);
         }
-        let mut parameters = [0; 19];
-        parameters[0] = 1; // LE Connection Complete
-        parameters[1] = status;
-        self.push_event(event_packet(0x3e, &parameters));
+        // Failure/cancel follows the same event choice: a Host that enabled
+        // only the Enhanced event must still learn that the attempt ended.
+        let (parameters, len) =
+            connection_event(None, status, subevent == ENHANCED_CONNECTION_COMPLETE);
+        self.push_event(event_packet(0x3e, &parameters[..len]));
         Ok(())
     }
 
@@ -557,6 +625,10 @@ impl ConnectionBridge {
         self.event_enabled(0x3e) && self.le_event_mask & (1u64 << (subevent - 1)) != 0
     }
 
+    fn connection_event_slot(&self) -> Option<u8> {
+        connection_event_slot_for(self.le_event_mask, self.event_enabled(0x3e))
+    }
+
     fn push_event(&mut self, packet: Packet) {
         *self
             .events
@@ -590,4 +662,127 @@ pub(crate) fn event_packet(code: u8, parameters: &[u8]) -> Packet {
     packet.bytes[2..2 + parameters.len()].copy_from_slice(parameters);
     packet.len = 2 + parameters.len();
     packet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RPA: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    const IDENTITY: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0xc0];
+    const LOCAL_RPA: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x4f];
+
+    fn info() -> ConnectionInfo {
+        ConnectionInfo {
+            handle: 0x0041,
+            role: Role::Peripheral,
+            peer_address_type: 1,
+            peer_address: RPA,
+            interval: 24,
+            latency: 0,
+            supervision_timeout: 200,
+            master_clock_accuracy: 1,
+            peer_rpa: Some(RPA),
+            local_rpa: Some(LOCAL_RPA),
+            peer_identity: Some((1, IDENTITY)),
+        }
+    }
+
+    #[test]
+    fn enhanced_wins_over_legacy() {
+        assert_eq!(connection_event_slot_for(0x201, true), Some(0x0a));
+        assert_eq!(connection_event_slot_for(0x001, true), Some(0x01));
+        assert_eq!(connection_event_slot_for(0x200, true), Some(0x0a));
+        assert_eq!(connection_event_slot_for(0x002, true), None);
+        assert_eq!(connection_event_slot_for(0x201, false), None);
+    }
+
+    #[test]
+    fn enhanced_event_encodes_resolved_identity() {
+        let (p, len) = connection_event(Some(&info()), 0, true);
+        assert_eq!(len, 31);
+        assert_eq!(p[0], 0x0a);
+        assert_eq!(p[1], 0);
+        assert_eq!(&p[2..4], &[0x41, 0x00]);
+        assert_eq!(p[4], 1);
+        assert_eq!(p[5], 3); // random identity
+        assert_eq!(&p[6..12], &IDENTITY);
+        assert_eq!(&p[12..18], &LOCAL_RPA);
+        assert_eq!(&p[18..24], &RPA);
+        assert_eq!(&p[24..26], &[24, 0]);
+        assert_eq!(p[30], 1);
+    }
+
+    #[test]
+    fn enhanced_event_keeps_unresolved_rpa_visible() {
+        let mut info = info();
+        info.peer_identity = None;
+        let (p, len) = connection_event(Some(&info), 0, true);
+        assert_eq!(len, 31);
+        assert_eq!(p[5], 1);
+        assert_eq!(&p[6..12], &RPA);
+        assert_eq!(&p[12..18], &LOCAL_RPA);
+        assert_eq!(&p[18..24], &[0; 6]);
+    }
+
+    #[test]
+    fn identity_without_rpa_is_not_reported_as_resolved() {
+        let mut info = info();
+        info.peer_rpa = None;
+        let (p, _) = connection_event(Some(&info), 0, true);
+        assert_eq!(p[5], 1);
+        assert_eq!(&p[6..12], &RPA);
+        assert_eq!(&p[18..24], &[0; 6]);
+    }
+
+    #[test]
+    fn public_identity_becomes_type_two() {
+        let mut info = info();
+        info.peer_identity = Some((0, [0x10, 0x20, 0x30, 0x40, 0x50, 0x60]));
+        let (p, _) = connection_event(Some(&info), 0, true);
+        assert_eq!(p[5], 2);
+        assert_eq!(&p[6..12], &[0x10, 0x20, 0x30, 0x40, 0x50, 0x60]);
+    }
+
+    #[test]
+    fn legacy_event_ignores_privacy_fields() {
+        let (p, len) = connection_event(Some(&info()), 0, false);
+        assert_eq!(len, 19);
+        assert_eq!(p[0], 0x01);
+        assert_eq!(p[5], 1);
+        assert_eq!(&p[6..12], &RPA);
+    }
+
+    #[test]
+    fn enhanced_event_parses_with_the_hci_crate() {
+        use bt_hci::event::le::LeEnhancedConnectionComplete;
+        use bt_hci::FromHciBytes;
+
+        let (parameters, _) = connection_event(Some(&info()), 0, true);
+        let event =
+            LeEnhancedConnectionComplete::from_hci_bytes_complete(&parameters[1..]).unwrap();
+        assert!(event.status.to_result().is_ok());
+        assert_eq!(event.handle.raw(), 0x0041);
+        assert_eq!(event.role, bt_hci::param::LeConnRole::Peripheral);
+        assert_eq!(event.peer_addr_kind.as_raw(), 3);
+        assert_eq!(event.peer_addr.raw(), IDENTITY);
+        assert_eq!(event.local_resolvable_private_addr.raw(), LOCAL_RPA);
+        assert_eq!(event.peer_resolvable_private_addr.raw(), RPA);
+        assert_eq!(event.conn_interval.as_micros(), 24 * 1_250);
+        assert_eq!(event.peripheral_latency, 0);
+        assert_eq!(event.supervision_timeout.as_micros(), 200 * 10_000);
+    }
+
+    #[test]
+    fn failure_uses_the_same_event_and_clears_fields() {
+        let (p, len) = connection_event(None, 0x02, true);
+        assert_eq!(len, 31);
+        assert_eq!(p[0], 0x0a);
+        assert_eq!(p[1], 0x02);
+        assert!(p[2..].iter().all(|byte| *byte == 0));
+        let (p, len) = connection_event(None, 0x02, false);
+        assert_eq!(len, 19);
+        assert_eq!(p[0], 0x01);
+        assert!(p[2..].iter().all(|byte| *byte == 0));
+    }
 }

@@ -5,9 +5,10 @@
 //! what the link layer needs to answer a later encryption request, plus the
 //! peer identity used to find it again after a reboot.
 //!
-//! The list is prefixed by the local advertised identity ([`LocalIdentity`]).
-//! A slot written under another address is ignored rather than served to the
-//! peer, which would fail at DHKeyCheck.
+//! The list is prefixed by the local advertised identity ([`LocalIdentity`])
+//! and the local IRK, so a reboot keeps the same resolvable address. A slot
+//! written under another identity is ignored rather than served to the peer,
+//! which would fail at DHKeyCheck.
 
 use super::{LocalIdentity, StoreError, LOCAL_IDENTITY_LEN};
 
@@ -18,11 +19,21 @@ pub const MAX_BONDS: usize = 4;
 /// Encoded size of one bond.
 pub const RECORD_LEN: usize = 52;
 
-/// Header before the records: local identity plus count.
-pub const HEADER_LEN: usize = LOCAL_IDENTITY_LEN + 1;
+/// Local identity resolving key carried in the header.
+pub const LOCAL_IRK_LEN: usize = 16;
 
-/// Largest payload [`encode_bonds`] can produce.
+/// Header before the records: identity, local IRK, count.
+pub const HEADER_LEN: usize = LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN + 1;
+
+/// Largest payload [`encode_bonds`] can produce: exactly one slot.
 pub const MAX_PAYLOAD: usize = HEADER_LEN + MAX_BONDS * RECORD_LEN;
+
+/// A decoded bond list and the local IRK it was written with.
+pub struct DecodedBonds<'a> {
+    /// Local IRK; all zero when the image did not use privacy.
+    pub local_irk: [u8; 16],
+    pub bonds: &'a [PersistedBond],
+}
 
 const FLAG_HAS_IRK: u8 = 1 << 0;
 const FLAG_BONDED: u8 = 1 << 1;
@@ -107,6 +118,7 @@ impl PersistedBond {
 /// Encode a bond list; returns the payload length.
 pub fn encode_bonds(
     local: &LocalIdentity,
+    local_irk: &[u8; LOCAL_IRK_LEN],
     bonds: &[PersistedBond],
     out: &mut [u8],
 ) -> Result<usize, StoreError> {
@@ -118,7 +130,8 @@ pub fn encode_bonds(
         });
     }
     out[..LOCAL_IDENTITY_LEN].copy_from_slice(&local.encode());
-    out[LOCAL_IDENTITY_LEN] = bonds.len() as u8;
+    out[LOCAL_IDENTITY_LEN..LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN].copy_from_slice(local_irk);
+    out[LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN] = bonds.len() as u8;
     for (index, bond) in bonds.iter().enumerate() {
         let start = HEADER_LEN + index * RECORD_LEN;
         bond.encode(&mut out[start..start + RECORD_LEN]);
@@ -131,11 +144,11 @@ pub fn encode_bonds(
 /// `Ok(None)` means the payload is well formed but was written under a
 /// different local identity; the caller must not serve those bonds and must
 /// not erase the slot.
-pub fn decode_bonds(
+pub fn decode_bonds<'a>(
     input: &[u8],
     local: &LocalIdentity,
-    out: &mut [PersistedBond],
-) -> Result<Option<usize>, StoreError> {
+    out: &'a mut [PersistedBond],
+) -> Result<Option<DecodedBonds<'a>>, StoreError> {
     let stored = LocalIdentity::decode(input).ok_or(StoreError::BadFormat)?;
     if stored != *local {
         return Ok(None);
@@ -143,23 +156,27 @@ pub fn decode_bonds(
     if input.len() < HEADER_LEN {
         return Err(StoreError::BadFormat);
     }
-    let count = input[LOCAL_IDENTITY_LEN] as usize;
-    if count > MAX_BONDS
-        || count > out.len()
-        || input.len() < HEADER_LEN + count * RECORD_LEN
-    {
+    let count = input[LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN] as usize;
+    if count > MAX_BONDS || count > out.len() || input.len() < HEADER_LEN + count * RECORD_LEN {
         return Err(StoreError::BadFormat);
     }
+    let mut local_irk = [0u8; LOCAL_IRK_LEN];
+    local_irk.copy_from_slice(&input[LOCAL_IDENTITY_LEN..LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN]);
     for (index, slot) in out[..count].iter_mut().enumerate() {
         let start = HEADER_LEN + index * RECORD_LEN;
         *slot = PersistedBond::decode(&input[start..start + RECORD_LEN]);
     }
-    Ok(Some(count))
+    Ok(Some(DecodedBonds {
+        local_irk,
+        bonds: &out[..count],
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IRK: [u8; LOCAL_IRK_LEN] = [0x5a; LOCAL_IRK_LEN];
 
     fn sample(key: u8) -> PersistedBond {
         PersistedBond {
@@ -183,13 +200,15 @@ mod tests {
     fn round_trip_without_irk() {
         let bonds = [sample(1), sample(2)];
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &bonds, &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &bonds, &mut payload).unwrap();
         assert_eq!(len, HEADER_LEN + 2 * RECORD_LEN);
 
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
-        let count = decode_bonds(&payload[..len], &local(), &mut decoded).unwrap();
-        assert_eq!(count, Some(2));
-        assert_eq!(&decoded[..2], &bonds);
+        let bonds_out = decode_bonds(&payload[..len], &local(), &mut decoded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bonds_out.local_irk, IRK);
+        assert_eq!(bonds_out.bonds, &bonds);
     }
 
     #[test]
@@ -198,73 +217,100 @@ mod tests {
         bond.irk = Some([0x5A; 16]);
         bond.is_bonded = false;
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &[bond], &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &[bond], &mut payload).unwrap();
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
-        assert_eq!(decode_bonds(&payload[..len], &local(), &mut decoded), Ok(Some(1)));
-        assert_eq!(decoded[0], bond);
+        let bonds_out = decode_bonds(&payload[..len], &local(), &mut decoded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bonds_out.bonds, &[bond]);
     }
 
     #[test]
-    fn maximum_capacity_fits_one_slot() {
+    fn irk_only_payload_is_legal() {
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let len = encode_bonds(&local(), &IRK, &[], &mut payload).unwrap();
+        assert_eq!(len, HEADER_LEN);
+        let mut decoded = [PersistedBond::empty(); MAX_BONDS];
+        let bonds_out = decode_bonds(&payload[..len], &local(), &mut decoded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bonds_out.local_irk, IRK);
+        assert!(bonds_out.bonds.is_empty());
+    }
+
+    #[test]
+    fn zero_irk_is_preserved() {
+        let mut payload = [0u8; MAX_PAYLOAD];
+        let len = encode_bonds(&local(), &[0; LOCAL_IRK_LEN], &[sample(1)], &mut payload).unwrap();
+        let mut decoded = [PersistedBond::empty(); MAX_BONDS];
+        let bonds_out = decode_bonds(&payload[..len], &local(), &mut decoded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bonds_out.local_irk, [0; LOCAL_IRK_LEN]);
+    }
+
+    #[test]
+    fn maximum_capacity_fills_one_slot() {
         let bonds = [sample(1), sample(2), sample(3), sample(4)];
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &bonds, &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &bonds, &mut payload).unwrap();
         assert_eq!(len, MAX_PAYLOAD);
-        assert!(MAX_PAYLOAD <= 256 - super::super::HEADER_LEN);
+        assert_eq!(MAX_PAYLOAD, 232);
     }
 
     #[test]
     fn foreign_local_identity_is_ignored() {
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &[sample(1)], &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &[sample(1)], &mut payload).unwrap();
         let other = LocalIdentity::random([0x18, 0x00, 0x00, 0xee, 0xff, 0xc1]);
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
-        assert_eq!(decode_bonds(&payload[..len], &other, &mut decoded), Ok(None));
+        assert!(decode_bonds(&payload[..len], &other, &mut decoded)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn identity_only_payload_is_rejected_not_read() {
-        // Exactly the local identity: the count byte is missing. This used to
-        // index past the end after the identity matched.
+    fn v2_header_is_rejected_not_read() {
+        // A v2 payload is exactly the identity and count, with no local IRK.
         let local = local();
         let input = local.encode();
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
-        assert_eq!(
+        assert!(matches!(
             decode_bonds(&input, &local, &mut decoded),
             Err(StoreError::BadFormat)
-        );
+        ));
     }
 
     #[test]
     fn too_many_bonds_rejected() {
         let bonds = [sample(1); MAX_BONDS + 1];
         let mut payload = [0u8; MAX_PAYLOAD + RECORD_LEN];
-        assert!(encode_bonds(&local(), &bonds, &mut payload).is_err());
+        assert!(encode_bonds(&local(), &IRK, &bonds, &mut payload).is_err());
     }
 
     #[test]
     fn truncated_payload_rejected() {
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &[sample(1), sample(2)], &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &[sample(1), sample(2)], &mut payload).unwrap();
         let mut decoded = [PersistedBond::empty(); MAX_BONDS];
-        assert_eq!(
+        assert!(matches!(
             decode_bonds(&payload[..len - 1], &local(), &mut decoded),
             Err(StoreError::BadFormat)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             decode_bonds(&[], &local(), &mut decoded),
             Err(StoreError::BadFormat)
-        );
+        ));
     }
 
     #[test]
     fn count_beyond_caller_buffer_rejected() {
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = encode_bonds(&local(), &[sample(1), sample(2)], &mut payload).unwrap();
+        let len = encode_bonds(&local(), &IRK, &[sample(1), sample(2)], &mut payload).unwrap();
         let mut decoded = [PersistedBond::empty(); 1];
-        assert_eq!(
+        assert!(matches!(
             decode_bonds(&payload[..len], &local(), &mut decoded),
             Err(StoreError::BadFormat)
-        );
+        ));
     }
 }

@@ -950,6 +950,9 @@ fn connection_event(
                             latency: p.latency,
                             supervision_timeout: p.timeout,
                             master_clock_accuracy: p.sca,
+                            peer_rpa: None,
+                            local_rpa: None,
+                            peer_identity: None,
                         };
                         if bridge.connected(info).is_err() {
                             inc(59);

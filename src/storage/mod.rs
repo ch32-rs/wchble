@@ -22,7 +22,7 @@ const MAGIC: u32 = 0x3344_4e42;
 
 /// Format revision written by this module. Version 2 adds the local identity
 /// to the bond and client-ATT payloads; version-1 slots are ignored once.
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 
 /// Record flags: the stored payload is a zero-length tombstone.
 const FLAG_TOMBSTONE: u16 = 1 << 0;
@@ -773,9 +773,12 @@ mod tests {
         let mut store = store();
         store.save(b"data").unwrap();
         let slot = store.active_slot().unwrap();
-        store.region.data[slot * PAGE + 4] = 3;
-        let mut out = [0u8; 16];
-        assert_eq!(store.load(&mut out), Ok(None));
+        // v2 slots are invalid after the v3 bump; 4 is a future version.
+        for version in [2u8, 4u8] {
+            store.region.data[slot * PAGE + 4] = version;
+            let mut out = [0u8; 16];
+            assert_eq!(store.load(&mut out), Ok(None));
+        }
     }
 
     #[test]

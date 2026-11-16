@@ -46,6 +46,8 @@ mod bond;
 mod client_att;
 #[cfg(feature = "secure")]
 mod rng;
+#[cfg(feature = "privacy")]
+mod privacy;
 #[cfg(feature = "secure")]
 mod time_driver;
 
@@ -70,6 +72,8 @@ pub static RUN_SECONDS: u32 = if cfg!(feature = "long-run") {
 } else {
     25
 };
+/// S4 acceptance: 5 s under `rpa-fast`, otherwise the 900 s default.
+const RPA_TIMEOUT_SECS: u32 = if cfg!(feature = "rpa-fast") { 5 } else { 900 };
 #[no_mangle]
 static mut STATS: [u32; 64] = [0; 64];
 #[no_mangle]
@@ -631,6 +635,10 @@ struct Session {
     /// that answers one event late abandons start encryption (Android only
     /// ACKs the late response and never sends `LL_START_ENC_REQ`).
     pending_ltk: Option<([u8; 8], u16)>,
+    /// Local RPA this connection was established with (snapshot, not current).
+    own_rpa: Option<[u8; 6]>,
+    /// Peer identity resolved by the controller for this connection.
+    peer_identity: Option<(u8, [u8; 6])>,
 }
 impl Session {
     fn new(
@@ -691,6 +699,8 @@ impl Session {
             pending_enc_req: None,
             enc_rsp_at: 0,
             pending_ltk: None,
+            own_rpa: None,
+            peer_identity: None,
         }
     }
     fn expiration(&self, now: u32) -> Option<u8> {
@@ -1159,7 +1169,7 @@ fn connection_event(
             // response does not make the link less real: report it here too,
             // or the Host refuses every ACL PDU for backpressure until the
             // peer's supervision timeout.
-            if let Some(reason) = report_connection(soft, s) {
+            if let Some(reason) = report_connection(soft, s, clock) {
                 return Some(reason);
             }
             if deliver_acl && soft.bridge.receive_acl(llid, payload).is_err() {
@@ -1170,7 +1180,7 @@ fn connection_event(
         }
         // Serialize HCI output only after the time-critical radio response.
         // No Host poll can consume the RX reservation in this interval.
-        if let Some(reason) = report_connection(soft, s) {
+        if let Some(reason) = report_connection(soft, s, clock) {
             return Some(reason);
         }
         if let Some(tag) = acknowledged_acl {
@@ -1224,7 +1234,7 @@ fn connection_event(
 /// Called both when the response left and when it could not leave (`Late`):
 /// the Host must know about the link before it receives any ACL data, or it
 /// answers every ACL PDU with backpressure until the peer times out.
-fn report_connection(soft: &mut SoftRunner, s: &Session) -> Option<u8> {
+fn report_connection(soft: &mut SoftRunner, s: &Session, clock: &Clock) -> Option<u8> {
     if soft.bridge.is_connected() {
         return None;
     }
@@ -1238,11 +1248,28 @@ fn report_connection(soft: &mut SoftRunner, s: &Session) -> Option<u8> {
         latency: p.latency,
         supervision_timeout: p.timeout,
         master_clock_accuracy: p.sca,
+        peer_rpa: None,
+        local_rpa: s.own_rpa,
+        peer_identity: None,
     };
+    #[cfg(feature = "privacy")]
+    let mut info = info;
+    // A resolved identity is the only case where Peer_RPA is valid, and the
+    // resolution runs here, on the idle path, before the Host sees the link.
+    #[cfg(feature = "privacy")]
+    if p.peer_random && wchble::ll::privacy::is_resolvable(p.peer_addr) {
+        info.peer_rpa = Some(p.peer_addr);
+        let started = clock.now_us();
+        info.peer_identity = soft.resolve_pending_peer();
+        privacy::note_resolve(clock.now_us().wrapping_sub(started));
+    }
     if soft.bridge.connected(info).is_err() {
         inc(63);
         return Some(0x1f);
     }
+    // The second reported link closes the rotation window.
+    #[cfg(feature = "privacy")]
+    privacy::note_connection(soft);
     None
 }
 
@@ -1751,6 +1778,28 @@ fn record_save_time(clock: &Clock, started: u32) {
     bond::observe_max(bond::STAT_MAX_SAVE_US, took);
 }
 
+/// Store the local IRK with the loaded bonds before any advertising starts.
+#[cfg(feature = "privacy")]
+fn persist_irk(
+    store: &mut DualCopyStore<Ch585DataFlash>,
+    irk: &[u8; 16],
+    bonds: &[PersistedBond],
+) -> bool {
+    let mut payload = [0u8; MAX_PAYLOAD];
+    let Ok(len) = encode_bonds(&bond::local_identity(), irk, bonds, &mut payload) else {
+        return false;
+    };
+    for _ in 0..2 {
+        bond::bump(bond::STAT_SAVE_ATTEMPTS);
+        if store.save(&payload[..len]).is_ok() {
+            bond::bump(bond::STAT_SAVE_OK);
+            return true;
+        }
+        bond::bump(bond::STAT_SAVE_FAIL);
+    }
+    false
+}
+
 /// Persist pending bond changes. `deadline` is the next RX prepare time when a
 /// connection is active; the save is deferred instead of running into an event.
 #[cfg(feature = "secure")]
@@ -1762,6 +1811,14 @@ fn flush_bonds(
 ) {
     let signals = bond::signals();
     let att_signals = client_att::signals();
+    // A failed boot load or a completed factory wipe must not be undone by a
+    // later snapshot: drop it instead of rewriting unreadable/old state.
+    if signals.writes_blocked.get() || signals.wipe_pending_restart.get() {
+        if signals.take_pending().is_some() {
+            bond::bump(bond::STAT_BLOCKED_SAVES);
+        }
+        att_signals.discard_pending();
+    }
     if let Some(deadline) = deadline {
         if reached(clock.now_us().wrapping_add(save_guard_us()), deadline) {
             bond::bump(bond::STAT_DEFERRED);
@@ -1803,7 +1860,15 @@ fn flush_bonds(
         let started = clock.now_us();
         bond::bump(bond::STAT_CLEAR_REQUESTS);
         match store.erase_all() {
-            Ok(()) => bond::bump(bond::STAT_CLEAR_OK),
+            Ok(()) => {
+                bond::bump(bond::STAT_CLEAR_OK);
+                // The Host future still holds the old IRK; a new snapshot must
+                // not write it back, so this boot stops saving bonds.
+                signals.wipe_pending_restart.set(true);
+                bond::set_local_irk(&[0; 16]);
+                #[cfg(feature = "privacy")]
+                privacy::set_flag(privacy::FLAG_WIPE_PENDING);
+            }
             Err(_) => {
                 bond::bump(bond::STAT_CLEAR_FAIL);
                 bond::set(bond::STAT_LAST_ERROR, 1);
@@ -1866,7 +1931,12 @@ fn flush_bonds(
             count += 1;
         }
         let mut payload = [0u8; MAX_PAYLOAD];
-        let len = match encode_bonds(&bond::local_identity(), &records[..count], &mut payload) {
+        let len = match encode_bonds(
+            &bond::local_identity(),
+            &bond::local_irk(),
+            &records[..count],
+            &mut payload,
+        ) {
             Ok(len) => len,
             Err(_) => {
                 bond::bump(bond::STAT_SAVE_FAIL);
@@ -2060,6 +2130,7 @@ fn main() -> ! {
     soft.ll.adv.chsel = true;
     // S3: restore bonds before the Host advertises. The read is a flash-engine
     // command, so it happens here with the radio stopped.
+    let mut privacy_irk: Option<[u8; 16]> = None;
     #[cfg(feature = "secure")]
     let mut store = DualCopyStore::new(Ch585DataFlash, Ch585DataFlash::BOND_SLOTS);
     #[cfg(feature = "secure")]
@@ -2071,6 +2142,9 @@ fn main() -> ! {
         client_att::set(client_att::STAT_MAGIC, client_att::CATT_MAGIC);
         client_att::set(client_att::STAT_VERSION, client_att::CATT_VERSION);
         let mut boot_bonds = [PersistedBond::empty(); MAX_BONDS];
+        // Read in every secure build: a save from a build without privacy must
+        // not zero a key that another image persisted.
+        let mut local_irk = [0u8; 16];
         let mut payload = [0u8; MAX_PAYLOAD];
         let read_started = clock.now_us();
         match store.load(&mut payload) {
@@ -2079,12 +2153,13 @@ fn main() -> ! {
                 &bond::local_identity(),
                 &mut boot_bonds,
             ) {
-                Ok(Some(count)) => {
+                Ok(Some(decoded)) => {
+                    local_irk = decoded.local_irk;
                     bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_VALID);
-                    bond::set(bond::STAT_RECORDS_LOADED, count as u32);
+                    bond::set(bond::STAT_RECORDS_LOADED, decoded.bonds.len() as u32);
                     bond::set(bond::STAT_WINNER_SLOT, store.active_slot().unwrap_or(0) as u32);
                     bond::set(bond::STAT_WINNER_SEQ, store.seq());
-                    bond::set_boot_bonds(&boot_bonds[..count]);
+                    bond::set_boot_bonds(decoded.bonds);
                 }
                 // Written by an image that advertised another address. The
                 // peer paired with that identity, so these keys must not be
@@ -2130,10 +2205,54 @@ fn main() -> ! {
             bond::STAT_BOOT_READ_US,
             clock.now_us().wrapping_sub(read_started),
         );
+        // S4: decide the local IRK before the Host is built. An unreadable or
+        // foreign slot blocks writes; an IRK that cannot be persisted is not
+        // used, so it is never handed to a peer and then lost.
+        #[cfg(feature = "privacy")]
+        {
+            let load = bond::value(bond::STAT_LOAD_RESULT);
+            let records = bond::value(bond::STAT_RECORDS_LOADED);
+            if matches!(
+                load,
+                bond::LOAD_IO | bond::LOAD_CORRUPT | bond::LOAD_FOREIGN
+            ) {
+                bond::signals().writes_blocked.set(true);
+                privacy::set_flag(privacy::FLAG_WRITES_BLOCKED);
+                local_irk = [0; 16];
+            } else if load == bond::LOAD_VALID && local_irk != [0; 16] {
+                // Same identity key across the reboot.
+            } else {
+                // Bonds written before privacy carry no IRK. Keep them and add
+                // a fresh one: the peer must re-pair to learn it, but the device
+                // no longer keeps advertising its identity address forever.
+                if load == bond::LOAD_VALID && records > 0 {
+                    privacy::set_flag(privacy::FLAG_IRK_MISSING);
+                }
+                let mut fresh = [0u8; 16];
+                rng::fill(&mut fresh);
+                local_irk = fresh;
+                if !persist_irk(&mut store, &local_irk, bond::boot_bonds()) {
+                    privacy::set_flag(privacy::FLAG_IRK_UNPERSISTED);
+                    local_irk = [0; 16];
+                    bond::set(bond::STAT_LAST_ERROR, 6);
+                }
+            }
+            bond::set_rl_expected(bond::boot_bonds());
+            if local_irk != [0; 16] {
+                privacy_irk = Some(local_irk);
+            }
+        }
+        bond::set_local_irk(&local_irk);
     }
     let app_stats = host::HostStats::new();
     set_peripheral_address(&peripheral_address);
-    let mut app = core::pin::pin!(host::run(controller, &app_stats, peripheral_address));
+    let mut app = core::pin::pin!(host::run(
+        controller,
+        &app_stats,
+        peripheral_address,
+        privacy_irk,
+        RPA_TIMEOUT_SECS,
+    ));
     let started = clock.now_us();
     let budget = *core::hint::black_box(&RUN_SECONDS) * 1_000_000;
     let finish = started.wrapping_add(budget);
@@ -2294,6 +2413,8 @@ fn main() -> ! {
                 session = None;
                 put(2, 2);
                 next_adv = clock.now_us();
+                #[cfg(feature = "privacy")]
+                privacy::snapshot(&soft);
                 #[cfg(feature = "secure")]
                 flush_bonds(&mut store, &mut att_store, &clock, None);
             }
@@ -2302,6 +2423,12 @@ fn main() -> ! {
         let now = clock.now_us();
         #[cfg(feature = "secure")]
         flush_bonds(&mut store, &mut att_store, &clock, None);
+        // Controller-side readiness: every boot peer's IRK must be loaded
+        // before the Host is allowed to advertise as a resolvable address.
+        #[cfg(feature = "privacy")]
+        bond::signals().rl_ready.set(bond::rl_expected().iter().all(
+            |&(kind, address, irk)| soft.privacy_has_peer(kind, address, &irk),
+        ));
         let idle_until = if soft.adv_enabled() && !reached(now, next_adv) {
             next_adv
         } else {
@@ -2318,6 +2445,8 @@ fn main() -> ! {
             continue;
         }
         radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
+        #[cfg(feature = "privacy")]
+        soft.poll_privacy(clock.now_us());
         let Some(adv_len) = soft.build_adv_pdu(&mut adv_buf.0) else {
             continue;
         };
@@ -2355,27 +2484,43 @@ fn main() -> ! {
             };
             let pdu = &rx.0[..packet.len];
             if soft.ll.adv.validate_scan_req(pdu, true) {
-                inc(10);
-                // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
-                // engine on error; the response frame only has to live for the call.
-                match unsafe {
-                    radio.tx_basic(
-                        &clock,
-                        &rsp_buf.0[..rsp_len],
-                        0,
-                        Some(packet.end.wrapping_add(120)),
-                    )
-                } {
-                    Ok(()) => inc(11),
-                    Err(wchble::Error::Late) => inc(12),
-                    Err(_) => inc(5),
+                // Network-mode peers must scan us at an RPA (Vol 6 Part B §6.2.1).
+                let scanner = [pdu[2], pdu[3], pdu[4], pdu[5], pdu[6], pdu[7]];
+                if soft.scan_request_allowed(scanner, pdu[0] & 0x40 != 0) {
+                    inc(10);
+                    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                    // engine on error; the response frame only has to live for the call.
+                    match unsafe {
+                        radio.tx_basic(
+                            &clock,
+                            &rsp_buf.0[..rsp_len],
+                            0,
+                            Some(packet.end.wrapping_add(120)),
+                        )
+                    } {
+                        Ok(()) => inc(11),
+                        Err(wchble::Error::Late) => inc(12),
+                        Err(_) => inc(5),
+                    }
+                    stop(&mut radio, &clock);
                 }
-                stop(&mut radio, &clock);
             } else if pdu[0] & 0x0f == 5 {
                 inc(13);
                 match ConnectParams::parse(pdu, true, soft.ll.adv.own_addr, soft.ll.adv.random_addr)
                 {
                     Ok(params) => {
+                        #[cfg(feature = "privacy")]
+                        {
+                            let started = clock.now_us();
+                            let accepted =
+                                soft.admit_connection(params.peer_addr, params.peer_random);
+                            privacy::note_admit(clock.now_us().wrapping_sub(started));
+                            if !accepted {
+                                // S4b rejected this initiator: no CONNECT_IND
+                                // goes back, so the link is never established.
+                                break;
+                            }
+                        }
                         inc(14);
                         put(45, u32::from(params.interval));
                         put(46, u32::from(params.hop));
@@ -2393,6 +2538,14 @@ fn main() -> ! {
                             clock.now_us(),
                             enc_rsp_random,
                         );
+                        #[cfg(feature = "privacy")]
+                        {
+                            if soft.ll.adv.random_addr
+                                && wchble::ll::privacy::is_resolvable(soft.ll.adv.own_addr)
+                            {
+                                s.own_rpa = Some(soft.ll.adv.own_addr);
+                            }
+                        }
                         if let Some((octets, time)) = soft.suggested_data_length_explicit() {
                             s.control.data_length.set_suggested_tx(octets, time);
                         }
@@ -2440,6 +2593,8 @@ fn main() -> ! {
     #[cfg(feature = "secure")]
     flush_bonds(&mut store, &mut att_store, &clock, None);
     host_snapshot(&app_stats);
+    #[cfg(feature = "privacy")]
+    privacy::publish(&soft);
     put(32, clock.now_us().wrapping_sub(started));
     put(33, reg(LLE_BASE, lle::CMD));
     put(34, reg(LLE_BASE, lle::MODE));

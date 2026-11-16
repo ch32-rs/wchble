@@ -76,6 +76,9 @@ public class MainActivity extends Activity {
             {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     };
     private static final int TIMEOUT_MS = 45_000;
+    // The privacy mode drops the first link, waits for the peer to rotate its
+    // RPA at least twice (rpa-fast uses 5 s), then reconnects.
+    private static final int ROTATION_WAIT_MS = 14_000;
     // `--es mode` selects the S3 acceptance phase. `pair` is the S2 flow.
     private String mode = "pair";
 
@@ -115,6 +118,9 @@ public class MainActivity extends Activity {
     private boolean mtuRequested;
     private boolean mtuReady;
     private boolean attStarted;
+    private boolean rotationPhase;
+    private boolean rotationReconnected;
+    private int connections;
     private boolean bulkWritten;
     private int attMtu;
     private int attNotifications;
@@ -225,6 +231,19 @@ public class MainActivity extends Activity {
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             logEvent("\"event\":\"connection_state\",\"status\":%d,\"state\":%d", status, newState);
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                connections += 1;
+                if (rotationPhase && !rotationReconnected) {
+                    // Second link in the same pair: the peer rotated its
+                    // address, so every per-connection flag starts over.
+                    rotationReconnected = true;
+                    discovered = false;
+                    started = false;
+                    verifyRead = false;
+                    writeSent = false;
+                    valueCharacteristic = null;
+                    controlCharacteristic = null;
+                    logEvent("\"event\":\"rotation_reconnected\"");
+                }
                 if (!bonding) {
                     bonding = true;
                     boolean peerBonded =
@@ -246,7 +265,8 @@ public class MainActivity extends Activity {
                             return;
                         }
                     } else if (!peerBonded) {
-                        if (!"pair".equals(mode) && !"hid".equals(mode) && !"att".equals(mode)) {
+                        if (!"pair".equals(mode) && !"hid".equals(mode)
+                                && !"att".equals(mode) && !"privacy".equals(mode)) {
                             // delete/fault act on the bond this phone and the
                             // Host already share.
                             finishRun(false, "not_bonded");
@@ -266,6 +286,11 @@ public class MainActivity extends Activity {
                     finishRun(false, "discover_failed");
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                // The privacy phase drops the link itself; the rescan follows.
+                if (rotationPhase && !rotationReconnected) {
+                    logEvent("\"event\":\"rotation_disconnected\"");
+                    return;
+                }
                 // In the HID hand-off path the disconnect is ours: the link is
                 // released so the system HID host can own it.
                 if (!done && !hidInputWatch) {
@@ -363,11 +388,15 @@ public class MainActivity extends Activity {
                 return;
             }
             if (verifyRead) {
-                if (value == WRITE_VALUE) {
-                    finishRun(true, reason());
-                } else {
+                if (value != WRITE_VALUE) {
                     finishRun(false, "verify_mismatch");
+                    return;
                 }
+                if ("privacy".equals(mode) && !rotationReconnected) {
+                    beginRotationWait(g);
+                    return;
+                }
+                finishRun(true, reason());
                 return;
             }
             // First read proves encrypted access. Control modes then send the
@@ -456,7 +485,7 @@ public class MainActivity extends Activity {
         }
         String requestedMode = getIntent().getStringExtra("mode");
         if (requestedMode != null) {
-            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid|att")) {
+            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid|att|privacy")) {
                 finishRun(false, "unknown_mode");
                 return;
             }
@@ -615,6 +644,8 @@ public class MainActivity extends Activity {
                 return "bond_wipe_ok";
             case "fault":
                 return "fault_injected_ok";
+            case "privacy":
+                return "privacy_rotation_ok";
             default:
                 return "encrypted_read_write_ok";
         }
@@ -665,6 +696,38 @@ public class MainActivity extends Activity {
 
     private static byte[] le32(int value) {
         return new byte[]{(byte) value, (byte) (value >> 8), (byte) (value >> 16), (byte) (value >> 24)};
+    }
+
+    /** Drop the first link, wait for RPA rotation, then scan for the new address. */
+    private void beginRotationWait(BluetoothGatt g) {
+        rotationPhase = true;
+        logEvent("\"event\":\"rotation_begin\",\"wait_ms\":%d", ROTATION_WAIT_MS);
+        logEvent("\"event\":\"rotation_disconnected\"");
+        try {
+            g.disconnect();
+            g.close();
+        } catch (RuntimeException ignored) {
+            // Already gone; the scan below still runs.
+        }
+        if (gatt == g) {
+            gatt = null;
+        }
+        handler.postDelayed(this::rescanAfterRotation, ROTATION_WAIT_MS);
+    }
+
+    private void rescanAfterRotation() {
+        if (done) {
+            return;
+        }
+        logEvent("\"event\":\"rotation_rescan\"");
+        scanning = true;
+        try {
+            scanner.startScan(null, new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build(), scanCallback);
+        } catch (RuntimeException failed) {
+            finishRun(false, "rotation_rescan_failed");
+        }
     }
 
     private void logEvent(String fmt, Object... args) {
@@ -1087,8 +1150,9 @@ public class MainActivity extends Activity {
         logInputDevices();
         logEvent("\"event\":\"summary\",\"pass\":%s,\"reason\":\"%s\",\"bonder\":%s,"
                         + "\"bonded\":%s,\"reads\":%d,\"wrote\":%s,\"mtu\":%d,"
-                        + "\"notifications\":%d",
-                pass, reason, bonding, bonded, reads, writeSent, attMtu, attNotifications);
+                        + "\"notifications\":%d,\"connections\":%d",
+                pass, reason, bonding, bonded, reads, writeSent, attMtu, attNotifications,
+                connections);
         if (gatt != null) {
             try {
                 gatt.disconnect();

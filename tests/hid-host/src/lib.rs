@@ -129,6 +129,9 @@ mod tests {
                     latency: 0,
                     supervision_timeout: 200,
                     master_clock_accuracy: 0,
+                    peer_rpa: None,
+                    local_rpa: None,
+                    peer_identity: None,
                 })
                 .unwrap();
             self.until("Host accepts connection", |f| {
@@ -410,7 +413,7 @@ mod tests {
         // The transport and the mock time driver are process-global: keep the
         // whole lifecycle in one test.
         let stats = host::HostStats::new();
-        let mut future = pin!(host::run(wchble::hci::new(), &stats, host::RANDOM_ADDRESS));
+        let mut future = pin!(host::run(wchble::hci::new(), &stats, host::RANDOM_ADDRESS, None, 900));
         let mut fixture = Fixture {
             host: future.as_mut(),
             stats: &stats,

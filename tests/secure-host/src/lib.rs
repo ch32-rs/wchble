@@ -160,6 +160,9 @@ mod tests {
                     latency: 0,
                     supervision_timeout: 500,
                     master_clock_accuracy: 0,
+                    peer_rpa: None,
+                    local_rpa: None,
+                    peer_identity: None,
                 })
                 .unwrap();
         }
@@ -298,7 +301,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -490,7 +495,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -554,7 +561,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -615,7 +624,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -678,7 +689,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -721,7 +734,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),
@@ -800,7 +815,9 @@ mod tests {
         let mut future = pin!(host::run(
             wchble::hci::new(),
             &stats,
-            host::RANDOM_ADDRESS
+            host::RANDOM_ADDRESS,
+            None,
+            900
         ));
         let mut fixture = Fixture {
             host: future.as_mut(),

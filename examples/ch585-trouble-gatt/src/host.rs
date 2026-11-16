@@ -344,14 +344,27 @@ pub async fn run(
     controller: wchble::hci::SoftController,
     stats: &HostStats,
     address: [u8; 6],
+    #[cfg_attr(not(feature = "privacy"), allow(unused_variables))] local_irk: Option<[u8; 16]>,
+    #[cfg_attr(not(feature = "privacy"), allow(unused_variables))] rpa_timeout_secs: u32,
 ) -> ! {
     stats.phase(PHASE_STARTING);
     // One connection; ATT and the LE signaling channel, with no dynamic channels.
     let mut resources: HostResources<DefaultPacketPool, 1, 2, 1, BOND_CAPACITY> =
         HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(address))
-        .build();
+    #[allow(unused_mut)]
+    let mut builder = trouble_host::new(controller, &mut resources)
+        .set_random_address(Address::random(address));
+    // The controller rotates the address itself; the Host only needs the IRK
+    // to distribute it during pairing and to resolve identities.
+    #[cfg(feature = "privacy")]
+    if let Some(irk) = local_irk {
+        if let Some(key) = IdentityResolvingKey::from_le_bytes(irk) {
+            builder = builder
+                .enable_privacy(key)
+                .set_rpa_timeout(Duration::from_secs(u64::from(rpa_timeout_secs)));
+        }
+    }
+    let stack = builder.build();
     // Restore bonds before advertising: the stack answers a peer's LTK request
     // from this table, so a rebooted device can resume encryption instead of
     // pairing again.
@@ -553,6 +566,24 @@ pub async fn run(
         loop {
             stats.phase(PHASE_ADVERTISING);
             stats.inc(STAT_ADVERTISE_ATTEMPTS);
+            // The controller must be able to resolve every bonded peer before
+            // we advertise an RPA: a stale resolving list makes the Host and
+            // the controller disagree about the peer address.
+            #[cfg(feature = "privacy")]
+            if !crate::bond::rl_expected().is_empty() {
+                let mut ready = false;
+                for _ in 0..100 {
+                    if crate::bond::signals().rl_ready.get() {
+                        ready = true;
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(10)).await;
+                }
+                if !ready {
+                    crate::privacy::set_flag(crate::privacy::FLAG_RL_NOT_READY);
+                    crate::bond::bump(crate::bond::STAT_RL_NOT_READY);
+                }
+            }
             let acceptor = match peripheral
                 .advertise(
                     &Default::default(),

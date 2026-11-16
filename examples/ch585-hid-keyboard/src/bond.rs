@@ -14,6 +14,11 @@ pub use wchble::storage::LocalIdentity;
 static mut SIGNALS: BondSignals = BondSignals::new();
 static mut BOOT_BONDS: [PersistedBond; MAX_BONDS] = [PersistedBond::empty(); MAX_BONDS];
 static mut BOOT_COUNT: usize = 0;
+static mut LOCAL_IRK: [u8; 16] = [0; 16];
+static mut RL_EXPECTED: [(u8, [u8; 6], [u8; 16]); MAX_BONDS] = [EXPECTED_EMPTY; MAX_BONDS];
+static mut RL_EXPECTED_LEN: usize = 0;
+
+const EXPECTED_EMPTY: (u8, [u8; 6], [u8; 16]) = (0, [0; 6], [0; 16]);
 
 /// Shared request slots, reachable from both the RF owner and the Host future.
 pub fn signals() -> &'static BondSignals {
@@ -41,6 +46,48 @@ pub fn boot_bonds() -> &'static [PersistedBond] {
     unsafe {
         let count = core::ptr::addr_of!(BOOT_COUNT).read_volatile();
         core::slice::from_raw_parts(core::ptr::addr_of!(BOOT_BONDS).cast(), count)
+    }
+}
+
+/// Local IRK in use, or all zero when this boot does not use privacy.
+pub fn set_local_irk(irk: &[u8; 16]) {
+    // SAFETY: written once at boot before the Host is polled.
+    unsafe { core::ptr::addr_of_mut!(LOCAL_IRK).write_volatile(*irk) };
+}
+
+pub fn local_irk() -> [u8; 16] {
+    // SAFETY: written once at boot, then read-only.
+    unsafe { core::ptr::addr_of!(LOCAL_IRK).read_volatile() }
+}
+
+/// Peers whose IRKs must be in the controller before advertising starts.
+pub fn set_rl_expected(list: &[PersistedBond]) {
+    let mut count = 0;
+    // SAFETY: single-threaded boot, before the Host future is polled.
+    unsafe {
+        let out = core::ptr::addr_of_mut!(RL_EXPECTED).cast::<(u8, [u8; 6], [u8; 16])>();
+        for record in list {
+            let Some(irk) = record.irk else {
+                continue;
+            };
+            if count == MAX_BONDS || irk == [0; 16] {
+                continue;
+            }
+            let mut address = record.address;
+            address.reverse();
+            out.add(count).write_volatile((record.address_kind, address, irk));
+            count += 1;
+        }
+        core::ptr::addr_of_mut!(RL_EXPECTED_LEN).write_volatile(count);
+    }
+}
+
+/// `(kind, on-air address, peer IRK)` pairs expected in the resolving list.
+pub fn rl_expected() -> &'static [(u8, [u8; 6], [u8; 16])] {
+    // SAFETY: written once at boot, then read-only.
+    unsafe {
+        let count = core::ptr::addr_of!(RL_EXPECTED_LEN).read_volatile();
+        core::slice::from_raw_parts(core::ptr::addr_of!(RL_EXPECTED).cast(), count)
     }
 }
 
@@ -91,6 +138,8 @@ pub const STAT_MALFORMED_CONTROL_WRITES: usize = 23;
 pub const STAT_ADD_BOND_OK: usize = 24;
 pub const STAT_ADD_BOND_FAIL: usize = 25;
 pub const STAT_IDENTITY_MISMATCH: usize = 26;
+pub const STAT_BLOCKED_SAVES: usize = 27;
+pub const STAT_RL_NOT_READY: usize = 28;
 
 /// Marker the acceptance runner reads to refuse a `fault` phase against an
 /// image built without the injection feature.
@@ -165,6 +214,12 @@ pub struct BondSignals {
     pub wipe: Cell<bool>,
     /// `FALT`: truncate the next save on purpose (needs `bond-fault`).
     pub fault: Cell<bool>,
+    /// Set by the RF owner once every expected peer IRK is in the controller.
+    pub rl_ready: Cell<bool>,
+    /// Boot loading failed or the slot holds a foreign identity: no writes.
+    pub writes_blocked: Cell<bool>,
+    /// `WIPE` succeeded: this boot must not save again.
+    pub wipe_pending_restart: Cell<bool>,
 }
 
 impl BondSignals {
@@ -174,6 +229,9 @@ impl BondSignals {
             delete: Cell::new(false),
             wipe: Cell::new(false),
             fault: Cell::new(false),
+            rl_ready: Cell::new(false),
+            writes_blocked: Cell::new(false),
+            wipe_pending_restart: Cell::new(false),
         }
     }
 
