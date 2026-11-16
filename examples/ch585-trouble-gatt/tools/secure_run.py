@@ -54,7 +54,7 @@ PRIVACY_NAMES = '''magic version flags generations rotations resolve_attempts re
     resolve_unresolved rejected_not_listed rejected_mode max_admit_us max_resolve_us
     rotated_at_us rpa_lo rpa_hi list_state fingerprint stage_generations stage_resolve_ok
     stage_rotations reconnect_generations reconnect_resolve_ok
-    reconnect_rotations'''.split()
+    reconnect_rotations stage_pairs_complete'''.split()
 P_RESOLUTION_ENABLED = 0x01
 P_LOCAL_IRK = 0x02
 P_ADV_USES_RPA = 0x04
@@ -596,7 +596,7 @@ def evaluate_security(sec, host, stats, run_seconds, encryptions=1):
 
 def decode_privacy(words):
     """PRIVACY_STATS: controller counters plus the example's storage facts."""
-    if len(words) != 23 or words[0] != PRIVACY_MAGIC:
+    if len(words) != 24 or words[0] != PRIVACY_MAGIC:
         return {'present': False, 'words': words}
     rpa = words[13].to_bytes(4, 'little') + words[14].to_bytes(4, 'little')[:2]
     return {
@@ -624,10 +624,11 @@ def decode_privacy(words):
         'reconnect_generations': words[20],
         'reconnect_resolve_ok': words[21],
         'reconnect_rotations': words[22],
+        'stage_pairs_complete': words[23],
     }
 
 
-def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
+def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None, pairs_complete=None):
     """Gate the S4 evidence: an RPA was used, persisted, and rotated."""
     errors = []
     if not privacy.get('present'):
@@ -682,6 +683,13 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
                 errors.append('the reconnect never resolved the peer RPA '
                               f'({privacy["reconnect_resolve_ok"]} <= '
                               f'{privacy["stage_resolve_ok"]})')
+            # A capture can miss the second link; the bond counter cannot.
+            if pairs_complete is None:
+                errors.append('BOND_STATS pairs_complete missing')
+            elif pairs_complete != privacy['stage_pairs_complete']:
+                errors.append('the reconnect paired again '
+                              f'({pairs_complete} != '
+                              f'{privacy["stage_pairs_complete"]})')
     return errors
 
 
@@ -734,7 +742,7 @@ def execute(args):
             symbols[name] = int(matches[0][0], 16)
         extra = [('X4_STATS', 16), ('X1_STATS', 24)]
         if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
-            extra.append(('PRIVACY_STATS', 23))
+            extra.append(('PRIVACY_STATS', 24))
         symbols = validate_observation_buffers(image, symbols, extra=extra)
         # Both feature sets write the same output path, so a plain `cargo
         # build` right after a secure build silently replaces this image.
@@ -837,16 +845,17 @@ def execute(args):
                                             observations.get('HOST_STATS', []),
                                             observations.get('STATS', []),
                                             args.run_seconds, links))
+        bond_words = io.read32(symbols['BOND_STATS'], 32, args.out / 'bond_stats.txt')
+        metadata['bond_stats'] = dict(zip(BOND_NAMES, bond_words))
         if 'PRIVACY_STATS' in symbols:
-            privacy_words = io.read32(symbols['PRIVACY_STATS'], 23,
+            privacy_words = io.read32(symbols['PRIVACY_STATS'], 24,
                                       args.out / 'privacy_stats.txt')
             metadata['privacy'] = decode_privacy(privacy_words)
             (args.out / 'privacy_stats.json').write_text(
                 json.dumps(metadata['privacy'], indent=2) + '\n')
             errors.extend(evaluate_privacy(metadata['privacy'], args.mode,
-                                           args.expect_irk_fingerprint))
-        bond_words = io.read32(symbols['BOND_STATS'], 32, args.out / 'bond_stats.txt')
-        metadata['bond_stats'] = dict(zip(BOND_NAMES, bond_words))
+                                           args.expect_irk_fingerprint,
+                                           metadata['bond_stats']['pairs_complete']))
         echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
         metadata['bond_echo'] = decode_bond_echo(echo_words)
         (args.out / 'bond_stats.json').write_text(

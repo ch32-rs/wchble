@@ -6,7 +6,7 @@
 
 use wchble::hci::SoftRunner;
 
-pub const WORDS: usize = 23;
+pub const WORDS: usize = 24;
 pub const MAGIC: u32 = 0x5334_5052;
 
 /// Example-owned bits OR-ed into word 2 above the library's `u8` flags.
@@ -28,6 +28,7 @@ static mut STAGE: (u32, u32, u32) = (0, 0, 0);
 static mut STAGE_SET: bool = false;
 static mut RECONNECT: (u32, u32, u32) = (0, 0, 0);
 static mut LINKS: u32 = 0;
+static mut STAGE_PAIRS: u32 = 0;
 
 pub fn set_flag(flag: u32) {
     // SAFETY: single-threaded; written from boot or the Host poll.
@@ -77,6 +78,7 @@ pub fn snapshot(soft: &SoftRunner) {
         set.write_volatile(true);
     }
     let stats = soft.privacy_stats();
+    let pairs = crate::bond::value(crate::bond::STAT_PAIRS_COMPLETE);
     // SAFETY: single-threaded.
     unsafe {
         core::ptr::addr_of_mut!(STAGE).write_volatile((
@@ -84,6 +86,7 @@ pub fn snapshot(soft: &SoftRunner) {
             stats.resolve_ok,
             stats.rotations,
         ));
+        core::ptr::addr_of_mut!(STAGE_PAIRS).write_volatile(pairs);
     }
 }
 
@@ -114,12 +117,13 @@ pub fn note_connection(soft: &SoftRunner) {
 pub fn publish(soft: &SoftRunner) {
     let stats = soft.privacy_stats();
     // SAFETY: single-threaded.
-    let (stage, reconnect, max_admit, max_resolve) = unsafe {
+    let (stage, reconnect, max_admit, max_resolve, stage_pairs) = unsafe {
         (
             core::ptr::addr_of!(STAGE).read_volatile(),
             core::ptr::addr_of!(RECONNECT).read_volatile(),
             core::ptr::addr_of!(MAX_ADMIT_US).read_volatile(),
             core::ptr::addr_of!(MAX_RESOLVE_US).read_volatile(),
+            core::ptr::addr_of!(STAGE_PAIRS).read_volatile(),
         )
     };
     let flags = flags()
@@ -162,6 +166,7 @@ pub fn publish(soft: &SoftRunner) {
         reconnect.0,
         reconnect.1,
         reconnect.2,
+        stage_pairs,
     ];
     // SAFETY: single-threaded.
     unsafe {

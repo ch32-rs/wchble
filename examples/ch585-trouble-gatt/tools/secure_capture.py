@@ -79,6 +79,22 @@ def decode(path, out, tshark, target, privacy=False):
     return analyze(rows, out, target, privacy)
 
 
+def att_after_encryption(att, control):
+    """Plaintext ATT after a link's own encryption start.
+
+    Each link has its own boundary: a reconnect performs service discovery
+    before it encrypts.
+    """
+    starts = {}
+    for entry in control:
+        if entry['name'] in ('ENC_REQ', 'START_ENC_REQ', 'START_ENC_RSP'):
+            starts.setdefault(entry['aa'], entry)
+    after = [entry for entry in att
+             if entry['aa'] in starts and entry['frame'] > starts[entry['aa']]['frame']]
+    first = min(starts.values(), key=lambda entry: entry['frame'], default=None)
+    return after, first
+
+
 def analyze(rows, out, target, privacy=False):
     """Only the link this firmware opened is evidence; neighbouring BLE traffic
     (the 37/38/39 scan sees plenty) must not be counted or decoded.
@@ -104,10 +120,11 @@ def analyze(rows, out, target, privacy=False):
         frame = int(row['frame.number'])
         direction = 'central' if row['nordic_ble.direction'] == 'True' else 'peripheral'
         cid = row.get('btl2cap.cid', '')
+        link_addr = row['btle.access_address'].lower()
         if row.get('btsmp.opcode'):
             opcode = row['btsmp.opcode']
             entry = {'frame': frame, 'dir': direction, 'opcode': opcode,
-                     'name': SMP_NAMES.get(int(opcode, 0), opcode)}
+                     'name': SMP_NAMES.get(int(opcode, 0), opcode), 'aa': link_addr}
             for key in ('btsmp.io_capability', 'btsmp.authreq', 'btsmp.mitm_flag',
                         'btsmp.sc_flag', 'btsmp.bonding_flags',
                         'btsmp.max_enc_key_size'):
@@ -117,10 +134,11 @@ def analyze(rows, out, target, privacy=False):
         if row.get('btle.control_opcode'):
             opcode = row['btle.control_opcode']
             control.append({'frame': frame, 'dir': direction, 'opcode': opcode,
-                            'name': LL_CONTROL.get(int(opcode, 0), opcode)})
+                            'name': LL_CONTROL.get(int(opcode, 0), opcode),
+                            'aa': link_addr})
         if row.get('btatt.opcode'):
             att.append({'frame': frame, 'dir': direction,
-                        'opcode': row['btatt.opcode'], 'cid': cid})
+                        'opcode': row['btatt.opcode'], 'cid': cid, 'aa': link_addr})
     # DLE is visible on air even when the payloads are encrypted: the LL
     # header stays plaintext, so a 132-octet payload can only exist after a
     # data length update. (LL control PDUs are encrypted once the link is,
@@ -145,14 +163,10 @@ def analyze(rows, out, target, privacy=False):
                     'over_27': sum(1 for length in lengths if length > 27),
                     'histogram': dict(sorted(histogram.items(), key=lambda item: int(item[0]))),
                 }}
-    # First LL encryption control PDU on the link marks the plaintext boundary.
-    start = next((entry for entry in control
-                  if entry['name'] in ('ENC_REQ', 'START_ENC_REQ', 'START_ENC_RSP')),
-                 None)
+    after, start = att_after_encryption(att, control)
     if start is not None:
         assessed['encryption_start'] = start
-        assessed['att_after_encryption_start'] = [
-            entry for entry in att if entry['frame'] > start['frame']]
+        assessed['att_after_encryption_start'] = after
     # The pairing response is the only frame that explains the chosen method.
     response = next((entry for entry in smp
                      if entry['name'] == 'PairingResponse' and entry['dir'] == 'peripheral'),
