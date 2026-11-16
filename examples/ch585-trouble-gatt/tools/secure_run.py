@@ -639,7 +639,7 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
                        (P_WRITES_BLOCKED, 'bond writes were blocked'),
                        (P_WIPE_PENDING, 'a wipe is pending; the IRK was reset'),
                        (P_RL_NOT_READY, 'the resolving list was not ready before advertising'),
-                       (P_IRK_MISSING, 'bonds exist but no local IRK was loaded')):
+                       (P_IRK_MISSING, 'bonds predate privacy; the peer must re-pair')):
         if flags & bit:
             errors.append(label)
     if not flags & P_STAMP_VALID:
