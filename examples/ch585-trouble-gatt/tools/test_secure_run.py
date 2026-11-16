@@ -142,30 +142,30 @@ class PrivacyTests(unittest.TestCase):
     def test_valid_privacy_run_passes(self):
         stats = secure.decode_privacy(privacy())
         self.assertEqual(secure.evaluate_privacy(
-            stats, pairs_complete=stats['stage_pairs_complete']), [])
+            stats, pairings=stats['stage_pairings']), [])
 
     def test_attempts_without_a_controller_resolution_fail(self):
         # The Host resolves on its own, so attempts alone prove nothing.
         stats = secure.decode_privacy(
             privacy(resolve_ok=1, stage_resolve_ok=1, reconnect_resolve_ok=1))
-        errors = secure.evaluate_privacy(stats, pairs_complete=0)
+        errors = secure.evaluate_privacy(stats, pairings=0)
         self.assertTrue(any('never resolved' in error for error in errors))
 
     def test_rotations_after_the_reconnect_do_not_count(self):
         # Final totals keep rotating while the app holds the second link.
         stats = secure.decode_privacy(privacy(rotations=12, reconnect_rotations=1))
-        errors = secure.evaluate_privacy(stats, pairs_complete=0)
+        errors = secure.evaluate_privacy(stats, pairings=0)
         self.assertTrue(any('fewer than two RPA rotations' in error for error in errors))
 
     def test_a_second_pairing_after_the_disconnect_fails(self):
-        stats = secure.decode_privacy(privacy(stage_pairs_complete=1))
-        errors = secure.evaluate_privacy(stats, pairs_complete=2)
+        stats = secure.decode_privacy(privacy(stage_pairings=1))
+        errors = secure.evaluate_privacy(stats, pairings=2)
         self.assertTrue(any('paired again' in error for error in errors))
 
     def test_missing_pairing_counter_fails(self):
         stats = secure.decode_privacy(privacy())
         errors = secure.evaluate_privacy(stats)
-        self.assertTrue(any('pairs_complete missing' in error for error in errors))
+        self.assertTrue(any('pairing counters missing' in error for error in errors))
 
     def test_capture_counts_plaintext_per_link(self):
         att = [{'frame': 30, 'aa': '0x1'}, {'frame': 110, 'aa': '0x2'}]
@@ -177,7 +177,7 @@ class PrivacyTests(unittest.TestCase):
 
     def test_missing_reconnect_snapshot_fails(self):
         stats = secure.decode_privacy(privacy(reconnect_generations=0))
-        errors = secure.evaluate_privacy(stats, pairs_complete=0)
+        errors = secure.evaluate_privacy(stats, pairings=0)
         self.assertTrue(any('reconnect was never reported' in error for error in errors))
 
     def test_capture_privacy_allows_the_first_pairing_only(self):

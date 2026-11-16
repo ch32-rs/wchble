@@ -78,7 +78,9 @@ pub fn snapshot(soft: &SoftRunner) {
         set.write_volatile(true);
     }
     let stats = soft.privacy_stats();
-    let pairs = crate::bond::value(crate::bond::STAT_PAIRS_COMPLETE);
+    // Every PairingComplete increments exactly one of these, bonded or not.
+    let pairs = crate::bond::value(crate::bond::STAT_PAIRS_COMPLETE)
+        .wrapping_add(crate::bond::value(crate::bond::STAT_PAIRS_WITHOUT_BOND));
     // SAFETY: single-threaded.
     unsafe {
         core::ptr::addr_of_mut!(STAGE).write_volatile((

@@ -54,7 +54,7 @@ PRIVACY_NAMES = '''magic version flags generations rotations resolve_attempts re
     resolve_unresolved rejected_not_listed rejected_mode max_admit_us max_resolve_us
     rotated_at_us rpa_lo rpa_hi list_state fingerprint stage_generations stage_resolve_ok
     stage_rotations reconnect_generations reconnect_resolve_ok
-    reconnect_rotations stage_pairs_complete'''.split()
+    reconnect_rotations stage_pairings'''.split()
 P_RESOLUTION_ENABLED = 0x01
 P_LOCAL_IRK = 0x02
 P_ADV_USES_RPA = 0x04
@@ -624,11 +624,11 @@ def decode_privacy(words):
         'reconnect_generations': words[20],
         'reconnect_resolve_ok': words[21],
         'reconnect_rotations': words[22],
-        'stage_pairs_complete': words[23],
+        'stage_pairings': words[23],
     }
 
 
-def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None, pairs_complete=None):
+def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None, pairings=None):
     """Gate the S4 evidence: an RPA was used, persisted, and rotated."""
     errors = []
     if not privacy.get('present'):
@@ -683,13 +683,12 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None, pairs_com
                 errors.append('the reconnect never resolved the peer RPA '
                               f'({privacy["reconnect_resolve_ok"]} <= '
                               f'{privacy["stage_resolve_ok"]})')
-            # A capture can miss the second link; the bond counter cannot.
-            if pairs_complete is None:
-                errors.append('BOND_STATS pairs_complete missing')
-            elif pairs_complete != privacy['stage_pairs_complete']:
+            # A capture can miss the second link; the pairing counters cannot.
+            if pairings is None:
+                errors.append('BOND_STATS pairing counters missing')
+            elif pairings != privacy['stage_pairings']:
                 errors.append('the reconnect paired again '
-                              f'({pairs_complete} != '
-                              f'{privacy["stage_pairs_complete"]})')
+                              f'({pairings} != {privacy["stage_pairings"]})')
     return errors
 
 
@@ -855,7 +854,8 @@ def execute(args):
                 json.dumps(metadata['privacy'], indent=2) + '\n')
             errors.extend(evaluate_privacy(metadata['privacy'], args.mode,
                                            args.expect_irk_fingerprint,
-                                           metadata['bond_stats']['pairs_complete']))
+                                           metadata['bond_stats']['pairs_complete']
+                                           + metadata['bond_stats']['pairs_without_bond']))
         echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
         metadata['bond_echo'] = decode_bond_echo(echo_words)
         (args.out / 'bond_stats.json').write_text(
