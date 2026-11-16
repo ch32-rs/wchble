@@ -280,8 +280,9 @@ impl Privacy {
         self.entries = [ResolvingEntry::empty(); MAX_RESOLVING_LIST];
         self.tables = core::array::from_fn(|_| None);
         self.used = 0;
-        self.pending = None;
-        self.cached_identity = None;
+        // The pending admission belongs to the connection being established,
+        // not to the list: a Host that clears and rebuilds the list between
+        // CONNECT_IND and its first ACL frame must still get it resolved.
         self.mutated();
     }
 
@@ -502,6 +503,13 @@ impl Privacy {
         None
     }
 
+    /// Network-mode peers may only connect with an RPA from their IRK.
+    fn identity_blocked(&self, kind: u8, address: [u8; 6]) -> bool {
+        self.find(kind, address).is_some_and(|slot| {
+            self.entries[slot].peer_irk != [0; 16] && self.entries[slot].privacy_mode == 0
+        })
+    }
+
     /// CONNECT_IND gate. Policy 0 accepts and defers; policy 2 decides here.
     pub fn admit(&mut self, address: [u8; 6], random: bool) -> bool {
         let rpa = random && is_resolvable(address);
@@ -509,9 +517,21 @@ impl Privacy {
             // FAL is not used, but a policy value we do not filter on must not
             // silently become "unfiltered" either; values 1/3 are rejected at
             // Set Advertising Parameters.
+            if !rpa && self.identity_blocked(u8::from(random), address) {
+                self.stats.rejected_mode = self.stats.rejected_mode.wrapping_add(1);
+                self.pending = None;
+                self.cached_identity = None;
+                return false;
+            }
             self.pending = Some((address, random));
             self.cached_identity = None;
             return true;
+        }
+        if rpa && !self.resolution_enabled {
+            // Without resolution a listed peer cannot be matched against the FAL.
+            self.stats.rejected_not_listed = self.stats.rejected_not_listed.wrapping_add(1);
+            self.cached_identity = None;
+            return false;
         }
         if rpa {
             self.stats.resolve_attempts = self.stats.resolve_attempts.wrapping_add(1);
@@ -525,6 +545,10 @@ impl Privacy {
             Some(identity) => {
                 if rpa {
                     self.stats.resolve_ok = self.stats.resolve_ok.wrapping_add(1);
+                } else if self.identity_blocked(identity.0, identity.1) {
+                    self.stats.rejected_mode = self.stats.rejected_mode.wrapping_add(1);
+                    self.cached_identity = None;
+                    return false;
                 }
                 if self.fal_contains(identity.0, identity.1) {
                     self.cached_identity = Some(identity);
@@ -549,6 +573,9 @@ impl Privacy {
         if self.adv_filter_policy == 2 {
             return self.cached_identity;
         }
+        if !self.resolution_enabled {
+            return None;
+        }
         let (address, random) = self.pending?;
         if !(random && is_resolvable(address)) {
             return None;
@@ -563,9 +590,9 @@ impl Privacy {
         identity
     }
 
-    /// Diagnostic entry; counts like the admission path.
+    /// Diagnostic entry; counts like the admission path and follows its switch.
     pub fn resolve_peer(&mut self, address: [u8; 6], random: bool) -> Option<(u8, [u8; 6])> {
-        if !(random && is_resolvable(address)) {
+        if !self.resolution_enabled || !(random && is_resolvable(address)) {
             return None;
         }
         self.stats.resolve_attempts = self.stats.resolve_attempts.wrapping_add(1);
@@ -943,6 +970,7 @@ mod tests {
     #[test]
     fn policy_zero_accepts_and_defers_resolution() {
         let mut p = Privacy::new();
+        p.set_enabled(true);
         p.add(ResolvingEntry {
             peer_kind: 0,
             peer_address: [1; 6],
@@ -961,6 +989,7 @@ mod tests {
     #[test]
     fn policy_two_filters_every_address_kind() {
         let mut p = Privacy::new();
+        p.set_enabled(true);
         p.set_filter_policy(2);
         p.add(ResolvingEntry {
             peer_kind: 0,
@@ -991,6 +1020,83 @@ mod tests {
         assert!(!p.admit(stranger, true));
         assert_eq!(p.stats().resolve_unresolved, 1);
         assert_eq!(p.stats().rejected_not_listed, 2);
+    }
+
+    #[test]
+    fn disabled_resolution_leaves_the_rpa_unresolved() {
+        let mut p = Privacy::new();
+        p.add(ResolvingEntry {
+            peer_kind: 0,
+            peer_address: [1; 6],
+            peer_irk: IRK,
+            local_irk: [0; 16],
+            privacy_mode: 1,
+        })
+        .unwrap();
+        let rpa = rpa_from(&IRK, [0x94, 0x81, 0x70]);
+        assert!(p.admit(rpa, true));
+        assert_eq!(p.resolve_pending(), None);
+        assert_eq!(p.resolve_peer(rpa, true), None);
+        assert_eq!(p.stats().resolve_attempts, 0);
+
+        p.set_enabled(true);
+        assert_eq!(p.resolve_pending(), Some((0, [1; 6])));
+        assert_eq!(p.stats().resolve_ok, 1);
+    }
+
+    #[test]
+    fn clearing_the_list_keeps_the_pending_admission() {
+        let entry = ResolvingEntry {
+            peer_kind: 0,
+            peer_address: [1; 6],
+            peer_irk: IRK,
+            local_irk: [0; 16],
+            privacy_mode: 1,
+        };
+        let mut p = Privacy::new();
+        p.set_enabled(true);
+        p.add(entry).unwrap();
+        let rpa = rpa_from(&IRK, [0x94, 0x81, 0x70]);
+        assert!(p.admit(rpa, true));
+
+        // A Host resync clears and rebuilds the list during setup.
+        p.clear();
+        p.add(entry).unwrap();
+        assert_eq!(p.resolve_pending(), Some((0, [1; 6])));
+    }
+
+    #[test]
+    fn network_mode_rejects_the_peer_identity_address() {
+        let entry = ResolvingEntry {
+            peer_kind: 0,
+            peer_address: [1; 6],
+            peer_irk: IRK,
+            local_irk: [0; 16],
+            privacy_mode: 0,
+        };
+        let mut p = Privacy::new();
+        p.set_enabled(true);
+        p.add(entry).unwrap();
+        assert!(!p.admit([1; 6], false));
+        assert_eq!(p.stats().rejected_mode, 1);
+
+        // The same peer using an RPA from its IRK is accepted and resolved.
+        let rpa = rpa_from(&IRK, [0x94, 0x81, 0x70]);
+        assert!(p.admit(rpa, true));
+        assert_eq!(p.resolve_pending(), Some((0, [1; 6])));
+
+        // Device privacy mode has no such restriction.
+        p.set_mode(0, [1; 6], 1).unwrap();
+        assert!(p.admit([1; 6], false));
+
+        // Policy 2 must not let the FAL bypass the mode either.
+        let mut q = Privacy::new();
+        q.set_enabled(true);
+        q.set_filter_policy(2);
+        q.add(entry).unwrap();
+        q.fal_add(0, [1; 6]).unwrap();
+        assert!(!q.admit([1; 6], false));
+        assert_eq!(q.stats().rejected_mode, 1);
     }
 
     #[test]

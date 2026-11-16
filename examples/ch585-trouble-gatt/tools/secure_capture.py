@@ -216,6 +216,18 @@ def evaluate(assessed, mode='pair'):
                 errors.append('capture saw no peripheral Pairing Response')
             if 'PairingDHKeyCheck' not in assessed['smp_opcodes_captured']:
                 errors.append('capture saw no DHKey Check in either direction')
+    elif mode == 'privacy':
+        # The first link pairs a fresh bond; the reconnect must only resume
+        # encryption. Pairing before the second CONNECT_IND is expected.
+        phase = assessed.get('rotate_phase') or []
+        reconnect = phase[1]['frame'] if len(phase) >= 2 else None
+        pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
+                   'PairingDHKeyCheck', 'PairingPublicKey'}
+        seen = [entry['name'] for entry in assessed['smp']
+                if entry['name'] in pairing
+                and (reconnect is None or entry['frame'] > reconnect)]
+        if seen:
+            errors.append(f'capture showed a new pairing during the reconnect: {sorted(set(seen))}')
     else:
         pairing = {'PairingRequest', 'PairingResponse', 'PairingConfirm', 'PairingRandom',
                    'PairingDHKeyCheck', 'PairingPublicKey'}

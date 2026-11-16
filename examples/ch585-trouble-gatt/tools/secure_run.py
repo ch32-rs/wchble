@@ -666,8 +666,12 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
             errors.append('fewer than two RPA rotations between disconnect and '
                           f'reconnect: {privacy["rotations"]} - '
                           f'{privacy["stage_rotations"]}')
-        if privacy['resolve_attempts'] < 1:
-            errors.append('the reconnect never resolved the peer RPA')
+        # The Host can resolve the peer on its own; only a controller-side
+        # success after the disconnect proves the reconnect went through us.
+        if privacy['resolve_ok'] <= privacy['stage_resolve_ok']:
+            errors.append('the reconnect never resolved the peer RPA '
+                          f'({privacy["resolve_ok"]} <= '
+                          f'{privacy["stage_resolve_ok"]})')
     return errors
 
 

@@ -1744,11 +1744,15 @@ fn record_save_time(clock: &Clock, started: u32) {
     bond::observe_max(bond::STAT_MAX_SAVE_US, took);
 }
 
-/// Write an IRK-only payload (count = 0) before any advertising starts.
+/// Store the local IRK with the loaded bonds before any advertising starts.
 #[cfg(feature = "privacy")]
-fn persist_irk(store: &mut DualCopyStore<Ch585DataFlash>, irk: &[u8; 16]) -> bool {
+fn persist_irk(
+    store: &mut DualCopyStore<Ch585DataFlash>,
+    irk: &[u8; 16],
+    bonds: &[PersistedBond],
+) -> bool {
     let mut payload = [0u8; MAX_PAYLOAD];
-    let Ok(len) = encode_bonds(&bond::local_identity(), irk, &[], &mut payload) else {
+    let Ok(len) = encode_bonds(&bond::local_identity(), irk, bonds, &mut payload) else {
         return false;
     };
     for _ in 0..2 {
@@ -2100,7 +2104,8 @@ fn main() -> ! {
         client_att::set(client_att::STAT_MAGIC, client_att::CATT_MAGIC);
         client_att::set(client_att::STAT_VERSION, client_att::CATT_VERSION);
         let mut boot_bonds = [PersistedBond::empty(); MAX_BONDS];
-        #[cfg(feature = "privacy")]
+        // Read in every secure build: a save from a build without privacy must
+        // not zero a key that another image persisted.
         let mut local_irk = [0u8; 16];
         let mut payload = [0u8; MAX_PAYLOAD];
         let read_started = clock.now_us();
@@ -2111,10 +2116,7 @@ fn main() -> ! {
                 &mut boot_bonds,
             ) {
                 Ok(Some(decoded)) => {
-                    #[cfg(feature = "privacy")]
-                    {
-                        local_irk = decoded.local_irk;
-                    }
+                    local_irk = decoded.local_irk;
                     bond::set(bond::STAT_LOAD_RESULT, bond::LOAD_VALID);
                     bond::set(bond::STAT_RECORDS_LOADED, decoded.bonds.len() as u32);
                     bond::set(bond::STAT_WINNER_SLOT, store.active_slot().unwrap_or(0) as u32);
@@ -2177,25 +2179,29 @@ fn main() -> ! {
                 privacy::set_flag(privacy::FLAG_WRITES_BLOCKED);
                 local_irk = [0; 16];
             } else if load == bond::LOAD_VALID && local_irk != [0; 16] {
-            } else if load == bond::LOAD_VALID && records > 0 {
-                privacy::set_flag(privacy::FLAG_IRK_MISSING);
-                local_irk = [0; 16];
+                // Same identity key across the reboot.
             } else {
+                // Bonds written before privacy carry no IRK. Keep them and add
+                // a fresh one: the peer must re-pair to learn it, but the device
+                // no longer keeps advertising its identity address forever.
+                if load == bond::LOAD_VALID && records > 0 {
+                    privacy::set_flag(privacy::FLAG_IRK_MISSING);
+                }
                 let mut fresh = [0u8; 16];
                 rng::fill(&mut fresh);
                 local_irk = fresh;
-                if !persist_irk(&mut store, &local_irk) {
+                if !persist_irk(&mut store, &local_irk, bond::boot_bonds()) {
                     privacy::set_flag(privacy::FLAG_IRK_UNPERSISTED);
                     local_irk = [0; 16];
                     bond::set(bond::STAT_LAST_ERROR, 6);
                 }
             }
-            bond::set_local_irk(&local_irk);
             bond::set_rl_expected(bond::boot_bonds());
             if local_irk != [0; 16] {
                 privacy_irk = Some(local_irk);
             }
         }
+        bond::set_local_irk(&local_irk);
     }
     let app_stats = host::HostStats::new();
     set_peripheral_address(&peripheral_address);

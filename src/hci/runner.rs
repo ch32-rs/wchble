@@ -833,11 +833,10 @@ impl SoftRunner {
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
         self.suggested_tx_time = LL_LEGACY_TIME_US;
         self.suggested_tx_explicit = false;
-        // Advertising parameters are HCI state; the resolving list is not
-        // cleared by Reset (the Host re-syncs it after init).
+        // Revert to the documented defaults: empty resolving and filter accept
+        // lists, resolution disabled, 900 s timeout.
         self.adv_own_addr_type = OWN_ADDR_UNSET;
-        self.privacy.set_filter_policy(0);
-        self.privacy.clear_pending();
+        self.privacy = Privacy::new();
         // `LinkLayer::new` resets AdvA to a zero random address; restore the
         // selected own address even when only a public BD_ADDR is known.
         self.sync_adv_addr(false);
@@ -1792,6 +1791,47 @@ mod tests {
             inject_cmd(0x202d, &[2]);
             runner.serve_one().await;
             expect_command_complete(0x202d, HCI_INVALID_PARAMETERS, &[]);
+        });
+    }
+
+    #[test]
+    fn reset_clears_privacy_state() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        let mut add = [0u8; 39];
+        add[1..7].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        add[7..23].fill(0x11);
+        add[23..39].fill(0x22);
+        let fal = [0, 7, 8, 9, 10, 11, 12];
+
+        pollster::block_on(async {
+            for (opcode, params) in [(0x2027, &add[..]), (0x202d, &[1u8][..]), (0x2011, &fal[..])] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_SUCCESS, &[]);
+            }
+            let before = runner.privacy_stats();
+            assert_eq!(before.list_len, 1);
+            assert_ne!(
+                before.flags & crate::ll::privacy::flags::RESOLUTION_ENABLED,
+                0
+            );
+            assert_ne!(before.flags & crate::ll::privacy::flags::FAL_NONEMPTY, 0);
+
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+
+            let after = runner.privacy_stats();
+            assert_eq!(after.list_len, 0);
+            assert_eq!(
+                after.flags
+                    & (crate::ll::privacy::flags::RESOLUTION_ENABLED
+                        | crate::ll::privacy::flags::FAL_NONEMPTY),
+                0
+            );
         });
     }
 

@@ -25,6 +25,7 @@ static mut FLAGS: u32 = 0;
 static mut MAX_ADMIT_US: u32 = 0;
 static mut MAX_RESOLVE_US: u32 = 0;
 static mut STAGE: (u32, u32, u32) = (0, 0, 0);
+static mut STAGE_SET: bool = false;
 
 pub fn set_flag(flag: u32) {
     // SAFETY: single-threaded; written from boot or the Host poll.
@@ -61,9 +62,18 @@ pub fn note_resolve(us: u32) {
     }
 }
 
-/// Snapshot the counters at disconnect so a reconnect can be compared without
-/// halting the radio mid-run.
+/// Snapshot the counters at the first disconnect, so the rotation window and
+/// the reconnect that follow can be compared. Later disconnects (the app ends
+/// the reconnected link before the finite run ends) must not move it.
 pub fn snapshot(soft: &SoftRunner) {
+    // SAFETY: single-threaded.
+    unsafe {
+        let set = core::ptr::addr_of_mut!(STAGE_SET);
+        if set.read_volatile() {
+            return;
+        }
+        set.write_volatile(true);
+    }
     let stats = soft.privacy_stats();
     // SAFETY: single-threaded.
     unsafe {
