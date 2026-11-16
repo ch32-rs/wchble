@@ -49,6 +49,24 @@ CATT_NAMES = '''magic version load_result records_loaded identity_mismatch
     save_attempts save_ok save_fail snapshots restore_attempts restore_ok
     restore_no_record restore_invalid overflow last_error shadow_records'''.split()
 CATT_MAGIC = 0x4333_4130
+PRIVACY_MAGIC = 0x5334_5052
+PRIVACY_NAMES = '''magic version flags generations rotations resolve_attempts resolve_ok
+    resolve_unresolved rejected_not_listed rejected_mode max_admit_us max_resolve_us
+    rotated_at_us rpa_lo rpa_hi list_state fingerprint stage_generations stage_resolve_ok
+    stage_rotations'''.split()
+P_RESOLUTION_ENABLED = 0x01
+P_LOCAL_IRK = 0x02
+P_ADV_USES_RPA = 0x04
+P_IDENTITY_FALLBACK = 0x08
+P_FAL_NONEMPTY = 0x10
+P_IRK_UNPERSISTED = 0x20
+P_WRITES_BLOCKED = 0x40
+P_WIPE_PENDING = 0x80
+P_RL_NOT_READY = 0x100
+P_STAMP_VALID = 0x200
+P_IRK_MISSING = 0x400
+# spec §16.2.7: the accept path has 900 us; only the reject path may overrun.
+ADMIT_BUDGET_US = 900
 X4_MAGIC = 0x5834_0001
 X4_NAMES = '''magic version mtu bulk_reads bulk_writes bulk_len bulk_sum bulk_match
     burst_runs burst_attempts burst_sent burst_queue_full burst_busy burst_other
@@ -75,6 +93,7 @@ SUMMARY_REASONS = {
     'wipe': 'bond_wipe_ok',
     'fault': 'fault_injected_ok',
     'att': 'att_mtu_long_burst_ok',
+    'privacy': 'privacy_rotation_ok',
 }
 ui_path = '/sdcard/wchble-ui.xml'
 
@@ -441,16 +460,19 @@ def evaluate_transcript(rows, mode='pair'):
     # A reused bond has no BOND_BONDED broadcast; the Host counters prove the
     # session resumed the stored key instead.
     already_bonded = 'already_bonded' in events
-    if mode in ('pair', 'reconnect') and summary.get('bonded') is not True:
+    if mode in ('pair', 'reconnect', 'privacy') and summary.get('bonded') is not True:
         errors.append('app summary did not observe a completed bond')
     if mode == 'wipe':
         required = ('scan_started', 'found', 'connecting', 'connection_state',
                     'services_discovered', 'control_start', 'write_ack')
-    elif mode in ('pair', 'reconnect'):
+    elif mode in ('pair', 'reconnect', 'privacy'):
         required = ('scan_started', 'found', 'connecting', 'connection_state',
                     'services_discovered', 'encrypted_gatt_start', 'read',
                     'write_requested', 'write_ack')
-        if mode == 'pair' and not already_bonded:
+        if mode == 'privacy':
+            required += ('rotation_begin', 'rotation_disconnected', 'rotation_rescan',
+                         'rotation_reconnected')
+        if mode in ('pair', 'privacy') and not already_bonded:
             required += ('bond_requested', 'bond_state')
     else:
         required = ('scan_started', 'found', 'connecting', 'connection_state',
@@ -459,16 +481,22 @@ def evaluate_transcript(rows, mode='pair'):
     for required_event in required:
         if required_event not in events:
             errors.append(f'app transcript is missing {required_event}')
-    if mode == 'pair' and not already_bonded:
+    if mode in ('pair', 'privacy') and not already_bonded:
         bond_states = [row.get('state') for row in rows if row.get('event') == 'bond_state']
         if 12 not in bond_states:  # BOND_BONDED
             errors.append(f'bond state never reached BOND_BONDED: {bond_states}')
-    if mode in ('pair', 'reconnect'):
+    if mode in ('pair', 'reconnect', 'privacy'):
         reads = [row for row in rows if row.get('event') == 'read' and row.get('status') == 0]
         if not reads or reads[0].get('value') != 0:
             errors.append(f'first encrypted read did not return the initial value 0: {reads[:1]}')
         if len(reads) < 2 or reads[-1].get('value') != 43:
             errors.append(f'read-back after write did not return 43: {reads}')
+    if mode == 'privacy':
+        # Both links must have done encrypted I/O, and the second one must not
+        # have paired again (a re-pair is a different failure the smp counters
+        # rule out independently).
+        if summary.get('connections') != 2:
+            errors.append(f'the app opened {summary.get("connections")} links, expected 2')
     writes = [row for row in rows if row.get('event') == 'write_ack' and row.get('status') == 0]
     if not writes:
         errors.append('no successful ATT write response')
@@ -532,7 +560,7 @@ def decode_bond_echo(words):
     }
 
 
-def evaluate_security(sec, host, stats, run_seconds):
+def evaluate_security(sec, host, stats, run_seconds, encryptions=1):
     errors = []
     if len(sec) != 16:
         return ['invalid SECURE_STATS size']
@@ -549,8 +577,8 @@ def evaluate_security(sec, host, stats, run_seconds):
     for index, count in minimum.items():
         if sec[index] < count:
             errors.append(f'{SEC_NAMES[index]}={sec[index]} < {count}')
-    if sec[10] != 1:
-        errors.append(f'encryption became active {sec[10]} times, expected 1')
+    if sec[10] != encryptions:
+        errors.append(f'encryption became active {sec[10]} times, expected {encryptions}')
     if sec[11]:
         errors.append(f'MIC failures: {sec[11]}')
     if sec[12]:
@@ -561,11 +589,89 @@ def evaluate_security(sec, host, stats, run_seconds):
         errors.append('invalid HOST_STATS size')
     elif host[15] != SECURITY_ENCRYPTED:
         errors.append(f'Host security state={host[15]}, expected encrypted ({SECURITY_ENCRYPTED})')
-    errors.extend(evaluate_finite_run(stats, run_seconds))
+    errors.extend(evaluate_finite_run(stats, run_seconds, encryptions))
     return errors
 
 
-def evaluate_finite_run(stats, run_seconds):
+def decode_privacy(words):
+    """PRIVACY_STATS: controller counters plus the example's storage facts."""
+    if len(words) != 20 or words[0] != PRIVACY_MAGIC:
+        return {'present': False, 'words': words}
+    rpa = words[13].to_bytes(4, 'little') + words[14].to_bytes(4, 'little')[:2]
+    return {
+        'present': True,
+        'version': words[1],
+        'flags': words[2],
+        'generations': words[3],
+        'rotations': words[4],
+        'resolve_attempts': words[5],
+        'resolve_ok': words[6],
+        'resolve_unresolved': words[7],
+        'rejected_not_listed': words[8],
+        'rejected_mode': words[9],
+        'max_admit_us': words[10],
+        'max_resolve_us': words[11],
+        'rotated_at_us': words[12],
+        'rpa': rpa.hex(),
+        'list_len': words[15] & 0xFF,
+        'filter_policy': (words[15] >> 8) & 0xFF,
+        'last_error': (words[15] >> 16) & 0xFF,
+        'fingerprint': f'{words[16]:08x}',
+        'stage_generations': words[17],
+        'stage_resolve_ok': words[18],
+        'stage_rotations': words[19],
+    }
+
+
+def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None):
+    """Gate the S4 evidence: an RPA was used, persisted, and rotated."""
+    errors = []
+    if not privacy.get('present'):
+        return ['PRIVACY_STATS magic missing or unreadable']
+    if privacy['version'] != 1:
+        errors.append(f'PRIVACY_STATS version is not 1: {privacy["version"]}')
+    flags = privacy['flags']
+    if not flags & P_ADV_USES_RPA:
+        errors.append('advertising never used the local RPA')
+    if flags & P_IDENTITY_FALLBACK:
+        errors.append('advertising fell back to the identity address')
+    for bit, label in ((P_IRK_UNPERSISTED, 'local IRK was never persisted'),
+                       (P_WRITES_BLOCKED, 'bond writes were blocked'),
+                       (P_WIPE_PENDING, 'a wipe is pending; the IRK was reset'),
+                       (P_RL_NOT_READY, 'the resolving list was not ready before advertising'),
+                       (P_IRK_MISSING, 'bonds exist but no local IRK was loaded')):
+        if flags & bit:
+            errors.append(label)
+    if not flags & P_STAMP_VALID:
+        errors.append('the RPA timestamp was never valid')
+    if privacy['generations'] < 1:
+        errors.append('no RPA was generated')
+    if privacy['fingerprint'] == '00000000':
+        errors.append('the local IRK fingerprint is zero')
+    if expect_fingerprint is not None and \
+            privacy['fingerprint'] != expect_fingerprint.lower().removeprefix('0x'):
+        errors.append(f'IRK fingerprint {privacy["fingerprint"]} differs from '
+                      f'the earlier boot {expect_fingerprint}')
+    if privacy['max_admit_us'] > ADMIT_BUDGET_US:
+        errors.append(f'connection admission took {privacy["max_admit_us"]} us, '
+                      f'over the {ADMIT_BUDGET_US} us budget')
+    rpa = bytes.fromhex(privacy['rpa'])
+    if rpa[5] & 0xC0 != 0x40:
+        errors.append(f'advertised address is not a resolvable private address: '
+                      f'{privacy["rpa"]}')
+    if mode == 'privacy':
+        if privacy['stage_generations'] < 1:
+            errors.append('the disconnect snapshot never ran')
+        if privacy['rotations'] - privacy['stage_rotations'] < 2:
+            errors.append('fewer than two RPA rotations between disconnect and '
+                          f'reconnect: {privacy["rotations"]} - '
+                          f'{privacy["stage_rotations"]}')
+        if privacy['resolve_attempts'] < 1:
+            errors.append('the reconnect never resolved the peer RPA')
+    return errors
+
+
+def evaluate_finite_run(stats, run_seconds, connections=1):
     """Gates that apply to every mode, encrypted or not."""
     errors = []
     if len(stats) == 64:
@@ -575,8 +681,8 @@ def evaluate_finite_run(stats, run_seconds):
             errors.append('RF stop was not clean (CMD/MODE/stop_err)')
         if not (run_seconds * 1_000_000 <= stats[32] <= (run_seconds + 3) * 1_000_000):
             errors.append('firmware runtime does not match the finite-run budget')
-        if stats[14] != 1 or stats[15] != 1:
-            errors.append(f'expected one connected link with data: {stats[14:16]}')
+        if stats[14] != connections or stats[15] != connections:
+            errors.append(f'expected {connections} connected link(s) with data: {stats[14:16]}')
     else:
         errors.append('invalid STATS size')
     return errors
@@ -601,16 +707,21 @@ def execute(args):
         metadata['smoke_sha256'] = hashlib.sha256(smoke.read_bytes()).hexdigest()
         nm_text = io.command([args.nm, str(archived)], args.out / 'symbols.txt')
         symbols = p4.symbols_from(nm_text)
-        for name in ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
-                     'BOND_STATS', 'BOND_ECHO', 'CATT_STATS', 'X4_STATS', 'X1_STATS',
-                     'PERIPHERAL_ADDRESS'):
+        wanted = ['HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
+                  'BOND_STATS', 'BOND_ECHO', 'CATT_STATS', 'X4_STATS', 'X1_STATS',
+                  'PERIPHERAL_ADDRESS']
+        if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
+            wanted.append('PRIVACY_STATS')
+        for name in wanted:
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
             if len(matches) != 1:
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = int(matches[0][0], 16)
-        symbols = validate_observation_buffers(
-            image, symbols, extra=(('X4_STATS', 16), ('X1_STATS', 24)))
+        extra = [('X4_STATS', 16), ('X1_STATS', 24)]
+        if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
+            extra.append(('PRIVACY_STATS', 20))
+        symbols = validate_observation_buffers(image, symbols, extra=extra)
         # Both feature sets write the same output path, so a plain `cargo
         # build` right after a secure build silently replaces this image.
         # Refuse to spend a probe session on a Host without the crypto backend.
@@ -707,10 +818,19 @@ def execute(args):
             errors.extend(evaluate_finite_run(observations.get('STATS', []),
                                               args.run_seconds))
         else:
+            links = 2 if args.mode == 'privacy' else 1
             errors.extend(evaluate_security(observations.get('SECURE_STATS', []),
                                             observations.get('HOST_STATS', []),
                                             observations.get('STATS', []),
-                                            args.run_seconds))
+                                            args.run_seconds, links))
+        if 'PRIVACY_STATS' in symbols:
+            privacy_words = io.read32(symbols['PRIVACY_STATS'], 20,
+                                      args.out / 'privacy_stats.txt')
+            metadata['privacy'] = decode_privacy(privacy_words)
+            (args.out / 'privacy_stats.json').write_text(
+                json.dumps(metadata['privacy'], indent=2) + '\n')
+            errors.extend(evaluate_privacy(metadata['privacy'], args.mode,
+                                           args.expect_irk_fingerprint))
         bond_words = io.read32(symbols['BOND_STATS'], 32, args.out / 'bond_stats.txt')
         metadata['bond_stats'] = dict(zip(BOND_NAMES, bond_words))
         echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
@@ -832,11 +952,16 @@ def options(argv=None):
                         help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')
     parser.add_argument('--full-logcat', action='store_true')
+    parser.add_argument('--expect-irk-fingerprint', default=None,
+                        help='compare the local IRK fingerprint with an earlier boot')
     args = parser.parse_args(argv)
     if not (math.isfinite(args.timeout) and 0 < args.timeout <= args.run_seconds):
         parser.error('require finite timeout <= run-seconds')
     if args.reject and args.mode == 'att':
         parser.error('--reject is meaningless for the att phase')
+    if args.expect_irk_fingerprint is not None and \
+            not re.fullmatch(r'(0x)?[0-9a-fA-F]{1,8}', args.expect_irk_fingerprint):
+        parser.error('require an 8-hex-digit IRK fingerprint')
     args.out, args.elf, args.smoke_elf = (args.out.resolve(), args.elf.resolve(),
                                           args.smoke_elf.resolve())
     return args

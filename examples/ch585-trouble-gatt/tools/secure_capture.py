@@ -64,7 +64,7 @@ def run_target(out):
     return result.get('peripheral_address', TARGET)
 
 
-def decode(path, out, tshark, target):
+def decode(path, out, tshark, target, privacy=False):
     command = [tshark, '-r', str(path), '-T', 'fields',
                '-E', 'header=y', '-E', 'separator=/t']
     for field in FIELDS:
@@ -76,20 +76,29 @@ def decode(path, out, tshark, target):
         raise RuntimeError(f'tshark exited {result.returncode}: {result.stderr[-400:]}')
     (out / 'packets.tsv').write_text(result.stdout)
     rows = list(csv.DictReader(io.StringIO(result.stdout), delimiter='\t'))
-    return analyze(rows, out, target)
+    return analyze(rows, out, target, privacy)
 
 
-def analyze(rows, out, target):
+def analyze(rows, out, target, privacy=False):
     """Only the link this firmware opened is evidence; neighbouring BLE traffic
-    (the 37/38/39 scan sees plenty) must not be counted or decoded."""
+    (the 37/38/39 scan sees plenty) must not be counted or decoded.
+
+    Privacy runs advertise an RPA that changes between links, so the target is
+    no longer one address: every CRC-valid CONNECT_IND on the capture is a
+    candidate and each link's access address is followed separately.
+    """
     connects = [row for row in rows
                 if row['btle.advertising_header.pdu_type'] == '0x05'
-                and row['btle.advertising_address'].lower() == target
-                and row['nordic_ble.crcok'] == 'True']
-    link = next((row['btle.link_layer_data.access_address'].lower()
-                 for row in connects if row['btle.link_layer_data.access_address']), None)
+                and row['nordic_ble.crcok'] == 'True'
+                and (privacy or row['btle.advertising_address'].lower() == target)]
+    links = []
+    for row in connects:
+        address = row['btle.link_layer_data.access_address']
+        if address and address.lower() not in links:
+            links.append(address.lower())
+    link = links[0] if links else None
     good = [row for row in rows if row['nordic_ble.crcok'] == 'True'
-            and link is not None and row['btle.access_address'].lower() == link]
+            and row['btle.access_address'].lower() in links]
     smp, control, att = [], [], []
     for row in good:
         frame = int(row['frame.number'])
@@ -121,8 +130,13 @@ def analyze(rows, out, target):
     histogram = {}
     for length in lengths:
         histogram[str(length)] = histogram.get(str(length), 0) + 1
-    assessed = {'target': target, 'connect_frame': int(connects[0]['frame.number']) if connects else None,
-                'access_address': link, 'smp': smp, 'll_control': control,
+    addresses = [row['btle.advertising_address'].lower() for row in connects]
+    assessed = {'target': target, 'privacy': privacy,
+                'connect_frame': int(connects[0]['frame.number']) if connects else None,
+                'connect_addresses': addresses,
+                'rotate_phase': [],
+                'access_address': link, 'access_addresses': links,
+                'smp': smp, 'll_control': control,
                 'att_frames': len(att), 'att_last_frame': att[-1]['frame'] if att else None,
                 'crc_valid_link_pdus': len(good),
                 'll_payload_lengths': {
@@ -148,6 +162,13 @@ def analyze(rows, out, target):
     assessed['pairing_request'] = request
     assessed['pairing_response'] = response
     assessed['smp_opcodes_captured'] = sorted({entry['name'] for entry in smp})
+    if privacy:
+        # The RPA that reached each link is the rotation evidence a sniffer
+        # can offer without the IRK.
+        assessed['rotate_phase'] = [
+            {'frame': int(row['frame.number']),
+             'address': row['btle.advertising_address'].lower()}
+            for row in connects]
     out.joinpath('capture-analysis.json').write_text(
         json.dumps(assessed, indent=2) + '\n')
     return assessed
@@ -164,6 +185,12 @@ def evaluate(assessed, mode='pair'):
     errors = []
     if assessed.get('access_address') is None:
         errors.append(f'capture saw no CRC-valid CONNECT_IND to {assessed.get("target")}')
+    if mode == 'privacy':
+        addresses = assessed.get('connect_addresses') or []
+        if len(addresses) >= 2 and len(set(addresses)) < 2:
+            errors.append('the peer advertised the same address for both links')
+        # One link only means the sniffer missed the rotated address; the
+        # firmware counters, not the capture, decide rotation.
     if mode in ('delete', 'reject'):
         if not any(entry['name'] == 'REJECT_IND' for entry in assessed['ll_control']):
             errors.append('capture saw no LL_REJECT_IND after the delete command')
@@ -368,7 +395,8 @@ def time_now():
 
 def assess_pcap(out, tshark, mode='pair'):
     structure = cap.validate_pcap(out / 'capture.pcap')
-    assessed = decode(out / 'capture.pcap', out, tshark, run_target(out))
+    assessed = decode(out / 'capture.pcap', out, tshark, run_target(out),
+                      mode == 'privacy')
     assessed['structure'] = structure
     assessed['mode'] = mode
     assessed['errors'] = evaluate(assessed, mode)
@@ -385,11 +413,16 @@ def options(argv=None):
     parser.add_argument('--follow-by-name', action='store_true')
     parser.add_argument('--nrfutil-home', type=Path, required=True)
     parser.add_argument('--tshark', default='tshark')
-    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject', 'fault', 'att'),
+    parser.add_argument('--mode', choices=('pair', 'reconnect', 'delete', 'reject',
+                                           'fault', 'att', 'privacy'),
                         default='pair')
     parser.add_argument('--serial-timeout-ms', type=int, default=100)
     parser.add_argument('--startup-timeout', type=float, default=10)
     capture, remaining = parser.parse_known_args(argv)
+    if capture.mode == 'privacy':
+        # The advertised address is an RPA from the first frame, so only the
+        # advertised name identifies the device.
+        capture.follow_by_name = True
     if not 1 <= capture.serial_timeout_ms <= 1000 or not 0 < capture.startup_timeout <= 30:
         parser.error('require serial timeout 1..1000ms and startup timeout 0..30s')
     args = secure.options(remaining)
