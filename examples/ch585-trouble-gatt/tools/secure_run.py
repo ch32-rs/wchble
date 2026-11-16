@@ -43,7 +43,8 @@ BOND_NAMES = '''magic version load_result records_loaded winner_slot winner_seq
     clear_requests clear_ok clear_fail fault_injected last_error max_save_us
     last_save_us boot_read_us pairs_complete pairs_without_bond in_memory_removed
     control_writes malformed_control_writes add_bond_ok add_bond_fail
-    identity_mismatch reserved1 reserved2 reserved3 reserved4 reserved5'''.split()
+    identity_mismatch blocked_saves rl_not_ready fal_builds fal_busy_retries
+    fal_members_max'''.split()
 BOND_MAGIC = 0x4233_5330
 CATT_NAMES = '''magic version load_result records_loaded identity_mismatch
     save_attempts save_ok save_fail snapshots restore_attempts restore_ok
@@ -66,6 +67,7 @@ P_WIPE_PENDING = 0x80
 P_RL_NOT_READY = 0x100
 P_STAMP_VALID = 0x200
 P_IRK_MISSING = 0x400
+P_FAL_REBUILD_FAILED = 0x800
 # spec §16.2.7: the accept path has 900 us; only the reject path may overrun.
 ADMIT_BUDGET_US = 900
 X4_MAGIC = 0x5834_0001
@@ -84,7 +86,8 @@ BURST_ATTEMPTS = 12
 ATT_REASON = 'att_mtu_long_burst_ok'
 HOST_NAMES = p4.HOST_NAMES
 STAT_NAMES = p4.STAT_NAMES
-FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
+FAILURES = (OSError, RuntimeError, ValueError, subprocess.SubprocessError,
+            KeyboardInterrupt)
 
 SECURITY_ENCRYPTED = 3
 SUMMARY_REASONS = {
@@ -96,6 +99,9 @@ SUMMARY_REASONS = {
     'att': 'att_mtu_long_burst_ok',
     'privacy': 'privacy_rotation_ok',
 }
+# `fal` drives the same reconnect phase on the phone and adds a Mac probe.
+MODES = tuple(SUMMARY_REASONS) + ('fal',)
+TOOLS = Path(__file__).resolve().parent
 ui_path = '/sdcard/wchble-ui.xml'
 
 
@@ -692,6 +698,104 @@ def evaluate_privacy(privacy, mode='privacy', expect_fingerprint=None, pairings=
     return errors
 
 
+def evaluate_fal(privacy, bonds, host, stats):
+    """S4b: a listed peer reconnects, an unbonded central is refused."""
+    errors = []
+    if privacy['filter_policy'] != 2:
+        errors.append(f'advertising filter policy is {privacy["filter_policy"]}, expected 2')
+    if not privacy['flags'] & P_FAL_NONEMPTY:
+        errors.append('the controller accept list was never populated')
+    if privacy['flags'] & P_RL_NOT_READY:
+        errors.append('the resolving list was not ready before advertising')
+    if privacy['flags'] & P_FAL_REBUILD_FAILED:
+        errors.append('the accept list could not be rebuilt; advertising fell back')
+    if privacy['rejected_not_listed'] < 1:
+        errors.append('no connection attempt was rejected by the accept list')
+    if bonds['fal_builds'] < 1:
+        errors.append('the Host never rebuilt the accept list')
+    if bonds['fal_members_max'] < 1:
+        errors.append('the accept list was never non-empty at advertise time')
+    # The phone already has the bond: any PairingComplete means it paired again.
+    pairs = bonds['pairs_complete'] + bonds['pairs_without_bond']
+    if pairs != 0:
+        errors.append(f'the run paired again ({pairs} PairingComplete event(s))')
+    if host['connections'] != 1:
+        errors.append(f'expected exactly one Host connection: {host["connections"]}')
+    if stats[14] != 1:
+        errors.append(f'expected one valid CONNECT_IND: {stats[14]}')
+    return errors
+
+
+def mac_bluetooth_state(out):
+    """Record the Mac's Bluetooth table so an existing bond fails the run."""
+    result = subprocess.run(['system_profiler', 'SPBluetoothDataType'],
+                            capture_output=True, text=True, timeout=60)
+    text = result.stdout
+    (out / 'mac-bluetooth.txt').write_text(text)
+    return text
+
+
+def build_probe(out):
+    """Compile the probe before the firmware run so compilation is off-clock."""
+    binary = out / 'central-probe'
+    subprocess.run(['swiftc', '-O', '-o', str(binary), str(TOOLS / 'central.swift')],
+                   check=True, capture_output=True, text=True, timeout=180)
+    return binary
+
+
+def run_connect_probe(args, out, binary):
+    """One bounded connection attempt from an unbonded macOS central."""
+    log = out / 'mac-probe.jsonl'
+    command = [str(binary), '--mode', 'connect-probe',
+               '--timeout', str(args.probe_timeout),
+               '--connect-wait', str(args.connect_wait)]
+    timeout = args.probe_timeout + 15
+    with log.open('w') as stream:
+        try:
+            result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
+                                    timeout=timeout)
+            code = result.returncode
+        except subprocess.TimeoutExpired:
+            code = None
+    rows = []
+    for line in log.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return evaluate_probe(rows, code)
+
+
+def evaluate_probe(rows, code):
+    """Classify the Mac's one attempt; the firmware counters are the hard gate.
+
+    CoreBluetooth does not surface a failure when the peripheral never answers
+    a CONNECT_IND, so exit 6 after a real attempt is recorded as `silent`: the
+    attempt happened and never connected. `evaluate_fal` then requires the
+    controller to have counted a refused attempt.
+    """
+    events = [row.get('event') for row in rows]
+    report = {'exit_code': code, 'events': events,
+              'rejected': code == 0 and 'connect_rejected' in events,
+              'connected': 'unexpected_connected' in events,
+              'attempted': 'connecting' in events}
+    errors = []
+    if report['connected']:
+        report['outcome'] = 'connected'
+        errors.append('the Mac connected although it is not in the accept list')
+    elif report['rejected']:
+        report['outcome'] = 'rejected'
+    elif code == 6 and report['attempted']:
+        report['outcome'] = 'silent'
+    elif not report['attempted']:
+        report['outcome'] = 'no_attempt'
+        errors.append(f'macOS never started a connection (exit {code})')
+    else:
+        report['outcome'] = 'failed'
+        errors.append(f'mac connect-probe failed (exit {code})')
+    return report, errors
+
+
 def evaluate_finite_run(stats, run_seconds, connections=1):
     """Gates that apply to every mode, encrypted or not."""
     errors = []
@@ -731,8 +835,10 @@ def execute(args):
         wanted = ['HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
                   'BOND_STATS', 'BOND_ECHO', 'CATT_STATS', 'X4_STATS', 'X1_STATS',
                   'PERIPHERAL_ADDRESS']
-        if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
+        if args.mode in ('privacy', 'fal') or args.expect_irk_fingerprint is not None:
             wanted.append('PRIVACY_STATS')
+        if args.mode == 'fal':
+            wanted.append('FAL_FILTER_BUILD')
         for name in wanted:
             matches = [parts for line in nm_text.splitlines()
                        if len(parts := line.split()) == 3 and parts[2] == name]
@@ -740,7 +846,7 @@ def execute(args):
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = int(matches[0][0], 16)
         extra = [('X4_STATS', 16), ('X1_STATS', 24)]
-        if args.mode == 'privacy' or args.expect_irk_fingerprint is not None:
+        if args.mode in ('privacy', 'fal') or args.expect_irk_fingerprint is not None:
             extra.append(('PRIVACY_STATS', 24))
         symbols = validate_observation_buffers(image, symbols, extra=extra)
         # Both feature sets write the same output path, so a plain `cargo
@@ -748,12 +854,22 @@ def execute(args):
         # Refuse to spend a probe session on a Host without the crypto backend.
         if '_embassy_crypto_aes128ecb_encrypt_blocks' not in nm_text:
             raise ValueError('ELF was not built with --features secure (no crypto backend)')
+        if args.mode == 'fal' and \
+                p4.embedded_u32(image, symbols['FAL_FILTER_BUILD']) != 1:
+            raise ValueError('ELF was not built with --features fal-filter')
         metadata['symbols'] = symbols
         metadata['ram_layout'] = p4.validate_ram_layout(image, symbols)
         embedded_seconds = p4.embedded_u32(image, symbols['RUN_SECONDS'])
         metadata['embedded_run_seconds'] = embedded_seconds
         if embedded_seconds != args.run_seconds:
             raise ValueError(f'ELF RUN_SECONDS={embedded_seconds}, requested {args.run_seconds}')
+        probe_binary = None
+        if args.mode == 'fal':
+            if 'wch585-p4' in mac_bluetooth_state(args.out):
+                # A bonded or remembered Mac would not be an unbonded central.
+                raise ValueError('the Mac already knows wch585-p4; remove it in '
+                                 'System Settings > Bluetooth before the fal run')
+            probe_binary = build_probe(args.out)
 
         if args.build_apk:
             io.command([str(APK.parent.parent / 'build.sh')], args.out / 'apk-build.log', timeout=180)
@@ -786,8 +902,19 @@ def execute(args):
         hook = getattr(args, 'capture_hook', None)
         if hook is not None:
             hook.before_app(args)
+        if args.mode == 'fal':
+            # The image advertises from boot; give it a settled RPA, then let
+            # the unbonded central make its one bounded attempt. The sniffer,
+            # when present, is already attached by the hook above.
+            time.sleep(args.fal_settle)
+            report, probe_errors = run_connect_probe(args, args.out, probe_binary)
+            metadata['mac_probe'] = report
+            errors.extend(probe_errors)
+            print('PROBE', json.dumps(report, sort_keys=True), flush=True)
+        # `fal` only adds the Mac probe; the phone still runs the reconnect phase.
+        app_mode = 'reconnect' if args.mode == 'fal' else args.mode
         adb(args.serial, 'shell', 'am', 'start', '-W', '-n', ACTIVITY,
-            '--es', 'mode', args.mode)
+            '--es', 'mode', app_mode)
         deadline = time.monotonic() + args.timeout
         metadata['pairing_consent'] = []
         while time.monotonic() < deadline:
@@ -818,7 +945,7 @@ def execute(args):
         if args.reject:
             errors.extend(evaluate_rejection(rows))
         else:
-            errors.extend(evaluate_transcript(rows, args.mode))
+            errors.extend(evaluate_transcript(rows, app_mode))
 
         p4.wait_until(safe_read_at)
         observations = {}
@@ -856,6 +983,9 @@ def execute(args):
                                            args.expect_irk_fingerprint,
                                            metadata['bond_stats']['pairs_complete']
                                            + metadata['bond_stats']['pairs_without_bond']))
+            if args.mode == 'fal':
+                errors.extend(evaluate_fal(metadata['privacy'], metadata['bond_stats'],
+                                           metadata['host_stats'], observations['STATS']))
         echo_words = io.read32(symbols['BOND_ECHO'], 16, args.out / 'bond_echo.txt')
         metadata['bond_echo'] = decode_bond_echo(echo_words)
         (args.out / 'bond_stats.json').write_text(
@@ -967,8 +1097,15 @@ def options(argv=None):
     parser.add_argument('--serial', default=ADB_SERIAL)
     parser.add_argument('--run-seconds', type=int, default=25)
     parser.add_argument('--timeout', type=float, default=45)
-    parser.add_argument('--mode', choices=tuple(SUMMARY_REASONS), default='pair',
-                        help='app phase: pair, reconnect, delete, wipe, fault or att')
+    parser.add_argument('--mode', choices=MODES, default='pair',
+                        help='app phase: pair, reconnect, delete, wipe, fault, att, '
+                             'privacy or fal')
+    parser.add_argument('--fal-settle', type=float, default=5.0,
+                        help='seconds between flash and the Mac connect-probe (fal)')
+    parser.add_argument('--probe-timeout', type=float, default=30.0,
+                        help='overall scan/connect budget for the Mac probe (fal)')
+    parser.add_argument('--connect-wait', type=float, default=25.0,
+                        help='seconds to wait for accept/reject after connecting (fal)')
     parser.add_argument('--require-dle', action='store_true',
                         help='require observed >27-byte PDUs and a fragmented Host packet')
     parser.add_argument('--reject', action='store_true',
@@ -982,6 +1119,22 @@ def options(argv=None):
         parser.error('require finite timeout <= run-seconds')
     if args.reject and args.mode == 'att':
         parser.error('--reject is meaningless for the att phase')
+    if args.reject and args.mode == 'fal':
+        parser.error('the fal phase drives its own reconnect')
+    if args.mode == 'fal':
+        if not (math.isfinite(args.connect_wait) and 0 < args.connect_wait <= 60):
+            parser.error('require a finite --connect-wait in (0, 60]')
+        if not (math.isfinite(args.probe_timeout) and 0 < args.probe_timeout <= 120):
+            parser.error('require a finite --probe-timeout in (0, 120]')
+        if not (math.isfinite(args.fal_settle) and 0 <= args.fal_settle <= 60):
+            parser.error('require a finite --fal-settle in [0, 60]')
+        if args.connect_wait > args.probe_timeout:
+            parser.error('--connect-wait cannot exceed --probe-timeout')
+        # The whole probe (scan + connect) can consume probe_timeout; the phone
+        # still needs its own window inside the finite firmware run.
+        if args.fal_settle + args.probe_timeout + 10 > args.run_seconds:
+            parser.error('fal settle + probe budget leaves under ten seconds '
+                         'for the phone inside the firmware run')
     if args.expect_irk_fingerprint is not None and \
             not re.fullmatch(r'(0x)?[0-9a-fA-F]{1,8}', args.expect_irk_fingerprint):
         parser.error('require an 8-hex-digit IRK fingerprint')

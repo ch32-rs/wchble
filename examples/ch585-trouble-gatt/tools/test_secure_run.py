@@ -208,5 +208,151 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(capture.evaluate(assessed, 'privacy'), [])
 
 
+def fal_privacy(policy=2, **values):
+    settings = {'rejected_not_listed': 1}
+    settings.update(values)
+    words = privacy(**settings)
+    words[2] |= secure.P_FAL_NONEMPTY
+    words[secure.PRIVACY_NAMES.index('list_state')] = 1 | (policy << 8)
+    return words
+
+
+def fal_bonds(**values):
+    bonds = {'pairs_complete': 0, 'pairs_without_bond': 0,
+             'fal_builds': 1, 'fal_busy_retries': 0, 'fal_members_max': 1}
+    bonds.update(values)
+    return bonds
+
+
+def fal_stats():
+    stats = [0] * 64
+    stats[14] = 1
+    return stats
+
+
+class FalTests(unittest.TestCase):
+    def test_valid_fal_run_passes(self):
+        stats = secure.decode_privacy(fal_privacy())
+        self.assertEqual(secure.evaluate_fal(stats, fal_bonds(), {'connections': 1},
+                                             fal_stats()), [])
+
+    def test_unfiltered_advertising_fails(self):
+        stats = secure.decode_privacy(fal_privacy(policy=0))
+        errors = secure.evaluate_fal(stats, fal_bonds(), {'connections': 1}, fal_stats())
+        self.assertTrue(any('filter policy' in error for error in errors))
+
+    def test_no_rejected_attempt_fails(self):
+        stats = secure.decode_privacy(fal_privacy(rejected_not_listed=0))
+        errors = secure.evaluate_fal(stats, fal_bonds(), {'connections': 1}, fal_stats())
+        self.assertTrue(any('rejected by the accept list' in error for error in errors))
+
+    def test_rebuilding_after_the_last_advertisement_fails(self):
+        stats = secure.decode_privacy(fal_privacy())
+        errors = secure.evaluate_fal(stats, fal_bonds(fal_builds=0),
+                                     {'connections': 1}, fal_stats())
+        self.assertTrue(any('never rebuilt' in error for error in errors))
+
+    def test_any_new_pairing_fails(self):
+        stats = secure.decode_privacy(fal_privacy())
+        errors = secure.evaluate_fal(stats, fal_bonds(pairs_complete=1),
+                                     {'connections': 1}, fal_stats())
+        self.assertTrue(any('paired again' in error for error in errors))
+
+    def test_a_second_host_connection_fails(self):
+        stats = secure.decode_privacy(fal_privacy())
+        errors = secure.evaluate_fal(stats, fal_bonds(), {'connections': 2}, fal_stats())
+        self.assertTrue(any('one Host connection' in error for error in errors))
+
+    def test_fallback_flag_fails(self):
+        stats = secure.decode_privacy(
+            fal_privacy(flags=secure.P_ADV_USES_RPA | secure.P_LOCAL_IRK
+                        | secure.P_STAMP_VALID | secure.P_FAL_NONEMPTY
+                        | secure.P_FAL_REBUILD_FAILED))
+        errors = secure.evaluate_fal(stats, fal_bonds(), {'connections': 1}, fal_stats())
+        self.assertTrue(any('could not be rebuilt' in error for error in errors))
+
+    def test_probe_rejection_passes(self):
+        report, errors = secure.evaluate_probe(
+            [{'event': 'connecting'}, {'event': 'connect_rejected'}], 0)
+        self.assertTrue(report['rejected'])
+        self.assertEqual(errors, [])
+
+    def test_probe_connection_is_a_failure(self):
+        _, errors = secure.evaluate_probe(
+            [{'event': 'connecting'}, {'event': 'unexpected_connected'}], 4)
+        self.assertTrue(any('connected although' in error for error in errors))
+
+    def test_probe_silence_after_an_attempt_is_recorded_not_judged(self):
+        # CoreBluetooth stays silent when the peripheral never answers; the
+        # firmware counter decides whether the attempt was refused.
+        report, errors = secure.evaluate_probe([{'event': 'connecting'}], 6)
+        self.assertEqual(report['outcome'], 'silent')
+        self.assertEqual(errors, [])
+
+    def test_probe_that_never_connected_fails(self):
+        report, errors = secure.evaluate_probe([{'event': 'scan_started'}], 6)
+        self.assertEqual(report['outcome'], 'no_attempt')
+        self.assertTrue(any('never started a connection' in error for error in errors))
+        _, errors = secure.evaluate_probe([], 3)
+        self.assertTrue(any('never started a connection' in error for error in errors))
+
+    def test_the_whole_probe_budget_must_fit_the_firmware_run(self):
+        argv = ['--out', '/tmp/x', '--run-seconds', '60', '--timeout', '10',
+                '--mode', 'fal', '--fal-settle', '0', '--connect-wait', '1',
+                '--probe-timeout', '120']
+        with self.assertRaises(SystemExit):
+            secure.options(argv)
+        argv[-1] = '30'
+        self.assertEqual(secure.options(argv).probe_timeout, 30)
+
+    def test_connect_wait_must_fit_inside_the_probe(self):
+        argv = ['--out', '/tmp/x', '--run-seconds', '60', '--timeout', '40',
+                '--mode', 'fal', '--fal-settle', '2', '--connect-wait', '40',
+                '--probe-timeout', '30']
+        with self.assertRaises(SystemExit):
+            secure.options(argv)
+        argv[-1] = '45'
+        self.assertEqual(secure.options(argv).connect_wait, 40)
+
+    def test_capture_classifies_a_central_only_link_as_refused(self):
+        rows = [{'btle.access_address': '0x1', 'nordic_ble.direction': 'True'},
+                {'btle.access_address': '0x2', 'nordic_ble.direction': 'True'},
+                {'btle.access_address': '0x2', 'nordic_ble.direction': 'False'}]
+        accepted, refused, unknown = capture.classify_links(['0x1', '0x2', '0x3'], rows)
+        self.assertEqual(accepted, ['0x2'])
+        self.assertEqual(refused, ['0x1'])
+        # No captured PDU is a missed follow, not a refusal.
+        self.assertEqual(unknown, ['0x3'])
+
+    def test_capture_fal_rejects_an_unknown_link_as_negative_evidence(self):
+        assessed = {'target': capture.TARGET, 'access_address': '0x1',
+                    'accepted_links': ['0x1'], 'rejected_links': [],
+                    'inconclusive_links': ['0x2'],
+                    'smp': [], 'smp_opcodes_captured': [],
+                    'll_control': [{'aa': '0x1', 'name': 'START_ENC_REQ'}],
+                    'encryption_start': {'aa': '0x1', 'frame': 40},
+                    'att_after_encryption_start': []}
+        errors = capture.evaluate(assessed, 'fal')
+        self.assertTrue(any('inconclusive' in error for error in errors))
+
+    def test_capture_fal_needs_one_refused_and_one_encrypted_link(self):
+        assessed = {'target': capture.TARGET, 'access_address': '0x1',
+                    'accepted_links': ['0x1'], 'rejected_links': ['0x2'],
+                    'smp': [], 'smp_opcodes_captured': [],
+                    'll_control': [{'aa': '0x1', 'name': 'START_ENC_REQ'}],
+                    'encryption_start': {'aa': '0x1', 'frame': 40},
+                    'att_after_encryption_start': []}
+        self.assertEqual(capture.evaluate(assessed, 'fal'), [])
+        assessed['rejected_links'] = []
+        self.assertTrue(any('refused' in error for error in capture.evaluate(assessed, 'fal')))
+        assessed['rejected_links'] = ['0x2']
+        assessed['smp'] = [{'aa': '0x1', 'name': 'PairingRequest'}]
+        self.assertTrue(any('SMP again' in error for error in capture.evaluate(assessed, 'fal')))
+        assessed['smp'] = []
+        assessed['ll_control'] = []
+        self.assertTrue(any('never started encryption' in error
+                            for error in capture.evaluate(assessed, 'fal')))
+
+
 if __name__ == '__main__':
     unittest.main()

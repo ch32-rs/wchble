@@ -584,9 +584,58 @@ pub async fn run(
                     crate::bond::bump(crate::bond::STAT_RL_NOT_READY);
                 }
             }
+            let mut adv_params = AdvertisementParameters::default();
+            // Rebuild the Filter Accept List from the live bond table: the
+            // controller resolves the peer's RPA and admits only listed
+            // identities. Without bonds the list stays empty and advertising
+            // remains unfiltered, so first pairing still works.
+            #[cfg(feature = "fal-filter")]
+            let members = stack.with_bond_information(|bonds| {
+                let mut list = Vec::<Address, BOND_CAPACITY>::new();
+                for bond in bonds {
+                    let identity = bond.identity.addr;
+                    let kind = AddrKind::new(identity.kind.into_inner() & 1);
+                    let _ = list.push(Address::new(kind, identity.addr));
+                }
+                list
+            });
+            #[cfg(feature = "fal-filter")]
+            if members.is_empty() {
+                // Drop stale entries from a bond set that was just deleted.
+                let _ = peripheral.set_filter_accept_list(&[]).await;
+            } else {
+                let mut applied = false;
+                // 0x0C: the controller may still be tearing down an
+                // advertisement from the previous iteration.
+                for _ in 0..20 {
+                    if peripheral.set_filter_accept_list(&members).await.is_ok() {
+                        applied = true;
+                        break;
+                    }
+                    crate::bond::bump(crate::bond::STAT_FAL_BUSY_RETRIES);
+                    Timer::after(Duration::from_millis(10)).await;
+                }
+                // A populated accept list does not prove the peer RPAs resolve;
+                // policy 2 would reject bonded peers whose entry is missing.
+                let resolving = crate::bond::rl_expected().is_empty()
+                    || crate::bond::signals().rl_ready.get();
+                if applied && resolving {
+                    adv_params.filter_policy = AdvFilterPolicy::FilterConn;
+                    crate::bond::bump(crate::bond::STAT_FAL_BUILDS);
+                    crate::bond::set(
+                        crate::bond::STAT_FAL_MEMBERS_MAX,
+                        crate::bond::value(crate::bond::STAT_FAL_MEMBERS_MAX)
+                            .max(members.len() as u32),
+                    );
+                } else if !applied {
+                    // Never advertise with a partial list; an unfiltered
+                    // advertisement is visible in the counters, not silent.
+                    crate::privacy::set_flag(crate::privacy::FLAG_FAL_REBUILD_FAILED);
+                }
+            }
             let acceptor = match peripheral
                 .advertise(
-                    &Default::default(),
+                    &adv_params,
                     Advertisement::ConnectableScannableUndirected {
                         adv_data: &adv_data[..adv_len],
                         scan_data: &scan_data[..scan_len],
@@ -759,6 +808,7 @@ pub async fn run(
                                 b"DEL!" => {
                                     crate::bond::bump(crate::bond::STAT_CLEAR_REQUESTS);
                                     remove_all_bonds();
+                                    crate::bond::set_rl_expected(&[]);
                                     // A snapshot queued before this command must
                                     // not be written after the tombstone, and
                                     // the shadow must not resurrect the deleted
@@ -769,6 +819,7 @@ pub async fn run(
                                 }
                                 b"WIPE" => {
                                     remove_all_bonds();
+                                    crate::bond::set_rl_expected(&[]);
                                     crate::bond::signals().discard_pending();
                                     crate::client_att::clear_shadow(&mut att_shadow);
                                     crate::bond::signals().wipe.set(true);
@@ -917,6 +968,9 @@ pub async fn run(
                                 }
                                 list
                             });
+                            // Include this bond in the next advertisement's
+                            // resolving-list and accept-list expectations.
+                            crate::bond::set_rl_expected_from_snapshot(&snapshot);
                             crate::bond::signals().set_pending(snapshot);
                             // The peer may have subscribed before it bonded;
                             // snapshot() refused that write while the peer was

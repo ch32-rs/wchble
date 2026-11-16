@@ -9,7 +9,8 @@ use bt_hci::transport::PacketKind;
 use crate::crypto::Aes128;
 use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
 use crate::ll::privacy::{
-    is_resolvable, Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_RESOLVING_LIST,
+    is_resolvable, Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_FILTER_ACCEPT_LIST,
+    MAX_RESOLVING_LIST,
 };
 use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
@@ -546,7 +547,8 @@ impl SoftRunner {
         }
     }
 
-    /// The accept list is in use while a filtered advertisement is running.
+    /// Scan and initiator filter policies are rejected, so only an active
+    /// filtered advertisement can pin the accept list.
     fn fal_busy(&self) -> bool {
         self.ll.adv.enabled && self.privacy.filter_policy() != 0
     }
@@ -1148,11 +1150,11 @@ impl SoftRunner {
             }
             // Filter Accept List: size / clear / add / remove. Only the
             // connect filter (policy 2) uses it (S4b).
-            0x200f if params.is_empty() => Ok(&[MAX_RESOLVING_LIST as u8][..]),
+            0x200f if params.is_empty() => Ok(&[MAX_FILTER_ACCEPT_LIST as u8][..]),
             0x2010 if params.is_empty() => self.clear_filter_accept_list(),
             0x2011 if params.len() == 7 => self.add_filter_accept(params),
             0x2012 if params.len() == 7 => self.remove_filter_accept(params),
-            0x2011 | 0x2012 => Err(HCI_INVALID_PARAMETERS),
+            0x200f | 0x2010 | 0x2011 | 0x2012 => Err(HCI_INVALID_PARAMETERS),
             // Resolving list (Core 5.4 Vol 4 Part E §7.8.38-40): add, remove,
             // clear, read size. Changes are disallowed while a role is active.
             0x2027 if params.len() == 39 => self.add_resolving_entry(params),
@@ -1281,7 +1283,9 @@ impl SoftRunner {
             || !(0x0004..=0x4000).contains(&window)
             || window > interval
             || params[5] > 1
-            || params[6] > 3
+            // Scanning filter policies 1..=3 are not implemented; rejecting
+            // them beats silently scanning unfiltered.
+            || params[6] != 0
         {
             return Err(HCI_INVALID_PARAMETERS);
         }
@@ -1313,7 +1317,8 @@ impl SoftRunner {
         let interval_max = le16(15);
         let latency = le16(17);
         let timeout = le16(19);
-        if filter_policy > 1
+        // Initiator filter policy 1 is not implemented.
+        if filter_policy != 0
             || peer_kind > 1
             || own_kind > 1
             || !(0x0004..=0x4000).contains(&scan_interval)
@@ -2011,6 +2016,153 @@ mod tests {
             expect_command_complete(0x2010, HCI_SUCCESS, &[]);
         });
     }
+    #[test]
+    fn filter_accept_list_rejects_bad_lengths_identities_and_overflow() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            for (opcode, params) in [
+                (0x200f, &[0u8][..]),
+                (0x2010, &[0u8][..]),
+                (0x2011, &[0u8; 6][..]),
+                (0x2012, &[0u8; 8][..]),
+            ] {
+                inject_cmd(opcode, params);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_INVALID_PARAMETERS, &[]);
+            }
+
+            // Identity kinds 0 and 1 only; a random identity must be static.
+            inject_cmd(0x2011, &[2, 1, 2, 3, 4, 5, 6]);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2011, &[1, 1, 2, 3, 4, 5, 0x40]);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2012, &[1, 1, 2, 3, 4, 5, 0x40]);
+            runner.serve_one().await;
+            expect_command_complete(0x2012, HCI_INVALID_PARAMETERS, &[]);
+
+            for n in 0..8u8 {
+                inject_cmd(0x2011, &[0, n, 0, 0, 0, 0, 0]);
+                runner.serve_one().await;
+                expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+            }
+            inject_cmd(0x2011, &[0, 9, 0, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_MEMORY_CAPACITY_EXCEEDED, &[]);
+        });
+    }
+
+    #[test]
+    fn advertising_filter_policy_accepts_only_zero_and_two() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let mut params = [0u8; 15];
+        params[0..2].copy_from_slice(&0x00a0u16.to_le_bytes());
+        params[2..4].copy_from_slice(&0x00a0u16.to_le_bytes());
+        params[13] = 0x07;
+
+        pollster::block_on(async {
+            for policy in [0u8, 2] {
+                params[14] = policy;
+                inject_cmd(0x2006, &params);
+                runner.serve_one().await;
+                expect_command_complete(0x2006, HCI_SUCCESS, &[]);
+                assert_eq!(runner.privacy.filter_policy(), policy);
+            }
+            for policy in [1u8, 3, 4] {
+                params[14] = policy;
+                inject_cmd(0x2006, &params);
+                runner.serve_one().await;
+                expect_command_complete(0x2006, HCI_INVALID_PARAMETERS, &[]);
+                // A rejected policy must not disturb the stored one.
+                assert_eq!(runner.privacy.filter_policy(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn fal_edits_are_disallowed_only_during_filtered_advertising() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let member = [0, 1, 2, 3, 4, 5, 0];
+        let mut params = [0u8; 15];
+        params[0..2].copy_from_slice(&0x00a0u16.to_le_bytes());
+        params[2..4].copy_from_slice(&0x00a0u16.to_le_bytes());
+        params[13] = 0x07;
+
+        pollster::block_on(async {
+            params[14] = 0; // unfiltered advertising does not pin the list
+            inject_cmd(0x2006, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2006, HCI_SUCCESS, &[]);
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+            inject_cmd(0x2011, &member);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+            inject_cmd(0x200a, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+
+            params[14] = 2;
+            inject_cmd(0x2006, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2006, HCI_SUCCESS, &[]);
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+
+            for (opcode, bytes) in [
+                (0x2010, &[][..]),
+                (0x2011, &member[..]),
+                (0x2012, &member[..]),
+            ] {
+                inject_cmd(opcode, bytes);
+                runner.serve_one().await;
+                expect_command_complete(opcode, HCI_COMMAND_DISALLOWED, &[]);
+            }
+            // The size is still readable while advertising.
+            inject_cmd(0x200f, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x200f, HCI_SUCCESS, &[8]);
+
+            inject_cmd(0x200a, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+            inject_cmd(0x2010, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x2010, HCI_SUCCESS, &[]);
+        });
+    }
+
+    #[test]
+    fn scan_filter_policies_are_rejected() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let mut params = scan_params();
+
+        pollster::block_on(async {
+            for policy in 1u8..=3 {
+                params[6] = policy;
+                inject_cmd(0x200b, &params);
+                runner.serve_one().await;
+                expect_command_complete(0x200b, HCI_INVALID_PARAMETERS, &[]);
+            }
+            params[6] = 0;
+            inject_cmd(0x200b, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x200b, HCI_SUCCESS, &[]);
+        });
+    }
+
     #[test]
     fn rx_backpressure_pb_mapping_and_empty_control_packets() {
         let _guard = test_lock();

@@ -6,13 +6,19 @@ let targetName = "wch585-p4"
 let serviceID = CBUUID(string: "00001000-b0cd-11ec-871f-d45ddf138840")
 let characteristicID = CBUUID(string: "00001001-b0cd-11ec-871f-d45ddf138840")
 let usage = """
-Usage: central [--cycles COUNT] [--timeout SECONDS] [--name wch585-p4]
-P4 u32LE GATT test (defaults: 1 cycle, 20-second total timeout).
+Usage: central [--mode gatt|connect-probe] [--cycles COUNT] [--timeout SECONDS]
+               [--hold SECONDS] [--connect-wait SECONDS] [--name wch585-p4]
+P4 u32LE GATT test (defaults: mode gatt, 1 cycle, 20-second total timeout).
 Matches the exact advertised local name, then locks its macOS UUID.
 Each cycle discovers services/characteristics, reads the initial value, writes
 1...3 with read-back, enables notifications, writes 101...110 waiting for both
 write acknowledgement and notification each time, disables notifications,
 reads back 110, and explicitly disconnects. No retries. Output is JSONL.
+
+connect-probe only scans and requests a connection, then exits without
+discovering services or pairing: connect_rejected (exit 0) when the peripheral
+refuses, unexpected_connected (exit 4) when it accepts, connect_no_callback
+(exit 6, inconclusive) when no connection callback arrives.
 """
 
 struct CLIError: Error, CustomStringConvertible {
@@ -20,12 +26,20 @@ struct CLIError: Error, CustomStringConvertible {
     init(_ message: String) { description = message }
 }
 
+enum Mode: String {
+    case gatt
+    case connectProbe = "connect-probe"
+}
+
 struct Options {
+    var mode = Mode.gatt
     var cycles = 1
     var timeout = 20.0
     // Delay between connecting and starting GATT discovery, so a peripheral
     // Security Request can start pairing first (the S2 differential).
     var hold = 0.0
+    // connect-probe: how long to wait for an accept/reject callback.
+    var connectWait = 8.0
 
     init(_ arguments: [String]) throws {
         var index = 0
@@ -36,6 +50,16 @@ struct Options {
             guard index + 1 < arguments.count else { throw CLIError("missing value for \(flag)") }
             let value = arguments[index + 1]
             switch flag {
+            case "--mode":
+                guard let parsed = Mode(rawValue: value) else {
+                    throw CLIError("--mode must be gatt or connect-probe")
+                }
+                mode = parsed
+            case "--connect-wait":
+                guard let seconds = Double(value), seconds.isFinite, seconds > 0, seconds <= 600 else {
+                    throw CLIError("--connect-wait must be finite and in (0, 600]")
+                }
+                connectWait = seconds
             case "--cycles":
                 guard let count = Int(value), (1...1000).contains(count) else {
                     throw CLIError("--cycles must be in 1...1000")
@@ -56,6 +80,10 @@ struct Options {
             default: throw CLIError("unknown option \(flag)")
             }
             index += 2
+        }
+        if mode == .connectProbe {
+            guard cycles == 1 else { throw CLIError("connect-probe runs exactly one attempt") }
+            guard hold == 0 else { throw CLIError("connect-probe never discovers services") }
         }
     }
 }
@@ -87,6 +115,7 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var lockedID: UUID?
     var phase = "initializing"
     var cancelAt: Double?
+    var connectAt: Double?
     var completed = 0
     var pendingFailure: (Int32, String)?
     var expectedValue: UInt32 = 0
@@ -107,8 +136,10 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func start() {
-        emit("start", ["name": targetName, "cycles": options.cycles,
+        emit("start", ["name": targetName, "mode": options.mode.rawValue,
+                       "cycles": options.cycles,
                        "timeout_seconds": options.timeout, "hold_seconds": options.hold,
+                       "connect_wait_seconds": options.connectWait,
                        "service": serviceID.uuidString.lowercased(),
                        "characteristic": characteristicID.uuidString.lowercased()])
         for number in [SIGINT, SIGTERM] {
@@ -138,7 +169,17 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             return
         }
         guard phase != "done" else { return }
+        if options.mode == .connectProbe, phase == "connecting",
+           let at = connectAt, now - at >= options.connectWait {
+            exitNow(code: 6, reason: "connect_no_callback")
+            return
+        }
         if now - started >= options.timeout {
+            if options.mode == .connectProbe {
+                // No callback is inconclusive, never a pass.
+                exitNow(code: 6, reason: phase == "connecting" ? "connect_no_callback" : "scan_timeout")
+                return
+            }
             fail(code: phase == "initializing" ? 3 : 4, reason: "timeout_\(phase)")
         } else if phase == "cancelling", now - (cancelAt ?? now) >= 2 {
             fail(code: 5, reason: "disconnect_timeout")
@@ -207,6 +248,7 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         lockedID = peripheral.identifier
         target = peripheral
         phase = "connecting"
+        connectAt = monotonic()
         central.stopScan()
         step("connecting", ["local_name": targetName, "rssi": RSSI])
         central.connect(peripheral, options: nil)
@@ -215,6 +257,14 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         if phase == "cleanup" {
             central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        if options.mode == .connectProbe {
+            // The peripheral accepted an unbonded central: the filter did not
+            // hold. Closing the link is best-effort; the exit code is the fact.
+            emit("unexpected_connected", ["id": peripheral.identifier.uuidString])
+            central.cancelPeripheralConnection(peripheral)
+            exitNow(code: 4, reason: "unexpected_connected")
             return
         }
         guard phase == "connecting", peripheral.identifier == lockedID else {
@@ -241,6 +291,13 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         error: Error?) {
         emit("connect_failed", ["id": peripheral.identifier.uuidString,
                                 "error": error?.localizedDescription as Any? ?? NSNull()])
+        if options.mode == .connectProbe, phase == "connecting",
+           peripheral.identifier == lockedID {
+            emit("connect_rejected", ["id": peripheral.identifier.uuidString,
+                                      "error": error?.localizedDescription as Any? ?? NSNull()])
+            exitNow(code: 0, reason: "connect_rejected")
+            return
+        }
         if phase == "cleanup", let failure = pendingFailure {
             exitNow(code: failure.0, reason: failure.1)
         } else {

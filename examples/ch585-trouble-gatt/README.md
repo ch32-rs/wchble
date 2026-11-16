@@ -372,11 +372,20 @@ SMP exchange, `ENC_REQ`/`ENC_RSP`/`START_ENC_REQ`, and no decodable ATT PDU
 after the encryption start. Connecting without encryption is not acceptance.
 
 `tools/secure_run.py` drives the Android client (`tools/android-pair`) and
-takes `--mode pair|reconnect|delete|wipe|fault|att|privacy` plus `--reject`
+takes `--mode pair|reconnect|delete|wipe|fault|att|privacy|fal` plus `--reject`
 (expect the reconnect to be refused). `privacy` pairs, disconnects, reconnects
 to the rotated RPA and requires `PRIVACY_STATS` to show the rotation, the
 resolution and the admission budget; `--expect-irk-fingerprint` compares the
-local IRK across boots without printing it. `tools/secure_capture.py` wraps it
+local IRK across boots without printing it. `fal` needs an existing bond and a
+`fal-filter` image: it compiles `tools/central.swift` into a one-shot
+`connect-probe` (no services, no pairing), lets that unbonded Mac try to
+connect, then runs the phone's `reconnect` phase. It requires advertising
+filter policy 2, a populated accept list, at least one refused attempt, no new
+pairing and exactly one Host connection. CoreBluetooth may never report the
+refusal (the peripheral simply ignores the CONNECT_IND), so that outcome is
+recorded as `silent` and the firmware counters decide; `secure_capture.py
+--mode fal` additionally requires a refused link with no peripheral-origin PDU
+next to one encrypted accepted link. `tools/secure_capture.py` wraps it
 with the sniffer;
 its `--mode` also gates the pcap (reconnect/fault forbid new SMP frames,
 delete/reject require `LL_REJECT_IND`). The capture wrapper starts the sniffer
@@ -546,6 +555,21 @@ python3 tools/secure_capture.py \
 
 The pairing dialog on Android needs one manual confirmation; the runner taps
 it and records the action. Use a new output directory for every attempt.
+
+S4b uses a non-`rpa-fast` image so the RPA is stable for the sniffer, and needs
+a bond that already exists on both sides:
+
+```sh
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
+  cargo build --release --features secure,privacy,fal-filter
+python3 tools/secure_run.py \
+  --out local-docs/results/s4b-<unique> \
+  --run-seconds 60 --timeout 40 --mode fal --fal-settle 2 \
+  --connect-wait 40 --probe-timeout 45
+```
+
+The Mac must not know `wch585-p4` in System Settings > Bluetooth, otherwise it
+is not an unbonded central and the runner refuses to start.
 
 The X4 MTU/long-data round uses the `att` mode of the same runner (from the
 example directory, after `cargo build --release --features secure`):

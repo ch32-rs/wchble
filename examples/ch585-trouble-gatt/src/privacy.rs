@@ -17,6 +17,15 @@ pub const FLAG_RL_NOT_READY: u32 = 0x100;
 pub const FLAG_STAMP_VALID: u32 = 0x200;
 /// Bonds exist but no local IRK: the peer must re-pair for privacy.
 pub const FLAG_IRK_MISSING: u32 = 0x400;
+/// The accept list could not be rebuilt; advertising fell back to unfiltered.
+pub const FLAG_FAL_REBUILD_FAILED: u32 = 0x800;
+
+/// Marker the acceptance runner reads to refuse a `fal` phase against an
+/// image built without the feature.
+#[cfg(feature = "fal-filter")]
+#[used]
+#[no_mangle]
+pub static FAL_FILTER_BUILD: u32 = 1;
 
 #[no_mangle]
 pub static mut PRIVACY_STATS: [u32; WORDS] = [0; WORDS];
@@ -115,7 +124,7 @@ pub fn note_connection(soft: &SoftRunner) {
     }
 }
 
-/// Publish the 23-word block read over SWD after a finite run.
+/// Publish the 24-word block read over SWD after a finite run.
 pub fn publish(soft: &SoftRunner) {
     let stats = soft.privacy_stats();
     // SAFETY: single-threaded.
