@@ -7,6 +7,8 @@ pub mod conn;
 pub mod ctrl;
 pub mod dle;
 pub mod enc;
+#[cfg(feature = "controller")]
+pub mod privacy;
 pub mod scan;
 
 /// High-level LL role for the scaffold.

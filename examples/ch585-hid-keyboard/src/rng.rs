@@ -32,6 +32,12 @@ pub fn seeded() -> bool {
     unsafe { (*RNG.0.get()).is_some() }
 }
 
+/// Fill from the Host DRBG. Boot-time callers (IRK generation) must run after
+/// [`seed`].
+pub fn fill(buf: &mut [u8]) {
+    <Driver as embassy_crypto::driver::Rng>::fill_bytes(buf);
+}
+
 struct Driver;
 
 impl embassy_crypto::driver::Rng for Driver {
