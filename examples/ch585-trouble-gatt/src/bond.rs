@@ -63,7 +63,7 @@ pub fn local_irk() -> [u8; 16] {
 /// Peers whose IRKs must be in the controller before advertising starts.
 pub fn set_rl_expected(list: &[PersistedBond]) {
     let mut count = 0;
-    // SAFETY: single-threaded boot, before the Host future is polled.
+    // SAFETY: written from boot or the Host task between polls.
     unsafe {
         let out = core::ptr::addr_of_mut!(RL_EXPECTED).cast::<(u8, [u8; 6], [u8; 16])>();
         for record in list {
@@ -74,18 +74,32 @@ pub fn set_rl_expected(list: &[PersistedBond]) {
                 continue;
             }
             // Stored addresses are display order; the controller works on-air.
+            // Identity kinds 2/3 map to the on-air public/random bit.
             let mut address = record.address;
             address.reverse();
-            out.add(count).write_volatile((record.address_kind, address, irk));
+            out.add(count)
+                .write_volatile((record.address_kind & 1, address, irk));
             count += 1;
         }
         core::ptr::addr_of_mut!(RL_EXPECTED_LEN).write_volatile(count);
     }
 }
 
+/// Re-derive the resolving-list expectations from the Host's live bond table,
+/// so a bond added during this boot also gates the next advertisement.
+pub fn set_rl_expected_from_snapshot(snapshot: &[BondInformation]) {
+    let mut records = Vec::<PersistedBond, MAX_BONDS>::new();
+    for bond in snapshot {
+        if records.push(from_bond(bond)).is_err() {
+            break;
+        }
+    }
+    set_rl_expected(&records);
+}
+
 /// `(kind, on-air address, peer IRK)` pairs expected in the resolving list.
 pub fn rl_expected() -> &'static [(u8, [u8; 6], [u8; 16])] {
-    // SAFETY: written once at boot, then read-only.
+    // SAFETY: written from boot or the Host task between polls.
     unsafe {
         let count = core::ptr::addr_of!(RL_EXPECTED_LEN).read_volatile();
         core::slice::from_raw_parts(core::ptr::addr_of!(RL_EXPECTED).cast(), count)
@@ -141,6 +155,12 @@ pub const STAT_ADD_BOND_FAIL: usize = 25;
 pub const STAT_IDENTITY_MISMATCH: usize = 26;
 pub const STAT_BLOCKED_SAVES: usize = 27;
 pub const STAT_RL_NOT_READY: usize = 28;
+#[cfg(feature = "fal-filter")]
+pub const STAT_FAL_BUILDS: usize = 29;
+#[cfg(feature = "fal-filter")]
+pub const STAT_FAL_BUSY_RETRIES: usize = 30;
+#[cfg(feature = "fal-filter")]
+pub const STAT_FAL_MEMBERS_MAX: usize = 31;
 
 /// Marker the acceptance runner reads to refuse a `fault` phase against an
 /// image built without the injection feature.
