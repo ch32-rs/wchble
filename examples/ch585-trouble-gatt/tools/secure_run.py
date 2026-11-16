@@ -1128,8 +1128,12 @@ def options(argv=None):
             parser.error('require a finite --probe-timeout in (0, 120]')
         if not (math.isfinite(args.fal_settle) and 0 <= args.fal_settle <= 60):
             parser.error('require a finite --fal-settle in [0, 60]')
-        if args.fal_settle + args.connect_wait + 10 > args.run_seconds:
-            parser.error('fal settle + connect wait leaves under ten seconds '
+        if args.connect_wait > args.probe_timeout:
+            parser.error('--connect-wait cannot exceed --probe-timeout')
+        # The whole probe (scan + connect) can consume probe_timeout; the phone
+        # still needs its own window inside the finite firmware run.
+        if args.fal_settle + args.probe_timeout + 10 > args.run_seconds:
+            parser.error('fal settle + probe budget leaves under ten seconds '
                          'for the phone inside the firmware run')
     if args.expect_irk_fingerprint is not None and \
             not re.fullmatch(r'(0x)?[0-9a-fA-F]{1,8}', args.expect_irk_fingerprint):

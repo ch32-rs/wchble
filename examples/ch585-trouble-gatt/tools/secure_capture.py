@@ -96,16 +96,24 @@ def att_after_encryption(att, control):
 
 
 def classify_links(links, rows):
-    """Split CONNECT_IND access addresses into accepted and refused links.
+    """Split CONNECT_IND access addresses into accepted, refused and unknown.
 
     An initiator retransmits on a refused link but the peripheral never
-    answers, so only a peripheral-origin PDU proves the link exists.
+    answers, so a link with central PDUs and none from the peripheral was
+    refused. A link with no captured PDUs at all (a missed follow) proves
+    nothing either way and must not count as negative evidence.
     """
-    peripheral = {row['btle.access_address'].lower() for row in rows
-                  if row['nordic_ble.direction'] == 'False'}
+    peripheral, central = set(), set()
+    for row in rows:
+        aa = row['btle.access_address'].lower()
+        if row['nordic_ble.direction'] == 'False':
+            peripheral.add(aa)
+        else:
+            central.add(aa)
     accepted = [aa for aa in links if aa in peripheral]
-    rejected = [aa for aa in links if aa not in peripheral]
-    return accepted, rejected
+    refused = [aa for aa in links if aa not in peripheral and aa in central]
+    unknown = [aa for aa in links if aa not in peripheral and aa not in central]
+    return accepted, refused, unknown
 
 
 def analyze(rows, out, target, privacy=False):
@@ -128,7 +136,7 @@ def analyze(rows, out, target, privacy=False):
     link = links[0] if links else None
     good = [row for row in rows if row['nordic_ble.crcok'] == 'True'
             and row['btle.access_address'].lower() in links]
-    accepted_links, rejected_links = classify_links(links, good)
+    accepted_links, rejected_links, unknown_links = classify_links(links, good)
     smp, control, att = [], [], []
     for row in good:
         frame = int(row['frame.number'])
@@ -169,6 +177,7 @@ def analyze(rows, out, target, privacy=False):
                 'rotate_phase': [],
                 'access_address': link, 'access_addresses': links,
                 'rejected_links': rejected_links, 'accepted_links': accepted_links,
+                'inconclusive_links': unknown_links,
                 'smp': smp, 'll_control': control,
                 'att_frames': len(att), 'att_last_frame': att[-1]['frame'] if att else None,
                 'crc_valid_link_pdus': len(good),
@@ -224,7 +233,12 @@ def evaluate(assessed, mode='pair'):
         rejected = assessed.get('rejected_links') or []
         accepted = assessed.get('accepted_links') or []
         if not rejected:
-            errors.append('capture saw no CONNECT_IND that was refused')
+            unknown = assessed.get('inconclusive_links') or []
+            if unknown:
+                errors.append(f'no link was observed as refused; {len(unknown)} '
+                              'link(s) had no captured PDUs (inconclusive)')
+            else:
+                errors.append('capture saw no CONNECT_IND that was refused')
         if not accepted:
             errors.append('capture saw no accepted link')
         encrypted = {entry['aa'] for entry in assessed['ll_control']

@@ -296,13 +296,44 @@ class FalTests(unittest.TestCase):
         _, errors = secure.evaluate_probe([], 3)
         self.assertTrue(any('never started a connection' in error for error in errors))
 
+    def test_the_whole_probe_budget_must_fit_the_firmware_run(self):
+        argv = ['--out', '/tmp/x', '--run-seconds', '60', '--timeout', '10',
+                '--mode', 'fal', '--fal-settle', '0', '--connect-wait', '1',
+                '--probe-timeout', '120']
+        with self.assertRaises(SystemExit):
+            secure.options(argv)
+        argv[-1] = '30'
+        self.assertEqual(secure.options(argv).probe_timeout, 30)
+
+    def test_connect_wait_must_fit_inside_the_probe(self):
+        argv = ['--out', '/tmp/x', '--run-seconds', '60', '--timeout', '40',
+                '--mode', 'fal', '--fal-settle', '2', '--connect-wait', '40',
+                '--probe-timeout', '30']
+        with self.assertRaises(SystemExit):
+            secure.options(argv)
+        argv[-1] = '45'
+        self.assertEqual(secure.options(argv).connect_wait, 40)
+
     def test_capture_classifies_a_central_only_link_as_refused(self):
         rows = [{'btle.access_address': '0x1', 'nordic_ble.direction': 'True'},
                 {'btle.access_address': '0x2', 'nordic_ble.direction': 'True'},
                 {'btle.access_address': '0x2', 'nordic_ble.direction': 'False'}]
-        accepted, rejected = capture.classify_links(['0x1', '0x2'], rows)
+        accepted, refused, unknown = capture.classify_links(['0x1', '0x2', '0x3'], rows)
         self.assertEqual(accepted, ['0x2'])
-        self.assertEqual(rejected, ['0x1'])
+        self.assertEqual(refused, ['0x1'])
+        # No captured PDU is a missed follow, not a refusal.
+        self.assertEqual(unknown, ['0x3'])
+
+    def test_capture_fal_rejects_an_unknown_link_as_negative_evidence(self):
+        assessed = {'target': capture.TARGET, 'access_address': '0x1',
+                    'accepted_links': ['0x1'], 'rejected_links': [],
+                    'inconclusive_links': ['0x2'],
+                    'smp': [], 'smp_opcodes_captured': [],
+                    'll_control': [{'aa': '0x1', 'name': 'START_ENC_REQ'}],
+                    'encryption_start': {'aa': '0x1', 'frame': 40},
+                    'att_after_encryption_start': []}
+        errors = capture.evaluate(assessed, 'fal')
+        self.assertTrue(any('inconclusive' in error for error in errors))
 
     def test_capture_fal_needs_one_refused_and_one_encrypted_link(self):
         assessed = {'target': capture.TARGET, 'access_address': '0x1',
