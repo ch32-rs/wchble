@@ -372,14 +372,20 @@ SMP exchange, `ENC_REQ`/`ENC_RSP`/`START_ENC_REQ`, and no decodable ATT PDU
 after the encryption start. Connecting without encryption is not acceptance.
 
 `tools/secure_run.py` drives the Android client (`tools/android-pair`) and
-takes `--mode pair|reconnect|delete|wipe|fault|att` plus `--reject` (expect the
-reconnect to be refused). `tools/secure_capture.py` wraps it with the sniffer;
+takes `--mode pair|reconnect|delete|wipe|fault|att|privacy` plus `--reject`
+(expect the reconnect to be refused). `privacy` pairs, disconnects, reconnects
+to the rotated RPA and requires `PRIVACY_STATS` to show the rotation, the
+resolution and the admission budget; `--expect-irk-fingerprint` compares the
+local IRK across boots without printing it. `tools/secure_capture.py` wraps it
+with the sniffer;
 its `--mode` also gates the pcap (reconnect/fault forbid new SMP frames,
 delete/reject require `LL_REJECT_IND`). The capture wrapper starts the sniffer
 only after the probe flash (so the firmware is already advertising) and
-follows the fixed address; `--follow-by-name` alone races the sniffer's
-one-shot name lookup. Both runners flash with the single-session preflight
-helper and restore the smoke image in a `finally`.
+follows the firmware's advertising address; privacy runs follow every
+CRC-valid connect instead, because the RPA rotates between links.
+`--follow-by-name` alone races the sniffer's one-shot name lookup. Both
+runners flash with the single-session preflight helper and restore the smoke
+image in a `finally`.
 
 Android 15 (CPH2411) passed this matrix on 2026-11-12. The iOS round has not
 been attempted and is tracked in the backlog: this repository has no iOS
@@ -527,7 +533,9 @@ with the feature right before the run (`tools/secure_run.py` refuses an ELF
 without the crypto backend):
 
 ```sh
-cargo build --release --features secure
+# S4 acceptance images must be opt-z + ICF; an opt-level 3 image loses the link at pairing.
+CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
+  cargo build --release --features secure,privacy,rpa-fast
 python3 tools/secure_capture.py \
   --out local-docs/results/s2-run-<unique> \
   --sniffer /tmp/wchble-nrfutil-state-20261109/bin/nrfutil-ble-sniffer \
