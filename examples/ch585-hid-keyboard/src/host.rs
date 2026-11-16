@@ -665,7 +665,11 @@ pub async fn run(
                     crate::bond::bump(crate::bond::STAT_FAL_BUSY_RETRIES);
                     Timer::after(Duration::from_millis(10)).await;
                 }
-                if applied {
+                // A populated accept list does not prove the peer RPAs resolve;
+                // policy 2 would reject bonded peers whose entry is missing.
+                let resolving = crate::bond::rl_expected().is_empty()
+                    || crate::bond::signals().rl_ready.get();
+                if applied && resolving {
                     adv_params.filter_policy = AdvFilterPolicy::FilterConn;
                     crate::bond::bump(crate::bond::STAT_FAL_BUILDS);
                     crate::bond::set(
@@ -673,7 +677,7 @@ pub async fn run(
                         crate::bond::value(crate::bond::STAT_FAL_MEMBERS_MAX)
                             .max(members.len() as u32),
                     );
-                } else {
+                } else if !applied {
                     // Never advertise with a partial list; an unfiltered
                     // advertisement is visible in the counters, not silent.
                     crate::privacy::set_flag(crate::privacy::FLAG_FAL_REBUILD_FAILED);
