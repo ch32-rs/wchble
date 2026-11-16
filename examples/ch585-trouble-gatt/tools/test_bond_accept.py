@@ -16,6 +16,7 @@ secure = bond.secure
 LTK = bytes(range(16))
 ADDRESS = bytes([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
 LOCAL = bytes([1]) + ADDRESS
+IRK = bytes(range(0x10, 0x20))
 
 
 def record(ltk=LTK):
@@ -23,8 +24,8 @@ def record(ltk=LTK):
             + bytes(8) + bytes([16]))
 
 
-def payload(count=1, ltk=LTK):
-    return LOCAL + bytes([count]) + record(ltk) * count
+def payload(count=1, ltk=LTK, irk=IRK):
+    return LOCAL + irk + bytes([count]) + record(ltk) * count
 
 
 def page(seq, body, flags=0):
@@ -135,6 +136,28 @@ class DumpTests(unittest.TestCase):
         self.assertEqual(len(bond.valid_slots(slots)), 1)
         self.assertEqual([slot['slot'] for slot in slots], [0, 1])
         self.assertFalse(slots[1]['header_ok'])
+
+    def test_irk_only_payload_is_valid(self):
+        slots = dumped(page(1, payload(count=0)), erased())
+        self.assertTrue(slots[0]['payload_ok'])
+        self.assertFalse(slots[0]['tombstone'])
+        self.assertEqual(slots[0]['count'], 0)
+        self.assertEqual(slots[0]['local_irk'], IRK.hex())
+        self.assertIsNone(slots[0]['record'])
+        self.assertEqual(bond.stored_irk(slots), IRK)
+
+    def test_v2_payload_is_not_a_valid_slot(self):
+        body = LOCAL + bytes([1]) + record()
+        header = struct.pack('<IHHIHHI', bond.STORE_MAGIC, 2, 0, 1,
+                             len(body), 0, zlib.crc32(body))
+        image = header + struct.pack('<I', zlib.crc32(header)) + body
+        image += b'\xff' * (bond.PAGE - len(image))
+        self.assertEqual(dumped(image, erased())[0]['version'], 2)
+        self.assertFalse(dumped(image, erased())[0]['payload_ok'])
+
+    def test_irk_is_read_from_its_own_offset(self):
+        slots = dumped(page(1, payload(irk=bytes([0xAA]) * 16)), erased())
+        self.assertEqual(bond.stored_irk(slots), b'\xaa' * 16)
 
     def test_tombstone_is_not_a_valid_bond(self):
         slots = dumped(page(2, b''), erased())

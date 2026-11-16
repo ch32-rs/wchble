@@ -40,9 +40,15 @@ STORE_MAGIC = 0x3344_4E42
 HOST_SECURITY = 15  # HOST_STATS.reserved_15 carries the Host security state
 LL_REJECT_UNKNOWN_KEY = 0x06
 PHASES = ('wipe', 'pair', 'reconnect', 'delete', 'repair', 'fault', 'powercycle')
-STORE_VERSION = 2
+STORE_VERSION = 3
 LOCAL_IDENTITY_LEN = 7
-BOND_HEADER_LEN = LOCAL_IDENTITY_LEN + 1
+LOCAL_IRK_LEN = 16
+# v3 bond payload: [identity 7][local IRK 16][count 1][records 52*n].
+BOND_HEADER_LEN = LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN + 1
+IRK_OFFSET = LOCAL_IDENTITY_LEN
+COUNT_OFFSET = LOCAL_IDENTITY_LEN + LOCAL_IRK_LEN
+# The client ATT store keeps its own v2-shaped header at version 3.
+ATT_HEADER_LEN = LOCAL_IDENTITY_LEN + 1
 CATT_RECORD_OVERHEAD = 8
 CATT_MAGIC = 0x4333_4130
 
@@ -82,11 +88,13 @@ def parse_dump(path):
         payload_ok = header_ok and payload_crc == zlib.crc32(page[24:24 + length])
         record = None
         local = None
+        local_irk = None
         count = 0
-        if header_ok and length > BOND_HEADER_LEN:
+        if header_ok and length >= BOND_HEADER_LEN:
             payload = page[24:24 + length]
             local = payload[:LOCAL_IDENTITY_LEN].hex()
-            count = payload[LOCAL_IDENTITY_LEN]
+            local_irk = payload[IRK_OFFSET:COUNT_OFFSET].hex()
+            count = payload[COUNT_OFFSET]
             if count:
                 start = BOND_HEADER_LEN
                 record = payload[start:start + 52].hex()
@@ -100,6 +108,7 @@ def parse_dump(path):
             'payload_ok': payload_ok,
             'tombstone': header_ok and length == 0,
             'local': local,
+            'local_irk': local_irk,
             'count': count,
             'record': record,
         })
@@ -129,11 +138,11 @@ def parse_att_dump(path):
         payload_ok = header_ok and payload_crc == zlib.crc32(page[24:24 + length])
         local = None
         records = []
-        if header_ok and length > BOND_HEADER_LEN:
+        if header_ok and length >= ATT_HEADER_LEN:
             payload = page[24:24 + length]
             local = payload[:LOCAL_IDENTITY_LEN].hex()
             count = payload[LOCAL_IDENTITY_LEN]
-            offset = BOND_HEADER_LEN
+            offset = ATT_HEADER_LEN
             for _ in range(count):
                 if offset + CATT_RECORD_OVERHEAD > len(payload):
                     break
@@ -159,6 +168,15 @@ def parse_att_dump(path):
             'records': records,
         })
     return slots
+
+
+def stored_irk(slots):
+    """Local IRK of the single valid copy, or None when the payload has none."""
+    valid = valid_slots(slots)
+    if len(valid) != 1 or not valid[0]['local_irk']:
+        return None
+    irk = bytes.fromhex(valid[0]['local_irk'])
+    return irk if len(irk) == LOCAL_IRK_LEN else None
 
 
 def dump_att(out, address, length):
