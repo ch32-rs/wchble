@@ -16,7 +16,7 @@ use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
 use super::connection::{event_packet, BridgeError, ConnectionBridge};
-use super::transport::{self, Packet};
+use super::transport::{self, HostPacket, Packet, PacketScope};
 
 /// HCI success.
 const HCI_SUCCESS: u8 = 0x00;
@@ -109,7 +109,8 @@ pub struct SoftRunner {
     pending_connect: Option<CreateConnRequest>,
     adv_reports_dropped: u32,
     pending_reply: Option<Packet>,
-    pending_input: Option<(Packet, u32)>,
+    /// Input held under backpressure, with the scope stamped at the producer.
+    pending_input: Option<HostPacket>,
     reset_pending: bool,
     event_mask: u64,
     le_event_mask: u64,
@@ -349,6 +350,15 @@ impl SoftRunner {
     pub fn clear_encryption(&mut self) {
         self.pending_encryption = None;
         self.ltk_reply = None;
+    }
+
+    /// Close the active link and drop everything scoped to it: queued ACL,
+    /// completions, key material and the published link identity. Global
+    /// controller state (masks, address, privacy lists, features) survives;
+    /// only Reset clears that (X3.1 contract).
+    pub fn connection_closed(&mut self, reason: u8) {
+        self.bridge.disconnected(reason);
+        self.clear_encryption();
     }
 
     /// Emit `LE LTK Request` for the connected handle. Returns false when the
@@ -782,21 +792,28 @@ impl SoftRunner {
         let input = self
             .pending_input
             .take()
-            .filter(|(_, epoch)| *epoch == self.bridge.epoch());
-        let Some((packet, epoch)) = input.or_else(|| {
-            transport::try_receive_host_packet().map(|packet| (packet, self.bridge.epoch()))
-        }) else {
+            .filter(|host| self.scope_current(host.scope));
+        let Some(host) = input.or_else(transport::try_receive_host_packet) else {
             return progressed;
         };
-        match packet.kind {
-            PacketKind::Cmd => self.handle_command(packet.payload()),
-            PacketKind::AclData => {
-                if self.bridge.enqueue_tx(&packet) == Err(BridgeError::Full) {
-                    self.pending_input = Some((packet, epoch));
-                    return progressed;
-                }
+        if !self.scope_current(host.scope) {
+            // The producer-time link no longer exists. ACL is dropped; a
+            // command the Host is awaiting still gets its unknown-connection
+            // response so its command credit is not lost.
+            if host.packet.kind == PacketKind::Cmd {
+                self.reject_stale_command(&host.packet);
             }
-            _ => {}
+        } else {
+            match host.packet.kind {
+                PacketKind::Cmd => self.handle_command(host.packet.payload()),
+                PacketKind::AclData => {
+                    if let Err(BridgeError::Full) = self.bridge.enqueue_tx(&host.packet) {
+                        self.pending_input = Some(host);
+                        return progressed;
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(reply) = self.pending_reply {
             if transport::try_send_controller_packet(reply).is_ok() {
@@ -805,6 +822,40 @@ impl SoftRunner {
             }
         }
         true
+    }
+
+    /// True while `scope` still names the live connection. A global command
+    /// is never invalidated by a link change.
+    fn scope_current(&self, scope: PacketScope) -> bool {
+        match scope {
+            PacketScope::Global => true,
+            PacketScope::Connection { handle, key } => {
+                key.generation != 0
+                    && self.bridge.handle() == Some(handle)
+                    && key == self.bridge.link_key()
+            }
+        }
+    }
+
+    /// Answer a command whose producer-time link is gone. The response class
+    /// follows the command: status events for asynchronous commands.
+    fn reject_stale_command(&mut self, packet: &Packet) {
+        let payload = packet.payload();
+        if payload.len() < 2 {
+            return;
+        }
+        let opcode = u16::from_le_bytes([payload[0], payload[1]]);
+        let reply = match opcode {
+            0x0406 | 0x2019 => transport::command_status_packet(opcode, HCI_UNKNOWN_CONNECTION),
+            0x201a | 0x201b | 0x2022 => error_command_complete(
+                opcode,
+                HCI_UNKNOWN_CONNECTION,
+                payload.get(3..).unwrap_or(&[]),
+            ),
+            _ => return,
+        };
+        self.log_command(opcode, HCI_UNKNOWN_CONNECTION);
+        self.pending_reply = Some(reply);
     }
 
     /// Compatibility entry point for existing cooperative async callers.
@@ -1236,7 +1287,7 @@ impl SoftRunner {
         self.log_command(opcode, status);
         self.pending_reply = Some(match result {
             Ok(return_data) => transport::command_complete_packet(opcode, HCI_SUCCESS, return_data),
-            Err(status) => transport::command_complete_packet(opcode, status, &[]),
+            Err(status) => error_command_complete(opcode, status, params),
         });
     }
 
@@ -1403,18 +1454,27 @@ fn le16_from(params: &[u8]) -> u16 {
     u16::from_le_bytes([params[0], params[1]])
 }
 
+/// Error Command Complete for a command whose return parameters start with a
+/// connection handle. §4.5 requires that handle to be echoed on errors too.
+fn error_command_complete(opcode: u16, status: u8, params: &[u8]) -> Packet {
+    let echo: &[u8] = if matches!(opcode, 0x201a | 0x201b | 0x2022) && params.len() >= 2 {
+        &params[..2]
+    } else {
+        &[]
+    };
+    transport::command_complete_packet(opcode, status, echo)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
     use super::*;
     use bt_hci::transport::PacketKind;
-    use std::sync::{Mutex, OnceLock};
 
     /// Global HCI channels are shared; serialize tests that touch them.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::hci::test_lock::lock()
     }
 
     fn inject_cmd(opcode: u16, params: &[u8]) {
@@ -1858,6 +1918,52 @@ mod tests {
     }
 
     #[test]
+    fn close_drops_link_state_but_reset_clears_global_configuration() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let fal = [0, 7, 8, 9, 10, 11, 12];
+
+        pollster::block_on(async {
+            inject_cmd(0x2011, &fal);
+            runner.serve_one().await;
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
+            open(&mut runner);
+            let mut ltk = [0u8; 18];
+            ltk[0..2].copy_from_slice(&1u16.to_le_bytes());
+            ltk[2..].fill(0x33);
+            inject_cmd(0x201a, &ltk);
+            runner.serve_one().await;
+            expect_command_complete(0x201a, HCI_SUCCESS, &[1, 0]);
+            runner.bridge.enqueue_tx(&acl(1, 0, &[1])).unwrap();
+
+            runner.connection_closed(0x13);
+            assert!(!runner.bridge.is_connected());
+            assert!(runner.take_ltk_reply().is_none());
+            // Global configuration survives a link close.
+            assert_ne!(
+                runner.privacy_stats().flags & crate::ll::privacy::flags::FAL_NONEMPTY,
+                0
+            );
+            // The closed link's queued ACL must not reach a new link.
+            runner.bridge.connected(connection_info()).unwrap();
+            assert!(runner.bridge.take_tx_acl().is_none());
+            runner.connection_closed(0x14);
+
+            // Flush the close events before the reset reply.
+            while runner.pump_once() {}
+            while transport::try_receive_controller_packet().is_some() {}
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+            assert_eq!(
+                runner.privacy_stats().flags & crate::ll::privacy::flags::FAL_NONEMPTY,
+                0
+            );
+        });
+    }
+
+    #[test]
     fn resolving_list_edits_are_disallowed_while_active() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
@@ -1976,7 +2082,10 @@ mod tests {
             let stats = runner.privacy_stats();
             assert_eq!(stats.generations, 1);
             assert!(stats.flags & crate::ll::privacy::flags::ADV_USES_RPA != 0);
-            assert_eq!(stats.flags & crate::ll::privacy::flags::IDENTITY_FALLBACK, 0);
+            assert_eq!(
+                stats.flags & crate::ll::privacy::flags::IDENTITY_FALLBACK,
+                0
+            );
         });
     }
 
@@ -2412,6 +2521,69 @@ mod tests {
         }
         runner.pump_once();
         assert!(runner.bridge.take_tx_acl().is_none());
+    }
+
+    fn scoped_cmd(opcode: u16, params: &[u8], key: transport::LinkKey) -> Packet {
+        let mut bytes = [0u8; transport::HCI_PACKET_CAPACITY];
+        bytes[0..2].copy_from_slice(&opcode.to_le_bytes());
+        bytes[2] = params.len() as u8;
+        bytes[3..3 + params.len()].copy_from_slice(params);
+        let packet = Packet::from_bytes(PacketKind::Cmd, &bytes[..3 + params.len()]).unwrap();
+        transport::try_send_host_packet_scoped(
+            packet,
+            transport::PacketScope::Connection { handle: 1, key },
+        )
+        .unwrap();
+        packet
+    }
+
+    fn reopen_with_a_new_generation(runner: &mut SoftRunner) -> transport::LinkKey {
+        let old = runner.bridge.link_key();
+        runner.bridge.disconnected(0x13);
+        assert!(runner.pump_once());
+        transport::try_receive_controller_packet().unwrap();
+        runner.bridge.connected(connection_info()).unwrap();
+        assert!(runner.pump_once());
+        transport::try_receive_controller_packet().unwrap();
+        assert_ne!(old, runner.bridge.link_key());
+        old
+    }
+
+    #[test]
+    fn stale_ltk_reply_is_answered_not_applied_after_handle_reuse() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        let old = reopen_with_a_new_generation(&mut runner);
+
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x5a; 16]);
+        scoped_cmd(0x201a, &params, old);
+        assert!(runner.pump_once());
+        // §4.5: the handle follows Status even on an error response.
+        expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[1, 0]);
+        assert!(runner.ltk_reply.is_none());
+    }
+
+    #[test]
+    fn stale_disconnect_and_set_data_length_keep_their_response_shape() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        let old = reopen_with_a_new_generation(&mut runner);
+
+        scoped_cmd(0x0406, &[1, 0, 0x13], old);
+        assert!(runner.pump_once());
+        expect_command_status(0x0406, HCI_UNKNOWN_CONNECTION);
+        assert!(runner.bridge.take_radio_request().is_none());
+
+        scoped_cmd(0x2022, &[1, 0, 0xf7, 0, 0x48, 0x08], old);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2022, HCI_UNKNOWN_CONNECTION, &[1, 0]);
+        assert!(runner.bridge.take_data_length_request().is_none());
     }
 
     #[test]
@@ -2921,11 +3093,11 @@ mod tests {
             bad[0] = 2;
             inject_cmd(0x201a, &bad);
             runner.serve_one().await;
-            expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[]);
+            expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[2, 0]);
 
             inject_cmd(0x201b, &[2, 0]);
             runner.serve_one().await;
-            expect_command_complete(0x201b, HCI_UNKNOWN_CONNECTION, &[]);
+            expect_command_complete(0x201b, HCI_UNKNOWN_CONNECTION, &[2, 0]);
         });
     }
 
@@ -3024,7 +3196,10 @@ mod tests {
         while runner.bridge.connection_updated(30, 1, 300).is_ok() {}
         // Only the reserved disconnect slot is left; security events must not
         // take it.
-        assert_eq!(runner.bridge.encryption_change(1, 0, 1), Err(BridgeError::Full));
+        assert_eq!(
+            runner.bridge.encryption_change(1, 0, 1),
+            Err(BridgeError::Full)
+        );
         assert_eq!(
             runner.bridge.ltk_request(1, [0; 8], 0),
             Err(BridgeError::Full)

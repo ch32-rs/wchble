@@ -8,8 +8,11 @@
 
 pub mod connection;
 pub mod controller;
+pub mod link;
 pub mod queue;
 pub mod runner;
+#[cfg(test)]
+pub(crate) mod test_lock;
 pub mod transport;
 
 pub use connection::{BridgeError, ConnectionBridge, ConnectionInfo, RadioRequest, TxAcl, TxTag};

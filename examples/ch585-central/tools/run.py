@@ -26,6 +26,10 @@ p3 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(p3)
 io = p3.io
 PROBE, NM = p3.PROBE, p3.NM
+_spec = importlib.util.spec_from_file_location(
+    'ch585_build_manifest', ROOT / 'examples/ch585-scannable/tools/build_manifest.py')
+build_manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(build_manifest)
 EXAMPLE = ROOT / 'examples/ch585-central'
 DEFAULT_ELF = EXAMPLE / 'target/riscv32imc-unknown-none-elf/release/ch585-central'
 DEFAULT_BOGUS_ELF = DEFAULT_ELF
@@ -406,6 +410,7 @@ def run_phase(args, phase, out):
     elf = args.bogus_elf if phase == 'negative-bogus-peer' else args.elf
     source = None
     touched = False
+    vanished = False
     safe_read_at = 0.0
     symbols = None
     try:
@@ -424,6 +429,13 @@ def run_phase(args, phase, out):
         metadata['embedded_run_seconds'] = embedded
         if embedded != args.run_seconds:
             raise PhaseError(f'ELF RUN_SECONDS={embedded}, but --run-seconds={args.run_seconds}')
+        if args.manifest is None:
+            raise PhaseError('--manifest is required before any hardware access')
+        manifest = out / 'manifest.json'
+        shutil.copyfile(args.manifest, manifest)
+        metadata['manifest'] = str(manifest)
+        metadata['manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        build_manifest.verify(manifest, archived, 'central', args.run_seconds, nm=args.nm)
 
         if phase == 'peer-vanish' and args.source != 'android':
             raise PhaseError('peer-vanish needs the Android source (adapter off)')
@@ -434,7 +446,6 @@ def run_phase(args, phase, out):
         finally:
             safe_read_at = time.monotonic() + args.run_seconds + 3
         started = time.monotonic()
-        vanished = False
         while time.monotonic() - started < args.run_seconds + 3:
             if (phase == 'peer-vanish' and not vanished
                     and time.monotonic() - started >= 5.5):
@@ -469,7 +480,7 @@ def run_phase(args, phase, out):
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
         errors.append(f'{type(error).__name__}: {error}')
     finally:
-        if phase == 'peer-vanish':
+        if vanished:
             try:
                 io.command(['adb', '-s', ANDROID_SERIAL, 'shell',
                             'svc', 'bluetooth', 'enable'],
@@ -483,10 +494,9 @@ def run_phase(args, phase, out):
                 errors.append(f'source cleanup: {error}')
         metadata['errors'] = errors
         metadata['passed'] = not errors
+        metadata['touched_hardware'] = touched
         (out / 'result.json').write_text(json.dumps(metadata, indent=2) + '\n')
-        if touched:
-            pass  # smoke restore is owned by execute(), after all phases
-    return errors
+    return errors, touched
 
 
 def execute(args):
@@ -494,22 +504,25 @@ def execute(args):
     phases = PHASES if args.phase == 'all' else (args.phase,)
     results = {}
     errors = []
-    symbols = None
+    touched_any = False
     for phase in phases:
-        phase_errors = run_phase(args, phase, args.out / phase)
+        phase_errors, touched = run_phase(args, phase, args.out / phase)
+        touched_any = touched_any or touched
         results[phase] = 'PASS' if not phase_errors else 'FAIL'
         errors.extend(f'{phase}: {error}' for error in phase_errors)
-    try:
-        if len(phases) > 1 or args.phase in PHASES:
+    if touched_any:
+        try:
             smoke = args.out / 'smoke-restore.elf'
             shutil.copyfile(args.smoke_elf, smoke)
             io.flash(smoke, args.out, 'restore', check_idle=False)
             io.command(['swift', str(io.SCANNER), 'wch585', '8'],
                        args.out / 'restore-scan.log', 20)
             results['smoke_recovery'] = 'PASS'
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-        errors.append(f'recovery: {error}')
-        results['smoke_recovery'] = 'FAIL'
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            errors.append(f'recovery: {error}')
+            results['smoke_recovery'] = 'FAIL'
+    else:
+        results['smoke_recovery'] = 'NOT ATTEMPTED: no phase reached hardware'
     (args.out / 'result.json').write_text(json.dumps(
         {'phases': results, 'errors': errors, 'passed': not errors}, indent=2) + '\n')
     for error in errors:
@@ -521,6 +534,7 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--elf', type=Path, default=DEFAULT_ELF)
+    parser.add_argument('--manifest', type=Path)
     parser.add_argument('--bogus-elf', type=Path, default=DEFAULT_BOGUS_ELF)
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)

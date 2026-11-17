@@ -116,6 +116,32 @@ pub trait Radio {
     fn crc_ok(&self) -> bool;
 }
 
+/// Receive state a connection-event loop polls between RX arming and capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxState {
+    /// LLE reports RX done or a cleared arm.
+    pub done: bool,
+    /// BB reports no CRC error for the completed packet.
+    pub crc_ok: bool,
+    /// A clock capture was latched for this window.
+    pub captured: bool,
+}
+
+/// Raw receive progress and bounded stop confirmation for the shared link
+/// loop. [`Radio`] only arms a window; the loop also needs these primitives so
+/// it can run against a fake backend as well as the CH58x/CH59x hardware.
+pub trait LinkRadio: Radio {
+    /// Clear the BB receive status latch before arming a window.
+    fn clear_rx_status(&mut self);
+    /// Current receive state for the polling loop.
+    fn rx_state(&mut self) -> RxState;
+    /// Latch the capture instant and reload the window (once per window).
+    fn note_capture(&mut self, now_us: u32);
+    /// Shut the engine down and wait, bounded, until it reports idle.
+    /// `false` means the engine did not confirm idle.
+    fn stop<T: InstantUs>(&mut self, clock: &T) -> bool;
+}
+
 /// Placeholder backend when no chip feature is selected.
 #[derive(Debug, Default)]
 pub struct UnselectedRadio;

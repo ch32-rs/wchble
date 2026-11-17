@@ -821,8 +821,43 @@ fn connection_event(
     put(50, clock.now_us().wrapping_sub(tx_return));
     let packet = receive_response(radio, clock, rx, rx_until, rx_expires, capture_us);
     let mut remote_terminate = None;
-    let mut first = false;
     if let Some(packet) = packet {
+        let first = !s.conn.established();
+        let payload_len = packet.len.saturating_sub(2) as u8;
+        // Any packet with a matching access address establishes the link,
+        // even with a CRC error; only a valid packet refreshes supervision.
+        if !s.conn.on_rx(packet.end, payload_len, packet.crc_ok && packet.len >= 2) {
+            return s.expiration(packet.end).or(Some(0x08));
+        }
+        if first {
+            inc(21);
+            put(44, event_start);
+            put(45, packet.end);
+            put(46, packet.end.wrapping_sub(event_start));
+        }
+        if first && !s.complete_sent {
+            let p = s.conn.params;
+            let info = ConnectionInfo {
+                handle: 1,
+                role: wchble::ll::Role::Central,
+                peer_address_type: u8::from(p.peer_random),
+                peer_address: p.peer_addr,
+                interval: p.interval,
+                latency: p.latency,
+                supervision_timeout: p.timeout,
+                master_clock_accuracy: p.sca,
+                peer_rpa: None,
+                local_rpa: None,
+                peer_identity: None,
+            };
+            if bridge.connected(info).is_err() {
+                inc(59);
+                return Some(0x1f);
+            }
+            s.complete_sent = true;
+            inc(34);
+            put(2, STAGE_CONNECTED);
+        }
         if packet.crc_ok && packet.len >= 2 {
             // Every usable RX PDU is classified into exactly one of the empty /
             // ACL / control / rejected counters below.
@@ -858,16 +893,6 @@ fn connection_event(
                             stop(radio, clock);
                             return Some(reason);
                         }
-                    }
-                    first = !s.conn.established();
-                    if !s.conn.on_rx(packet.end, payload.len() as u8, true) {
-                        return s.expiration(packet.end).or(Some(0x08));
-                    }
-                    if first {
-                        inc(21);
-                        put(44, event_start);
-                        put(45, packet.end);
-                        put(46, packet.end.wrapping_sub(event_start));
                     }
                     inc(22);
                     match outcome.status {
@@ -938,29 +963,6 @@ fn connection_event(
                             inc(63);
                         }
                         RxStatus::Invalid => inc(63),
-                    }
-                    if first && !s.complete_sent {
-                        let p = s.conn.params;
-                        let info = ConnectionInfo {
-                            handle: 1,
-                            role: wchble::ll::Role::Central,
-                            peer_address_type: u8::from(p.peer_random),
-                            peer_address: p.peer_addr,
-                            interval: p.interval,
-                            latency: p.latency,
-                            supervision_timeout: p.timeout,
-                            master_clock_accuracy: p.sca,
-                            peer_rpa: None,
-                            local_rpa: None,
-                            peer_identity: None,
-                        };
-                        if bridge.connected(info).is_err() {
-                            inc(59);
-                            return Some(0x1f);
-                        }
-                        s.complete_sent = true;
-                        inc(34);
-                        put(2, STAGE_CONNECTED);
                     }
                     if let Some(tag) = acknowledged_acl {
                         if !bridge.ack_tx(tag) {
@@ -1333,7 +1335,7 @@ fn main() -> ! {
                     clock.now_us().wrapping_sub(s.began),
                 );
                 if soft.bridge.is_connected() {
-                    soft.bridge.disconnected(reason);
+                    soft.connection_closed(reason);
                     inc(35);
                 } else {
                     // The first connection event never completed.
@@ -1457,7 +1459,7 @@ fn main() -> ! {
     }
     stop(&mut radio, &clock);
     if soft.bridge.is_connected() {
-        soft.bridge.disconnected(0x08);
+        soft.connection_closed(0x08);
     }
     host_snapshot(&app_stats);
     put(3, clock.now_us().wrapping_sub(started));

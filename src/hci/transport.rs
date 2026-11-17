@@ -5,12 +5,14 @@
 //! [`crate::hci::runner::SoftRunner`] must be polled or Trouble's `exec` hangs
 //! waiting for Command Complete.
 
+use core::cell::Cell;
 use core::convert::Infallible;
 
 use bt_hci::transport::{
     PacketKind, PacketToController, PacketToHost, Transport as TransportTrait,
 };
 use bt_hci::{FromHciBytesError, ReadHciError};
+use critical_section::Mutex as CsMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
@@ -22,10 +24,109 @@ pub const HCI_PACKET_CAPACITY: usize = 255;
 const HOST_TO_CONTROLLER_CAPACITY: usize = 1;
 const CONTROLLER_TO_HOST_CAPACITY: usize = 4;
 
-static HOST_TO_CONTROLLER: Channel<CriticalSectionRawMutex, Packet, HOST_TO_CONTROLLER_CAPACITY> =
-    Channel::new();
+/// Link slots the transport can attribute packets to. X3 first ships two.
+pub const MAX_LINKS: usize = 2;
+
+/// Identity of a link slot. The HCI handle is a protocol label, not identity:
+/// a reused handle gets a new generation. Generation zero is never live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkKey {
+    pub slot: u8,
+    pub generation: u32,
+}
+
+/// Where an inbound Host packet belongs. `Global` commands survive link
+/// changes; connection-scoped packets are validated against the producer-time
+/// key and are never re-stamped on dequeue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketScope {
+    Global,
+    Connection { handle: u16, key: LinkKey },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostPacket {
+    pub packet: Packet,
+    pub scope: PacketScope,
+}
+
+/// Links currently published for producer-side packet classification.
+type LinkTable = [Option<(u16, LinkKey)>; MAX_LINKS];
+
+static LINKS: CsMutex<Cell<LinkTable>> = CsMutex::new(Cell::new([None; MAX_LINKS]));
+
+static HOST_TO_CONTROLLER: Channel<
+    CriticalSectionRawMutex,
+    HostPacket,
+    HOST_TO_CONTROLLER_CAPACITY,
+> = Channel::new();
 static CONTROLLER_TO_HOST: Channel<CriticalSectionRawMutex, Packet, CONTROLLER_TO_HOST_CAPACITY> =
     Channel::new();
+
+/// Publish or retire the link occupying `slot`. Called by the link owner when
+/// a connection is accepted or released, never by the packet consumer.
+pub(crate) fn set_link(slot: u8, link: Option<(u16, LinkKey)>) {
+    let slot = usize::from(slot);
+    if slot >= MAX_LINKS {
+        return;
+    }
+    critical_section::with(|cs| {
+        let mut links = LINKS.borrow(cs).get();
+        links[slot] = link.map(|(handle, key)| {
+            (
+                handle,
+                LinkKey {
+                    slot: slot as u8,
+                    ..key
+                },
+            )
+        });
+        LINKS.borrow(cs).set(links);
+    });
+}
+
+fn published_key(handle: u16) -> Option<LinkKey> {
+    critical_section::with(|cs| {
+        LINKS
+            .borrow(cs)
+            .get()
+            .iter()
+            .flatten()
+            .find(|(published, _)| *published == handle)
+            .map(|(_, key)| *key)
+    })
+}
+
+/// HCI commands whose first parameter is a connection handle.
+fn connection_command(opcode: u16) -> bool {
+    matches!(opcode, 0x0406 | 0x2019 | 0x201a | 0x201b | 0x2022)
+}
+
+/// Attach the producer-time link identity. A packet naming an unpublished
+/// handle keeps generation zero and is rejected when it is dequeued.
+fn classify(packet: &Packet) -> PacketScope {
+    let handle = match packet.kind {
+        PacketKind::AclData if packet.len >= 2 => {
+            Some(u16::from_le_bytes([packet.bytes[0], packet.bytes[1]]) & 0x0fff)
+        }
+        PacketKind::Cmd if packet.len >= 5 => {
+            let opcode = u16::from_le_bytes([packet.bytes[0], packet.bytes[1]]);
+            connection_command(opcode)
+                .then(|| u16::from_le_bytes([packet.bytes[3], packet.bytes[4]]))
+        }
+        _ => None,
+    };
+    match handle {
+        None => PacketScope::Global,
+        Some(handle) => PacketScope::Connection {
+            handle,
+            key: published_key(handle).unwrap_or(LinkKey {
+                slot: u8::MAX,
+                generation: 0,
+            }),
+        },
+    }
+}
 
 /// Owned HCI packet stored in the static channels.
 #[derive(Clone, Copy, Debug)]
@@ -142,18 +243,25 @@ impl TransportTrait for HciTransport {
             .map_err(|_| Error::PacketTooLarge)?;
         packet.len = size;
 
-        HOST_TO_CONTROLLER.send(packet).await;
+        // Bind the link identity here, at the producer, so a packet queued
+        // across a disconnect cannot be attributed to a later connection.
+        HOST_TO_CONTROLLER
+            .send(HostPacket {
+                packet,
+                scope: classify(&packet),
+            })
+            .await;
         Ok(())
     }
 }
 
 /// Drain one Host→Controller packet (async).
-pub async fn receive_host_packet() -> Packet {
+pub async fn receive_host_packet() -> HostPacket {
     HOST_TO_CONTROLLER.receive().await
 }
 
 /// Non-blocking Host→Controller poll (tests / cooperative pump).
-pub fn try_receive_host_packet() -> Option<Packet> {
+pub fn try_receive_host_packet() -> Option<HostPacket> {
     HOST_TO_CONTROLLER.try_receive().ok()
 }
 
@@ -162,8 +270,14 @@ pub fn try_receive_host_packet() -> Option<Packet> {
 /// For cooperative pumps and diagnostics that have no async Host; production
 /// Hosts use [`HciTransport`] through `bt-hci`.
 pub fn try_send_host_packet(packet: Packet) -> Result<(), Error> {
+    try_send_host_packet_scoped(packet, classify(&packet))
+}
+
+/// Test hook: inject a packet with an explicit producer-time scope. Crate-only
+/// so real Hosts cannot choose a scope; they go through [`HciTransport`].
+pub(crate) fn try_send_host_packet_scoped(packet: Packet, scope: PacketScope) -> Result<(), Error> {
     HOST_TO_CONTROLLER
-        .try_send(packet)
+        .try_send(HostPacket { packet, scope })
         .map_err(|_| Error::PacketTooLarge)
 }
 
@@ -225,9 +339,11 @@ pub(crate) fn discard_connection_data() {
     for packet in retained.into_iter().flatten() {
         let _ = CONTROLLER_TO_HOST.try_send(packet);
     }
-    if let Ok(packet) = HOST_TO_CONTROLLER.try_receive() {
-        if packet.kind != PacketKind::AclData {
-            let _ = HOST_TO_CONTROLLER.try_send(packet);
+    // Connection-scoped commands keep their producer-time scope, so they are
+    // answered as stale instead of being applied to the next link.
+    if let Ok(host) = HOST_TO_CONTROLLER.try_receive() {
+        if host.packet.kind != PacketKind::AclData {
+            let _ = HOST_TO_CONTROLLER.try_send(host);
         }
     }
 }
@@ -256,11 +372,12 @@ pub(crate) fn command_status_packet(opcode: u16, status: u8) -> Packet {
     super::connection::event_packet(0x0f, &[status, 1, opcode as u8, (opcode >> 8) as u8])
 }
 
-/// Test helper: drop any residual channel state between unit tests.
+/// Test helper: drop any residual channel and link state between unit tests.
 #[cfg(test)]
 pub fn drain_channels_for_test() {
     while HOST_TO_CONTROLLER.try_receive().is_ok() {}
     while CONTROLLER_TO_HOST.try_receive().is_ok() {}
+    critical_section::with(|cs| LINKS.borrow(cs).set([None; MAX_LINKS]));
 }
 
 #[cfg(test)]

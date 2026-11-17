@@ -25,6 +25,10 @@ _spec = importlib.util.spec_from_file_location(
 p4 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(p4)
 io, PROBE, NM = p4.io, p4.PROBE, p4.NM
+_spec = importlib.util.spec_from_file_location(
+    'ch585_build_manifest', ROOT / 'examples/ch585-scannable/tools/build_manifest.py')
+build_manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(build_manifest)
 
 EXAMPLE = ROOT / 'examples/ch585-trouble-gatt'
 DEFAULT_ELF = EXAMPLE / 'target/riscv32imc-unknown-none-elf/release/ch585-trouble-gatt'
@@ -863,6 +867,13 @@ def execute(args):
         metadata['embedded_run_seconds'] = embedded_seconds
         if embedded_seconds != args.run_seconds:
             raise ValueError(f'ELF RUN_SECONDS={embedded_seconds}, requested {args.run_seconds}')
+        if args.manifest is None:
+            raise ValueError('--manifest is required before any hardware access')
+        manifest = args.out / 'manifest.json'
+        shutil.copyfile(args.manifest, manifest)
+        metadata['manifest'] = str(manifest)
+        metadata['manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        build_manifest.verify(manifest, archived, 'secure', args.run_seconds, nm=args.nm)
         probe_binary = None
         if args.mode == 'fal':
             if 'wch585-p4' in mac_bluetooth_state(args.out):
@@ -1092,6 +1103,7 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--elf', type=Path, default=DEFAULT_ELF)
+    parser.add_argument('--manifest', type=Path)
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)
     parser.add_argument('--serial', default=ADB_SERIAL)

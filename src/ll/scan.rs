@@ -134,7 +134,9 @@ impl<'a> Pdu<'a> {
         if !self.pdu_type().has_adv_a() {
             return None;
         }
-        self.payload.get(..6).and_then(|bytes| bytes.try_into().ok())
+        self.payload
+            .get(..6)
+            .and_then(|bytes| bytes.try_into().ok())
     }
 
     /// Addressed peer address: TargetA for ADV_DIRECT_IND, AdvA for SCAN_REQ
@@ -196,9 +198,7 @@ pub fn build_scan_req(
     if out.len() < LEN {
         return None;
     }
-    out[0] = 0x03
-        | if scan_random { 0x40 } else { 0 }
-        | if adv_random { 0x80 } else { 0 };
+    out[0] = 0x03 | if scan_random { 0x40 } else { 0 } | if adv_random { 0x80 } else { 0 };
     out[1] = 12;
     out[2..8].copy_from_slice(scan_addr);
     out[8..14].copy_from_slice(adv_addr);

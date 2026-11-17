@@ -70,6 +70,13 @@ impl core::fmt::Debug for Aes128 {
     }
 }
 
+#[cfg(feature = "controller")]
+impl crate::hci::link::AesFromKey for Aes128 {
+    fn from_key(key: &[u8; 16]) -> Self {
+        Self::new(key)
+    }
+}
+
 impl Aes128 {
     #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
     pub fn new(key: &[u8; 16]) -> Self {

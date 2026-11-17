@@ -8,6 +8,8 @@
 
 pub mod tables;
 
+/// DIAGNOSTIC ONLY: scheduled-TX startup boundary samples (temporary).
+
 /// Shared CH58x/CH59x runtime; each family keeps its own DevInit and quirks.
 #[cfg(any(feature = "ch585", feature = "ch592"))]
 pub(crate) mod ch58x_common;

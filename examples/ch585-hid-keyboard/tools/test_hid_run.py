@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Offline tests for the HID acceptance runner; no hardware access."""
+import argparse
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -218,6 +224,40 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(len(hid.HID_NAMES), 16)
         self.assertEqual(len(hid.HOST_NAMES), 16)
         self.assertEqual(len(set(hid.HID_NAMES)), 16)
+
+
+class PreflightTests(unittest.TestCase):
+    def test_missing_manifest_never_touches_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            elf = root / 'image.elf'
+            elf.write_bytes(b'\x7fELF-test')
+            text = '\n'.join(f'20000200 T {name}'
+                             for name in hid.REQUIRED_SYMBOLS + ('RUN_SECONDS',))
+            text += '\n20000300 T _embassy_crypto_aes128ecb_encrypt_blocks'
+            args = argparse.Namespace(out=root / 'out', elf=elf, smoke_elf=elf,
+                                      nm='nm', run_seconds=60, timeout=40,
+                                      pair_click=None, manifest=None)
+            calls = []
+
+            def command(argv, *rest, **kwargs):
+                calls.append(argv[0])
+                return text
+
+            with patch.object(hid.io, 'command', side_effect=command), \
+                    patch.object(hid.p4, 'symbols_from', return_value={}), \
+                    patch.object(hid, 'validate_hid_buffers',
+                                 side_effect=lambda image, symbols: symbols), \
+                    patch.object(hid.p4, 'validate_ram_layout', return_value={}), \
+                    patch.object(hid.p4, 'embedded_u32', return_value=60), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = hid.execute(args)
+            result = json.loads((args.out / 'result.json').read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, ['nm'])
+            self.assertTrue(any('manifest' in error.lower() for error in result['errors']))
+            self.assertEqual(result['smoke_recovery'],
+                             'NOT ATTEMPTED: preflight failed before hardware access')
 
 
 if __name__ == '__main__':
