@@ -66,6 +66,10 @@ pub(crate) struct FakeRadio {
     sent: Vec<Vec<u8>>,
     /// Next transmit returns `Error::Late` without going on air.
     late: bool,
+    /// Next transmit returns this error, with the engine stopped, once.
+    tx_error: Option<crate::Error>,
+    /// Report a capture that never completes, to exercise the capture timeout.
+    stall_capture: bool,
     stop_ok: bool,
     stops: Rc<Cell<u32>>,
     channel: u8,
@@ -87,6 +91,8 @@ impl FakeRadio {
             windows: VecDeque::new(),
             sent: Vec::new(),
             late: false,
+            tx_error: None,
+            stall_capture: false,
             stop_ok: true,
             stops,
             channel: 0,
@@ -151,6 +157,9 @@ impl Radio for FakeRadio {
         _start_cputime: Option<u32>,
     ) -> crate::Result<()> {
         self.tx_deadlines.push(_start_cputime);
+        if let Some(error) = self.tx_error.take() {
+            return Err(error);
+        }
         if self.late {
             self.late = false;
             return Err(crate::Error::Late);
@@ -187,6 +196,13 @@ impl LinkRadio for FakeRadio {
         self.armed = None;
     }
     fn rx_state(&mut self) -> RxState {
+        if self.stall_capture {
+            return RxState {
+                done: false,
+                crc_ok: true,
+                captured: true,
+            };
+        }
         match &self.armed {
             Some(w) if w.frame.is_some() => {
                 // `receive` reads the clock once more after this returns.
@@ -211,6 +227,7 @@ impl LinkRadio for FakeRadio {
 
 struct RecHost {
     stats: [u32; 64],
+    features: [u8; 8],
     sec: [u32; 16],
     log: Vec<&'static str>,
     connections: u32,
@@ -225,6 +242,13 @@ struct RecHost {
     diag_rx: Vec<(u8, Vec<u8>, bool)>,
     acl_tx: VecDeque<TxAcl>,
     acked: Vec<TxTag>,
+    acl_reply_calls: Vec<(u8, Vec<u8>)>,
+    acl_replies: VecDeque<Option<AclReply>>,
+    payload_limit: usize,
+    capture_timeout: Option<u32>,
+    rearm: Option<u32>,
+    feature_request_allowed: bool,
+    establishment_limit: Option<u16>,
     can_receive: bool,
     skipped: u32,
     rx_frames: Vec<usize>,
@@ -239,6 +263,10 @@ impl RecHost {
     fn new(stops: Rc<Cell<u32>>) -> Self {
         Self {
             stats: [0; 64],
+            features: crate::ll::ctrl::feature_bits(&[
+                crate::ll::ctrl::FEATURE_LE_DATA_LENGTH_EXTENSION,
+                crate::ll::ctrl::FEATURE_LE_CSA2,
+            ]),
             sec: [0; 16],
             log: Vec::new(),
             connections: 0,
@@ -253,6 +281,13 @@ impl RecHost {
             diag_rx: Vec::new(),
             acl_tx: VecDeque::new(),
             acked: Vec::new(),
+            acl_reply_calls: Vec::new(),
+            acl_replies: VecDeque::new(),
+            payload_limit: MAX_ENCRYPTED,
+            capture_timeout: None,
+            rearm: None,
+            feature_request_allowed: true,
+            establishment_limit: None,
             can_receive: true,
             skipped: 0,
             rx_frames: Vec::new(),
@@ -269,10 +304,7 @@ impl LinkHost for RecHost {
     type Aes = crate::crypto::aes::Aes128;
 
     fn local_features(&self) -> [u8; 8] {
-        crate::ll::ctrl::feature_bits(&[
-            crate::ll::ctrl::FEATURE_LE_DATA_LENGTH_EXTENSION,
-            crate::ll::ctrl::FEATURE_LE_CSA2,
-        ])
+        self.features
     }
     fn new_aes(&mut self, key: &[u8; 16]) -> Self::Aes {
         crate::crypto::aes::Aes128::new(key)
@@ -345,6 +377,26 @@ impl LinkHost for RecHost {
     fn ack_tx(&mut self, tag: TxTag) -> bool {
         self.acked.push(tag);
         true
+    }
+
+    fn acl_reply(&mut self, llid: u8, payload: &[u8]) -> Option<AclReply> {
+        self.acl_reply_calls.push((llid, payload.to_vec()));
+        self.acl_replies.pop_front().unwrap_or(None)
+    }
+    fn rx_payload_limit(&self) -> usize {
+        self.payload_limit
+    }
+    fn rx_capture_timeout_us(&self) -> Option<u32> {
+        self.capture_timeout
+    }
+    fn rx_rearm_window_us(&self) -> Option<u32> {
+        self.rearm
+    }
+    fn allows_feature_request(&self) -> bool {
+        self.feature_request_allowed
+    }
+    fn establishment_event_limit(&self) -> Option<u16> {
+        self.establishment_limit
     }
 
     fn is_connected(&self) -> bool {
@@ -1099,4 +1151,439 @@ fn feature_request_exchange_replies_after_the_empty_ack() {
     h.radio.push(FakeRadio::missed());
     assert_eq!(h.event(FINISH), EventEnd::Continue);
     assert_eq!(h.radio.sent[3], std::vec![0x05, 0x00]);
+}
+
+#[test]
+fn host_reply_is_selected_in_the_same_event_and_retransmitted_verbatim() {
+    let mut h = Harness::new();
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::new(2, &[0x11, 0x22]).unwrap()));
+
+    // Central ATT request: LLID 2, SN 0, NESN 0.
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        h.host.acl_reply_calls,
+        std::vec![(2, std::vec![0xaa, 0xbb])]
+    );
+    assert_eq!(h.radio.sent.len(), 1, "reply chosen in the same event");
+    // LLID 2, SN 0, NESN 1.
+    assert_eq!(h.radio.sent[0], std::vec![0x06, 2, 0x11, 0x22]);
+
+    // The same SN is a duplicate: no second Host call, same bytes retransmit.
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        h.host.acl_reply_calls.len(),
+        1,
+        "duplicate is not delivered"
+    );
+    assert_eq!(h.radio.sent[1], h.radio.sent[0]);
+
+    // The Central acknowledges SN 0 and advances to SN 1.
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.radio.sent[2].len(), 2, "an empty PDU");
+    assert_eq!(h.radio.sent[2][0] & 3, 1);
+    assert_eq!(h.radio.sent[2][1], 0);
+}
+
+#[test]
+fn a_pending_control_reply_defers_the_acl_reply_to_the_next_event() {
+    let mut h = Harness::new();
+    h.session.pending_control = Some(DataPdu::new(3, &[0x07, 0xff]).unwrap());
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::new(2, &[0x44]).unwrap()));
+
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        &h.radio.sent[0][2..],
+        &[0x07, 0xff],
+        "control owns the event"
+    );
+    assert!(
+        h.session.pending_acl_reply.is_some(),
+        "the request is held, not lost"
+    );
+
+    // The Central acknowledges the control PDU; the held reply goes out.
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(&h.radio.sent[1][2..], &[0x44], "reply after contention");
+    assert!(h.session.pending_acl_reply.is_none());
+    assert_eq!(h.host.acl_reply_calls.len(), 1, "the Host ran once");
+}
+
+#[test]
+fn an_occupied_reply_slot_backpressures_a_new_request_without_acking_it() {
+    let mut h = Harness::new();
+    h.session.pending_acl_reply = Some(AclReply::new(2, &[0x33]).unwrap());
+
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.acl_reply_calls.len(), 0, "not accepted");
+    assert_eq!(h.host.stats[31], 1, "rx backpressure counted");
+    assert_eq!(&h.radio.sent[0][2..], &[0x33], "only the held reply");
+    // NESN 0: the rejected request was not acknowledged.
+    assert_eq!(h.radio.sent[0][0] & 4, 0);
+}
+
+#[test]
+fn a_termination_reply_uses_the_single_termination_state_machine() {
+    let mut h = Harness::new();
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::terminate(0x13)));
+
+    // A non-empty continuation fragment: LLID 1, SN 0.
+    h.radio.push(FakeRadio::frame(std::vec![0x01, 1, 0xaa]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        h.radio.sent[0],
+        std::vec![0x07, 2, 2, 0x13],
+        "one LL_TERMINATE_IND, LLID 3/NESN 1/SN 0"
+    );
+    assert!(h.session.pending_acl_reply.is_none(), "no second owner");
+
+    // The Central acknowledges it: the link closes with the Host's reason.
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Close(0x13));
+    assert_eq!(h.host.stats[28], 1, "terminated ack counted");
+    assert_eq!(h.host.stats[25], 0, "no retransmission on the ACK");
+}
+
+#[test]
+fn the_host_payload_cap_rejects_28_bytes_and_accepts_27() {
+    let mut h = Harness::new();
+    h.host.payload_limit = 27;
+
+    let mut frame = std::vec![0x02, 28];
+    frame.extend_from_slice(&[0u8; 28]);
+    h.radio.push(FakeRadio::frame(frame));
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.stats[9], 1, "oversize counted once");
+    assert_eq!(h.radio.sent.len(), 0, "nothing answered, no ACK");
+
+    // 27 octets is the boundary the Host accepts.
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::new(2, &[0x55]).unwrap()));
+    let mut frame = std::vec![0x02, 27];
+    frame.extend_from_slice(&[0x55; 27]);
+    h.radio.push(FakeRadio::frame(frame));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.stats[9], 1, "27 bytes is not oversize");
+    assert_eq!(h.host.acl_reply_calls.len(), 1);
+    assert_eq!(&h.radio.sent[0][2..], &[0x55]);
+}
+
+#[test]
+fn host_capture_timeout_bounds_a_stalled_completion() {
+    fn elapsed(capture: Option<u32>) -> u32 {
+        let mut h = Harness::new();
+        h.host.capture_timeout = capture;
+        h.radio.stall_capture = true;
+        h.radio.push(FakeRadio::frame(empty_pdu()));
+        let start = h.clock.now();
+        assert_eq!(h.event(FINISH), EventEnd::Continue);
+        h.clock.now().wrapping_sub(start)
+    }
+    let default = elapsed(None);
+    let configured = elapsed(Some(700));
+    let delta = configured.wrapping_sub(default);
+    // The engine default is `allowance + 64`; only the wait differs here.
+    assert!((280..=340).contains(&delta), "delta was {delta}");
+}
+
+#[test]
+fn host_rearm_window_sets_the_post_exchange_until() {
+    let mut h = Harness::new();
+    h.host.rearm = Some(500);
+    h.radio.push(FakeRadio::frame(empty_pdu()));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.radio.windows_armed.len() >= 2, "a second window is armed");
+    let window = h.radio.windows_armed[1];
+    assert!((980..=1000).contains(&window), "window was {window}");
+}
+
+#[test]
+fn encryption_requests_take_the_unsupported_path_without_the_feature_bit() {
+    let mut h = Harness::new();
+    assert_eq!(h.session.pending_enc_req, None);
+
+    // LL_ENC_REQ (0x03) is a valid 23-octet control PDU.
+    let mut req = std::vec![0x03, 23];
+    req.extend_from_slice(&[0x03; 23]);
+    h.radio.push(FakeRadio::frame(req));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(&h.radio.sent[0][2..], &[0x07, 0x03], "LL_UNKNOWN_RSP");
+    assert!(h.session.pending_enc_req.is_none());
+    assert_eq!(h.host.sec[2], 0, "no ENC_REQ statistics");
+
+    // LL_START_ENC_REQ (0x05) is answered the same way.
+    h.radio.push(FakeRadio::frame(std::vec![0x0f, 1, 0x05]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(&h.radio.sent[1][2..], &[0x07, 0x05], "LL_UNKNOWN_RSP");
+    assert_eq!(h.host.sec[6], 0, "no START_ENC statistics");
+}
+
+#[test]
+fn encryption_requests_are_hoisted_when_the_feature_bit_is_set() {
+    let mut h = Harness::new();
+    let features = crate::ll::ctrl::feature_bits(&[
+        crate::ll::ctrl::FEATURE_LE_ENCRYPTION,
+        crate::ll::ctrl::FEATURE_LE_DATA_LENGTH_EXTENSION,
+        crate::ll::ctrl::FEATURE_LE_CSA2,
+    ]);
+    h.host.features = features;
+    h.session = Session::new(params(), false, CONNECT_END, 0, [0x11; 12], features);
+
+    let mut req = std::vec![0x03, 23];
+    req.extend_from_slice(&[0x03; 23]);
+    h.radio.push(FakeRadio::frame(req));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.pending_enc_req.is_some(), "hoisted for AES");
+    assert_eq!(h.radio.sent[0], std::vec![0x05, 0x00], "empty ack");
+    assert_eq!(h.host.sec[2], 1, "ENC_REQ counted");
+}
+
+#[test]
+fn feature_request_suppression_keeps_the_control_queue_empty() {
+    fn pending_after(allowed: bool) -> bool {
+        let mut h = Harness::new();
+        h.host.feature_request_allowed = allowed;
+        h.radio.push(FakeRadio::frame(empty_pdu()));
+        h.radio.push(FakeRadio::missed());
+        assert_eq!(h.event(FINISH), EventEnd::Continue);
+        assert!(h.session.established());
+        // Settle our empty reply so the link is idle.
+        let _ = h.session.link.on_rx(0x0d, &[], true, true);
+        assert!(!h.session.link.has_outstanding());
+        super::service_dle(&mut h.host, &mut h.session);
+        h.session.pending_control.is_some()
+    }
+    assert!(pending_after(true), "the default still starts the exchange");
+    assert!(!pending_after(false), "suppressed for this Host");
+}
+
+#[test]
+fn a_remote_terminate_drops_a_held_reply_and_closes() {
+    let mut h = Harness::new();
+    h.session.pending_acl_reply = Some(AclReply::new(2, &[0x66]).unwrap());
+
+    // LL_TERMINATE_IND (0x02) from the Central: LLID 3, SN 0.
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x03, 2, 0x02, 0x13]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Close(0x13));
+    assert_eq!(h.radio.sent.len(), 1, "only the acknowledge PDU");
+    assert_eq!(h.radio.sent[0][0] & 3, 1, "empty PDU, not the reply");
+    assert!(h.session.pending_acl_reply.is_none());
+}
+
+#[test]
+fn establishment_limit_closes_at_the_configured_event_and_counts_once() {
+    let mut h = Harness::new();
+    h.host.establishment_limit = Some(6);
+    let mut control = Control::Continue;
+    for _ in 0..40 {
+        if h.session.event_counter() == 6 {
+            break;
+        }
+        control = h.step(FINISH);
+        assert_eq!(control, Control::Continue);
+    }
+    assert_eq!(h.session.event_counter(), 6);
+    assert_eq!(h.host.stats[30], 0, "events below the limit are allowed");
+    let mut control = Control::Continue;
+    for _ in 0..8 {
+        control = h.step(FINISH);
+        if control != Control::Continue {
+            break;
+        }
+    }
+    assert_eq!(control, Control::Closed(0x3e));
+    assert_eq!(h.host.stats[30], 1, "counted once");
+    assert_eq!(h.host.closes, std::vec![0x3e]);
+    assert_eq!(h.host.stats[37], 0x3e, "close reason recorded");
+}
+
+#[test]
+fn establishment_limit_catches_up_without_arming_a_forbidden_event() {
+    let mut h = Harness::new();
+    h.host.establishment_limit = Some(6);
+    for _ in 0..40 {
+        if h.session.event_counter() == 5 {
+            break;
+        }
+        assert_eq!(h.step(FINISH), Control::Continue);
+    }
+    assert_eq!(h.session.event_counter(), 5);
+    let arms = h.radio.windows_armed.len();
+
+    // One delayed step skips events past the limit via the catch-up loop.
+    h.clock.advance(35_000);
+    assert_eq!(h.step(FINISH), Control::Continue);
+    assert_eq!(h.radio.windows_armed.len(), arms, "no RX armed");
+    assert_eq!(h.host.stats[30], 0);
+
+    assert_eq!(h.step(FINISH), Control::Closed(0x3e));
+    assert_eq!(h.host.stats[30], 1);
+}
+
+#[test]
+fn an_established_link_never_trips_the_establishment_limit() {
+    let mut h = Harness::new();
+    h.host.establishment_limit = Some(6);
+    h.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.established());
+    for _ in 0..10 {
+        h.step(FINISH);
+    }
+    assert!(h.session.event_counter() >= 6);
+    assert_eq!(h.host.stats[30], 0);
+    assert!(h.host.closes.is_empty());
+}
+
+#[test]
+fn the_run_budget_wins_over_the_establishment_limit() {
+    let mut h = Harness::new();
+    h.host.establishment_limit = Some(6);
+    for _ in 0..40 {
+        if h.session.event_counter() == 6 {
+            break;
+        }
+        assert_eq!(h.step(FINISH), Control::Continue);
+    }
+    let now = h.clock.now();
+    assert_eq!(h.step(now), Control::Finish);
+    assert_eq!(h.host.stats[30], 0, "no establishment failure counted");
+    assert!(h.host.closes.is_empty());
+}
+
+#[test]
+fn establishment_limit_does_not_publish_when_the_stop_fails() {
+    let mut h = Harness::new();
+    h.host.establishment_limit = Some(6);
+    for _ in 0..40 {
+        if h.session.event_counter() == 6 {
+            break;
+        }
+        assert_eq!(h.step(FINISH), Control::Continue);
+    }
+    h.radio.stop_ok = false;
+    let mut control = Control::Continue;
+    for _ in 0..8 {
+        control = h.step(FINISH);
+        if control != Control::Continue {
+            break;
+        }
+    }
+    assert_eq!(control, Control::StopTimeout);
+    assert_eq!(h.host.stats[30], 1);
+    assert!(h.host.closes.is_empty(), "no disconnect published");
+    assert!(h.host.after_close == 0);
+}
+
+#[test]
+fn an_encryption_capable_session_never_captures_acl_replies() {
+    let mut h = Harness::new();
+    let features = crate::ll::ctrl::feature_bits(&[
+        crate::ll::ctrl::FEATURE_LE_ENCRYPTION,
+        crate::ll::ctrl::FEATURE_LE_DATA_LENGTH_EXTENSION,
+        crate::ll::ctrl::FEATURE_LE_CSA2,
+    ]);
+    h.host.features = features;
+    h.session = Session::new(params(), false, CONNECT_END, 0, [0x11; 12], features);
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::new(2, &[0x77]).unwrap()));
+
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.acl_reply_calls.len(), 0, "hook not consulted");
+    assert!(h.session.pending_acl_reply.is_none());
+}
+
+#[test]
+fn a_non_late_tx_error_keeps_the_reply_for_retransmission() {
+    let mut h = Harness::new();
+    h.host
+        .acl_replies
+        .push_back(Some(AclReply::new(2, &[0x88]).unwrap()));
+    h.radio.tx_error = Some(crate::Error::Timeout);
+
+    // A failed response ends the event early; do not queue another window.
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x02, 2, 0xaa, 0xbb]));
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.stats[20], 1, "tx_err counted");
+    assert_eq!(h.host.stats[19], 0, "not Late");
+    assert_eq!(h.radio.sent.len(), 0, "nothing went on air");
+    assert!(h.session.link.has_outstanding());
+
+    // The peer's next PDU does not acknowledge it: the reply retransmits.
+    h.radio.push(FakeRadio::frame(empty_with(false, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(&h.radio.sent[0][2..], &[0x88]);
+    assert_eq!(h.host.acl_reply_calls.len(), 1, "business ran once");
+
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    // The acknowledged reply advanced our SN: the response is a fresh PDU.
+    assert_eq!(h.radio.sent[1][0] & 8, 8, "SN advanced after the ACK");
+    assert_eq!(h.host.stats[25], 1, "retransmitted exactly once");
+}
+
+#[test]
+fn maximum_length_frames_never_reach_the_host() {
+    for len in [251usize, 252, 255] {
+        let mut h = Harness::new();
+        h.host
+            .acl_replies
+            .push_back(Some(AclReply::new(2, &[0x01]).unwrap()));
+        let mut frame = std::vec![0x02, len as u8];
+        frame.extend_from_slice(&[0xaa; 255][..len]);
+        h.radio.push(FakeRadio::frame(frame));
+        assert_eq!(h.event(FINISH), EventEnd::Continue, "len {len}");
+        assert_eq!(h.host.acl_reply_calls.len(), 0, "len {len}");
+        assert_eq!(h.host.stats[9], 1, "len {len} counted invalid");
+    }
+}
+
+#[test]
+fn a_crc_bad_maximum_length_header_only_establishes() {
+    let mut h = Harness::new();
+    h.radio.push(FakeRadio::bad_frame(std::vec![0x01, 255]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.established());
+    assert_eq!(h.host.stats[8], 1, "crc error counted");
+    assert_eq!(h.host.stats[9], 0, "not an invalid PDU");
 }
