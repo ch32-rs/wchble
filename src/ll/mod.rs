@@ -11,6 +11,7 @@ pub mod link;
 #[cfg(feature = "controller")]
 pub mod privacy;
 pub mod scan;
+pub mod sched;
 
 /// High-level LL role for the scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
