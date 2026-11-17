@@ -597,12 +597,22 @@ impl PeripheralConnection {
     /// A later packet in the same event refreshes supervision, not the anchor.
     /// Returns false for an invalid length or a link that already expired.
     pub fn on_rx_anchor(&mut self, rx_done_us: u32, payload_len: u8) -> bool {
-        if usize::from(payload_len) > usize::from(self.rx_max_payload)
-            || self.supervision_expired(rx_done_us)
+        self.received_packet(rx_done_us, payload_len, true)
+    }
+
+    /// A received packet with a matching access address but a CRC error still
+    /// establishes the link and determines the first anchor (Core 5.4 Vol 6
+    /// Part B §4.5.5); it does not refresh supervision.
+    pub fn on_rx_anchor_crc(&mut self, rx_done_us: u32, payload_len: u8) -> bool {
+        self.received_packet(rx_done_us, payload_len, false)
+    }
+
+    fn received_packet(&mut self, rx_done_us: u32, payload_len: u8, crc_ok: bool) -> bool {
+        if self.supervision_expired(rx_done_us)
+            || (crc_ok && usize::from(payload_len) > usize::from(self.rx_max_payload))
         {
             return false;
         }
-        self.supervision_base_us = rx_done_us;
         self.established = true;
         if !self.anchor_seen {
             // Preamble + AA + header + payload + CRC on LE 1M.
@@ -611,6 +621,9 @@ impl PeripheralConnection {
             self.last_anchor_us = anchor;
             self.window_width_us = 0;
             self.anchor_seen = true;
+        }
+        if crc_ok {
+            self.supervision_base_us = rx_done_us;
         }
         true
     }
@@ -665,20 +678,22 @@ impl PeripheralConnection {
         if let Some(update) = self.pending_update {
             if update.instant == self.event_counter {
                 let old_deadline = self.supervision_deadline_us();
+                // The instant is the old-schedule anchor; WinOffset moves the
+                // send window, not the instant (§5.1.1).
+                let instant_us = self.event_start_us;
                 // Offset is relative to this event's anchor on the old schedule.
-                self.event_start_us = self
-                    .event_start_us
-                    .wrapping_add(u32::from(update.win_offset) * 1250);
+                self.event_start_us = instant_us.wrapping_add(u32::from(update.win_offset) * 1250);
                 self.window_width_us = u32::from(update.win_size) * 1250;
                 self.params.win_size = update.win_size;
                 self.params.win_offset = update.win_offset;
                 self.params.interval = update.interval;
                 self.params.latency = update.latency;
                 self.params.timeout = update.timeout;
-                // Restart at the update window only if the old link can live
-                // until then. next_event plans ahead: a future instant must not
-                // erase a supervision deadline occurring during the wait.
-                self.supervision_base_us = if time_reached(self.event_start_us, old_deadline) {
+                // Restart at the update window if the old link was alive at
+                // the instant. A deadline reached between the instant and the
+                // offset window must not be extended, but it must not be kept
+                // as if the link had died before the instant either.
+                self.supervision_base_us = if time_reached(instant_us, old_deadline) {
                     old_deadline.wrapping_sub(u32::from(self.params.timeout) * 10_000)
                 } else {
                     self.event_start_us
@@ -768,10 +783,7 @@ mod tests {
     fn connect_ind_builder_rejects_short_buffers_and_window_overflow() {
         let params = params();
         let mut short = [0x5a; 35];
-        assert_eq!(
-            params.build_connect_ind(&mut short, [0; 6], false),
-            None
-        );
+        assert_eq!(params.build_connect_ind(&mut short, [0; 6], false), None);
         assert!(short.iter().all(|byte| *byte == 0x5a));
 
         let mut overflow = params;
@@ -825,6 +837,36 @@ mod tests {
             // Completion allowance must not revive an expired link.
             assert!(!conn.on_rx_anchor(conn.supervision_deadline_us(), 27));
         }
+    }
+
+    #[test]
+    fn crc_error_first_packet_sets_the_anchor_without_refreshing_supervision() {
+        let mut conn = PeripheralConnection::new(params(), 1000, false);
+        assert!(conn.on_rx_anchor_crc(2_500, 0));
+        assert!(conn.established());
+        assert_eq!(conn.event_start_us(), 2_500 - 80);
+        // Supervision still runs from the CONNECT_IND base, now with the
+        // negotiated timeout: a CRC error establishes but does not refresh.
+        assert_eq!(conn.supervision_deadline_us(), 1000 + 200 * 10_000);
+        assert!(conn.on_rx_anchor(3_000, 0));
+        assert_eq!(conn.supervision_deadline_us(), 3_000 + 200 * 10_000);
+    }
+
+    #[test]
+    fn crc_error_after_the_establishment_deadline_is_rejected() {
+        let mut conn = PeripheralConnection::new(params(), 0, false);
+        assert!(!conn.on_rx_anchor_crc(conn.supervision_deadline_us(), 0));
+        assert!(!conn.established());
+    }
+
+    #[test]
+    fn crc_error_does_not_move_an_existing_anchor() {
+        let mut conn = PeripheralConnection::new(params(), 0, false);
+        assert!(conn.on_rx_anchor(2_500, 0));
+        let anchor = conn.event_start_us();
+        assert!(conn.on_rx_anchor_crc(3_500, 4));
+        assert_eq!(conn.event_start_us(), anchor);
+        assert_eq!(conn.supervision_deadline_us(), 2_500 + 200 * 10_000);
     }
 
     #[test]
@@ -1157,6 +1199,30 @@ mod tests {
         assert!(c.supervision_expired(121_330));
         assert!(!c.on_rx_anchor(121_330, 0));
         assert_eq!(c.supervision_deadline_us(), 101_330);
+    }
+
+    #[test]
+    fn update_window_resets_a_deadline_that_falls_before_the_window() {
+        let mut p = params();
+        p.timeout = 10;
+        let mut c = PeripheralConnection::new(p, 0, false);
+        assert!(c.on_rx_anchor(1330, 0));
+        assert_eq!(c.supervision_deadline_us(), 101_330);
+        // Instant anchor 91,250 is alive; the offset window (116,250) is not.
+        c.schedule_update(ConnectionUpdate {
+            win_size: 1,
+            win_offset: 20,
+            interval: 24,
+            latency: 0,
+            timeout: 10,
+            instant: 3,
+        })
+        .unwrap();
+        for _ in 0..3 {
+            c.next_event().unwrap();
+        }
+        assert_eq!(c.event_start_us(), 116_250);
+        assert_eq!(c.supervision_deadline_us(), 216_250);
     }
 
     #[test]

@@ -60,16 +60,47 @@ Raw captures and experiment records remain local; they are not required to build
   `same_instant_update_uses_the_packet_as_anchor`,
   `same_instant_channel_map_applies_now` and the central-role
   `past_instant_is_rejected_but_same_instant_applies`.
-- [ ] **B4 — CRC-failed packet vs establishment/supervision.** Core §4.5 lets any
+- [x] **B4 — CRC-failed packet vs establishment/supervision.** Core §4.5 lets any
   received data-channel packet establish the link (and §4.5.5 uses the first
   received packet as the Peripheral anchor) even on a CRC error, while payload
-  acceptance and supervision refresh need a valid packet. The current Central RX
-  path conflates the two and drops the anchor of a CRC-failed packet.
-- [ ] **B5 — Central supervision timer at connection-update instants.** The timer
-  should restart at the instant/transmit window; it currently keeps the old base.
-- [ ] **B6 — scan/filter policy application.** Filter_Duplicates, basic filtered
-  policy 1 (with an accept list) and directed-ADV target filtering are accepted
-  but not applied; initiator policy 1 ignores Peer_Address.
+  acceptance and supervision refresh need a valid packet. Both roles now
+  follow that: `CentralConnection::on_rx` and
+  `PeripheralConnection::on_rx_anchor_crc` establish on any AA match without
+  refreshing supervision, and only a valid packet moves the supervision base.
+  Tests: `crc_error_establishes_without_refreshing_supervision`,
+  `crc_error_after_the_establishment_deadline_is_rejected`,
+  `crc_error_first_packet_sets_the_anchor_without_refreshing_supervision`,
+  `crc_error_does_not_move_an_existing_anchor`. CRC-error packets keep the
+  header Length for anchor estimation and get a response (retransmit or Empty)
+  exactly once; two consecutive CRC errors close the event (§4.5.1/§4.5.6),
+  and the next RX window is recomputed after a successful response. Offline
+  review R1/R2 PASS. The example-level CRC-only lifecycle fixture (including
+  `bridge.connected` backpressure) is the first X3.2a deliverable.
+  Current-tree hardware (2026-11-17): P3 (`e6d88ba9…`, 6 clean client rounds
+  incl. `x3-n1-p3-repro1..5`), C1 (`3f3fae94…`), GATT reconnect
+  (`105a6e9e…`) and fresh pairing (`7ade1071…`) pass with clean RF counters
+  (`tx_late=0` on P3/C1). One P3 round (`x3-n1-p3b`) failed to finish
+  (stage 2, runtime 0) and is retained as an unexplained observation. CRC-first
+  establishment and the two-CRC-error event close are not yet fixed-point
+  tested on air; HID encrypted reports are not verified.
+- [x] **B5 — supervision timer at connection-update instants.** The timer now
+  restarts at the instant's transmit window (`next_event`), but a deadline that
+  was already reached before the instant is not extended by the new timeout;
+  a deadline that falls between the instant and the offset window resets at the
+  window instead of expiring during the wait. Tests:
+  `update_instant_restarts_supervision_at_the_new_anchor`,
+  `update_instant_cannot_extend_a_deadline_reached_while_waiting`,
+  `update_window_resets_a_deadline_that_falls_before_the_window` (both roles).
+  Current-tree P3/C1/reconnect/fresh-pair rounds pass, but none exercised a
+  connection-update instant across the old deadline; air fixed-point evidence
+  for the instant boundary is still pending.
+- [ ] **B6 — scan/filter policy application.** Filter_Duplicates and
+  directed-ADV target filtering are still accepted but not applied, and
+  initiator policy 1 still ignores Peer_Address. Unimplemented accept-list
+  policies no longer silently pass: Set Scan Parameters with policy ≠ 0 and
+  LE Create Connection with initiator policy ≠ 0 now return `0x12` (S4b).
+  Tests: `scan_filter_policies_are_rejected`,
+  `create_connection_rejects_invalid_parameters`.
 - [x] **B7 — HCI state restrictions.** Set Random Address now returns Command
   Disallowed while advertising, scanning or initiating (§7.8.4), and Set Scan
   Parameters while scanning (§7.8.10). Test:
@@ -95,14 +126,25 @@ tests per chip feature, `tests/{secure,trouble,hid}-host`) and built into all
 PASS (`5d004331…`, re-run against merged ch5xx-hal main after the HCI review
 fix; the earlier `e889b449…` predates it) and P4 PASS after the late-TX fix
 below (`85fc661a…`, `tx_late=0`, no retries, GATT cycle counters complete).
-- [ ] **B10 — Host→Controller queue has no enqueue epoch.** A Host command still
+- [x] **B10 — Host→Controller queue has no enqueue epoch.** A Host command still
   in the one-slot `HOST_TO_CONTROLLER` channel when the link drops is parsed
   after reconnect and attributed to the new connection (`pending_input` reads
   the epoch on dequeue). `c40c008` stamped the packet at enqueue, but adding a
-  field to `Packet` broke first pairing on hardware, so it was removed. Fix
-  without growing `Packet`: keep connection-scoped metadata beside the queue
-  (valid only while capacity is 1), or make the packet carry it explicitly.
-  See `local-docs/results/bond-session-20261115.md`.
+  field to `Packet` broke first pairing on hardware, so it was removed. Fixed
+  without growing `Packet`: the channel item is `HostPacket { packet, scope }`,
+  `Transport::write` binds `LinkKey { slot, generation }` at the producer, and
+  the consumer never re-stamps. Stale ACL data is dropped; stale
+  connection-scoped commands (0x0406/0x2019/0x201a/0x201b/0x2022) are answered
+  with the correct response shape (`0x02`) instead of being applied. Tests:
+  `stale_ltk_reply_is_answered_not_applied_after_handle_reuse`,
+  `stale_disconnect_and_set_data_length_keep_their_response_shape`. Stale
+  0x201a/0x201b replies now echo the handle as §4.5 requires.
+  Hardware fresh pairing on the current tree PASS (`7ade1071…`,
+  `secure,accept-control` opt-z+ICF, 2026-11-17): both sides cleared
+  (`load_result=0`, phone unpair verified), `pairs_complete=1`, `save_ok=1`,
+  six handshake counters = 1, encrypted TX/RX = 9/15, MIC/errors = 0
+  (`local-docs/results/x3-n1-pair-20261117`). This is the fresh-pairing
+  regression, not a fixed-point test of stale epoch injection.
 - [x] **Peripheral Host connection report skipped after a late first response.**
   Found while validating the batch above. Both secure peripheral examples
   (`ch585-trouble-gatt`, `ch585-hid-keyboard`) reported LE Connection Complete

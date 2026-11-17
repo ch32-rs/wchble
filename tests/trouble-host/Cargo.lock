@@ -370,6 +370,7 @@ name = "wchble"
 version = "0.1.0"
 dependencies = [
  "bt-hci",
+ "critical-section",
  "embassy-sync",
  "embedded-io",
 ]

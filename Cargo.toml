@@ -42,6 +42,7 @@ description = "Embassy-style BLE layer for ch32-hal / ch5xx-hal: Rust RF/LL + so
 
 [dependencies]
 bt-hci = { workspace = true, optional = true }
+critical-section = { version = "1", optional = true }
 defmt = { workspace = true, optional = true }
 embassy-sync = { workspace = true, optional = true }
 embedded-io = { workspace = true, optional = true }
@@ -60,7 +61,7 @@ ch585 = []
 ch592 = []
 ch595 = []
 # Soft HCI + LL surface for Trouble Host (`ExternalController` + runner).
-controller = ["dep:bt-hci", "dep:embassy-sync", "dep:embedded-io"]
+controller = ["dep:bt-hci", "dep:critical-section", "dep:embassy-sync", "dep:embedded-io"]
 # PHY scheduler helpers (can be used without full controller).
 phy = []
 # Test-only: let the storage layer inject a truncated program.

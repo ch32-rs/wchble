@@ -144,7 +144,9 @@ pub fn decode_client_att(
         }
         let mut record = ClientAttRecord {
             address_kind: input[offset],
-            address: input[offset + 1..offset + 7].try_into().expect("fixed length"),
+            address: input[offset + 1..offset + 7]
+                .try_into()
+                .expect("fixed length"),
             raw_len: raw_len as u8,
             raw: [0; RAW_MAX],
         };
@@ -204,7 +206,12 @@ mod tests {
         // A real table is far smaller than RAW_MAX: three CCCD entries are
         // `4 + 4 * 3 + 2 * 3 = 22` bytes, so four peers take 8 + 4 * 30.
         let raw = [0u8; 22];
-        let records = [record(1, &raw), record(2, &raw), record(3, &raw), record(4, &raw)];
+        let records = [
+            record(1, &raw),
+            record(2, &raw),
+            record(3, &raw),
+            record(4, &raw),
+        ];
         assert_eq!(MAX_CLIENT_ATT, super::super::bond::MAX_BONDS);
         assert!(MAX_PAYLOAD <= 256 - super::super::HEADER_LEN);
         assert_eq!(encoded_len(&records), 128);

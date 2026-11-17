@@ -22,6 +22,10 @@ _spec.loader.exec_module(io)
 assert io.ROOT == ROOT
 PROBE = io.PROBE
 NM = io.NM
+_spec = importlib.util.spec_from_file_location(
+    'ch585_build_manifest', ROOT / 'examples/ch585-scannable/tools/build_manifest.py')
+build_manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(build_manifest)
 EXAMPLE = ROOT / 'examples/ch585-peripheral'
 DEFAULT_ELF = EXAMPLE / 'target/riscv32imc-unknown-none-elf/release/ch585-peripheral'
 SMOKE = ROOT / 'examples/ch585-rf-smoke/target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke'
@@ -328,6 +332,13 @@ def execute(args):
         metadata['embedded_run_seconds'] = embedded_seconds
         if embedded_seconds != args.run_seconds:
             raise ValueError(f'ELF RUN_SECONDS={embedded_seconds}, but --run-seconds={args.run_seconds}')
+        if args.manifest is None:
+            raise ValueError('--manifest is required before any hardware access')
+        manifest = args.out / 'manifest.json'
+        shutil.copyfile(args.manifest, manifest)
+        metadata['manifest'] = str(manifest)
+        metadata['manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        build_manifest.verify(manifest, archived, 'peripheral', args.run_seconds, nm=args.nm)
         source = args.out / 'central.swift'
         shutil.copyfile(EXAMPLE / 'tools/central.swift', source)
         binary = (args.out / 'central').resolve()
@@ -410,6 +421,7 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--elf', type=Path, default=DEFAULT_ELF)
+    parser.add_argument('--manifest', type=Path)
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)
     parser.add_argument('--run-seconds', type=int, choices=(25, 360), default=25)

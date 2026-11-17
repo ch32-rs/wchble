@@ -46,6 +46,9 @@ macro_rules! ch58x_common {
                 }
             }
 
+            // Reached from the RAM `receive`/`transmit` hot path.
+            #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+            #[inline(never)]
             fn program_channel_bb(&mut self, channel: u8) {
                 let whiten = if self.whiten_disabled {
                     bb5::WHITEN_OFF
@@ -241,6 +244,9 @@ macro_rules! ch58x_common {
                 self.calibrate(clock)
             }
 
+            // Called from the RAM `LinkRadio::stop` hot path.
+            #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+            #[inline(never)]
             fn shut(&mut self) {
                 self.engine_shut();
                 self.isr.clear_rx_flags();
@@ -377,6 +383,46 @@ macro_rules! ch58x_common {
 
             fn crc_ok(&self) -> bool {
                 unsafe { regs::read(BB_BASE, bb::IRQSTAT) & bb_irq::CRC_ERR == 0 }
+            }
+        }
+
+        impl crate::rf::LinkRadio for $ty {
+            fn clear_rx_status(&mut self) {
+                unsafe {
+                    regs::write(BB_BASE, bb::IRQSTAT, 0xf0);
+                }
+            }
+
+            fn rx_state(&mut self) -> crate::rf::RxState {
+                let status = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
+                let bb = unsafe { regs::read(BB_BASE, bb::IRQSTAT) };
+                crate::rf::RxState {
+                    done: status & 5 != 0,
+                    crc_ok: bb & bb_irq::CRC_ERR == 0,
+                    captured: bb & bb_irq::CLKCAP != 0,
+                }
+            }
+
+            fn note_capture(&mut self, now_us: u32) {
+                self.note_anchor_us(now_us);
+                self.bb_isr();
+            }
+
+            // Every RX/TX ends here, inside the response window; keep it in RAM.
+            #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+            #[inline(never)]
+            fn stop<T: InstantUs>(&mut self, clock: &T) -> bool {
+                self.shut();
+                let start = clock.now_us();
+                while unsafe { regs::read(LLE_BASE, lle::CMD) } & 3 != 0 {
+                    if clock.now_us().wrapping_sub(start) >= 100 {
+                        return false;
+                    }
+                }
+                unsafe {
+                    core::arch::asm!("fence iorw, iorw", options(nostack));
+                }
+                true
             }
         }
     };

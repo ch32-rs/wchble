@@ -44,6 +44,63 @@ def elf_image(seconds=25):
     return bytes(image)
 
 
+MANIFEST_SYMBOLS = {
+    '_highcode_vma_start': (0x20000000, 0), '_highcode_vma_end': (0x20000030, 0),
+    'STATS': (0x3000, 4), 'TRACE': (0x4000, 4), 'RUN_SECONDS': (0x2000, 4),
+    'run_connection': (0x20000000, 0x10), 'receive': (0x20000010, 0x10),
+    'transmit': (0x20000020, 8), 'main': (0x20000028, 8),
+}
+DIGEST, HEAD = '1' * 64, '2' * 40
+
+
+def write_manifest(path, elf_path, role='peripheral', run_seconds=25, **overrides):
+    report = [{'root': 'run_connection', 'chain': ['run_connection', 'transmit'],
+               'call_site': 0x20000004, 'mnemonic': 'jal',
+               'target': 'transmit', 'target_address': 0x20000020}]
+    snapshot = Path(path).with_suffix('.tar.gz')
+    snapshot.write_bytes(b'snapshot')
+    modules = runner.build_manifest
+    elf_bytes = Path(elf_path).read_bytes()
+    payload = {
+        'schema': 2, 'role': role, 'run_seconds': run_seconds,
+        'features': '', 'recipe_source': 'declared', 'recipe_note': '',
+        'capture_context': 'capture-time tree',
+        'build': {'target': 'riscv32imc-unknown-none-elf', 'cwd': 'examples/x',
+                  'command': 'cargo build --release', 'env': {}},
+        'toolchain': {'rustc': 'rustc 1.95.0\nLLVM version: 21.1.2',
+                      'cargo': 'cargo 1.95.0', 'llvm_nm': 'LLVM version 21.1.2',
+                      'llvm_objdump': 'LLVM version 21.1.2',
+                      'linker': {'path': 'rust-lld', 'version': 'LLD 21'}},
+        'config': {'cargo_config': None, 'rust_toolchain': DIGEST},
+        'tree': {'head': HEAD, 'staged_sha256': DIGEST, 'unstaged_sha256': DIGEST,
+                 'untracked_names_sha256': DIGEST,
+                 'untracked_content_sha256': DIGEST, 'digest': DIGEST, 'dirty': False},
+        'path_inputs': {'ch5xx-hal': {'head': HEAD, 'digest': DIGEST, 'dirty': False}},
+        'snapshot': {'path': str(snapshot),
+                     'sha256': runner.hashlib.sha256(snapshot.read_bytes()).hexdigest()},
+        'locks': {'Cargo.lock': DIGEST},
+        'elf': {'sha256': runner.hashlib.sha256(elf_bytes).hexdigest(),
+                'size': len(elf_bytes)},
+        'highcode': {'start': 0x20000000, 'end': 0x20000030},
+        'symbols': {name: MANIFEST_SYMBOLS[name][0] for name in ('STATS', 'TRACE', 'RUN_SECONDS')},
+        'roots': [{'name': name, 'address': MANIFEST_SYMBOLS[name][0],
+                   'size': MANIFEST_SYMBOLS[name][1], 'in_highcode': True}
+                  for name in ('run_connection', 'receive', 'transmit', 'main')],
+        'hot_symbols': {name: None for name in modules.HOT_SYMBOLS},
+        'call_report': report,
+        'call_coverage': {name: {'functions': 1, 'depth_limited': False,
+                                 'unresolved_indirect': 0, 'unknown_targets': 0}
+                          for name in ('run_connection', 'receive', 'transmit', 'main')},
+        'review': {'status': 'reviewed', 'reviewer': 'test', 'utc': 'now',
+                   'elf_sha256': runner.hashlib.sha256(elf_bytes).hexdigest(),
+                   'report_sha256': modules.report_digest(report),
+                   'note': 'checked'},
+    }
+    payload.update(overrides)
+    Path(path).write_text(json.dumps(payload))
+    return Path(path)
+
+
 def good_stats(cycles=1, hold=1, seconds=25):
     stats = [0] * 64
     for index, value in {0: 0x50333538, 1: 1, 2: 9, 3: 10, 4: 10, 6: 1000,
@@ -237,7 +294,7 @@ class ValidationTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
-    def run_mocked(self, mode='pass', seconds=25):
+    def run_mocked(self, mode='pass', seconds=25, manifest_kwargs=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             elf, smoke, out = root / 'test.elf', root / 'smoke.elf', root / 'out'
@@ -245,8 +302,13 @@ class ExecutionTests(unittest.TestCase):
             if mode == 'ram_gap': struct.pack_into('<I', image, 220, 0x20000024)
             elf.write_bytes(image)
             smoke.write_bytes(b'smoke')
+            manifest = None
+            if mode != 'no_manifest':
+                manifest = write_manifest(root / 'manifest.json', elf,
+                                          **(manifest_kwargs or {}))
             args = argparse.Namespace(out=out, elf=elf, smoke_elf=smoke, nm='mock-nm',
-                                      run_seconds=25, cycles=1, hold=1, timeout=20)
+                                      run_seconds=25, cycles=1, hold=1, timeout=20,
+                                      manifest=manifest)
             now, calls = [100.0], []
 
             def command(argv, path, timeout=40):
@@ -328,6 +390,12 @@ class ExecutionTests(unittest.TestCase):
                     patch.object(runner.io, 'flash', side_effect=flash), \
                     patch.object(runner.io, 'read32', side_effect=read), \
                     patch.object(runner.subprocess, 'Popen', Client), \
+                    patch.object(runner.build_manifest, 'nm_symbols',
+                                 return_value=dict(MANIFEST_SYMBOLS)), \
+                    patch.object(runner.build_manifest, 'sections',
+                                 return_value={'.highcode': {
+                                     'size': 0x30, 'vma': 0x20000000, 'lma': 4,
+                                     'type': 'TEXT'}}), \
                     patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]), \
                     patch.object(runner.time, 'sleep', side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
                     contextlib.redirect_stderr(io.StringIO()):
@@ -358,6 +426,24 @@ class ExecutionTests(unittest.TestCase):
                 code, result, calls, _ = self.run_mocked(mode, seconds)
                 self.assertEqual(code, 1)
                 self.assertFalse(any(call[0] in ('read', 'flash', 'idle', 'client', 'halt') for call in calls))
+                self.assertIn('NOT ATTEMPTED', result['smoke_recovery'])
+
+    def test_manifest_gate_fails_before_hardware(self):
+        cases = {'no_manifest': None,
+                 'role': {'role': 'central'},
+                 'run_seconds': {'run_seconds': 60},
+                 'elf': {'elf': {'sha256': '0' * 64}}}
+        for mode, overrides in cases.items():
+            with self.subTest(mode=mode):
+                if overrides is None:
+                    code, result, calls, _ = self.run_mocked('no_manifest')
+                else:
+                    code, result, calls, _ = self.run_mocked(manifest_kwargs=overrides)
+                self.assertEqual(code, 1)
+                self.assertFalse(any(call[0] in ('read', 'flash', 'idle', 'client', 'halt')
+                                     for call in calls))
+                self.assertTrue(any('manifest' in error.lower() for error in result['errors']),
+                                result['errors'])
                 self.assertIn('NOT ATTEMPTED', result['smoke_recovery'])
 
     def test_initial_preflight_failure_prevents_client_but_recovery_flashes(self):

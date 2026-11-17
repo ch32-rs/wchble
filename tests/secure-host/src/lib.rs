@@ -850,4 +850,370 @@ mod tests {
             .iter()
             .any(|record| record.address_kind == kind && record.address == address));
     }
+
+    /// Lifecycle through the shared `ll::link` + `hci::link` engine instead of the
+    /// fixture's direct `ConnectionBridge` calls: the real Trouble Host must see
+    /// Connection Complete and Disconnection Complete exactly once per link and
+    /// re-enable advertising after the shared close.
+    #[cfg(test)]
+    mod shared_driver {
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::task::{Context, Waker};
+        use std::rc::Rc;
+
+        use wchble::crypto::Aes128;
+        use wchble::hci::connection::RadioRequest;
+        use wchble::hci::link::{LinkExtras, RunnerHost};
+        use wchble::hci::SoftRunner;
+        use wchble::ll::conn::ConnectParams;
+        use wchble::ll::ctrl::{feature_bits, FEATURE_LE_CSA2, FEATURE_LE_DATA_LENGTH_EXTENSION};
+        use wchble::ll::link::{self, Control, Session, X1Snapshot};
+        use wchble::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
+        use wchble::rf::{Channel, LinkRadio, PhyMode, Radio, RfCallback, RxState};
+        use wchble::time::InstantUs;
+
+        use crate::host;
+
+        const FINISH: u32 = 120_000_000;
+        const PUMP_LIMIT: usize = 2048;
+
+        struct FakeClock {
+            now: Rc<Cell<u32>>,
+        }
+
+        impl FakeClock {
+            fn new(start: u32) -> Self {
+                Self {
+                    now: Rc::new(Cell::new(start)),
+                }
+            }
+            fn now(&self) -> u32 {
+                self.now.get()
+            }
+            fn handle(&self) -> Rc<Cell<u32>> {
+                self.now.clone()
+            }
+        }
+
+        impl InstantUs for FakeClock {
+            fn now_us(&self) -> u32 {
+                let v = self.now.get();
+                self.now.set(v.wrapping_add(1));
+                v
+            }
+            fn delay_us(&self, us: u32) {
+                self.now.set(self.now.get().wrapping_add(us));
+            }
+        }
+
+        struct Frame {
+            bytes: Vec<u8>,
+            crc_ok: bool,
+        }
+
+        struct FakeRadio {
+            windows: std::collections::VecDeque<Option<Frame>>,
+            armed: Option<Frame>,
+            sent: Vec<Vec<u8>>,
+            channel: u8,
+        }
+
+        impl FakeRadio {
+            fn new() -> Self {
+                Self {
+                    windows: std::collections::VecDeque::new(),
+                    armed: None,
+                    sent: Vec::new(),
+                    channel: 0,
+                }
+            }
+            fn push_bad(&mut self, header: u8, payload: &[u8]) {
+                let mut bytes = vec![header, payload.len() as u8];
+                bytes.extend_from_slice(payload);
+                self.windows
+                    .push_back(Some(Frame { bytes, crc_ok: false }));
+            }
+            fn push_missed(&mut self) {
+                self.windows.push_back(None);
+            }
+        }
+
+        impl Radio for FakeRadio {
+            fn init<T: InstantUs>(&mut self, _clock: &T) -> wchble::Result<()> {
+                Ok(())
+            }
+            fn recalibrate<T: InstantUs>(&mut self, _clock: &T) -> wchble::Result<()> {
+                Ok(())
+            }
+            fn shut(&mut self) {}
+            fn set_channel(&mut self, channel: Channel) -> wchble::Result<()> {
+                self.channel = channel;
+                Ok(())
+            }
+            fn channel(&self) -> Channel {
+                self.channel
+            }
+            fn set_aa_crc(&mut self, _access_address: u32, _crc_init: u32) {}
+            fn set_phy(&mut self, _tx: PhyMode, _rx: PhyMode) {}
+            fn set_whiten_disabled(&mut self, _disabled: bool) {}
+            fn set_encrypt(&mut self, _enabled: bool) {}
+            fn set_callback(&mut self, _cb: Option<RfCallback>) {}
+            unsafe fn tx_basic<T: InstantUs>(
+                &mut self,
+                _clock: &T,
+                frame: &[u8],
+                _timeout_half_us: u32,
+                _start_cputime: Option<u32>,
+            ) -> wchble::Result<()> {
+                self.sent.push(frame.to_vec());
+                Ok(())
+            }
+            unsafe fn rx_basic<T: InstantUs>(
+                &mut self,
+                _clock: &T,
+                rxbuf: &mut [u8],
+                _window_half_us: u32,
+            ) -> wchble::Result<()> {
+                let window = self.windows.pop_front().flatten();
+                if let Some(frame) = &window {
+                    rxbuf[..frame.bytes.len()].copy_from_slice(&frame.bytes);
+                }
+                self.armed = window;
+                Ok(())
+            }
+            fn rssi(&self) -> i8 {
+                0
+            }
+            fn crc_ok(&self) -> bool {
+                true
+            }
+        }
+
+        impl LinkRadio for FakeRadio {
+            fn clear_rx_status(&mut self) {
+                self.armed = None;
+            }
+            fn rx_state(&mut self) -> RxState {
+                match &self.armed {
+                    Some(frame) => RxState {
+                        done: true,
+                        crc_ok: frame.crc_ok,
+                        captured: true,
+                    },
+                    None => RxState::default(),
+                }
+            }
+            fn note_capture(&mut self, _now_us: u32) {}
+            fn stop<T: InstantUs>(&mut self, _clock: &T) -> bool {
+                true
+            }
+        }
+
+        struct Extras {
+            now: Rc<Cell<u32>>,
+        }
+
+        impl LinkExtras for Extras {
+            type Aes = Aes128;
+
+            fn local_features(&self) -> [u8; 8] {
+                feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2])
+            }
+            fn stat_inc(&mut self, _slot: usize) {}
+            fn stat_put(&mut self, _slot: usize, _value: u32) {}
+            fn stat_get(&self, _slot: usize) -> u32 {
+                0
+            }
+            fn sec_inc(&mut self, _slot: usize) {}
+            fn sec_put(&mut self, _slot: usize, _value: u32) {}
+            fn trace(&mut self, _a: u32, _b: u32, _c: u16, _d: u8, _e: u8, _f: u8, _g: u32, _h: u32) {}
+            fn diag_acl_raw(&mut self, _llid: u8, _payload: &[u8], _ciphertext: bool) {}
+            fn diag_acl_plain(&mut self, _llid: u8, _payload: &[u8]) {}
+            fn diag_control_opcode(&mut self, _opcode: u8) {}
+            fn note_bad_pdu(&mut self, _header: u8, _len: usize) {}
+            fn note_rx_frame(&mut self, _len: usize) {}
+            fn note_rx_oversize(&mut self) {}
+            fn note_start_req_queued(&mut self) {}
+            fn note_start_rsp_queued(&mut self) {}
+            fn diag_skipped_event(&mut self) {}
+            fn publish_x1(&mut self, _snapshot: &X1Snapshot) {}
+            fn idle_gap(&mut self, _soft: &mut SoftRunner, _deadline: u32, until: u32) {
+                // Production blocks here until `until`; the fake clock jumps.
+                self.now.set(until);
+            }
+            fn after_close(&mut self, _soft: &mut SoftRunner) {}
+            fn on_disconnect_request(&mut self, _reason: u8) {}
+            fn pre_iteration(&mut self) {}
+        }
+
+        fn connect_pdu() -> [u8; 36] {
+            let mut pdu = [0; 36];
+            pdu[0] = 0x85;
+            pdu[1] = 34;
+            pdu[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+            pdu[8..14].copy_from_slice(&[0xc0; 6]);
+            pdu[14..18].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            pdu[18..21].copy_from_slice(&[0x55, 0x55, 0x55]);
+            pdu[21] = 2;
+            pdu[24..26].copy_from_slice(&24u16.to_le_bytes());
+            pdu[28..30].copy_from_slice(&200u16.to_le_bytes());
+            pdu[30..35].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x1f]);
+            pdu[35] = 5;
+            pdu
+        }
+
+        fn pump<F: Future>(
+            soft: &mut SoftRunner,
+            future: &mut Pin<&mut F>,
+            stats: &host::HostStats,
+        ) {
+            soft.pump_once();
+            if let Some(request) = soft.bridge.take_radio_request() {
+                match request {
+                    RadioRequest::Reset => soft.bridge.reset_finished(),
+                    RadioRequest::Disconnect { reason } => {
+                        panic!("unexpected Host disconnect request: {reason:#04x}");
+                    }
+                }
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                stats.word(host::STAT_ERRORS),
+                0,
+                "Host error stage {}",
+                stats.word(host::STAT_LAST_ERROR)
+            );
+        }
+
+        /// One production outer-loop iteration plus a Host poll.
+        #[allow(clippy::too_many_arguments)]
+        fn step_and_pump<F: Future>(
+            soft: &mut SoftRunner,
+            future: &mut Pin<&mut F>,
+            stats: &host::HostStats,
+            clock: &FakeClock,
+            radio: &mut FakeRadio,
+            rx: &mut DmaBuf<RX_DMA_MIN>,
+            tx: &mut DmaBuf<MAX_PDU>,
+            session: &mut Session<wchble::crypto::Aes128>,
+            finish: u32,
+        ) -> Control {
+            let mut host = RunnerHost::new(soft, Extras { now: clock.handle() });
+            let control = link::step(session, &mut host, radio, clock, rx, tx, finish);
+            drop(host);
+            pump(soft, future, stats);
+            control
+        }
+
+        #[test]
+        fn shared_engine_lifecycle_is_reported_once_and_readvertises() {
+            let _guard = super::serialize();
+            let stats = host::HostStats::new();
+            let mut soft = SoftRunner::new();
+            let mut future = core::pin::pin!(host::run(
+                wchble::hci::new(),
+                &stats,
+                host::RANDOM_ADDRESS,
+                None,
+                900
+            ));
+            for _ in 0..PUMP_LIMIT {
+                pump(&mut soft, &mut future.as_mut(), &stats);
+                if soft.adv_enabled() {
+                    break;
+                }
+            }
+            assert!(soft.adv_enabled(), "Host advertises");
+
+            let clock = FakeClock::new(0);
+            let mut radio = FakeRadio::new();
+            let mut rx = DmaBuf::zeroed();
+            let mut tx = DmaBuf::zeroed();
+
+            for cycle in 1..=2u32 {
+                let now = clock.now();
+                let params = ConnectParams::parse(&connect_pdu(), true, [0xc0; 6], true).unwrap();
+                let features =
+                    feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]);
+                let mut session = Session::new(params, false, now + 1_000, now, [0x55; 12], features);
+                radio.push_bad(0x01, &[]);
+
+                // The production outer loop: idle to the first event, then run it.
+                for _ in 0..4 {
+                    let control = step_and_pump(
+                        &mut soft,
+                        &mut future.as_mut(),
+                        &stats,
+                        &clock,
+                        &mut radio,
+                        &mut rx,
+                        &mut tx,
+                        &mut session,
+                        clock.now().wrapping_add(FINISH),
+                    );
+                    assert_eq!(control, Control::Continue);
+                    if stats.word(host::STAT_CONNECTIONS) == cycle {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    stats.word(host::STAT_CONNECTIONS),
+                    cycle,
+                    "Connection Complete exactly once per link"
+                );
+                assert_eq!(
+                    stats.word(host::STAT_DISCONNECTS),
+                    cycle - 1,
+                    "the link is still up after establishment"
+                );
+                assert!(!soft.adv_enabled(), "shared step disabled advertising");
+
+                // No packet arrives: walk past the negotiated 2 s supervision timeout.
+                clock.delay_us(2_500_000);
+                let control = step_and_pump(
+                    &mut soft,
+                    &mut future.as_mut(),
+                    &stats,
+                    &clock,
+                    &mut radio,
+                    &mut rx,
+                    &mut tx,
+                    &mut session,
+                    clock.now().wrapping_add(FINISH),
+                );
+                assert_eq!(
+                    control,
+                    Control::Closed(0x08),
+                    "supervision timeout is the close reason"
+                );
+                drop(session);
+
+                for _ in 0..PUMP_LIMIT {
+                    pump(&mut soft, &mut future.as_mut(), &stats);
+                    if stats.word(host::STAT_DISCONNECTS) == cycle {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    stats.word(host::STAT_DISCONNECTS),
+                    cycle,
+                    "Disconnection Complete exactly once per link"
+                );
+                for _ in 0..PUMP_LIMIT {
+                    pump(&mut soft, &mut future.as_mut(), &stats);
+                    if soft.adv_enabled() {
+                        break;
+                    }
+                }
+                assert!(
+                    soft.adv_enabled(),
+                    "Host re-enabled advertising after cycle {cycle}"
+                );
+            }
+        }
+
+    }
 }

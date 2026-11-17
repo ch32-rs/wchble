@@ -223,8 +223,7 @@ impl Ch32v208Radio {
                 unsafe {
                     regs::write(LLE_BASE, lle::WINDOW, reload);
                 }
-                self.isr
-                    .dispatch(RfEvent::RxStart, self.isr.last_anchor_us);
+                self.isr.dispatch(RfEvent::RxStart, self.isr.last_anchor_us);
             }
         }
         unsafe {
@@ -375,20 +374,10 @@ impl Ch32v208Radio {
             let ga_high = i32::from(ga[1]) - i32::from(ga[2]);
 
             for i in 0..40usize {
-                analog::nibble_write(
-                    RFEND_BASE,
-                    rfend::VCOTAB,
-                    i,
-                    co_low * (39 - i as i32) / 39,
-                );
+                analog::nibble_write(RFEND_BASE, rfend::VCOTAB, i, co_low * (39 - i as i32) / 39);
             }
             for i in 1..=42usize {
-                analog::nibble_write(
-                    RFEND_BASE,
-                    rfend::VCOTAB,
-                    39 + i,
-                    co_high * i as i32 / 40,
-                );
+                analog::nibble_write(RFEND_BASE, rfend::VCOTAB, 39 + i, co_high * i as i32 / 40);
             }
             for i in 0..10usize {
                 analog::nibble_write(
@@ -414,7 +403,12 @@ impl Ch32v208Radio {
             regs::rmw(RFEND_BASE, rfend::FREQMODE, 0, 0x10);
             regs::rmw(RFEND_BASE, rfend::CFG38, 0x3f, u32::from(co[1]));
             // Open: (RF(0x38) & 0x80ffffff) | (ga_mid << 24)
-            regs::rmw(RFEND_BASE, rfend::CFG38, 0x7f00_0000, u32::from(ga[1]) << 24);
+            regs::rmw(
+                RFEND_BASE,
+                rfend::CFG38,
+                0x7f00_0000,
+                u32::from(ga[1]) << 24,
+            );
         }
         Ok(())
     }
@@ -513,8 +507,8 @@ impl Ch32v208Radio {
             regs::write(BB_BASE, bb::RFCTRL, v);
         }
         self.channel = channel;
-        self.synth_khz =
-            timing::freq_for_channel_khz(channel).saturating_sub(u32::from(timing::lo_inject_khz(phy)));
+        self.synth_khz = timing::freq_for_channel_khz(channel)
+            .saturating_sub(u32::from(timing::lo_inject_khz(phy)));
     }
 
     fn phy_bits_tx(mode: PhyMode) -> u32 {

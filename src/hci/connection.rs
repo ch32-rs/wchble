@@ -5,7 +5,10 @@ use bt_hci::transport::PacketKind;
 
 use crate::ll::Role;
 
-use super::transport::{self, Packet};
+use super::transport::{self, LinkKey, Packet};
+
+/// The transport slot this single bridge owns until X3 assigns slots per link.
+const LINK_SLOT: u8 = 0;
 
 /// Maximum Host ACL payload advertised through `LE Read Buffer Size`: the
 /// DLE on-air maximum of 251 octets. The Host may still hand over smaller
@@ -52,6 +55,12 @@ pub enum BridgeError {
 pub struct TxTag {
     epoch: u32,
     serial: u32,
+}
+
+/// Test-only identity for fixtures that supply their own TX buffer.
+#[cfg(test)]
+pub(crate) fn test_tag(epoch: u32, serial: u32) -> TxTag {
+    TxTag { epoch, serial }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,6 +237,13 @@ impl ConnectionBridge {
         self.epoch
     }
 
+    pub(crate) fn link_key(&self) -> LinkKey {
+        LinkKey {
+            slot: LINK_SLOT,
+            generation: self.epoch,
+        }
+    }
+
     /// Reserve lifecycle storage before the LL accepts a new connection.
     pub fn connected(&mut self, info: ConnectionInfo) -> Result<(), BridgeError> {
         if self.info.is_some() || self.resetting {
@@ -246,6 +262,7 @@ impl ConnectionBridge {
         self.epoch = self.epoch.wrapping_add(1);
         self.info = Some(info);
         self.disconnecting = false;
+        transport::set_link(LINK_SLOT, Some((info.handle, self.link_key())));
         if let Some(subevent) = self.connection_event_slot() {
             let (parameters, len) =
                 connection_event(Some(&info), 0, subevent == ENHANCED_CONNECTION_COMPLETE);
@@ -275,12 +292,15 @@ impl ConnectionBridge {
         Ok(())
     }
 
+    /// Close this link only: its TX/RX data, completions, DLE request and
+    /// published identity. Event masks, addresses, lists and features stay.
     /// Called only once the radio has stopped using this connection's buffers.
     pub fn disconnected(&mut self, reason: u8) {
         let Some(info) = self.info.take() else {
             return;
         };
         self.clear_data();
+        transport::set_link(LINK_SLOT, None);
         self.radio_request = None;
         self.disconnecting = false;
         if !self.resetting && self.event_enabled(0x05) {
@@ -497,6 +517,7 @@ impl ConnectionBridge {
         }
         self.info = None;
         self.clear_data();
+        transport::set_link(LINK_SLOT, None);
         self.events = [None; EVENT_CAPACITY];
         self.radio_request = None;
         self.disconnecting = false;

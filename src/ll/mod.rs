@@ -7,6 +7,7 @@ pub mod conn;
 pub mod ctrl;
 pub mod dle;
 pub mod enc;
+pub mod link;
 #[cfg(feature = "controller")]
 pub mod privacy;
 pub mod scan;

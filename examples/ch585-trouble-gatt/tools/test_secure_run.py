@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Offline tests for the secure runner's rejection gates; no hardware access."""
+import argparse
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -352,6 +358,43 @@ class FalTests(unittest.TestCase):
         assessed['ll_control'] = []
         self.assertTrue(any('never started encryption' in error
                             for error in capture.evaluate(assessed, 'fal')))
+
+
+class PreflightTests(unittest.TestCase):
+    def test_missing_manifest_never_touches_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            elf = root / 'image.elf'
+            elf.write_bytes(b'\x7fELF-test')
+            wanted = ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES',
+                      'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO', 'CATT_STATS',
+                      'X4_STATS', 'X1_STATS', 'PERIPHERAL_ADDRESS')
+            text = '\n'.join(f'20000200 T {name}' for name in wanted)
+            text += '\n20000300 T _embassy_crypto_aes128ecb_encrypt_blocks'
+            args = argparse.Namespace(out=root / 'out', elf=elf, smoke_elf=elf,
+                                      nm='nm', mode='att', run_seconds=60,
+                                      timeout=40, expect_irk_fingerprint=None,
+                                      manifest=None)
+            calls = []
+
+            def command(argv, *rest, **kwargs):
+                calls.append(argv[0])
+                return text
+
+            with patch.object(secure.io, 'command', side_effect=command), \
+                    patch.object(secure, 'validate_observation_buffers',
+                                 side_effect=lambda image, symbols, extra=(): symbols), \
+                    patch.object(secure.p4, 'symbols_from',
+                                 return_value={'RUN_SECONDS': 0x2000}), \
+                    patch.object(secure.p4, 'validate_ram_layout', return_value={}), \
+                    patch.object(secure.p4, 'embedded_u32', return_value=60), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = secure.execute(args)
+            result = json.loads((args.out / 'result.json').read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, ['nm'])
+            self.assertTrue(any('manifest' in error.lower() for error in result['errors']))
+            self.assertEqual(result['smoke_recovery'], 'NOT ATTEMPTED')
 
 
 if __name__ == '__main__':

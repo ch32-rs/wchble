@@ -130,18 +130,23 @@ impl CentralConnection {
         time_reached(now_us, self.supervision_deadline_us())
     }
 
-    /// Call only for a CRC-correct data-channel packet. Returns false when the
-    /// packet cannot establish or refresh the link. The anchor is deliberately
-    /// unchanged; the central's own schedule defines it.
+    /// Call for every received data-channel packet whose access address
+    /// matched. Any packet establishes the link, even with a CRC error; only a
+    /// valid packet refreshes supervision (Core 5.4 Vol 6 Part B §4.5.2).
+    /// The anchor is deliberately unchanged; the central's own schedule
+    /// defines it.
     pub fn on_rx(&mut self, rx_done_us: u32, payload_len: u8, crc_ok: bool) -> bool {
-        if !crc_ok
-            || usize::from(payload_len) > usize::from(self.rx_max_payload)
-            || self.supervision_expired(rx_done_us)
-        {
+        if self.supervision_expired(rx_done_us) {
+            return false;
+        }
+        self.established = true;
+        if !crc_ok {
+            return true;
+        }
+        if usize::from(payload_len) > usize::from(self.rx_max_payload) {
             return false;
         }
         self.supervision_base_us = rx_done_us;
-        self.established = true;
         true
     }
 
@@ -192,15 +197,25 @@ impl CentralConnection {
         }
         if let Some(update) = self.pending_update {
             if update.instant == self.event_counter {
-                // WinOffset is relative to the anchor of the instant event.
-                self.event_start_us = self
-                    .event_start_us
-                    .wrapping_add(u32::from(update.win_offset) * 1250);
+                let old_deadline = self.supervision_deadline_us();
+                // The instant is the old-schedule anchor; WinOffset moves the
+                // send window, not the instant (§5.1.1).
+                let instant_us = self.event_start_us;
+                self.event_start_us = instant_us.wrapping_add(u32::from(update.win_offset) * 1250);
                 self.params.win_size = update.win_size;
                 self.params.win_offset = update.win_offset;
                 self.params.interval = update.interval;
                 self.params.latency = update.latency;
                 self.params.timeout = update.timeout;
+                // §5.1.1: the supervision timer restarts at the instant.
+                // Only a deadline reached before the instant may not be
+                // pushed past it; one reached between the instant and the
+                // offset send window was still alive at the instant.
+                self.supervision_base_us = if time_reached(instant_us, old_deadline) {
+                    old_deadline.wrapping_sub(u32::from(self.params.timeout) * 10_000)
+                } else {
+                    self.event_start_us
+                };
                 self.pending_update = None;
             }
         }
@@ -297,6 +312,99 @@ mod tests {
     }
 
     #[test]
+    fn crc_error_establishes_without_refreshing_supervision() {
+        let mut conn = CentralConnection::new(params(), 1000);
+        assert!(conn.on_rx(2_000, 0, false));
+        assert!(conn.established());
+        // The timer was not reset: it still runs from the CONNECT_IND base,
+        // but the established link now uses the negotiated timeout.
+        assert_eq!(conn.supervision_deadline_us(), 1000 + 200 * 10_000);
+        // The next valid packet is what restarts the timer.
+        assert!(conn.on_rx(3_000, 0, true));
+        assert_eq!(conn.supervision_deadline_us(), 3_000 + 200 * 10_000);
+    }
+
+    #[test]
+    fn crc_error_after_the_establishment_deadline_is_rejected() {
+        let mut conn = CentralConnection::new(params(), 1000);
+        assert!(!conn.on_rx(conn.supervision_deadline_us(), 0, false));
+        assert!(!conn.established());
+    }
+
+    #[test]
+    fn update_instant_restarts_supervision_at_the_new_anchor() {
+        let mut conn = CentralConnection::new(params(), 0);
+        assert!(conn.on_rx(500, 0, true));
+        conn.schedule_update(ConnectionUpdate {
+            win_size: 1,
+            win_offset: 1,
+            interval: 40,
+            latency: 0,
+            timeout: 100,
+            instant: 2,
+        })
+        .unwrap();
+        conn.next_event().unwrap();
+        conn.next_event().unwrap();
+        assert_eq!(conn.params.timeout, 100);
+        assert_eq!(
+            conn.supervision_deadline_us(),
+            conn.event_start_us() + 100 * 10_000
+        );
+    }
+
+    #[test]
+    fn update_window_resets_a_deadline_that_falls_before_the_window() {
+        let mut p = params();
+        p.timeout = 10; // 100 ms
+        let mut conn = CentralConnection::new(p, 0);
+        assert!(conn.on_rx(500, 0, true));
+        assert_eq!(conn.supervision_deadline_us(), 100_500);
+        // The instant anchor (92,500) is still inside the old deadline, but
+        // the offset window (117,500) is not. The link was alive at the
+        // instant, so the timer restarts at the window rather than expiring
+        // during the offset wait.
+        conn.schedule_update(ConnectionUpdate {
+            win_size: 1,
+            win_offset: 20,
+            interval: 24,
+            latency: 0,
+            timeout: 10,
+            instant: 3,
+        })
+        .unwrap();
+        for _ in 0..3 {
+            conn.next_event().unwrap();
+        }
+        assert_eq!(conn.event_start_us(), 117_500);
+        assert_eq!(conn.supervision_deadline_us(), 217_500);
+    }
+
+    #[test]
+    fn update_instant_cannot_extend_a_deadline_reached_while_waiting() {
+        let mut p = params();
+        p.timeout = 10; // 100 ms
+        let mut conn = CentralConnection::new(p, 0);
+        // The old deadline (100.5 ms) expires before the instant event
+        // (about 123.75 ms), so the update must not revive the link.
+        assert!(conn.on_rx(500, 0, true));
+        conn.schedule_update(ConnectionUpdate {
+            win_size: 1,
+            win_offset: 1,
+            interval: 24,
+            latency: 0,
+            timeout: 10,
+            instant: 4,
+        })
+        .unwrap();
+        let old_deadline = conn.supervision_deadline_us();
+        for _ in 0..4 {
+            conn.next_event().unwrap();
+        }
+        assert_eq!(conn.supervision_deadline_us(), old_deadline);
+    }
+
+    #[test]
     fn reception_establishes_without_moving_the_anchor() {
         let mut conn = CentralConnection::new(params(), 1000);
         let anchor = conn.event_start_us();
@@ -304,7 +412,8 @@ mod tests {
         assert!(conn.on_rx(anchor + 400, 0, true));
         assert!(conn.established());
         assert_eq!(conn.event_start_us(), anchor);
-        assert!(!conn.on_rx(anchor + 500, 0, false));
+        // A CRC error after establishment keeps the link and the anchor.
+        assert!(conn.on_rx(anchor + 500, 0, false));
         conn.next_event().unwrap();
         assert_eq!(conn.event_start_us(), anchor + 24 * 1250);
         assert_eq!(conn.channel(), 10);

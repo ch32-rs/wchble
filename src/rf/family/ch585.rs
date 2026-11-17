@@ -593,6 +593,10 @@ impl Ch585Radio {
     }
 
     /// Vendor `ble_ll_hw_api_shut` (`ip.o`).
+    ///
+    /// Called from the RAM `LinkRadio::stop` between RX done and TX start.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
     fn engine_shut(&mut self) {
         unsafe {
             regs::rmw(LLE_BASE, lle::MODE, lle5_mode::SHUT_MASK, 0);
@@ -609,6 +613,29 @@ impl Ch585Radio {
             regs::write(RFEND_BASE, rfend5::FECTRL, v);
             regs::write(LLE_BASE, lle::MODE, lle5_mode::POST_INIT);
         }
+    }
+}
+
+/// SysTick CNTL: the counter the timeout `Clock` also samples.
+const SYSTICK_CNTL: *const u32 = 0xe000_f008 as *const u32;
+
+#[inline(always)]
+fn systick() -> u32 {
+    // SAFETY: read-only hardware counter; no DMA or aliasing.
+    unsafe { core::ptr::read_volatile(SYSTICK_CNTL) }
+}
+
+/// RF-trigger to `LLE CMD=2` target for scheduled responses.
+///
+/// X3.2a N=1: 160/232/320-tick targets passed, 128 and 728 failed; before this
+/// constant the interval was whatever code sat between the two writes.
+const TX_TRIG_CMD_TICKS: u32 = 232;
+
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+#[inline(never)]
+fn wait_trig_gap(start: u32) {
+    while systick().wrapping_sub(start) < TX_TRIG_CMD_TICKS {
+        core::hint::spin_loop();
     }
 }
 
@@ -718,7 +745,14 @@ ch58x_common! {
             regs::rmw(BB_BASE, bb::RFCTRL, 0, bb5::TX_TRIG);
             regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0);
         }
+        let trig_ticks = if start_cputime.is_some() { systick() } else { 0 };
         let started = clock.now_us();
+        // Scheduled responses need a fixed TRIG->CMD interval; it used to fall
+        // out of whatever code sat between the writes (X3.2a N=1). Sampling
+        // the clock first keeps its cost inside the enforced gap.
+        if start_cputime.is_some() {
+            wait_trig_gap(trig_ticks);
+        }
         unsafe {
             regs::write(LLE_BASE, lle::CMD, 2);
         }
@@ -818,6 +852,13 @@ mod aes_block {
 
     fn le_word(bytes: &[u8]) -> u32 {
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    #[cfg(feature = "controller")]
+    impl crate::hci::link::AesFromKey for Ch585Aes {
+        fn from_key(key: &[u8; 16]) -> Self {
+            Self::new(key)
+        }
     }
 
     impl AesEngine for Ch585Aes {

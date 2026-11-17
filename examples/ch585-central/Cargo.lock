@@ -112,7 +112,7 @@ dependencies = [
 [[package]]
 name = "ch5xx-metapac"
 version = "0.1.2"
-source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=ee136f4#ee136f4b9f0a80c8ac0aa43958da009ab04b406f"
+source = "git+https://github.com/ch32-rs/ch5xx-metapac?rev=680e2e12#680e2e12436bc4a6b9dbd483f03d2d8e2f7bbf5e"
 dependencies = [
  "cortex-m",
  "riscv",
@@ -641,6 +641,7 @@ name = "wchble"
 version = "0.1.0"
 dependencies = [
  "bt-hci",
+ "critical-section",
  "embassy-sync",
  "embedded-io",
 ]

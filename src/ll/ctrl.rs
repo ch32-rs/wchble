@@ -107,13 +107,11 @@ impl ControlPdu {
     /// (peripheral role). Both carry the sender's own FeatureSet; the opcode
     /// is role-specific (Core 5.4 Vol 6 Part B 5.1.4).
     pub fn feature_req(features: [u8; 8]) -> Self {
-        Self::new(&[LlCtrlOpcode::FeatureReq as u8])
-            .with_features(features)
+        Self::new(&[LlCtrlOpcode::FeatureReq as u8]).with_features(features)
     }
 
     pub fn peripheral_feature_req(features: [u8; 8]) -> Self {
-        Self::new(&[LlCtrlOpcode::PeripheralFeatureReq as u8])
-            .with_features(features)
+        Self::new(&[LlCtrlOpcode::PeripheralFeatureReq as u8]).with_features(features)
     }
 
     fn with_features(self, features: [u8; 8]) -> Self {

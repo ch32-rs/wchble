@@ -16,9 +16,7 @@
 //! - [`Certainty::Unverified`] — shape known, value or side-effects unclear.
 
 use crate::rf::analog::AnalogInit;
-use crate::rf::family::tables::{
-    BbDevInit, Certainty, LleDevInit, RegInit, RfendInit,
-};
+use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::{Channel, PhyMode, Radio, RfCallback};
 use crate::time::InstantUs;

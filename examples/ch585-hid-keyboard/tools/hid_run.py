@@ -31,6 +31,8 @@ def load(name, path):
 p4 = load('hid_p4_runner', ROOT / 'examples/ch585-trouble-gatt/tools/run.py')
 secure = load('hid_secure_runner', ROOT / 'examples/ch585-trouble-gatt/tools/secure_run.py')
 io, PROBE, NM = p4.io, p4.PROBE, p4.NM
+build_manifest = load('ch585_build_manifest',
+                      ROOT / 'examples/ch585-scannable/tools/build_manifest.py')
 SMOKE = p4.SMOKE
 EXAMPLE = ROOT / 'examples/ch585-hid-keyboard'
 DEFAULT_ELF = EXAMPLE / 'target/riscv32imc-unknown-none-elf/release/ch585-hid-keyboard'
@@ -288,6 +290,13 @@ def execute(args):
         metadata['embedded_run_seconds'] = embedded
         if embedded != args.run_seconds:
             raise ValueError(f'ELF RUN_SECONDS={embedded}, requested {args.run_seconds}')
+        if args.manifest is None:
+            raise ValueError('--manifest is required before any hardware access')
+        manifest = args.out / 'manifest.json'
+        shutil.copyfile(args.manifest, manifest)
+        metadata['manifest'] = str(manifest)
+        metadata['manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        build_manifest.verify(manifest, archived, 'hid', args.run_seconds, nm=args.nm)
         if args.timeout + 3 > args.run_seconds:
             raise ValueError('--timeout plus the cleanup margin exceeds RUN_SECONDS')
 
@@ -409,6 +418,7 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--elf', type=Path, default=DEFAULT_ELF)
+    parser.add_argument('--manifest', type=Path)
     parser.add_argument('--smoke-elf', type=Path, default=SMOKE)
     parser.add_argument('--nm', default=NM)
     parser.add_argument('--require-dle', action='store_true',

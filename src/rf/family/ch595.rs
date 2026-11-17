@@ -12,9 +12,7 @@
 //! timeout highs are `0x84` (not CH585's `0x8C`).
 
 use crate::rf::analog::AnalogInit;
-use crate::rf::family::tables::{
-    BbDevInit, Certainty, LleDevInit, RegInit, RfendInit,
-};
+use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::{Channel, PhyMode, Radio, RfCallback};
 use crate::time::InstantUs;

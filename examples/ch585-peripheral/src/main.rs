@@ -135,7 +135,11 @@ fn stop(radio: &mut Ch585Radio, clock: &Clock) {
 
 struct Received {
     len: usize,
+    /// Header Length field: the on-air payload length to assume even when the
+    /// CRC failed (§4.5.1), used only for anchor estimation.
+    air_len: u8,
     end: u32,
+    crc_ok: bool,
 }
 
 #[link_section = ".highcode"]
@@ -193,18 +197,34 @@ fn receive(
     stop(radio, clock);
     put(54, clock.now_us().wrapping_sub(end));
     inc(7);
-    if !crc_ok {
-        inc(8);
-        return None;
-    }
     // Never inspect DMA until the engine has acknowledged the stop.
     let len = usize::from(rx.0[1]) + 2;
+    let air_len = rx.0[1];
     if len > 40 {
+        if !crc_ok {
+            // Matching AA still establishes the link (§4.5); the payload is
+            // unusable but the header Length is what the anchor must assume.
+            inc(8);
+            return Some(Received {
+                len: 2,
+                air_len,
+                end,
+                crc_ok,
+            });
+        }
         inc(9);
         return None;
     }
     put(55, clock.now_us().wrapping_sub(end));
-    Some(Received { len, end })
+    if !crc_ok {
+        inc(8);
+    }
+    Some(Received {
+        len,
+        air_len,
+        end,
+        crc_ok,
+    })
 }
 
 #[link_section = ".highcode"]
@@ -311,6 +331,7 @@ fn run_connection(
         expires = earlier(expires, event_limit);
         let mut until = conn.rx_complete_end_us();
         let mut any_rx = false;
+        let mut consecutive_crc = 0u8;
         // Bound packet exchanges as well as wall time; a busy Central cannot
         // make this event consume the following event or the finite run budget.
         for _ in 0..32 {
@@ -322,6 +343,50 @@ fn run_connection(
             };
             let header = rx.0[0];
             let payload = &rx.0[2..packet.len];
+            if !packet.crc_ok {
+                consecutive_crc = consecutive_crc.saturating_add(1);
+                // A matching access address establishes the link and fixes
+                // the first anchor even with a CRC error; the header Length
+                // is the only airtime fact available (§4.5.1).
+                let first = !conn.established();
+                if !conn.on_rx_anchor_crc(packet.end, packet.air_len) {
+                    expired(conn, &control, packet.end);
+                    break 'connection;
+                }
+                if first {
+                    inc(15);
+                    if get(36) == 0 {
+                        put(36, packet.end);
+                    }
+                }
+                any_rx = true;
+                // §4.5.6: a second consecutive CRC error closes the event
+                // without another response.
+                if consecutive_crc >= 2 {
+                    break;
+                }
+                // §4.5.1: answer the first CRC-error packet with a
+                // retransmission or an Empty PDU; the corrupt packet does not
+                // advance the SN.
+                let retry = link.has_outstanding();
+                let pdu = link.tx_pdu();
+                let frame = pdu.as_bytes();
+                tx.0[..frame.len()].copy_from_slice(frame);
+                let sent = transmit(radio, clock, &tx.0[..frame.len()], packet.end);
+                if retry {
+                    inc(25);
+                }
+                if !sent {
+                    put(37, 0x3f);
+                    break 'connection;
+                }
+                until = clock.now_us().wrapping_add(500);
+                if reached(until, event_limit) {
+                    until = event_limit;
+                }
+                continue;
+            }
+            consecutive_crc = 0;
             if payload.len() > 27 {
                 inc(9);
                 break;
@@ -590,7 +655,7 @@ fn main() -> ! {
                 continue;
             };
             let pdu = &rx.0[..packet.len];
-            if adv.validate_scan_req(pdu, true) {
+            if adv.validate_scan_req(pdu, packet.crc_ok) {
                 inc(10);
                 // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
                 // engine on error; the response frame only has to live for the call.
@@ -609,7 +674,7 @@ fn main() -> ! {
                 stop(&mut radio, &clock);
             } else if pdu[0] & 0x0f == 5 {
                 inc(13);
-                match ConnectParams::parse(pdu, true, adv.own_addr, adv.random_addr) {
+                match ConnectParams::parse(pdu, packet.crc_ok, adv.own_addr, adv.random_addr) {
                     Ok(params) => {
                         inc(14);
                         put(45, u32::from(params.interval));
