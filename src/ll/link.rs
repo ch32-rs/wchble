@@ -17,6 +17,7 @@ use crate::ll::acl::{DataPdu, LinkSequence, RxStatus};
 use crate::ll::conn::{ChannelSelectionAlgorithm, ConnectParams, PeripheralConnection};
 use crate::ll::ctrl::{
     termination_reason, ControlAction, ControlPdu, ControlState, EncReq, LocalVersion,
+    FEATURE_LE_ENCRYPTION,
 };
 use crate::ll::dle::LL_LEGACY_PAYLOAD;
 use crate::ll::enc::{
@@ -33,6 +34,52 @@ pub const LOCAL_VERSION: LocalVersion = LocalVersion {
     company_id: 0xffff,
     subversion: 1,
 };
+
+/// A same-event reply for an accepted ACL fragment.
+///
+/// Bypasses the Host TX queue, so it is limited to a legacy 27-octet payload;
+/// once queued the link sequence owns its SN, ACK and retransmission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AclReply {
+    llid: u8,
+    len: u8,
+    bytes: [u8; LL_LEGACY_PAYLOAD as usize],
+}
+
+impl AclReply {
+    /// `None` unless this is LLID 2 data or the `[2, reason]` termination PDU.
+    /// Other control replies stay with the engine's `ControlState`.
+    pub fn new(llid: u8, payload: &[u8]) -> Option<Self> {
+        let allowed = match llid {
+            2 => !payload.is_empty(),
+            3 => payload.len() == 2 && payload[0] == 2,
+            _ => false,
+        };
+        if !allowed || payload.len() > LL_LEGACY_PAYLOAD as usize {
+            return None;
+        }
+        let mut bytes = [0u8; LL_LEGACY_PAYLOAD as usize];
+        bytes[..payload.len()].copy_from_slice(payload);
+        Some(Self {
+            llid,
+            len: payload.len() as u8,
+            bytes,
+        })
+    }
+
+    pub fn llid(&self) -> u8 {
+        self.llid
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Our local `LL_TERMINATE_IND` reply.
+    pub fn terminate(reason: u8) -> Self {
+        Self::new(3, &[2, reason]).expect("terminate reply is a two-byte control PDU")
+    }
+}
 
 // STATS slots the shared engine owns. The example keeps the same layout; the
 // numbers are part of the acceptance tooling.
@@ -170,6 +217,35 @@ pub trait LinkHost {
     /// Per-iteration hook before anything else (example time-driver advance).
     fn pre_iteration(&mut self);
     fn take_radio_request(&mut self) -> Option<RadioRequest>;
+
+    /// Reply for an accepted, non-empty, plaintext LLID 1/2 fragment. Only
+    /// consulted by sessions that do not advertise LE Encryption; called once
+    /// per new fragment and held across events if the window is owned.
+    /// `None` (the default) keeps the Host TX queue only.
+    fn acl_reply(&mut self, _llid: u8, _payload: &[u8]) -> Option<AclReply> {
+        None
+    }
+    /// Largest ACL payload the Host accepts; never widens the engine buffer.
+    fn rx_payload_limit(&self) -> usize {
+        MAX_ENCRYPTED
+    }
+    /// Capture-to-completion timeout; `None` keeps the engine's allowance.
+    fn rx_capture_timeout_us(&self) -> Option<u32> {
+        None
+    }
+    /// Post-exchange receive window; `None` keeps the engine's allowance.
+    fn rx_rearm_window_us(&self) -> Option<u32> {
+        None
+    }
+    /// Whether this Peripheral may start the feature exchange itself.
+    fn allows_feature_request(&self) -> bool {
+        true
+    }
+    /// Close with 0x3e when this many events pass without a first anchor.
+    /// `None` (the default) keeps supervision as the only bound.
+    fn establishment_event_limit(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// CSA #2 / DLE observations published once per event.
@@ -298,6 +374,12 @@ fn earlier(a: u32, b: u32) -> u32 {
     }
 }
 
+/// Only builds that advertise LE Encryption may run the hoisted procedure.
+/// Otherwise the PDUs take `ControlState`'s unsupported path.
+fn encryption_supported<E: AesEngine>(s: &Session<E>) -> bool {
+    s.control.local_features[0] & (1 << FEATURE_LE_ENCRYPTION) != 0
+}
+
 /// Peripheral link state. The engine owns everything the RF loop mutates; the
 /// example only creates it and inspects the negotiated parameters.
 pub struct Session<E: AesEngine> {
@@ -305,6 +387,8 @@ pub struct Session<E: AesEngine> {
     link: LinkSequence,
     control: ControlState,
     pending_control: Option<DataPdu>,
+    /// Same-event reply captured from `LinkHost::acl_reply`.
+    pending_acl_reply: Option<AclReply>,
     acl_tag: Option<TxTag>,
     terminating: Option<u8>,
     /// End the link once the control PDU in `pending_control` is acknowledged.
@@ -370,6 +454,7 @@ impl<E: AesEngine> Session<E> {
             link: LinkSequence::new(),
             control,
             pending_control: None,
+            pending_acl_reply: None,
             acl_tag: None,
             terminating: None,
             terminate_after_control: None,
@@ -426,6 +511,10 @@ impl<E: AesEngine> Session<E> {
 
     pub fn event_start_us(&self) -> u32 {
         self.conn.event_start_us()
+    }
+
+    pub fn event_counter(&self) -> u16 {
+        self.conn.event_counter()
     }
 
     pub fn channel(&self) -> u8 {
@@ -697,6 +786,20 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
     if let Some(reason) = s.expiration(host, clock.now_us()) {
         return EventEnd::Close(reason);
     }
+    // The caller's catch-up can cross the limit inside one step, so the check
+    // lives here, before any RX is armed.
+    if !s.conn.established() {
+        if let Some(limit) = host.establishment_event_limit() {
+            if s.conn.event_counter() >= limit {
+                if reached(clock.now_us(), finish) {
+                    // The finite run budget ends first; no event is armed.
+                    return EventEnd::Continue;
+                }
+                host.stat_inc(STAT_CONNECT_FAIL);
+                return EventEnd::Close(0x3e);
+            }
+        }
+    }
     let event = s.conn.event_counter();
     let channel = s.conn.channel();
     host.stat_put(STAT_EVENT_NO, u32::from(event));
@@ -737,7 +840,9 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
         }
         let first_exchange = !any_rx;
         let mut arm_times = [0; 2];
-        let capture_us = s.conn.rx_complete_allowance_us() + 64;
+        let capture_us = host
+            .rx_capture_timeout_us()
+            .unwrap_or_else(|| s.conn.rx_complete_allowance_us() + 64);
         let packet = match receive(
             radio,
             clock,
@@ -819,16 +924,15 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             if !sent {
                 return EventEnd::Continue;
             }
-            until = earlier(
-                clock
-                    .now_us()
-                    .wrapping_add(s.conn.rx_complete_allowance_us() + 64),
-                event_limit,
-            );
+            let rearm = host
+                .rx_rearm_window_us()
+                .unwrap_or_else(|| s.conn.rx_complete_allowance_us() + 64);
+            until = earlier(clock.now_us().wrapping_add(rearm), event_limit);
             continue;
         }
         consecutive_crc = 0;
-        if payload.len() > MAX_ENCRYPTED {
+        // The Host may narrow the payload cap; the engine buffer is the limit.
+        if payload.len() > host.rx_payload_limit().min(MAX_ENCRYPTED) {
             host.note_bad_pdu(header, payload.len());
             host.stat_inc(STAT_INVALID_PDU);
             break;
@@ -843,14 +947,14 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             let plain_len = payload.len().saturating_sub(BLE_MIC_LEN);
             s.deferred_rx.is_none()
                 && match llid {
-                    1 | 2 => host.can_receive_acl(llid, plain_len),
+                    1 | 2 => s.pending_acl_reply.is_none() && host.can_receive_acl(llid, plain_len),
                     3 => true,
                     _ => false,
                 }
         } else {
             match llid {
                 1 if payload.is_empty() => true,
-                1 | 2 => host.can_receive_acl(llid, payload.len()),
+                1 | 2 => s.pending_acl_reply.is_none() && host.can_receive_acl(llid, payload.len()),
                 3 => {
                     s.pending_control.is_none()
                         && s.terminate_requested.is_none()
@@ -919,7 +1023,7 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
                     host.stat_inc(STAT_CONTROL_RX);
                     host.stat_put(STAT_LAST_CONTROL, u32::from(payload[0]));
                     match payload[0] {
-                        0x03 if s.start.stage() == StartStage::Idle => {
+                        0x03 if encryption_supported(s) && s.start.stage() == StartStage::Idle => {
                             // Hand the request over for parsing once the event
                             // is over. This event answers with an empty PDU;
                             // the response leaves two events later, as macOS
@@ -938,7 +1042,7 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
                                 s.request_terminate(host, 0x1e, packet.end);
                             }
                         }
-                        0x05 => {
+                        0x05 if encryption_supported(s) => {
                             // Core §5.1.3.1 has the Peripheral send this PDU;
                             // a Central that sends one is only counted.
                             host.sec_inc(SEC_START_REQ);
@@ -978,6 +1082,9 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
                                                     Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
                                             }
                                             ControlAction::Terminate(reason) => {
+                                                // A closing link must not send
+                                                // a business reply it still holds.
+                                                s.pending_acl_reply = None;
                                                 remote_terminate = Some(reason)
                                             }
                                             ControlAction::None => {
@@ -1011,6 +1118,19 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             RxStatus::Duplicate => host.stat_inc(STAT_DUPLICATE),
             RxStatus::Backpressure => host.stat_inc(STAT_RX_BACKPRESSURE),
             RxStatus::Invalid => unreachable!(),
+        }
+        // Captured only for a newly accepted fragment, so duplicates and
+        // retransmissions never re-run the Host. A termination reply keeps
+        // its single owner: the existing termination state machine. Sessions
+        // that advertise LE Encryption keep the procedure's TX ownership.
+        if deliver_acl && !encryption_supported(s) {
+            match host.acl_reply(llid, payload) {
+                Some(reply) if reply.llid() == 3 => {
+                    s.request_terminate(host, reply.payload()[1], packet.end);
+                }
+                Some(reply) => s.pending_acl_reply = Some(reply),
+                None => {}
+            }
         }
         expires = earlier(
             event_limit,
@@ -1094,6 +1214,9 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
                 if let Some(reason) = s.terminate_after_control.take() {
                     s.terminating = Some(reason);
                 }
+            } else if let Some(reply) = s.pending_acl_reply.take() {
+                // No higher-priority control or retransmission this event.
+                s.link.queue(reply.llid(), reply.payload()).unwrap();
             } else if s.enc_rsp_at == 0 || reached(clock.now_us(), s.enc_rsp_at) {
                 // The encryption procedure owns the link until it ends: no ACL
                 // data may share the event with LL_ENC_REQ/LL_ENC_RSP.
@@ -1174,12 +1297,10 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             host.stat_inc(STAT_TERMINATED_ACK);
             return EventEnd::Close(reason);
         }
-        until = earlier(
-            clock
-                .now_us()
-                .wrapping_add(s.conn.rx_complete_allowance_us() + 64),
-            event_limit,
-        );
+        let rearm = host
+            .rx_rearm_window_us()
+            .unwrap_or_else(|| s.conn.rx_complete_allowance_us() + 64);
+        until = earlier(clock.now_us().wrapping_add(rearm), event_limit);
     }
     if !any_rx {
         host.stat_inc(STAT_EMPTY_EVENTS);
@@ -1403,8 +1524,10 @@ pub fn service_dle<E: AesEngine, H: LinkHost<Aes = E>>(
             s.length_req_tx += 1;
             return None;
         }
-        if let Some(pdu) = s.control.feature_request(true) {
-            s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+        if host.allows_feature_request() {
+            if let Some(pdu) = s.control.feature_request(true) {
+                s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+            }
         }
     }
     None

@@ -7,12 +7,15 @@ use core::cell::Cell;
 use hal::{rcc, time::Hertz};
 use qingke_rt::entry;
 use static_cell::StaticCell;
-use wchble::ll::acl::{DataPdu, LinkSequence, RxStatus};
+use wchble::crypto::{AesEngine, AesEngineError};
+use wchble::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
+use wchble::hci::runner::LtkReply;
 use wchble::ll::adv::AdvState;
 use wchble::ll::conn::{ConnectParams, PeripheralConnection};
+use wchble::ll::link::{self, AclReply, Control, LinkHost, Session, X1Snapshot};
 use wchble::rf::family::ch585::{Ch585Radio, BB_BASE, LLE_BASE};
 use wchble::rf::regs::{self, bb, bb_irq, lle};
-use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
+use wchble::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use {panic_halt as _, portable_atomic as _};
@@ -23,7 +26,7 @@ static SCRATCH: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static RX: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static ADV: StaticCell<DmaBuf<64>> = StaticCell::new();
 static RSP: StaticCell<DmaBuf<64>> = StaticCell::new();
-static DATA: StaticCell<DmaBuf<64>> = StaticCell::new();
+static DATA: StaticCell<DmaBuf<MAX_PDU>> = StaticCell::new();
 
 #[no_mangle]
 #[used]
@@ -85,7 +88,7 @@ impl InstantUs for Clock {
     }
 }
 
-fn trace(clock: &Clock, kind: u32, event: u16, channel: u8, header: u8, len: u8, a: u32, b: u32) {
+fn trace_at(now_us: u32, kind: u32, event: u16, channel: u8, header: u8, len: u8, a: u32, b: u32) {
     let count = get(39) as usize;
     // Keep a short opening trace plus a rolling tail; counters cover the run.
     let row = if count < 128 {
@@ -94,7 +97,7 @@ fn trace(clock: &Clock, kind: u32, event: u16, channel: u8, header: u8, len: u8,
         64 + (count - 128) % 64
     };
     let words = [
-        clock.now_us(),
+        now_us,
         kind,
         u32::from(event),
         u32::from(channel),
@@ -117,6 +120,10 @@ fn trace(clock: &Clock, kind: u32, event: u16, channel: u8, header: u8, len: u8,
     }
 }
 
+fn trace(clock: &Clock, kind: u32, event: u16, channel: u8, header: u8, len: u8, a: u32, b: u32) {
+    trace_at(clock.now_us(), kind, event, channel, header, len, a, b);
+}
+
 fn stop(radio: &mut Ch585Radio, clock: &Clock) {
     radio.shut();
     let start = clock.now_us();
@@ -135,16 +142,13 @@ fn stop(radio: &mut Ch585Radio, clock: &Clock) {
 
 struct Received {
     len: usize,
-    /// Header Length field: the on-air payload length to assume even when the
-    /// CRC failed (§4.5.1), used only for anchor estimation.
-    air_len: u8,
     end: u32,
     crc_ok: bool,
 }
 
 #[link_section = ".highcode"]
 #[inline(never)]
-fn receive(
+fn receive_adv(
     radio: &mut Ch585Radio,
     clock: &Clock,
     rx: &mut DmaBuf<RX_DMA_MIN>,
@@ -199,15 +203,12 @@ fn receive(
     inc(7);
     // Never inspect DMA until the engine has acknowledged the stop.
     let len = usize::from(rx.0[1]) + 2;
-    let air_len = rx.0[1];
     if len > 40 {
         if !crc_ok {
-            // Matching AA still establishes the link (§4.5); the payload is
-            // unusable but the header Length is what the anchor must assume.
+            // A header-only error still consumes the frame.
             inc(8);
             return Some(Received {
                 len: 2,
-                air_len,
                 end,
                 crc_ok,
             });
@@ -219,56 +220,159 @@ fn receive(
     if !crc_ok {
         inc(8);
     }
-    Some(Received {
-        len,
-        air_len,
-        end,
-        crc_ok,
-    })
+    Some(Received { len, end, crc_ok })
 }
 
-#[link_section = ".highcode"]
-#[inline(never)]
-fn transmit(radio: &mut Ch585Radio, clock: &Clock, frame: &[u8], end: u32) -> bool {
-    // P2 starting point, NOT an independent measurement of air IFS.
-    put(56, clock.now_us().wrapping_sub(end));
-    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or
-    // stops the engine on a failed send (including timeout); `frame` only has
-    // to live for the call.
-    let result = unsafe { radio.tx_basic(clock, frame, 0, Some(end.wrapping_add(120))) };
-    put(57, clock.now_us().wrapping_sub(end));
-    match result {
-        Ok(()) => inc(18),
-        Err(wchble::Error::Late) => inc(19),
-        Err(_) => inc(20),
+/// Legacy LL payload P3 accepts and answers with.
+const P3_PAYLOAD_LIMIT: usize = 27;
+/// P3 advertises no optional features, so the engine gates encryption/DLE.
+const P3_FEATURES: [u8; 8] = [0; 8];
+
+/// P3 never advertises LE Encryption, so the AES engine must stay unreachable.
+struct NoEncryption;
+
+impl AesEngine for NoEncryption {
+    fn encrypt_block(&mut self, _block: &mut [u8; 16]) -> Result<(), AesEngineError> {
+        Err(AesEngineError::Timeout)
     }
-    stop(radio, clock);
-    result.is_ok()
 }
 
-fn expired(
-    conn: &PeripheralConnection,
-    control: &wchble::ll::ctrl::ControlState,
-    now: u32,
-) -> bool {
-    if control.termination_expired(now) {
-        inc(60);
-        put(37, 0x08);
-        return true;
-    }
-    if conn.supervision_expired(now) {
-        inc(if conn.established() { 29 } else { 30 });
-        put(37, if conn.established() { 0x08 } else { 0x3e });
-        return true;
-    }
-    false
+/// P3 has no HCI bridge: requests are answered from `upper::reply`; an
+/// unsupported or fragmented request terminates the link with 0x13.
+struct P3Host<'a> {
+    clock: &'a Clock,
 }
 
-fn earlier(a: u32, b: u32) -> u32 {
-    if reached(a, b) {
-        b
-    } else {
-        a
+impl LinkHost for P3Host<'_> {
+    type Aes = NoEncryption;
+
+    fn local_features(&self) -> [u8; 8] {
+        P3_FEATURES
+    }
+    fn new_aes(&mut self, _key: &[u8; 16]) -> NoEncryption {
+        NoEncryption
+    }
+
+    fn stat_inc(&mut self, slot: usize) {
+        inc(slot);
+    }
+    fn stat_put(&mut self, slot: usize, value: u32) {
+        put(slot, value);
+    }
+    fn stat_get(&self, slot: usize) -> u32 {
+        get(slot)
+    }
+    fn sec_inc(&mut self, _slot: usize) {}
+    fn sec_put(&mut self, _slot: usize, _value: u32) {}
+
+    fn trace(
+        &mut self,
+        now_us: u32,
+        kind: u32,
+        event: u16,
+        channel: u8,
+        header: u8,
+        len: u8,
+        a: u32,
+        b: u32,
+    ) {
+        trace_at(now_us, kind, event, channel, header, len, a, b);
+    }
+
+    fn diag_acl_raw(&mut self, _llid: u8, _payload: &[u8], _ciphertext: bool) {}
+    fn diag_acl_plain(&mut self, _llid: u8, _payload: &[u8]) {}
+    fn diag_control_opcode(&mut self, _opcode: u8) {}
+    fn note_bad_pdu(&mut self, _header: u8, _len: usize) {}
+    fn note_rx_frame(&mut self, _len: usize) {}
+    fn note_rx_oversize(&mut self) {}
+    fn note_start_req_queued(&mut self) {}
+    fn note_start_rsp_queued(&mut self) {}
+    fn diag_skipped_event(&mut self) {}
+
+    fn can_receive_acl(&mut self, _llid: u8, len: usize) -> bool {
+        len <= P3_PAYLOAD_LIMIT
+    }
+    fn receive_acl(&mut self, _llid: u8, _payload: &[u8]) -> bool {
+        // The request side effect already ran in `acl_reply`.
+        true
+    }
+    fn take_tx_acl(&mut self) -> Option<TxAcl> {
+        None
+    }
+    fn ack_tx(&mut self, _tag: TxTag) -> bool {
+        true
+    }
+
+    // Between packet end and the scheduled response: keep it in RAM.
+    #[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+    #[inline(never)]
+    fn acl_reply(&mut self, llid: u8, payload: &[u8]) -> Option<AclReply> {
+        if llid != 2 {
+            // A non-empty continuation fragment is not an L2CAP packet.
+            return Some(AclReply::terminate(0x13));
+        }
+        let mut out = [0u8; P3_PAYLOAD_LIMIT];
+        match upper::reply(payload, &mut out) {
+            Ok(len) => AclReply::new(2, &out[..len]),
+            Err(()) => Some(AclReply::terminate(0x13)),
+        }
+    }
+    fn rx_payload_limit(&self) -> usize {
+        P3_PAYLOAD_LIMIT
+    }
+    fn rx_capture_timeout_us(&self) -> Option<u32> {
+        Some(700)
+    }
+    fn rx_rearm_window_us(&self) -> Option<u32> {
+        Some(500)
+    }
+    fn allows_feature_request(&self) -> bool {
+        false
+    }
+    fn establishment_event_limit(&self) -> Option<u16> {
+        Some(6)
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+    fn publish_connection(&mut self, _info: &mut ConnectionInfo) -> bool {
+        true
+    }
+    fn disable_adv(&mut self) {}
+    fn connection_closed(&mut self, _reason: u8) {}
+    fn encryption_change(&mut self, _handle: u16, _status: u8, _enabled: u8) {}
+    fn connection_updated(&mut self, _interval: u16, _latency: u16, _timeout: u16) -> bool {
+        true
+    }
+    fn data_length_change(&mut self, _a: u16, _b: u16, _c: u16, _d: u16) -> bool {
+        true
+    }
+
+    fn take_ltk_reply(&mut self) -> Option<LtkReply> {
+        None
+    }
+    fn push_ltk_request(&mut self, _rand: [u8; 8], _ediv: u16) -> bool {
+        false
+    }
+    fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
+        None
+    }
+
+    fn publish_x1(&mut self, _snapshot: &X1Snapshot) {}
+
+    fn idle_gap(&mut self, _deadline: u32, until: u32) {
+        // The outer loop re-enters `step`; spin like the old inner wait.
+        while !reached(self.clock.now_us(), until) {
+            core::hint::spin_loop();
+        }
+    }
+    fn after_close(&mut self) {}
+    fn on_reset(&mut self) {}
+    fn on_disconnect_request(&mut self, _reason: u8) {}
+    fn pre_iteration(&mut self) {}
+    fn take_radio_request(&mut self) -> Option<RadioRequest> {
+        None
     }
 }
 
@@ -278,304 +382,50 @@ fn run_connection(
     radio: &mut Ch585Radio,
     clock: &Clock,
     rx: &mut DmaBuf<RX_DMA_MIN>,
-    tx: &mut DmaBuf<64>,
-    conn: &mut PeripheralConnection,
+    tx: &mut DmaBuf<MAX_PDU>,
+    params: ConnectParams,
+    end: u32,
     finish: u32,
 ) {
     let began = clock.now_us();
-    let mut link = LinkSequence::new();
-    let mut pending: Option<DataPdu> = None;
-    let mut control = wchble::ll::ctrl::ControlState::new();
-    let mut outgoing_terminate = None;
-    let local_version = wchble::ll::ctrl::LocalVersion {
-        version: 0x0d,
-        company_id: 0xffff,
-        subversion: 1,
-    };
-    put(37, 0);
-    radio.set_aa_crc(conn.params.access_addr, conn.params.crc_init);
+    let mut host = P3Host { clock };
+    let mut session = Session::new(params, false, end, began, [0; 12], P3_FEATURES);
+    radio.set_aa_crc(params.access_addr, params.crc_init);
     put(2, 3);
-    'connection: while !reached(clock.now_us(), finish) {
-        if expired(conn, &control, clock.now_us()) {
-            break;
-        }
-        if !conn.established() && conn.event_counter() >= 6 {
-            inc(30);
-            put(37, 0x3e);
-            break;
-        }
-        let event = conn.event_counter();
-        let channel = conn.channel();
-        put(51, u32::from(event));
-        put(52, u32::from(channel));
-        radio.set_channel(channel).unwrap();
-        let prepare = conn.rx_start_us().wrapping_sub(100);
-        let mut expires = earlier(finish, conn.supervision_deadline_us());
-        if let Some(end) = control.termination_deadline_us() {
-            expires = earlier(expires, end);
-        }
-        while !reached(clock.now_us(), prepare) {
-            if reached(clock.now_us(), expires) {
-                expired(conn, &control, clock.now_us());
-                break 'connection;
+    put(37, 0);
+    loop {
+        match link::step(&mut session, &mut host, radio, clock, rx, tx, finish) {
+            Control::Continue => {}
+            Control::Closed(_) | Control::Reset => {
+                put(2, 2);
+                return;
             }
-        }
-        if expired(conn, &control, clock.now_us()) {
-            break;
-        }
-        inc(16);
-        let event_limit = conn
-            .event_start_us()
-            .wrapping_add(u32::from(conn.params.interval) * 1250)
-            .wrapping_sub(600);
-        expires = earlier(expires, event_limit);
-        let mut until = conn.rx_complete_end_us();
-        let mut any_rx = false;
-        let mut consecutive_crc = 0u8;
-        // Bound packet exchanges as well as wall time; a busy Central cannot
-        // make this event consume the following event or the finite run budget.
-        for _ in 0..32 {
-            if reached(clock.now_us(), finish) || reached(clock.now_us(), event_limit) {
-                break;
-            }
-            let Some(packet) = receive(radio, clock, rx, until, expires) else {
-                break;
-            };
-            let header = rx.0[0];
-            let payload = &rx.0[2..packet.len];
-            if !packet.crc_ok {
-                consecutive_crc = consecutive_crc.saturating_add(1);
-                // A matching access address establishes the link and fixes
-                // the first anchor even with a CRC error; the header Length
-                // is the only airtime fact available (§4.5.1).
-                let first = !conn.established();
-                if !conn.on_rx_anchor_crc(packet.end, packet.air_len) {
-                    expired(conn, &control, packet.end);
-                    break 'connection;
+            Control::Finish => {
+                stop(radio, clock);
+                let duration = clock.now_us().wrapping_sub(began);
+                if duration > get(44) {
+                    put(44, duration);
                 }
-                if first {
-                    inc(15);
-                    if get(36) == 0 {
-                        put(36, packet.end);
-                    }
-                }
-                any_rx = true;
-                // §4.5.6: a second consecutive CRC error closes the event
-                // without another response.
-                if consecutive_crc >= 2 {
-                    break;
-                }
-                // §4.5.1: answer the first CRC-error packet with a
-                // retransmission or an Empty PDU; the corrupt packet does not
-                // advance the SN.
-                let retry = link.has_outstanding();
-                let pdu = link.tx_pdu();
-                let frame = pdu.as_bytes();
-                tx.0[..frame.len()].copy_from_slice(frame);
-                let sent = transmit(radio, clock, &tx.0[..frame.len()], packet.end);
-                if retry {
-                    inc(25);
-                }
-                if !sent {
-                    put(37, 0x3f);
-                    break 'connection;
-                }
-                until = clock.now_us().wrapping_add(500);
-                if reached(until, event_limit) {
-                    until = event_limit;
-                }
-                continue;
-            }
-            consecutive_crc = 0;
-            if payload.len() > 27 {
-                inc(9);
-                break;
-            }
-            let accepted = link.on_rx(
-                header,
-                payload,
-                true,
-                payload.is_empty()
-                    || (pending.is_none() && control.termination_deadline_us().is_none()),
-            );
-            if accepted.status == RxStatus::Invalid {
-                inc(9);
-                break;
-            }
-            if accepted.tx_acked {
-                if let Some(reason) = outgoing_terminate {
-                    inc(28);
-                    put(37, u32::from(reason));
-                    break 'connection;
-                }
-            }
-            let sequence_us = clock.now_us().wrapping_sub(packet.end);
-            let first = !conn.established();
-            // CPU completion minus full packet airtime follows the V208
-            // estimator. Its CH585 latency has not been independently measured.
-            if !conn.on_rx_anchor(packet.end, payload.len() as u8) {
-                expired(conn, &control, packet.end);
-                break 'connection;
-            }
-            if first {
-                inc(15);
-                if get(36) == 0 {
-                    put(36, packet.end);
-                }
-            }
-            any_rx = true;
-            inc(17);
-            put(42, u32::from(header));
-            put(43, payload.len() as u32);
-            let mut terminate = None;
-            match accepted.status {
-                RxStatus::Accepted => {
-                    inc(41);
-                    match header & 3 {
-                        3 => {
-                            inc(26);
-                            put(38, u32::from(payload[0]));
-                            match control.on_pdu(conn, payload, local_version) {
-                                Ok(wchble::ll::ctrl::ControlAction::Reply(pdu)) => {
-                                    if pdu.as_bytes().first() == Some(&7) {
-                                        inc(27);
-                                    }
-                                    pending = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
-                                }
-                                Ok(wchble::ll::ctrl::ControlAction::Terminate(reason)) => {
-                                    terminate = Some(reason)
-                                }
-                                Ok(wchble::ll::ctrl::ControlAction::None) => {}
-                                Err(error) => {
-                                    let reason = wchble::ll::ctrl::termination_reason(error);
-                                    pending = Some(DataPdu::new(3, &[2, reason]).unwrap());
-                                    put(37, u32::from(reason));
-                                }
-                            }
-                        }
-                        2 => {
-                            let mut response = [0; 27];
-                            match upper::reply(payload, &mut response) {
-                                Ok(len) => {
-                                    pending = Some(DataPdu::new(2, &response[..len]).unwrap())
-                                }
-                                Err(()) => {
-                                    pending = Some(DataPdu::new(3, &[2, 0x13]).unwrap());
-                                    put(37, 0x13);
-                                }
-                            }
-                        }
-                        1 if !payload.is_empty() => {
-                            pending = Some(DataPdu::new(3, &[2, 0x13]).unwrap());
-                            put(37, 0x13);
-                        }
-                        _ => {}
-                    }
-                }
-                RxStatus::Duplicate => inc(24),
-                RxStatus::Backpressure => inc(31),
-                RxStatus::Invalid => unreachable!(),
-            }
-            if pending
-                .as_ref()
-                .is_some_and(|pdu| pdu.llid() == 3 && pdu.payload().first() == Some(&2))
-            {
-                control.start_termination(clock.now_us(), conn.params.timeout);
-            }
-            expires = earlier(event_limit, earlier(finish, conn.supervision_deadline_us()));
-            if let Some(end) = control.termination_deadline_us() {
-                expires = earlier(expires, end);
-            }
-            let handled_us = clock.now_us().wrapping_sub(packet.end);
-            let retry = link.has_outstanding();
-            if !link.has_outstanding() {
-                if let Some(pdu) = pending.take() {
-                    if pdu.llid() == 3 && pdu.payload().first() == Some(&2) {
-                        outgoing_terminate = Some(pdu.payload()[1]);
-                    }
-                    link.queue(pdu.llid(), pdu.payload()).unwrap();
-                }
-            }
-            let pdu = link.tx_pdu();
-            let frame = pdu.as_bytes();
-            tx.0[..frame.len()].copy_from_slice(frame);
-            let sent = transmit(radio, clock, &tx.0[..frame.len()], packet.end);
-            put(58, sequence_us);
-            put(59, handled_us);
-            if retry {
-                inc(25);
-            }
-            trace(
-                clock,
-                3,
-                event,
-                channel,
-                header,
-                payload.len() as u8,
-                packet.end,
-                u32::from(pdu.header()),
-            );
-            if !sent {
-                put(37, 0x3f);
-                break 'connection;
-            }
-            if let Some(reason) = terminate {
-                inc(28);
-                put(37, u32::from(reason));
-                trace(
-                    clock,
-                    4,
-                    event,
-                    channel,
-                    header,
-                    payload.len() as u8,
-                    u32::from(reason),
+                trace_at(
+                    clock.now_us(),
+                    6,
+                    session.event_counter(),
+                    session.channel(),
                     0,
+                    0,
+                    get(37),
+                    duration,
                 );
-                break 'connection;
+                put(2, 2);
+                return;
             }
-            // Local terminate remains outstanding until ACK or supervision.
-            // Even with MD=0, listen briefly for a retry; an empty window is
-            // normal when the Central has ended the event.
-            until = clock.now_us().wrapping_add(500);
-            if reached(until, event_limit) {
-                until = event_limit;
+            Control::StopTimeout => {
+                inc(22);
+                put(2, 0xee);
+                park();
             }
-        }
-        if !any_rx {
-            inc(23);
-            trace(
-                clock,
-                5,
-                event,
-                channel,
-                0,
-                0,
-                conn.rx_start_us(),
-                conn.rx_end_us(),
-            );
-        }
-        if conn.next_event().is_err() {
-            put(37, 0x28);
-            break;
         }
     }
-    stop(radio, clock);
-    let duration = clock.now_us().wrapping_sub(began);
-    if duration > get(44) {
-        put(44, duration);
-    }
-    trace(
-        clock,
-        6,
-        conn.event_counter(),
-        conn.channel(),
-        0,
-        0,
-        get(37),
-        duration,
-    );
-    put(2, 2);
 }
 
 #[entry]
@@ -585,9 +435,7 @@ fn main() -> ! {
     // HSE/PLL nominal is more accurate than the RC-referenced delay estimate.
     let hz = hal::rcc::clocks().sysclk.0;
     let clock = Clock {
-        ticks: Cell::new(ExtendingTicks::new(
-            hal::pac::SYSTICK.cntl().read().cntl(),
-        )),
+        ticks: Cell::new(ExtendingTicks::new(hal::pac::SYSTICK.cntl().read().cntl())),
         rate: TickRate::new(hz).unwrap(),
     };
     put(0, 0x5033_3538);
@@ -645,7 +493,7 @@ fn main() -> ! {
                 continue;
             }
             inc(4);
-            let Some(packet) = receive(
+            let Some(packet) = receive_adv(
                 &mut radio,
                 &clock,
                 rx,
@@ -684,7 +532,7 @@ fn main() -> ! {
                             u32::from_le_bytes(params.channel_map[..4].try_into().unwrap()),
                         );
                         put(48, u32::from(params.channel_map[4]));
-                        let mut conn = PeripheralConnection::new(params, packet.end, false);
+                        let conn = PeripheralConnection::new(params, packet.end, false);
                         put(49, conn.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(conn.channel()));
@@ -698,7 +546,9 @@ fn main() -> ! {
                             params.access_addr,
                             packet.end,
                         );
-                        run_connection(&mut radio, &clock, rx, data_buf, &mut conn, finish);
+                        run_connection(
+                            &mut radio, &clock, rx, data_buf, params, packet.end, finish,
+                        );
                         stop(&mut radio, &clock);
                         radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
                         break;
