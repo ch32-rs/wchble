@@ -1587,3 +1587,104 @@ fn a_crc_bad_maximum_length_header_only_establishes() {
     assert_eq!(h.host.stats[8], 1, "crc error counted");
     assert_eq!(h.host.stats[9], 0, "not an invalid PDU");
 }
+
+#[test]
+fn table_owner_advances_the_event_counter_exactly_once() {
+    let mut h = Harness::new();
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    h.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+    let before = h.session.event_counter();
+    let mut served = false;
+    for _ in 0..10 {
+        assert_eq!(h.step(FINISH), Control::Continue);
+        served |= h.session.take_event_served();
+    }
+    assert!(served, "the event body ran");
+    assert_eq!(
+        h.session.event_counter(),
+        before,
+        "the engine must not advance in table mode"
+    );
+
+    let mut link = SessionLink::new(h.session);
+    link.advance_one().unwrap();
+    assert_eq!(link.session.event_counter(), before.wrapping_add(1));
+    assert!(!link.session.take_event_served(), "advance is not an event");
+}
+
+#[test]
+fn self_owner_still_advances_and_reports_the_event() {
+    let mut h = Harness::new();
+    h.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+    let before = h.session.event_counter();
+    let mut served = false;
+    for _ in 0..10 {
+        assert_eq!(h.step(FINISH), Control::Continue);
+        served |= h.session.take_event_served();
+    }
+    assert!(served);
+    assert_ne!(
+        h.session.event_counter(),
+        before,
+        "self mode advances inside step"
+    );
+}
+
+#[test]
+fn advance_one_publishes_a_queued_connection_update() {
+    let mut h = Harness::new();
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    h.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+    let mut served = false;
+    for _ in 0..10 {
+        assert_eq!(h.step(FINISH), Control::Continue);
+        served |= h.session.take_event_served();
+    }
+    assert!(served);
+
+    let mut link = SessionLink::new(h.session);
+    let next = link.session.event_counter().wrapping_add(1);
+    link.session.update_instant = Some(next);
+    link.session.update_report = None;
+    link.advance_one().unwrap();
+    assert_eq!(link.session.event_counter(), next);
+    assert!(
+        link.session.update_report.is_some(),
+        "the table-owned advance must publish the update"
+    );
+}
+
+#[test]
+fn session_link_window_is_ordered_inside_the_table_budget() {
+    let h = Harness::new();
+    let now = h.clock.now();
+    let link = SessionLink::new(h.session);
+    let window = link.window();
+    assert!(window.prepare_us <= window.latest_start_us);
+    assert!(window.latest_start_us <= window.reservation_end_us);
+    assert!(window.min_service_us <= window.reservation_end_us.wrapping_sub(window.prepare_us));
+    assert_eq!(window.event, link.session.event_counter());
+    assert_eq!(window.channel, link.session.channel());
+    assert!(link.expiry(now).is_none());
+
+    let expiry = link
+        .expiry(window.deadline_us)
+        .expect("the deadline is reported once reached");
+    assert_eq!(expiry.at_us, window.deadline_us);
+    assert_eq!(expiry.cause, window.deadline_cause);
+    assert_eq!(expiry.reason, window.deadline_reason);
+}
+
+#[test]
+fn table_mode_never_advances_during_the_late_catch_up() {
+    let mut h = Harness::new();
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    h.clock.advance(90_000);
+    let before = h.session.event_counter();
+    let _ = h.step(FINISH);
+    assert_eq!(
+        h.session.event_counter(),
+        before,
+        "table mode must leave catching up to Skipped"
+    );
+}
