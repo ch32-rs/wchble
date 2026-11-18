@@ -171,6 +171,17 @@ observations), and the board was restored to the smoke image. The stub stands
 in for the real boot manager: an update still rewrites the whole image. Secure
 builds of the trouble-host examples exceed one slot.
 
+**CH585 X3 dual-link PP/CP subsets** (2026-11-18):
+[`examples/ch585-trouble-gatt`](examples/ch585-trouble-gatt) can now drive two
+links from one scheduler table. `--features pp` holds two peripheral links and
+keeps advertising while a slot is free; `--features cp` holds one outbound
+central link to an Android GATT server and one inbound peripheral link from a
+macOS client in the same round. Both pass finite macOS/Android rounds (host two
+connections/disconnects, clean rate and bridge error counters, smoke restored).
+These are verified plaintext subsets, not full multilink: `pp+secure`, the
+reverse CP connect order, encrypted outbound links, the total ACL-credit claim
+and the full X3.3 scope remain open (see `BACKLOG.md`).
+
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.

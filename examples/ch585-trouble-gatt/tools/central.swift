@@ -6,8 +6,9 @@ let targetName = "wch585-p4"
 let serviceID = CBUUID(string: "00001000-b0cd-11ec-871f-d45ddf138840")
 let characteristicID = CBUUID(string: "00001001-b0cd-11ec-871f-d45ddf138840")
 let usage = """
-Usage: central [--mode gatt|connect-probe] [--cycles COUNT] [--timeout SECONDS]
-               [--hold SECONDS] [--connect-wait SECONDS] [--name wch585-p4]
+Usage: central [--mode gatt|connect-probe|pp] [--cycles COUNT] [--timeout SECONDS]
+               [--hold SECONDS] [--connect-wait SECONDS] [--role N]
+               [--name wch585-p4]
 P4 u32LE GATT test (defaults: mode gatt, 1 cycle, 20-second total timeout).
 Matches the exact advertised local name, then locks its macOS UUID.
 Each cycle discovers services/characteristics, reads the initial value, writes
@@ -29,6 +30,8 @@ struct CLIError: Error, CustomStringConvertible {
 enum Mode: String {
     case gatt
     case connectProbe = "connect-probe"
+    // X3.4a PP: hold one link, write a role-specific sequence, count fan-out.
+    case pp
 }
 
 struct Options {
@@ -38,6 +41,8 @@ struct Options {
     // Delay between connecting and starting GATT discovery, so a peripheral
     // Security Request can start pairing first (the S2 differential).
     var hold = 0.0
+    // PP: role number; its writes are role * 1000 + sequence.
+    var role = 1
     // connect-probe: how long to wait for an accept/reject callback.
     var connectWait = 8.0
 
@@ -52,7 +57,7 @@ struct Options {
             switch flag {
             case "--mode":
                 guard let parsed = Mode(rawValue: value) else {
-                    throw CLIError("--mode must be gatt or connect-probe")
+                    throw CLIError("--mode must be gatt, connect-probe or pp")
                 }
                 mode = parsed
             case "--connect-wait":
@@ -75,6 +80,11 @@ struct Options {
                     throw CLIError("--hold must be finite and in [0, 600]")
                 }
                 hold = seconds
+            case "--role":
+                guard let number = Int(value), (1...16).contains(number) else {
+                    throw CLIError("--role must be in 1...16")
+                }
+                role = number
             case "--name":
                 guard value == targetName else { throw CLIError("--name must be \(targetName)") }
             default: throw CLIError("unknown option \(flag)")
@@ -125,6 +135,12 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var writes = 0
     var notifications = 0
     var subscriptions = 0
+    var ppOutstanding = false
+    var ppLastWriteAt = 0.0
+    var ppNextWriteAt = 0.0
+    var ppSequence = 0
+    var ppLastWritten: UInt32 = 0
+    var ppLastNotification: UInt32 = 0
 
     init(options: Options) { self.options = options; super.init() }
 
@@ -137,6 +153,7 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func start() {
         emit("start", ["name": targetName, "mode": options.mode.rawValue,
+                       "role": options.role,
                        "cycles": options.cycles,
                        "timeout_seconds": options.timeout, "hold_seconds": options.hold,
                        "connect_wait_seconds": options.connectWait,
@@ -169,6 +186,26 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             return
         }
         guard phase != "done" else { return }
+        if options.mode == .pp {
+            if phase == "pp_active" {
+                if now - started >= options.timeout - 1 {
+                    finishPp()
+                    return
+                }
+                if ppOutstanding, now - ppLastWriteAt >= 1 {
+                    emit("write_timeout", ["value": ppLastWritten])
+                    ppOutstanding = false
+                }
+                if !ppOutstanding, now >= ppNextWriteAt {
+                    ppWrite()
+                }
+            } else if now - started >= options.timeout {
+                // Scan/connect/discover never finished: a pp client must not
+                // hang past its own timeout.
+                fail(code: phase == "initializing" ? 3 : 4, reason: "timeout_\(phase)")
+            }
+            return
+        }
         if options.mode == .connectProbe, phase == "connecting",
            let at = connectAt, now - at >= options.connectWait {
             exitNow(code: 6, reason: "connect_no_callback")
@@ -315,6 +352,14 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             exitNow(code: failure.0, reason: failure.1)
             return
         }
+        if options.mode == .pp, phase == "cancelling" {
+            guard expected, error == nil else {
+                fail(reason: "pp_disconnect_failed")
+                return
+            }
+            summarisePp()
+            return
+        }
         guard expected, error == nil else {
             fail(reason: "unexpected_disconnect")
             return
@@ -362,6 +407,14 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             return
         }
         characteristic = found
+        if options.mode == .pp {
+            guard readable, writable, notifiable else {
+                fail(reason: "pp_characteristic_properties_invalid")
+                return
+            }
+            ppRead("initial")
+            return
+        }
         read("initial")
     }
 
@@ -391,6 +444,19 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor changed: CBCharacteristic,
                     error: Error?) {
         guard phase != "cleanup", phase != "done" else { return }
+        if options.mode == .pp {
+            guard peripheral.identifier == lockedID, changed === characteristic, error == nil,
+                  phase == "pp_notify_on", changed.isNotifying else {
+                fail(reason: "pp_notification_state_invalid")
+                return
+            }
+            subscriptions += 1
+            emit("notify_state", ["enabled": true])
+            phase = "pp_active"
+            ppOutstanding = false
+            ppNextWriteAt = monotonic()
+            return
+        }
         let enabling = phase == "notify_on"
         guard (enabling || phase == "notify_off"), peripheral.identifier == lockedID,
               changed === characteristic, error == nil, changed.isNotifying == enabling else {
@@ -405,6 +471,18 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor changed: CBCharacteristic,
                     error: Error?) {
         guard phase != "cleanup", phase != "done" else { return }
+        if options.mode == .pp {
+            guard peripheral.identifier == lockedID, changed === characteristic, error == nil,
+                  phase == "pp_active", ppOutstanding else {
+                fail(reason: "pp_write_invalid")
+                return
+            }
+            ppOutstanding = false
+            writes += 1
+            emit("write_ack", ["value": ppLastWritten])
+            ppNextWriteAt = monotonic() + 0.3
+            return
+        }
         guard (phase == "write_notify" || phase == "write_readback"),
               peripheral.identifier == lockedID, changed === characteristic,
               error == nil, !writeAcknowledged else {
@@ -420,6 +498,37 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor changed: CBCharacteristic,
                     error: Error?) {
         guard phase != "cleanup", phase != "done" else { return }
+        if options.mode == .pp {
+            guard peripheral.identifier == lockedID, changed === characteristic,
+                  error == nil, let data = changed.value, data.count == 4 else {
+                // Name what the peer actually sent: an ATT error reads like a
+                // silent firmware stall without the code.
+                var detail: [String: Any] = ["phase": phase]
+                if let error = error { detail["error"] = String(describing: error) }
+                if let data = changed.value { detail["bytes"] = Array(data) }
+                emit("value_rejected", detail)
+                fail(reason: "pp_value_invalid")
+                return
+            }
+            let value = data.enumerated().reduce(UInt32(0)) {
+                $0 | (UInt32($1.element) << ($1.offset * 8))
+            }
+            if phase.hasPrefix("pp_read_") {
+                reads += 1
+                emit("read_result", ["purpose": String(phase.dropFirst(8)),
+                                     "value": value, "bytes": Array(data)])
+                if phase == "pp_read_initial" {
+                    ppNotify(on: true)
+                }
+            } else if phase == "pp_active", changed.isNotifying {
+                notifications += 1
+                ppLastNotification = value
+                emit("notification", ["value": value, "bytes": Array(data)])
+            } else {
+                fail(reason: "pp_unexpected_value")
+            }
+            return
+        }
         guard peripheral.identifier == lockedID, changed === characteristic,
               error == nil, let data = changed.value, data.count == 4 else {
             fail(reason: "value_failed_or_not_u32le")
@@ -458,6 +567,50 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         } else {
             fail(reason: "unexpected_value_callback")
         }
+    }
+
+    func ppRead(_ purpose: String) {
+        phase = "pp_read_\(purpose)"
+        emit("read_requested", ["purpose": purpose])
+        target!.readValue(for: characteristic!)
+    }
+
+    func ppNotify(on enabled: Bool) {
+        phase = enabled ? "pp_notify_on" : "pp_notify_off"
+        emit("notify_requested", ["enabled": enabled])
+        target!.setNotifyValue(enabled, for: characteristic!)
+    }
+
+    func ppWrite() {
+        ppSequence += 1
+        let value = UInt32(options.role) * 1000 + UInt32(ppSequence)
+        ppLastWritten = value
+        ppOutstanding = true
+        ppLastWriteAt = monotonic()
+        let data = Data((0..<4).map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) })
+        emit("write_requested", ["value": value, "bytes": Array(data)])
+        target!.writeValue(data, for: characteristic!, type: .withResponse)
+    }
+
+    func finishPp() {
+        // Close the link ourselves so the peer sees an expected disconnect
+        // before the process exits; the summary follows the callback.
+        phase = "cancelling"
+        cancelAt = monotonic()
+        emit("cancel_requested")
+        manager.cancelPeripheralConnection(target!)
+    }
+
+    func summarisePp() {
+        phase = "pp_done"
+        emit("summary", ["exit_code": 0, "reason": "pp_complete", "role": options.role,
+                          "elapsed_seconds": monotonic() - started,
+                          "locked_id": lockedID?.uuidString as Any? ?? NSNull(),
+                          "reads": reads, "writes": writes,
+                          "notifications": notifications, "subscriptions": subscriptions,
+                          "last_written": ppLastWritten,
+                          "last_notification": ppLastNotification])
+        exitNow(code: 0, reason: "pp_complete")
     }
 
     func advanceNotificationWrite() {

@@ -14,7 +14,7 @@ use crate::crypto::BLE_MIC_LEN;
 use crate::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use crate::hci::runner::LtkReply;
 use crate::ll::acl::{DataPdu, LinkSequence, RxStatus};
-use crate::ll::conn::{ChannelSelectionAlgorithm, ConnectParams, PeripheralConnection};
+use crate::ll::conn::{ChannelSelectionAlgorithm, ConnError, ConnectParams, PeripheralConnection};
 use crate::ll::ctrl::{
     termination_reason, ControlAction, ControlPdu, ControlState, EncReq, LocalVersion,
     FEATURE_LE_ENCRYPTION,
@@ -23,6 +23,7 @@ use crate::ll::dle::LL_LEGACY_PAYLOAD;
 use crate::ll::enc::{
     EncError, EncRole, Encryption, PeripheralStart, StartStage, MAX_ENCRYPTED, MAX_PLAINTEXT,
 };
+use crate::ll::sched::{CloseCause, Expiry, LinkWindow, ScheduledLink, ARM_LEAD_US, EVENT_TAIL_US};
 use crate::ll::Role;
 use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
 use crate::rf::LinkRadio;
@@ -191,6 +192,10 @@ pub trait LinkHost {
     fn publish_connection(&mut self, info: &mut ConnectionInfo) -> bool;
     fn disable_adv(&mut self);
     fn connection_closed(&mut self, reason: u8);
+    /// HCI handle of the live link, when this host fronts one.
+    fn local_handle(&self) -> Option<u16> {
+        None
+    }
     fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8);
     fn connection_updated(&mut self, interval: u16, latency: u16, timeout: u16) -> bool;
     fn data_length_change(
@@ -382,6 +387,71 @@ fn encryption_supported<E: AesEngine>(s: &Session<E>) -> bool {
 
 /// Peripheral link state. The engine owns everything the RF loop mutates; the
 /// example only creates it and inspects the negotiated parameters.
+/// Who advances the connection event counter after a served event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdvanceOwner {
+    /// The engine advances inside [`connection_event`]/[`step`] (P3, HID).
+    SelfRun,
+    /// A [`SessionLink`] in the scheduler table advances via
+    /// [`ScheduledLink::advance_one`]; the engine must not.
+    Table,
+}
+
+/// Scheduler adapter that owns one [`Session`] inside [`LinkTable`].
+///
+/// [`LinkTable`]: crate::ll::sched::LinkTable
+pub struct SessionLink<E: AesEngine> {
+    pub session: Session<E>,
+}
+
+impl<E: AesEngine> SessionLink<E> {
+    pub fn new(mut session: Session<E>) -> Self {
+        session.set_advance_owner(AdvanceOwner::Table);
+        Self { session }
+    }
+}
+
+impl<E: AesEngine> ScheduledLink for SessionLink<E> {
+    fn window(&self) -> LinkWindow {
+        let conn = &self.session.conn;
+        // One bounded exchange: RX the largest accepted PDU, then TX one frame
+        // of the same size. `step` is handed `hard_end_us` as its budget, so
+        // the event cannot outlive this reservation.
+        let air = conn.rx_complete_allowance_us();
+        let (deadline_us, deadline_cause) = self.session.event_deadline();
+        LinkWindow {
+            prepare_us: conn.rx_start_us().wrapping_sub(ARM_LEAD_US),
+            latest_start_us: conn.event_start_us(),
+            reservation_end_us: conn
+                .rx_complete_end_us()
+                .wrapping_add(air)
+                .wrapping_add(EVENT_TAIL_US),
+            min_service_us: air + 80 + EVENT_TAIL_US,
+            deadline_us,
+            deadline_cause,
+            deadline_reason: deadline_cause.default_reason(),
+            channel: conn.channel(),
+            priority: 0,
+            event: conn.event_counter(),
+        }
+    }
+
+    fn advance_one(&mut self) -> Result<(), ConnError> {
+        self.session.conn.next_event()?;
+        self.session.report_update_instant();
+        Ok(())
+    }
+
+    fn expiry(&self, now: u32) -> Option<Expiry> {
+        let (at_us, cause) = self.session.event_deadline();
+        super::conn::time_reached(now, at_us).then_some(Expiry {
+            at_us,
+            cause,
+            reason: cause.default_reason(),
+        })
+    }
+}
+
 pub struct Session<E: AesEngine> {
     conn: PeripheralConnection,
     link: LinkSequence,
@@ -432,6 +502,12 @@ pub struct Session<E: AesEngine> {
     enc_rsp_at: u32,
     pending_ltk: Option<([u8; 8], u16)>,
     own_rpa: Option<[u8; 6]>,
+    /// Who advances the connection event counter after a served event.
+    advance_owner: AdvanceOwner,
+    /// The last `step` ran a connection event body.
+    event_served: bool,
+    /// This link already stopped the advertising that formed it.
+    adv_stopped: bool,
 }
 
 impl<E: AesEngine> Session<E> {
@@ -496,6 +572,43 @@ impl<E: AesEngine> Session<E> {
             enc_rsp_at: 0,
             pending_ltk: None,
             own_rpa: None,
+            advance_owner: AdvanceOwner::SelfRun,
+            event_served: false,
+            adv_stopped: false,
+        }
+    }
+
+    /// Hand event advancement to the scheduler table (`ll::sched`).
+    pub fn set_advance_owner(&mut self, owner: AdvanceOwner) {
+        self.advance_owner = owner;
+    }
+
+    /// True when the last [`step`] ran a connection event body.
+    pub fn take_event_served(&mut self) -> bool {
+        core::mem::take(&mut self.event_served)
+    }
+
+    /// Publish a queued Connection Update once its instant has passed.
+    fn report_update_instant(&mut self) {
+        if self.update_instant == Some(self.conn.event_counter()) {
+            self.update_instant = None;
+            self.update_report = Some((
+                self.conn.params.interval,
+                self.conn.params.latency,
+                self.conn.params.timeout,
+            ));
+        }
+    }
+
+    /// Hard deadline of the next event, with the cause the table reports.
+    fn event_deadline(&self) -> (u32, CloseCause) {
+        let supervision = self.conn.supervision_deadline_us();
+        match self.control.termination_deadline_us() {
+            Some(termination) if !super::conn::time_reached(supervision, termination) => {
+                (termination, CloseCause::Termination)
+            }
+            _ if self.conn.established() => (supervision, CloseCause::SupervisionTimeout),
+            _ => (supervision, CloseCause::EstablishmentTimeout),
         }
     }
 
@@ -1315,16 +1428,13 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             s.conn.rx_end_us(),
         );
     }
-    if s.conn.next_event().is_err() {
-        return EventEnd::Close(0x28);
-    }
-    if s.update_instant == Some(s.conn.event_counter()) {
-        s.update_instant = None;
-        s.update_report = Some((
-            s.conn.params.interval,
-            s.conn.params.latency,
-            s.conn.params.timeout,
-        ));
+    // The scheduler table owns advancement in `AdvanceOwner::Table` mode and
+    // runs the same update-instant bookkeeping in `advance_one`.
+    if s.advance_owner == AdvanceOwner::SelfRun {
+        if s.conn.next_event().is_err() {
+            return EventEnd::Close(0x28);
+        }
+        s.report_update_instant();
     }
     match s.expiration(host, clock.now_us()) {
         Some(reason) => EventEnd::Close(reason),
@@ -1781,6 +1891,26 @@ pub fn close_session<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Instan
     true
 }
 
+/// Everything that only queues work for the next event: encryption setup,
+/// deferred control replies, DLE and prebuilt ciphertext.
+fn service_pending<E: AesEngine, H: LinkHost<Aes = E>>(
+    host: &mut H,
+    s: &mut Session<E>,
+    now: u32,
+) -> Option<u8> {
+    let mut reason = service_encryption(host, s);
+    if reason.is_none() {
+        reason = service_control(host, s, now);
+    }
+    if reason.is_none() {
+        reason = service_dle(host, s);
+    }
+    if reason.is_none() {
+        reason = prefetch_encrypted(host, s);
+    }
+    reason
+}
+
 /// One outer-loop iteration while a session is active.
 ///
 /// Covers the missed-event catch-up, deferred services, the idle gap, the
@@ -1798,6 +1928,7 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     finish: u32,
 ) -> Control {
     host.pre_iteration();
+    s.event_served = false;
     if reached(clock.now_us(), finish) {
         return Control::Finish;
     }
@@ -1821,7 +1952,11 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     // A Host poll is non-preemptible, and LESC key agreement blocks the
     // executor for more than a second. Step over missed events instead of
     // transmitting into a window that already closed.
-    while reached(clock.now_us().wrapping_sub(2_000), prepare) {
+    // Table mode never advances here: a late window reaches the owner as
+    // `Decision::Skipped` and `advance_one` steps the counter exactly once.
+    while s.advance_owner == AdvanceOwner::SelfRun
+        && reached(clock.now_us().wrapping_sub(2_000), prepare)
+    {
         if s.conn.next_event().is_err() {
             break;
         }
@@ -1866,17 +2001,10 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
             s.request_terminate(host, 0x1e, clock.now_us());
         }
     }
+    let mut serviced = false;
     if reason.is_none() && !reached(clock.now_us().wrapping_add(4000), prepare) {
-        reason = service_encryption(host, s);
-        if reason.is_none() {
-            reason = service_control(host, s, clock.now_us());
-        }
-        if reason.is_none() {
-            reason = service_dle(host, s);
-        }
-        if reason.is_none() {
-            reason = prefetch_encrypted(host, s);
-        }
+        serviced = true;
+        reason = service_pending(host, s, clock.now_us());
     }
     if let Some((interval, latency, timeout)) = s.update_report {
         if host.connection_updated(interval, latency, timeout) {
@@ -1888,6 +2016,11 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     if reason.is_none() && radio.channel() != s.conn.channel() {
         radio.set_channel(s.conn.channel()).unwrap();
     }
+    // Advertising between events reprograms the AA/CRC; restore ours before
+    // arming, or every later event is heard on the wrong access address.
+    if reason.is_none() {
+        radio.set_aa_crc(s.conn.params.access_addr, s.conn.params.crc_init);
+    }
     if reason.is_none() && !reached(clock.now_us().wrapping_add(2000), prepare) {
         let mut until = earlier(prepare, earlier(finish, s.conn.supervision_deadline_us()));
         if let Some(end) = s.control.termination_deadline_us() {
@@ -1898,22 +2031,40 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     }
     if reason.is_none() {
         reason = match connection_event(radio, clock, rx, tx, s, host, finish) {
-            EventEnd::Continue => None,
-            EventEnd::Close(reason) => Some(reason),
+            EventEnd::Continue => {
+                s.event_served = true;
+                None
+            }
+            EventEnd::Close(reason) => {
+                s.event_served = true;
+                Some(reason)
+            }
             EventEnd::Stopped => return Control::StopTimeout,
         };
-        if s.conn.established() {
+        if s.conn.established() && !s.adv_stopped {
+            // Stop the advertising that formed this link once. A Host that
+            // keeps a second advertising instance alive re-arms it after the
+            // connection; disarming every event would silence that slot.
+            s.adv_stopped = true;
             host.disable_adv();
         }
         if reason.is_none() {
             reason = finish_deferred(host, s);
+        }
+        // A scheduler dispatches `step` once, at the arm boundary, so the
+        // 4 ms pre-event pass never runs there. Catch up in the long gap
+        // after the event; these services only queue work for the next one.
+        if !serviced && reason.is_none() {
+            reason = service_pending(host, s, clock.now_us());
         }
         host.publish_x1(&s.x1_snapshot());
         if s.enc_change_pending {
             // Our encrypted START_ENC_RSP is on air: tell the Host the link is
             // encrypted. HCI work stays outside the event.
             s.enc_change_pending = false;
-            host.encryption_change(1, 0, 1);
+            if let Some(handle) = host.local_handle() {
+                host.encryption_change(handle, 0, 1);
+            }
         }
     }
     if let Some(reason) = reason {
@@ -1924,6 +2075,9 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     }
     Control::Continue
 }
+
+pub mod central;
+pub mod cp;
 
 #[cfg(test)]
 pub(crate) mod tests;

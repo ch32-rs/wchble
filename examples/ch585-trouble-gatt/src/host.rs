@@ -1,4 +1,5 @@
 //! Real Trouble GATT host, cooperatively polled outside RF deadlines.
+#![cfg_attr(feature = "pp", allow(dead_code))]
 
 use core::cell::Cell;
 use core::convert::Infallible;
@@ -7,9 +8,9 @@ use core::future::pending;
 use embassy_futures::join::join;
 #[cfg(feature = "secure")]
 use embassy_futures::select::{select, Either};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 #[cfg(feature = "secure")]
 use embassy_time::{Duration, Instant, Timer};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use heapless::Vec;
 use trouble_host::prelude::*;
 
@@ -43,6 +44,9 @@ pub const UART_CHARACTERISTIC_UUID_TEXT: &str = "6e400002-b5a3-f393-e0a9-e50e24d
 // X4 changes the GATT database again, so this is a new identity: the old
 // address's bond and cached layout must not be reused.
 pub const RANDOM_ADDRESS: [u8; 6] = [0x18, 0x00, 0x00, 0xee, 0xff, 0xc1];
+// The pp table is shorter than the X4 one above, so it needs its own identity:
+// macOS keeps a peer's GATT database per address and would read the X4 handles.
+pub const PP_RANDOM_ADDRESS: [u8; 6] = [0x1a, 0x00, 0x00, 0xee, 0xff, 0xc1];
 
 /// Bond capacity of the Host. Matches `storage::bond::MAX_BONDS` so the stored
 /// list always fits the Host's in-memory table.
@@ -151,7 +155,9 @@ pub fn x4_word(index: usize) -> u32 {
 }
 
 fn x4_sum(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0u32, |sum, &byte| sum.wrapping_add(u32::from(byte)))
+    bytes
+        .iter()
+        .fold(0u32, |sum, &byte| sum.wrapping_add(u32::from(byte)))
 }
 
 // X1 telemetry: CSA #2 selection and the bidirectional DLE negotiation. The
@@ -312,15 +318,15 @@ impl HostStats {
         self.words.get(index).map_or(0, Cell::get)
     }
 
-    fn set(&self, index: usize, value: u32) {
+    pub(crate) fn set(&self, index: usize, value: u32) {
         self.words[index].set(value);
     }
 
-    fn inc(&self, index: usize) {
+    pub(crate) fn inc(&self, index: usize) {
         self.set(index, self.word(index).wrapping_add(1));
     }
 
-    fn phase(&self, phase: u32) {
+    pub(crate) fn phase(&self, phase: u32) {
         if self.word(STAT_PHASE) != PHASE_FATAL {
             self.set(STAT_PHASE, phase);
         }
@@ -352,8 +358,8 @@ pub async fn run(
     let mut resources: HostResources<DefaultPacketPool, 1, 2, 1, BOND_CAPACITY> =
         HostResources::new();
     #[allow(unused_mut)]
-    let mut builder = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(address));
+    let mut builder =
+        trouble_host::new(controller, &mut resources).set_random_address(Address::random(address));
     // The controller rotates the address itself; the Host only needs the IRK
     // to distribute it during pairing and to resolve identities.
     #[cfg(feature = "privacy")]
@@ -617,8 +623,8 @@ pub async fn run(
                 }
                 // A populated accept list does not prove the peer RPAs resolve;
                 // policy 2 would reject bonded peers whose entry is missing.
-                let resolving = crate::bond::rl_expected().is_empty()
-                    || crate::bond::signals().rl_ready.get();
+                let resolving =
+                    crate::bond::rl_expected().is_empty() || crate::bond::signals().rl_ready.get();
                 if applied && resolving {
                     adv_params.filter_policy = AdvFilterPolicy::FilterConn;
                     crate::bond::bump(crate::bond::STAT_FAL_BUILDS);
@@ -795,7 +801,12 @@ pub async fn run(
                         #[cfg(feature = "secure")]
                         if wrote_cccd {
                             cccd_written = true;
-                            crate::client_att::snapshot(&server, &connection, &mut att_shadow, true);
+                            crate::client_att::snapshot(
+                                &server,
+                                &connection,
+                                &mut att_shadow,
+                                true,
+                            );
                         }
                         #[cfg(feature = "accept-control")]
                         if wrote_control {
@@ -842,9 +853,10 @@ pub async fn run(
                             x4_put(X4_BULK_LEN, current.len() as u32);
                             x4_put(X4_BULK_SUM, x4_sum(&current));
                             let expected = current.len() == BULK_LEN
-                                && current.iter().enumerate().all(|(index, byte)| {
-                                    *byte == x4_bulk_write_byte(index)
-                                });
+                                && current
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(index, byte)| *byte == x4_bulk_write_byte(index));
                             x4_put(X4_BULK_MATCH, u32::from(expected));
                         }
                         if wrote_x4_control {
@@ -868,11 +880,8 @@ pub async fn run(
                                         // blocking or retrying.
                                         for _ in 0..BURST_ATTEMPTS {
                                             x4_inc(X4_BURST_ATTEMPTS);
-                                            match burst.try_notify_raw(
-                                                &connection,
-                                                &pattern,
-                                                false,
-                                            ) {
+                                            match burst.try_notify_raw(&connection, &pattern, false)
+                                            {
                                                 Ok(()) => x4_inc(X4_BURST_SENT),
                                                 Err(Error::OutOfMemory) => {
                                                     x4_inc(X4_BURST_QUEUE_FULL)

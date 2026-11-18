@@ -181,7 +181,12 @@ pub static mut BOND_ECHO: [u32; BOND_ECHO_WORDS] = [0; BOND_ECHO_WORDS];
 fn word(index: usize) -> u32 {
     // SAFETY: single-threaded example; the RF loop and the Host poll never run
     // at the same time.
-    unsafe { core::ptr::addr_of!(BOND_STATS).cast::<u32>().add(index).read_volatile() }
+    unsafe {
+        core::ptr::addr_of!(BOND_STATS)
+            .cast::<u32>()
+            .add(index)
+            .read_volatile()
+    }
 }
 
 /// Increment a counter.
@@ -273,10 +278,7 @@ pub fn from_bond(bond: &BondInformation) -> PersistedBond {
     record.ltk = bond.ltk.to_le_bytes();
     record.address_kind = address[0];
     record.address.copy_from_slice(&address[1..]);
-    record.irk = bond
-        .identity
-        .irk
-        .map(|key| key.0.get().to_le_bytes());
+    record.irk = bond.identity.irk.map(|key| key.0.get().to_le_bytes());
     record.is_bonded = bond.is_bonded;
     record.security_level = match bond.security_level {
         SecurityLevel::NoEncryption => 0,
@@ -316,7 +318,12 @@ pub fn echo(bond: &BondInformation) {
     let words = [
         BOND_ECHO_MAGIC,
         1,
-        u32::from_be_bytes([record.address[0], record.address[1], record.address[2], record.address[3]]),
+        u32::from_be_bytes([
+            record.address[0],
+            record.address[1],
+            record.address[2],
+            record.address[3],
+        ]),
         (u32::from(record.address[4]) << 24)
             | (u32::from(record.address[5]) << 16)
             | (u32::from(record.address_kind) << 8)

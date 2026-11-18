@@ -828,9 +828,7 @@ mod tests {
             skds: SKDS,
             ivs: IVS,
         };
-        let rsp_bytes = start
-            .on_enc_req(req_bytes.as_bytes(), SKDS, IVS)
-            .unwrap();
+        let rsp_bytes = start.on_enc_req(req_bytes.as_bytes(), SKDS, IVS).unwrap();
         assert_eq!(rsp_bytes.as_bytes(), ControlPdu::enc_rsp(&rsp).as_bytes());
         assert_eq!(start.stage(), StartStage::AwaitingKey);
 

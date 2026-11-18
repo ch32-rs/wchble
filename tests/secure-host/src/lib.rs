@@ -130,7 +130,10 @@ mod tests {
             self.controller.pump_once();
             if let Some(request) = self.controller.bridge.take_radio_request() {
                 match request {
-                    RadioRequest::Reset => self.controller.bridge.reset_finished(),
+                    RadioRequest::Reset => {
+                        self.controller.bridge.reset_finished();
+                        self.controller.reset_radio_stopped();
+                    }
                     RadioRequest::Disconnect { reason } => {
                         self.disconnect = Some(reason);
                     }
@@ -1072,7 +1075,10 @@ mod tests {
             soft.pump_once();
             if let Some(request) = soft.bridge.take_radio_request() {
                 match request {
-                    RadioRequest::Reset => soft.bridge.reset_finished(),
+                    RadioRequest::Reset => {
+                        soft.bridge.reset_finished();
+                        soft.reset_radio_stopped();
+                    }
                     RadioRequest::Disconnect { reason } => {
                         panic!("unexpected Host disconnect request: {reason:#04x}");
                     }
