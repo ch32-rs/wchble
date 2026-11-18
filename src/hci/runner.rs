@@ -31,6 +31,8 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 /// Memory capacity exceeded (resolving or filter accept list full).
 const HCI_MEMORY_CAPACITY_EXCEEDED: u8 = 0x07;
+/// Unsupported feature or parameter value.
+const HCI_UNSUPPORTED_FEATURE: u8 = 0x1f;
 
 /// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
@@ -143,6 +145,8 @@ pub struct SoftRunner {
     ltk_reply: [Option<(LinkKey, LtkReply)>; MAX_LINKS],
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
+    /// `LE Set Default PHY` preferences for future connections (masks).
+    default_phy: (u8, u8),
     /// Host's `LE Write Suggested Default Data Length` values.
     suggested_tx_octets: u16,
     suggested_tx_time: u16,
@@ -195,6 +199,7 @@ impl SoftRunner {
             pending_encryption: [None; MAX_LINKS],
             ltk_reply: [None; MAX_LINKS],
             le_features: [0; 8],
+            default_phy: (0x03, 0x03),
             suggested_tx_octets: LL_LEGACY_PAYLOAD,
             suggested_tx_time: LL_LEGACY_TIME_US,
             suggested_tx_explicit: false,
@@ -403,6 +408,23 @@ impl SoftRunner {
 
     pub fn le_features(&self) -> [u8; 8] {
         self.le_features
+    }
+
+    /// `LE Set Default PHY` preferences (TX/RX masks) stored for later links.
+    pub fn default_phy(&self) -> (u8, u8) {
+        self.default_phy
+    }
+
+    /// Report a completed PHY procedure for `handle`, including peer-initiated
+    /// ones. A stale handle is dropped with the link it belonged to.
+    pub fn phy_update_complete_on(&mut self, handle: u16, status: u8, tx: u8, rx: u8) -> bool {
+        match self.live_key(handle) {
+            Some(key) => self
+                .bridge_slot_mut(key.slot)
+                .phy_update_complete(status, tx, rx)
+                .is_ok(),
+            None => false,
+        }
     }
 
     /// Suggested default TX data length last written by the Host.
@@ -1116,8 +1138,10 @@ impl SoftRunner {
         }
         let opcode = u16::from_le_bytes([payload[0], payload[1]]);
         let reply = match opcode {
-            0x0406 | 0x2019 => transport::command_status_packet(opcode, HCI_UNKNOWN_CONNECTION),
-            0x201a | 0x201b | 0x2022 => error_command_complete(
+            0x0406 | 0x2019 | 0x2032 => {
+                transport::command_status_packet(opcode, HCI_UNKNOWN_CONNECTION)
+            }
+            0x201a | 0x201b | 0x2022 | 0x2030 => error_command_complete(
                 opcode,
                 HCI_UNKNOWN_CONNECTION,
                 payload.get(3..).unwrap_or(&[]),
@@ -1178,6 +1202,7 @@ impl SoftRunner {
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
         self.suggested_tx_time = LL_LEGACY_TIME_US;
         self.suggested_tx_explicit = false;
+        self.default_phy = (0x03, 0x03);
         // Revert to the documented defaults: empty resolving and filter accept
         // lists, resolution disabled, 900 s timeout.
         self.adv_own_addr_type = OWN_ADDR_UNSET;
@@ -1231,6 +1256,18 @@ impl SoftRunner {
             }
             0x2019 => {
                 let status = self.enable_encryption(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_status_packet(opcode, status));
+                return;
+            }
+            // LE Set PHY: async; the LL procedure answers with
+            // LE PHY Update Complete.
+            0x2032 => {
+                let status = if params.len() == 7 {
+                    self.set_phy_command(params)
+                } else {
+                    HCI_INVALID_PARAMETERS
+                };
                 self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
@@ -1341,6 +1378,37 @@ impl SoftRunner {
                     HCI_SUCCESS,
                     &features,
                 ));
+                return;
+            }
+            // LE Read PHY
+            0x2030 if params.len() == 2 => {
+                let handle = le16_from(params);
+                let codes = self.live_key(handle).map(|key| {
+                    let (tx, rx) = self.bridge_slot(key.slot).phy_codes();
+                    (tx, rx)
+                });
+                let reply = match codes {
+                    Some((tx, rx)) => transport::command_complete_packet(
+                        opcode,
+                        HCI_SUCCESS,
+                        &[params[0], params[1], tx, rx],
+                    ),
+                    None => error_command_complete(opcode, HCI_UNKNOWN_CONNECTION, params),
+                };
+                let status = if codes.is_some() {
+                    HCI_SUCCESS
+                } else {
+                    HCI_UNKNOWN_CONNECTION
+                };
+                self.log_command(opcode, status);
+                self.pending_reply = Some(reply);
+                return;
+            }
+            // LE Set Default PHY
+            0x2031 if params.len() == 3 => {
+                let status = self.set_default_phy_command(params[0], params[1], params[2]);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
                 return;
             }
             // LE Set Data Length: the RF owner performs LL_LENGTH_REQ.
@@ -1719,6 +1787,65 @@ impl SoftRunner {
         HCI_SUCCESS
     }
 
+    fn set_default_phy_command(&mut self, all_phys: u8, tx: u8, rx: u8) -> u8 {
+        if all_phys & !0x03 != 0 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        let no_tx = all_phys & 0x01 != 0;
+        let no_rx = all_phys & 0x02 != 0;
+        // Only LE 1M and LE 2M are implemented; zero or Coded is unsupported.
+        if !no_tx && (tx == 0 || tx & !0x03 != 0) {
+            return HCI_UNSUPPORTED_FEATURE;
+        }
+        if !no_rx && (rx == 0 || rx & !0x03 != 0) {
+            return HCI_UNSUPPORTED_FEATURE;
+        }
+        if !no_tx {
+            self.default_phy.0 = tx;
+        }
+        if !no_rx {
+            self.default_phy.1 = rx;
+        }
+        HCI_SUCCESS
+    }
+
+    /// `LE Set PHY` parameters: handle(2), all_phys, tx_phys, rx_phys,
+    /// phy_options(2). The LL owner performs the procedure.
+    fn set_phy_command(&mut self, params: &[u8]) -> u8 {
+        // Without the advertised LE 2M bit the LL procedure cannot run; fail
+        // here instead of accepting a request that would never complete.
+        if self.le_features[1] & 1 == 0 {
+            return HCI_UNSUPPORTED_FEATURE;
+        }
+        let handle = le16_from(params);
+        let all_phys = params[2];
+        let options = le16_from(&params[5..]);
+        if all_phys & !0x03 != 0 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        // Phy_Options is only defined for LE Coded; 1M/2M require zero.
+        if options != 0 {
+            return HCI_UNSUPPORTED_FEATURE;
+        }
+        let no_tx = all_phys & 0x01 != 0;
+        let no_rx = all_phys & 0x02 != 0;
+        if no_tx && no_rx {
+            // Nothing to negotiate: report the current PHYs immediately.
+            return self
+                .live_key(handle)
+                .map(|key| self.bridge_slot_mut(key.slot).complete_phy_now(handle))
+                .unwrap_or(HCI_UNKNOWN_CONNECTION);
+        }
+        let tx = if no_tx { self.default_phy.0 } else { params[3] };
+        let rx = if no_rx { self.default_phy.1 } else { params[4] };
+        if tx == 0 || tx & !0x03 != 0 || rx == 0 || rx & !0x03 != 0 {
+            return HCI_UNSUPPORTED_FEATURE;
+        }
+        self.live_key(handle)
+            .map(|key| self.bridge_slot_mut(key.slot).request_phy(handle, tx, rx))
+            .unwrap_or(HCI_UNKNOWN_CONNECTION)
+    }
+
     fn enable_encryption(&mut self, params: &[u8]) -> u8 {
         // Connection_Handle 2 + Random_Number 8 + Encrypted_Diversifier 2 +
         // Long_Term_Key 16 = 28 octets (Core 5.4 Vol 4 Part E §7.8.24).
@@ -1768,7 +1895,7 @@ fn le16_from(params: &[u8]) -> u16 {
 /// Error Command Complete for a command whose return parameters start with a
 /// connection handle. §4.5 requires that handle to be echoed on errors too.
 fn error_command_complete(opcode: u16, status: u8, params: &[u8]) -> Packet {
-    let echo: &[u8] = if matches!(opcode, 0x201a | 0x201b | 0x2022) && params.len() >= 2 {
+    let echo: &[u8] = if matches!(opcode, 0x201a | 0x201b | 0x2022 | 0x2030) && params.len() >= 2 {
         &params[..2]
     } else {
         &[]
@@ -2784,6 +2911,150 @@ mod tests {
             .bridge
             .data_length_change(247, 2120, 247, 2120)
             .unwrap();
+        assert!(!runner.pump_once());
+    }
+
+    #[test]
+    fn le_set_phy_queues_one_procedure_and_reports_completion() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_le_features(crate::ll::ctrl::feature_bits(&[
+            crate::ll::ctrl::FEATURE_LE_2M_PHY,
+        ]));
+        open(&mut runner);
+        runner.bridge.set_masks(u64::MAX, 0x1f | (1 << 11));
+        // handle 1, all_phys 0, TX 2M, RX 2M, options 0.
+        inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), Some((2, 2)));
+        // A second command cannot overwrite the live procedure.
+        inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x0c, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), None);
+        // The LL owner completes it; LE Read PHY reports the new codes.
+        assert!(runner.phy_update_complete_on(1, 0, 2, 2));
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x3e, 6, 0x0c, 0, 1, 0, 2, 2]
+        );
+        inject_cmd(0x2030, &[1, 0]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2030, 0, &[1, 0, 2, 2]);
+        // The procedure is done, so another request is accepted.
+        inject_cmd(0x2032, &[1, 0, 0, 0x01, 0x01, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0, 1, 0x32, 0x20]
+        );
+    }
+
+    #[test]
+    fn le_set_phy_requires_the_2m_feature_bit() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), None);
+    }
+
+    #[test]
+    fn le_phy_commands_validate_masks_and_the_handle() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_le_features(crate::ll::ctrl::feature_bits(&[
+            crate::ll::ctrl::FEATURE_LE_2M_PHY,
+        ]));
+        open(&mut runner);
+        runner.bridge.set_masks(u64::MAX, 0x1f | (1 << 11));
+
+        // Unknown handle: Read PHY echoes it, Set PHY reports 0x02.
+        inject_cmd(0x2030, &[9, 0]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2030, 0x02, &[9, 0]);
+        inject_cmd(0x2032, &[9, 0, 0, 0x02, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x02, 1, 0x32, 0x20]
+        );
+        // Coded PHY in the mask, and non-zero options, are unsupported.
+        inject_cmd(0x2032, &[1, 0, 0, 0x04, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+        );
+        inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0x01, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+        );
+        // Set Default PHY: a zero mask without "no preference" is unsupported.
+        inject_cmd(0x2031, &[0, 0, 0x02]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2031, 0x1f, &[]);
+        // A default of 2M in both directions fills the "no preference" side.
+        inject_cmd(0x2031, &[0, 0x02, 0x02]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2031, 0, &[]);
+        inject_cmd(0x2032, &[1, 0, 0x01, 0, 0x02, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), Some((2, 2)));
+        runner.bridge.set_masks(u64::MAX, 0x7ff & !(1 << 11));
+        runner.bridge.phy_update_complete(0, 2, 2).unwrap();
+
+        // Both directions "no preference": no procedure, current PHYs reported.
+        inject_cmd(0x2032, &[1, 0, 0x03, 0, 0, 0, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), None);
+        // The completion event was masked off, so it is not queued.
         assert!(!runner.pump_once());
     }
 

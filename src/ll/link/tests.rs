@@ -17,7 +17,7 @@ use super::cp::CpLink;
 use super::*;
 use crate::ll::conn::ConnectParams;
 use crate::ll::sched::{Decision, EventOutcome, LinkTable};
-use crate::rf::{Radio, RfCallback, RxState};
+use crate::rf::{PhyMode, Radio, RfCallback, RxState};
 
 /// Self-advancing microsecond clock: every read moves time forward.
 #[derive(Clone)]
@@ -89,6 +89,8 @@ pub(crate) struct FakeRadio {
     access_address: u32,
     /// Last CRC init programmed by the engine.
     crc_init: u32,
+    /// Every `set_phy` call, in order.
+    phys: Vec<(PhyMode, PhyMode)>,
 }
 
 impl FakeRadio {
@@ -110,6 +112,7 @@ impl FakeRadio {
             rx_entries: Vec::new(),
             access_address: 0x8e89_bed6,
             crc_init: 0x55_5555,
+            phys: Vec::new(),
         }
     }
     pub(crate) fn push(&mut self, window: Window) {
@@ -157,7 +160,9 @@ impl Radio for FakeRadio {
         self.access_address = access_address;
         self.crc_init = crc_init;
     }
-    fn set_phy(&mut self, _tx: crate::rf::PhyMode, _rx: crate::rf::PhyMode) {}
+    fn set_phy(&mut self, tx: crate::rf::PhyMode, rx: crate::rf::PhyMode) {
+        self.phys.push((tx, rx));
+    }
     fn set_whiten_disabled(&mut self, _disabled: bool) {}
     fn set_encrypt(&mut self, _enabled: bool) {}
     fn set_callback(&mut self, _cb: Option<RfCallback>) {}
@@ -252,6 +257,7 @@ struct RecHost {
     clock: Option<Rc<Cell<u32>>>,
     acl_rx: Vec<(u8, Vec<u8>)>,
     diag_rx: Vec<(u8, Vec<u8>, bool)>,
+    diag_tx: Vec<(u8, Vec<u8>)>,
     acl_tx: VecDeque<TxAcl>,
     acked: Vec<TxTag>,
     acl_reply_calls: Vec<(u8, Vec<u8>)>,
@@ -270,6 +276,8 @@ struct RecHost {
     radio_requests: VecDeque<RadioRequest>,
     x1: Option<X1Snapshot>,
     published: Vec<ConnectionInfo>,
+    phy_requests: VecDeque<(u8, u8)>,
+    phy_events: Vec<(u8, u8, u8)>,
 }
 
 impl RecHost {
@@ -292,6 +300,7 @@ impl RecHost {
             clock: None,
             acl_rx: Vec::new(),
             diag_rx: Vec::new(),
+            diag_tx: Vec::new(),
             acl_tx: VecDeque::new(),
             acked: Vec::new(),
             acl_reply_calls: Vec::new(),
@@ -310,6 +319,8 @@ impl RecHost {
             radio_requests: VecDeque::new(),
             x1: None,
             published: Vec::new(),
+            phy_requests: VecDeque::new(),
+            phy_events: Vec::new(),
         }
     }
 }
@@ -355,6 +366,9 @@ impl LinkHost for RecHost {
 
     fn diag_acl_raw(&mut self, llid: u8, payload: &[u8], ciphertext: bool) {
         self.diag_rx.push((llid, payload.to_vec(), ciphertext));
+    }
+    fn diag_acl_tx(&mut self, llid: u8, payload: &[u8]) {
+        self.diag_tx.push((llid, payload.to_vec()));
     }
     fn diag_acl_plain(&mut self, llid: u8, payload: &[u8]) {
         self.diag_rx.push((llid, payload.to_vec(), false));
@@ -459,6 +473,12 @@ impl LinkHost for RecHost {
     fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
         None
     }
+    fn take_phy_request(&mut self) -> Option<(u8, u8)> {
+        self.phy_requests.pop_front()
+    }
+    fn phy_update_complete(&mut self, status: u8, tx: u8, rx: u8) {
+        self.phy_events.push((status, tx, rx));
+    }
 
     fn publish_x1(&mut self, snapshot: &X1Snapshot) {
         self.x1 = Some(*snapshot);
@@ -523,10 +543,21 @@ impl Harness {
     }
 
     fn new_at(start: u32) -> Self {
+        Self::new_at_with_features(start, None)
+    }
+
+    fn new_with_features(features: [u8; 8]) -> Self {
+        Self::new_at_with_features(0, Some(features))
+    }
+
+    fn new_at_with_features(start: u32, features: Option<[u8; 8]>) -> Self {
         let clock = FakeClock::new(start);
         let stops = Rc::new(Cell::new(0));
         let radio = FakeRadio::new(&clock, stops.clone());
         let mut host = RecHost::new(stops);
+        if let Some(features) = features {
+            host.features = features;
+        }
         host.clock = Some(clock.now.clone());
         let session = Session::new(
             params(),
@@ -1123,6 +1154,29 @@ fn bad_crc_retransmits_the_outstanding_pdu_and_acks_only_once() {
     h.radio.push(FakeRadio::missed());
     assert_eq!(h.event(FINISH), EventEnd::Continue);
     assert_eq!(h.host.acked, std::vec![tag]);
+}
+
+#[test]
+fn host_tx_diag_reports_the_packet_once_and_not_as_rx() {
+    let mut h = Harness::new();
+    let tag = crate::hci::connection::test_tag(0, 1, 8);
+    h.host.acl_tx.push_back(queued_data_acl(tag));
+
+    h.radio.push(FakeRadio::frame(empty_with(false, false)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        h.host.diag_tx,
+        std::vec![(2, std::vec![0xde, 0xad, 0xbe, 0xef])],
+        "the whole Host packet, counted once"
+    );
+    assert!(
+        !h.host
+            .diag_rx
+            .iter()
+            .any(|(_, payload, _)| payload == &[0xde, 0xad, 0xbe, 0xef]),
+        "TX is not an RX fragment"
+    );
 }
 
 #[test]
@@ -1767,6 +1821,58 @@ fn session_link_window_is_ordered_inside_the_table_budget() {
 }
 
 #[test]
+fn table_mode_advance_applies_the_phy_on_the_instant_event() {
+    let features = crate::ll::ctrl::feature_bits(&[crate::ll::ctrl::FEATURE_LE_2M_PHY]);
+    let mut h = Harness::new_with_features(features);
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    h.radio.push(FakeRadio::frame(empty_pdu()));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.conn.established());
+
+    // The table owner, not the engine, advances to the Instant.
+    let instant = h.session.conn.event_counter() + 6;
+    let [lo, hi] = instant.to_le_bytes();
+    h.session
+        .control
+        .on_pdu(&mut h.session.conn, &[0x18, 2, 2, lo, hi], LOCAL_VERSION)
+        .unwrap();
+
+    let mut link = SessionLink::new(h.session);
+    for _ in 0..5 {
+        link.advance_one().unwrap();
+    }
+    assert_eq!(link.session.conn.tx_phy(), PhyMode::Rate1m, "not yet");
+    link.advance_one().unwrap();
+    assert_eq!(link.session.conn.tx_phy(), PhyMode::Rate2m);
+    assert_eq!(link.session.conn.rx_phy(), PhyMode::Rate2m);
+
+    // The report and the radio switch belong to the Instant's event.
+    h.radio.push(FakeRadio::missed());
+    let mut control = Control::Continue;
+    for _ in 0..5 {
+        control = step(
+            &mut link.session,
+            &mut h.host,
+            &mut h.radio,
+            &h.clock,
+            &mut h.rx,
+            &mut h.tx,
+            FINISH,
+        );
+        if !h.host.phy_events.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(control, Control::Continue);
+    assert_eq!(
+        h.radio.phys.last(),
+        Some(&(PhyMode::Rate2m, PhyMode::Rate2m))
+    );
+    assert_eq!(h.host.phy_events, std::vec![(0, 2, 2)]);
+}
+
+#[test]
 fn table_mode_never_advances_during_the_late_catch_up() {
     let mut h = Harness::new();
     h.session.set_advance_owner(AdvanceOwner::Table);
@@ -2169,4 +2275,85 @@ fn a_two_slot_table_dispatches_one_peripheral_and_one_central() {
     let advanced = table.link(peripheral).unwrap().window();
     assert_eq!(advanced.event, early.event.wrapping_add(1));
     assert_eq!(table.link(central).unwrap().window().event, late.event);
+}
+
+#[test]
+fn phy_request_leaves_once_and_switches_the_radio_at_the_instant() {
+    let features = crate::ll::ctrl::feature_bits(&[crate::ll::ctrl::FEATURE_LE_2M_PHY]);
+    let mut h = Harness::new_with_features(features);
+
+    // Establish on 1M.
+    h.radio.push(FakeRadio::frame(empty_pdu()));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.conn.established());
+
+    // The Host asks for 2M. The request waits in the control slot even though
+    // our empty response is still outstanding.
+    h.host.phy_requests.push_back((2, 2));
+    service_phy(&mut h.host, &mut h.session);
+    assert_eq!(h.session.control.phy_req_tx, 1);
+    assert!(h.session.pending_control.is_some());
+
+    // The peer acknowledges; LL_PHY_REQ leaves with that event.
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(
+        h.radio.sent.last().map(|p| &p[2..]),
+        Some(&[0x16, 2, 2][..]),
+        "LL_PHY_REQ"
+    );
+
+    // LL_PHY_RSP is parsed after the response window and leaves the request
+    // waiting for the Central's IND. The header acks our REQ (NESN 1, SN 0).
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x07, 3, 0x17, 2, 2]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    let now = h.clock.now_us();
+    service_control(&mut h.host, &mut h.session, now);
+    assert_eq!(h.session.control.phy_rsp_rx, 1);
+    assert_eq!(h.host.phy_events, std::vec![], "not complete yet");
+
+    // The Central's IND applies six events later, not in its own event.
+    let instant = h.session.conn.event_counter() + 6;
+    let [lo, hi] = instant.to_le_bytes();
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x0f, 5, 0x18, 2, 2, lo, hi]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.session.control.phy_update_rx, 1);
+    assert_eq!(
+        h.radio.phys.last(),
+        Some(&(PhyMode::Rate1m, PhyMode::Rate1m)),
+        "still 1M before the Instant"
+    );
+
+    for _ in 0..6 {
+        h.radio.push(FakeRadio::missed());
+        assert_eq!(h.event(FINISH), EventEnd::Continue);
+    }
+
+    assert_eq!(
+        h.radio.phys.last(),
+        Some(&(PhyMode::Rate2m, PhyMode::Rate2m))
+    );
+    assert_eq!(h.host.phy_events, std::vec![(0, 2, 2)], "one completion");
+    assert_eq!(h.session.control.phy_changes, 1);
+}
+
+#[test]
+fn phy_request_is_ended_when_the_feature_bit_is_off() {
+    let mut h = Harness::new();
+    h.radio.push(FakeRadio::frame(empty_pdu()));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert!(h.session.conn.established());
+
+    h.host.phy_requests.push_back((2, 2));
+    service_phy(&mut h.host, &mut h.session);
+    assert!(h.session.pending_control.is_none(), "no LL_PHY_REQ");
+    assert_eq!(h.session.control.phy_req_tx, 0);
+    assert_eq!(h.host.phy_events, std::vec![(0x1f, 1, 1)]);
 }

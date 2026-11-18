@@ -40,6 +40,11 @@ cp = ["trouble-host/central", "trouble-host/scan", "dep:embassy-time-driver"]
 # Test-only: ask the central for a fixed connection interval over L2CAP.
 conn-params-30 = []
 conn-params-48 = []
+# X1b-2: advertise LE 2M PHY and request it from the Host after connect.
+x1b-2m = []
+# X1b-3 peer-initiated acceptance: the phone sends LE Set PHY, so the Host
+# must not race it with its own request.
+x1b-2m-peer = ["x1b-2m"]
 
 [dependencies]
 ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }

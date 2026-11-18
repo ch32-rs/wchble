@@ -251,6 +251,11 @@ impl LinkTiming for CentralConnection {
     fn schedule_update(&mut self, update: ConnectionUpdate) -> Result<(), ConnError> {
         CentralConnection::schedule_update(self, update)
     }
+
+    /// The Central link does not carry the PHY procedure in this stage.
+    fn schedule_phy(&mut self, _update: crate::ll::conn::PhyUpdate) -> Result<(), ConnError> {
+        Err(ConnError::Parameters)
+    }
 }
 
 #[cfg(test)]

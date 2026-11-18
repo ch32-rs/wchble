@@ -1,6 +1,7 @@
 //! Pure legacy LE 1M peripheral connection timing and channel selection.
 
 use super::dle::{LL_DEFAULT_RX_PAYLOAD, LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD};
+use crate::rf::PhyMode;
 
 /// Connection handle / timing placeholders retained for the HCI scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +171,7 @@ pub trait LinkTiming {
     fn event_counter(&self) -> u16;
     fn schedule_channel_map(&mut self, map: [u8; 5], instant: u16) -> Result<(), ConnError>;
     fn schedule_update(&mut self, update: ConnectionUpdate) -> Result<(), ConnError>;
+    fn schedule_phy(&mut self, update: PhyUpdate) -> Result<(), ConnError>;
 }
 
 pub(crate) fn le16(bytes: &[u8]) -> u16 {
@@ -442,6 +444,58 @@ impl ConnectionUpdate {
     }
 }
 
+/// `LL_PHY_UPDATE_IND` payload. Fields are single PHY codes: 0 = no change,
+/// 1 = LE 1M, 2 = LE 2M (3 = Coded is rejected by this build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhyUpdate {
+    pub m_to_s: u8,
+    pub s_to_m: u8,
+    pub instant: u16,
+}
+
+impl PhyUpdate {
+    pub const fn new(m_to_s: u8, s_to_m: u8, instant: u16) -> Self {
+        Self {
+            m_to_s,
+            s_to_m,
+            instant,
+        }
+    }
+
+    /// This controller accepts no change, LE 1M and LE 2M only.
+    pub fn validate(&self) -> Result<(), ConnError> {
+        if self.m_to_s > 2 || self.s_to_m > 2 {
+            return Err(ConnError::Parameters);
+        }
+        Ok(())
+    }
+}
+
+/// Fixed on-air overhead at the current RX PHY: preamble + AA + header + CRC.
+/// LE 1M: 8 + 32 + 16 + 24 = 80 us. LE 2M: 8 + 16 + 8 + 12 = 44 us.
+pub fn phy_overhead_us(phy: PhyMode) -> u32 {
+    match phy {
+        PhyMode::Rate2m => 44,
+        _ => 80,
+    }
+}
+
+/// Payload time per payload octet at the current RX PHY.
+pub fn phy_octet_us(phy: PhyMode) -> u32 {
+    match phy {
+        PhyMode::Rate2m => 4,
+        _ => 8,
+    }
+}
+
+fn phy_from_code(code: u8) -> Option<PhyMode> {
+    match code {
+        1 => Some(PhyMode::Rate1m),
+        2 => Some(PhyMode::Rate2m),
+        _ => None,
+    }
+}
+
 /// `now` is at or after `deadline`, for distances below 2^31 microseconds.
 pub fn time_reached(now: u32, deadline: u32) -> bool {
     now.wrapping_sub(deadline) as i32 >= 0
@@ -477,6 +531,10 @@ pub struct PeripheralConnection {
     established: bool,
     pending_map: Option<(u16, [u8; 5])>,
     pending_update: Option<ConnectionUpdate>,
+    pending_phy: Option<PhyUpdate>,
+    rx_phy: PhyMode,
+    tx_phy: PhyMode,
+    phy_applied: Option<(PhyMode, PhyMode)>,
 }
 
 impl PeripheralConnection {
@@ -507,6 +565,10 @@ impl PeripheralConnection {
             established: false,
             pending_map: None,
             pending_update: None,
+            pending_phy: None,
+            rx_phy: PhyMode::Rate1m,
+            tx_phy: PhyMode::Rate1m,
+            phy_applied: None,
         }
     }
 
@@ -526,6 +588,36 @@ impl PeripheralConnection {
     /// the pre-negotiation value stays in place while a request is in flight.
     pub fn set_rx_max_payload(&mut self, octets: u16) {
         self.rx_max_payload = octets.clamp(LL_LEGACY_PAYLOAD, LL_MAX_PAYLOAD);
+    }
+
+    pub fn rx_phy(&self) -> PhyMode {
+        self.rx_phy
+    }
+
+    pub fn tx_phy(&self) -> PhyMode {
+        self.tx_phy
+    }
+
+    /// The PHYs applied at the last Instant, for the one HCI report.
+    pub fn take_phy_applied(&mut self) -> Option<(PhyMode, PhyMode)> {
+        self.phy_applied.take()
+    }
+
+    /// Queue an `LL_PHY_UPDATE_IND` for a future Instant.
+    pub fn schedule_phy(&mut self, update: PhyUpdate) -> Result<(), ConnError> {
+        update.validate()?;
+        if self.pending_phy.is_some() {
+            return Err(ConnError::ProcedureCollision);
+        }
+        // The Central picks the Instant; Core only forbids the past. Its own
+        // six-event margin is not ours to enforce: Android's controller sends
+        // this side five events out after `setPreferredPhy`.
+        let distance = update.instant.wrapping_sub(self.event_counter);
+        if distance == 0 || distance >= 0x7fff {
+            return Err(ConnError::InstantPassed);
+        }
+        self.pending_phy = Some(update);
+        Ok(())
     }
 
     pub fn event_counter(&self) -> u16 {
@@ -561,17 +653,14 @@ impl PeripheralConnection {
             .wrapping_add(self.window_width_us + self.widening_us())
     }
 
-    /// On-air time of the largest accepted PDU: 80 us preamble/AA/header/CRC
-    /// overhead plus 8 us per payload octet. Address match cannot occur before
-    /// the 40 us preamble/AA reception; its exact hardware flag latency is not
-    /// assumed.
+    /// On-air time of the largest accepted PDU at the current RX PHY.
     pub fn rx_complete_allowance_us(&self) -> u32 {
-        80 + u32::from(self.rx_max_payload) * 8
+        phy_overhead_us(self.rx_phy) + u32::from(self.rx_max_payload) * phy_octet_us(self.rx_phy)
     }
 
-    /// Allow the latest-starting LE 1M packet to finish. Use this for the
-    /// initial hardware window and the software no-capture timeout, while
-    /// still honoring earlier finite, supervision and event deadlines.
+    /// Allow the latest-starting packet to finish. Use this for the initial
+    /// hardware window and the software no-capture timeout, while still
+    /// honoring earlier finite, supervision and event deadlines.
     pub fn rx_complete_end_us(&self) -> u32 {
         self.rx_end_us()
             .wrapping_add(self.rx_complete_allowance_us())
@@ -615,8 +704,10 @@ impl PeripheralConnection {
         }
         self.established = true;
         if !self.anchor_seen {
-            // Preamble + AA + header + payload + CRC on LE 1M.
-            let anchor = rx_done_us.wrapping_sub(80 + u32::from(payload_len) * 8);
+            // Preamble + AA + header + payload + CRC at the RX PHY.
+            let anchor = rx_done_us.wrapping_sub(
+                phy_overhead_us(self.rx_phy) + u32::from(payload_len) * phy_octet_us(self.rx_phy),
+            );
             self.event_start_us = anchor;
             self.last_anchor_us = anchor;
             self.window_width_us = 0;
@@ -701,6 +792,18 @@ impl PeripheralConnection {
                 self.pending_update = None;
             }
         }
+        if let Some(phy) = self.pending_phy {
+            if phy.instant == self.event_counter {
+                if let Some(tx) = phy_from_code(phy.s_to_m) {
+                    self.tx_phy = tx;
+                }
+                if let Some(rx) = phy_from_code(phy.m_to_s) {
+                    self.rx_phy = rx;
+                }
+                self.pending_phy = None;
+                self.phy_applied = Some((self.tx_phy, self.rx_phy));
+            }
+        }
         self.channel = self.csa.next_channel(self.event_counter);
         Ok(())
     }
@@ -717,6 +820,10 @@ impl LinkTiming for PeripheralConnection {
 
     fn schedule_update(&mut self, update: ConnectionUpdate) -> Result<(), ConnError> {
         PeripheralConnection::schedule_update(self, update)
+    }
+
+    fn schedule_phy(&mut self, update: PhyUpdate) -> Result<(), ConnError> {
+        PeripheralConnection::schedule_phy(self, update)
     }
 }
 
@@ -1337,5 +1444,69 @@ mod tests {
         assert_eq!(c.schedule_channel_map(map, 0), Ok(()));
         assert_eq!(c.params.channel_map, map);
         assert!(c.pending_map.is_none());
+    }
+
+    #[test]
+    fn phy_air_time_scales_with_the_rate() {
+        assert_eq!(phy_overhead_us(PhyMode::Rate1m), 80);
+        assert_eq!(phy_overhead_us(PhyMode::Rate2m), 44);
+        assert_eq!(phy_octet_us(PhyMode::Rate2m), 4);
+        // The default receive ceiling is the encrypted legacy maximum (31).
+        let c = PeripheralConnection::new(params(), 0, false);
+        assert_eq!(c.rx_complete_allowance_us(), 80 + 31 * 8);
+    }
+
+    #[test]
+    fn two_m_anchor_uses_the_short_overhead() {
+        let mut c = PeripheralConnection::new(params(), 0, false);
+        c.schedule_phy(PhyUpdate::new(2, 2, 6)).unwrap();
+        for _ in 0..6 {
+            c.next_event().unwrap();
+        }
+        assert_eq!(
+            c.take_phy_applied(),
+            Some((PhyMode::Rate2m, PhyMode::Rate2m))
+        );
+        assert!(c.on_rx_anchor(10_000, 10));
+        // 44 us overhead + 10 octets at 4 us, not the 1M 80 + 8n.
+        assert_eq!(c.event_start_us(), 10_000 - (44 + 10 * 4));
+        assert_eq!(c.rx_complete_allowance_us(), 44 + 31 * 4);
+    }
+
+    #[test]
+    fn phy_instant_must_be_in_the_future() {
+        let mut c = PeripheralConnection::new(params(), 0, false);
+        assert_eq!(
+            c.schedule_phy(PhyUpdate::new(2, 2, 0)),
+            Err(ConnError::InstantPassed),
+            "the current event is too late"
+        );
+        assert_eq!(
+            c.schedule_phy(PhyUpdate::new(2, 2, 0x8000)),
+            Err(ConnError::InstantPassed),
+            "a wrapped instant is in the past"
+        );
+        assert_eq!(
+            c.schedule_phy(PhyUpdate::new(3, 2, 6)),
+            Err(ConnError::Parameters),
+            "Coded PHY is not implemented"
+        );
+        assert_eq!(
+            c.schedule_phy(PhyUpdate::new(2, 2, 5)),
+            Ok(()),
+            "the Central may pick the minimum margin"
+        );
+        assert_eq!(
+            c.schedule_phy(PhyUpdate::new(2, 2, 8)),
+            Err(ConnError::ProcedureCollision),
+            "one PHY procedure at a time"
+        );
+        // The accepted update survives the rejected call.
+        for _ in 1..5 {
+            c.next_event().unwrap();
+        }
+        assert_eq!(c.tx_phy(), PhyMode::Rate1m);
+        c.next_event().unwrap();
+        assert_eq!(c.rx_phy(), PhyMode::Rate2m);
     }
 }

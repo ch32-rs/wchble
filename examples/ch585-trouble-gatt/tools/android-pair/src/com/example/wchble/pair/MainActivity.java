@@ -81,6 +81,8 @@ public class MainActivity extends Activity {
     private static final int ROTATION_WAIT_MS = 14_000;
     // `--es mode` selects the S3 acceptance phase. `pair` is the S2 flow.
     private String mode = "pair";
+    // X1b-3: the phone sends LE Set PHY so the peer-initiated path runs.
+    private boolean peerPhy;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter;
@@ -228,6 +230,12 @@ public class MainActivity extends Activity {
 
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @Override
+        public void onPhyUpdate(BluetoothGatt gatt, int txPhy, int rxPhy, int status) {
+            logEvent("\"event\":\"phy_update\",\"status\":%d,\"tx\":%d,\"rx\":%d",
+                    status, txPhy, rxPhy);
+        }
+
+        @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             logEvent("\"event\":\"connection_state\",\"status\":%d,\"state\":%d", status, newState);
             if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -275,6 +283,12 @@ public class MainActivity extends Activity {
                         boolean requested = g.getDevice().createBond();
                         logEvent("\"event\":\"bond_requested\",\"ok\":%s", requested);
                     }
+                }
+                if (peerPhy) {
+                    g.setPreferredPhy(BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_OPTION_NO_PREFERRED);
+                    logEvent("\"event\":\"phy_requested\"");
                 }
                 if ("att".equals(mode)) {
                     // The MTU has to be negotiated before discovery so the
@@ -491,6 +505,7 @@ public class MainActivity extends Activity {
             }
             mode = requestedMode;
         }
+        peerPhy = getIntent().getBooleanExtra("peer_phy", false);
         logEvent("\"event\":\"mode\",\"mode\":\"%s\"", mode);
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {

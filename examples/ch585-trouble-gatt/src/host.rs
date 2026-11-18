@@ -223,6 +223,40 @@ pub fn x1_inc(index: usize) {
     x1_put(index, x1_get(index).wrapping_add(1));
 }
 
+// X1b: PHY procedure telemetry. Words 0..=8 are written by the RF owner every
+// event; the Host records the `LE Read PHY` result and the last completion
+// status in 9..=11.
+pub const PHY_STATS_WORDS: usize = 16;
+pub const PHY_TX: usize = 0;
+pub const PHY_RX: usize = 1;
+pub const PHY_REQ_TX: usize = 2;
+pub const PHY_REQ_RX: usize = 3;
+pub const PHY_RSP_TX: usize = 4;
+pub const PHY_RSP_RX: usize = 5;
+pub const PHY_UPDATE_RX: usize = 6;
+pub const PHY_CHANGES: usize = 7;
+pub const PHY_INVALID: usize = 8;
+pub const PHY_READ_TX: usize = 9;
+pub const PHY_READ_RX: usize = 10;
+pub const PHY_LAST_STATUS: usize = 11;
+pub const PHY_IND_M2S: usize = 12;
+pub const PHY_IND_S2M: usize = 13;
+pub const PHY_IND_INSTANT: usize = 14;
+pub const PHY_IND_COUNTER: usize = 15;
+
+#[no_mangle]
+static mut PHY_STATS: [u32; PHY_STATS_WORDS] = [0; PHY_STATS_WORDS];
+
+pub fn phy_put(index: usize, value: u32) {
+    // SAFETY: single-threaded example; the RF owner and Host share the array.
+    unsafe {
+        core::ptr::addr_of_mut!(PHY_STATS)
+            .cast::<u32>()
+            .add(index)
+            .write_volatile(value)
+    }
+}
+
 /// Read an X1 counter. The firmware runner uses the exported symbol; the
 /// native host fixture uses this hook.
 #[allow(dead_code)]
@@ -264,6 +298,14 @@ pub const SECURITY_FAILED: u32 = 4;
 /// See the comment on `security_deadline`: Android must get the first word.
 #[cfg(feature = "secure")]
 const SECURITY_REQUEST_DELAY_MS: u64 = 2_000;
+
+#[cfg(feature = "x1b-2m")]
+fn phy_code(phy: PhyKind) -> u32 {
+    match phy {
+        PhyKind::Le2M => 2,
+        _ => 1,
+    }
+}
 
 #[cfg(feature = "conn-params-30")]
 const CONN_INTERVAL_US: u64 = 30_000;
@@ -674,6 +716,13 @@ pub async fn run(
             stats.inc(STAT_CONNECTIONS);
             stats.phase(PHASE_CONNECTED);
             stats.set(STAT_SUBSCRIBED, 0);
+            // X1b-2: request 2M once the link exists. The controller queues the
+            // procedure until the LL can carry it. The peer-initiated image
+            // leaves the request to the phone so the two cannot collide.
+            #[cfg(all(feature = "x1b-2m", not(feature = "x1b-2m-peer")))]
+            if connection.raw().set_phy(&stack, PhyKind::Le2M).await.is_err() {
+                stats.error(17);
+            }
             // S2: a peripheral Security Request is what makes a macOS central
             // start pairing without a protected attribute. It must not be the
             // first SMP traffic, though: when Android receives one in SMP IDLE
@@ -1004,6 +1053,26 @@ pub async fn run(
                     GattConnectionEvent::PairingFailed(_) => {
                         stats.error(15);
                         stats.set(STAT_SECURITY, SECURITY_FAILED);
+                    }
+                    // X1b-3 evidence: the Host-visible completion plus its own
+                    // LE Read PHY answer.
+                    #[cfg(feature = "x1b-2m")]
+                    GattConnectionEvent::PhyUpdated { tx_phy, rx_phy } => {
+                        phy_put(PHY_LAST_STATUS, 0);
+                        phy_put(PHY_READ_TX, phy_code(tx_phy));
+                        phy_put(PHY_READ_RX, phy_code(rx_phy));
+                        match connection.raw().read_phy(&stack).await {
+                            Ok((tx, rx)) => {
+                                phy_put(PHY_READ_TX, phy_code(tx));
+                                phy_put(PHY_READ_RX, phy_code(rx));
+                            }
+                            Err(_) => stats.error(18),
+                        }
+                    }
+                    #[cfg(feature = "x1b-2m")]
+                    GattConnectionEvent::PhyUpdateFailed { status } => {
+                        phy_put(PHY_LAST_STATUS, u32::from(status.into_inner()));
+                        stats.error(19);
                     }
                     _ => {}
                 }
