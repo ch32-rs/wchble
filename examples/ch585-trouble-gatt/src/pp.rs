@@ -25,7 +25,12 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
     let mut peripheral = stack.peripheral();
 
     let mut storage = [0u8; 4];
-    let mut table: AttributeTable<'_, NoopRawMutex, 8> = AttributeTable::new();
+    let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
+    // The macOS client matches the advertised local name.
+    let mut gap = table.add_service(Service::new(0x1800u16));
+    gap.add_characteristic_ro(0x2a00u16, host::LOCAL_NAME);
+    gap.add_characteristic_ro(0x2a01u16, &[0u8, 0]);
+    gap.build();
     let mut service = table.add_service(Service::new(SERVICE_UUID));
     let value: Characteristic<u32> = service
         .add_characteristic(
@@ -40,7 +45,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
         )
         .build();
     service.build();
-    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 8, 2>::new(table);
+    let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 24, 2>::new(table);
 
     let app = async {
         loop {
@@ -88,9 +93,14 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
 
 async fn accept<'d, 's, C: Controller>(
     peripheral: &mut Peripheral<'d, C, DefaultPacketPool>,
-    server: &'s AttributeServer<'_, NoopRawMutex, DefaultPacketPool, 8, 2>,
+    server: &'s AttributeServer<'_, NoopRawMutex, DefaultPacketPool, 24, 2>,
 ) -> GattConnection<'d, 's, DefaultPacketPool> {
-    let adv_data = [0x02, 0x01, 0x06];
+    // Flags plus the local name the macOS client matches exactly.
+    let mut adv_data = [0u8; 14];
+    adv_data[..3].copy_from_slice(&[0x02, 0x01, 0x06]);
+    adv_data[3] = 0x0A;
+    adv_data[4] = 0x09;
+    adv_data[5..].copy_from_slice(host::LOCAL_NAME);
     let scan_data = [];
     let acceptor = peripheral
         .advertise(
