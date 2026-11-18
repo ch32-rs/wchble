@@ -1,14 +1,11 @@
-//! Bounded single-connection HCI state. The radio/LL owner calls this bridge
-//! only outside its timing-critical exchange; no method waits on the Host.
+//! Bounded per-slot HCI state. The radio/LL owner calls this bridge only
+//! outside its timing-critical exchange; no method waits on the Host.
 
 use bt_hci::transport::PacketKind;
 
 use crate::ll::Role;
 
 use super::transport::{self, LinkKey, Packet};
-
-/// The transport slot this single bridge owns until X3 assigns slots per link.
-const LINK_SLOT: u8 = 0;
 
 /// Maximum Host ACL payload advertised through `LE Read Buffer Size`: the
 /// DLE on-air maximum of 251 octets. The Host may still hand over smaller
@@ -48,19 +45,27 @@ pub enum BridgeError {
     AlreadyConnected,
     /// The Host has not enabled the event required to continue.
     Disabled,
+    /// No live `u32` generation remains for a new connection.
+    GenerationExhausted,
+    /// Another slot still owes the Host a lifecycle event for this handle.
+    HandleRetiring,
 }
 
 /// An opaque identity for an actual Host ACL buffer, not an LL sequence number.
+/// The complete link key keeps a tag from one slot/generation out of another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxTag {
-    epoch: u32,
+    key: LinkKey,
     serial: u32,
 }
 
 /// Test-only identity for fixtures that supply their own TX buffer.
 #[cfg(test)]
-pub(crate) fn test_tag(epoch: u32, serial: u32) -> TxTag {
-    TxTag { epoch, serial }
+pub(crate) fn test_tag(slot: u8, generation: u32, serial: u32) -> TxTag {
+    TxTag {
+        key: LinkKey { slot, generation },
+        serial,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,8 +163,10 @@ fn connection_event(
 
 #[derive(Debug)]
 pub struct ConnectionBridge {
+    slot: u8,
     info: Option<ConnectionInfo>,
     epoch: u32,
+    generation_exhausted: bool,
     serial: u32,
     tx: [Option<TxSlot>; ACL_CREDITS],
     rx: [Option<Packet>; RX_CAPACITY],
@@ -184,9 +191,17 @@ impl Default for ConnectionBridge {
 
 impl ConnectionBridge {
     pub const fn new() -> Self {
+        Self::for_slot(0)
+    }
+
+    /// Each bridge owns one transport slot; the slot is part of every TxTag.
+    pub const fn for_slot(slot: u8) -> Self {
+        assert!(slot < super::transport::MAX_LINKS as u8);
         Self {
+            slot,
             info: None,
             epoch: 0,
+            generation_exhausted: false,
             serial: 0,
             tx: [None; ACL_CREDITS],
             rx: [None; RX_CAPACITY],
@@ -233,14 +248,31 @@ impl ConnectionBridge {
         self.info.map(|info| info.role)
     }
 
+    /// Test-only view of the generation counter.
+    #[cfg(test)]
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch
     }
 
     pub(crate) fn link_key(&self) -> LinkKey {
         LinkKey {
-            slot: LINK_SLOT,
+            slot: self.slot,
             generation: self.epoch,
+        }
+    }
+
+    /// Advance the identity generation. Zero is never live, and wrapping past
+    /// `u32::MAX` retires the slot instead of reusing an old identity.
+    fn bump_generation(&mut self) -> bool {
+        match self.epoch.checked_add(1) {
+            Some(next) => {
+                self.epoch = next;
+                true
+            }
+            None => {
+                self.generation_exhausted = true;
+                false
+            }
         }
     }
 
@@ -249,6 +281,9 @@ impl ConnectionBridge {
         if self.info.is_some() || self.resetting {
             return Err(BridgeError::AlreadyConnected);
         }
+        if self.generation_exhausted {
+            return Err(BridgeError::GenerationExhausted);
+        }
         if info.handle > 0x0eff
             || info.peer_address_type > 1
             || !matches!(info.role, Role::Central | Role::Peripheral)
@@ -256,17 +291,30 @@ impl ConnectionBridge {
         {
             return Err(BridgeError::InvalidPacket);
         }
+        // A handle is a protocol label shared by both slots, so it may only
+        // name one live link at a time.
+        if transport::published_key(info.handle).is_some_and(|key| key.slot != self.slot) {
+            return Err(BridgeError::InvalidPacket);
+        }
+        // Nor may it reopen elsewhere while the Host still owes the previous
+        // link's Connection/Disconnection Complete: slot rotation could hand
+        // the new connect over first.
+        if transport::link_event_pending_elsewhere(self.slot, info.handle) {
+            return Err(BridgeError::HandleRetiring);
+        }
         if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
             return Err(BridgeError::Full);
         }
-        self.epoch = self.epoch.wrapping_add(1);
+        if !self.bump_generation() {
+            return Err(BridgeError::GenerationExhausted);
+        }
         self.info = Some(info);
         self.disconnecting = false;
-        transport::set_link(LINK_SLOT, Some((info.handle, self.link_key())));
+        transport::set_link(self.slot, Some((info.handle, self.link_key())));
         if let Some(subevent) = self.connection_event_slot() {
             let (parameters, len) =
                 connection_event(Some(&info), 0, subevent == ENHANCED_CONNECTION_COMPLETE);
-            self.push_event(event_packet(0x3e, &parameters[..len]));
+            self.push_link_event(event_packet(0x3e, &parameters[..len]), info.handle);
         }
         Ok(())
     }
@@ -296,16 +344,17 @@ impl ConnectionBridge {
     /// published identity. Event masks, addresses, lists and features stay.
     /// Called only once the radio has stopped using this connection's buffers.
     pub fn disconnected(&mut self, reason: u8) {
+        let key = self.link_key();
         let Some(info) = self.info.take() else {
             return;
         };
-        self.clear_data();
-        transport::set_link(LINK_SLOT, None);
+        self.retire(Some(info.handle), key);
+        transport::set_link(self.slot, None);
         self.radio_request = None;
         self.disconnecting = false;
         if !self.resetting && self.event_enabled(0x05) {
             let [lo, hi] = info.handle.to_le_bytes();
-            self.push_event(event_packet(0x05, &[0, lo, hi, reason]));
+            self.push_link_event(event_packet(0x05, &[0, lo, hi, reason]), info.handle);
         }
     }
 
@@ -333,7 +382,7 @@ impl ConnectionBridge {
         parameters[4..6].copy_from_slice(&interval.to_le_bytes());
         parameters[6..8].copy_from_slice(&latency.to_le_bytes());
         parameters[8..10].copy_from_slice(&timeout.to_le_bytes());
-        self.push_event(event_packet(0x3e, &parameters));
+        self.push_link_event(event_packet(0x3e, &parameters), handle);
         Ok(())
     }
 
@@ -367,7 +416,7 @@ impl ConnectionBridge {
         parameters[5..7].copy_from_slice(&max_tx_time.to_le_bytes());
         parameters[7..9].copy_from_slice(&max_rx_octets.to_le_bytes());
         parameters[9..11].copy_from_slice(&max_rx_time.to_le_bytes());
-        self.push_event(event_packet(0x3e, &parameters));
+        self.push_link_event(event_packet(0x3e, &parameters), handle);
         Ok(())
     }
 
@@ -394,7 +443,7 @@ impl ConnectionBridge {
             return Err(BridgeError::Full);
         }
         let [lo, hi] = handle.to_le_bytes();
-        self.push_event(event_packet(0x08, &[status, lo, hi, enabled]));
+        self.push_link_event(event_packet(0x08, &[status, lo, hi, enabled]), handle);
         Ok(())
     }
 
@@ -426,7 +475,7 @@ impl ConnectionBridge {
         parameters[3..11].copy_from_slice(&rand);
         parameters[11] = elo;
         parameters[12] = ehi;
-        self.push_event(event_packet(0x3e, &parameters));
+        self.push_link_event(event_packet(0x3e, &parameters), handle);
         Ok(())
     }
 
@@ -491,7 +540,7 @@ impl ConnectionBridge {
     /// Only the first acknowledgement of a live, in-flight ACL tag returns a
     /// credit. Empty/control PDUs have no TxTag and cannot call this by accident.
     pub fn ack_tx(&mut self, tag: TxTag) -> bool {
-        if tag.epoch != self.epoch || self.resetting {
+        if tag.key != self.link_key() || self.resetting {
             return false;
         }
         let Some(slot) = self.tx.iter_mut().find(|slot| {
@@ -516,13 +565,14 @@ impl ConnectionBridge {
             return;
         }
         self.info = None;
-        self.clear_data();
-        transport::set_link(LINK_SLOT, None);
+        self.retire(None, self.link_key());
+        transport::set_link(self.slot, None);
         self.events = [None; EVENT_CAPACITY];
         self.radio_request = None;
         self.disconnecting = false;
         self.resetting = false;
         self.reset_done = true;
+        transport::clear_link_events(self.slot);
     }
 
     pub(crate) fn set_masks(&mut self, event_mask: u64, le_event_mask: u64) {
@@ -545,6 +595,10 @@ impl ConnectionBridge {
     pub(crate) fn request_reset(&mut self) {
         self.resetting = true;
         self.radio_request = Some(RadioRequest::Reset);
+    }
+
+    pub(crate) fn is_resetting(&self) -> bool {
+        self.resetting
     }
 
     pub(crate) fn take_reset_done(&mut self) -> bool {
@@ -571,6 +625,7 @@ impl ConnectionBridge {
         if self.disconnecting || self.resetting {
             return Err(BridgeError::NotConnected);
         }
+        let key = self.link_key();
         let slot = self
             .tx
             .iter_mut()
@@ -579,7 +634,7 @@ impl ConnectionBridge {
         self.serial = self.serial.wrapping_add(1);
         let mut acl = TxAcl {
             tag: TxTag {
-                epoch: self.epoch,
+                key,
                 serial: self.serial,
             },
             llid: if pb == 0 { 2 } else { 1 },
@@ -605,6 +660,14 @@ impl ConnectionBridge {
                 return false;
             }
             shift(&mut self.events);
+            if let Some(handle) = link_event_handle(&packet) {
+                transport::release_link_event(self.slot, handle);
+            }
+            if self.events[0].is_none() {
+                // Nothing from this slot can reach the Host after an empty
+                // ring; a saturated handle table can be dropped now.
+                transport::clear_link_events(self.slot);
+            }
             return true;
         }
         if self.completed != 0 {
@@ -629,13 +692,18 @@ impl ConnectionBridge {
         false
     }
 
-    fn clear_data(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
+    /// Retire the current identity and its queued data. `None` means Reset,
+    /// which clears both links; a handle drains only that link's packets.
+    fn retire(&mut self, handle: Option<u16>, key: LinkKey) {
+        self.bump_generation();
         self.tx = [None; ACL_CREDITS];
         self.rx = [None; RX_CAPACITY];
         self.completed = 0;
         self.data_length_request = None;
-        transport::discard_connection_data();
+        match handle {
+            Some(handle) => transport::discard_connection_data(handle, key),
+            None => transport::discard_all_connection_data(),
+        }
     }
 
     fn event_enabled(&self, code: u8) -> bool {
@@ -658,6 +726,13 @@ impl ConnectionBridge {
             .expect("reserved lifecycle slot") = Some(packet);
     }
 
+    /// Queue an event that names a link and record it in the cross-slot
+    /// barrier until the Host has it.
+    fn push_link_event(&mut self, packet: Packet, handle: u16) {
+        self.push_event(packet);
+        transport::note_link_event(self.slot, handle);
+    }
+
     /// Best-effort event for droppable diagnostics such as scan reports.
     /// Keeps `LIFECYCLE_RESERVE` slots free so a connect/disconnect event can
     /// always be queued.
@@ -668,6 +743,31 @@ impl ConnectionBridge {
         }
         self.push_event(packet);
         true
+    }
+}
+
+/// Handle named by a link-scoped event (lifecycle, encryption, LTK, update,
+/// DLE). Scan/adv reports and unrelated events have no link.
+fn link_event_handle(packet: &Packet) -> Option<u16> {
+    if packet.kind != bt_hci::transport::PacketKind::Event || packet.len < 5 {
+        return None;
+    }
+    let at =
+        |index: usize| u16::from_le_bytes([packet.bytes[index], packet.bytes[index + 1]]) & 0x0fff;
+    match packet.bytes[0] {
+        0x05 | 0x08 => Some(at(3)),
+        0x3e if packet.len >= 6 => match packet.bytes[2] {
+            // Connection Complete names a link only on success; a failure
+            // event carries handle 0 and must not block a real handle 0.
+            CONNECTION_COMPLETE | ENHANCED_CONNECTION_COMPLETE if packet.bytes[3] == 0 => {
+                Some(at(4))
+            }
+            // Connection Update (0x03), LTK Request (0x05), DLE Change (0x07).
+            0x03 => Some(at(4)),
+            0x05 | 0x07 => Some(at(3)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -687,6 +787,8 @@ pub(crate) fn event_packet(code: u8, parameters: &[u8]) -> Packet {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     const RPA: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -805,5 +907,159 @@ mod tests {
         assert_eq!(len, 19);
         assert_eq!(p[0], 0x01);
         assert!(p[2..].iter().all(|byte| *byte == 0));
+    }
+
+    fn info_for(handle: u16) -> ConnectionInfo {
+        ConnectionInfo { handle, ..info() }
+    }
+
+    fn acl(handle: u16, data: &[u8]) -> Packet {
+        let mut packet = Packet::empty(PacketKind::AclData);
+        packet.bytes[..2].copy_from_slice(&handle.to_le_bytes());
+        packet.bytes[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        packet.bytes[4..4 + data.len()].copy_from_slice(data);
+        packet.len = data.len() + 4;
+        packet
+    }
+
+    /// Every test here touches the global channels and link table.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::hci::test_lock::lock();
+        transport::drain_channels_for_test();
+        guard
+    }
+
+    #[test]
+    fn a_tx_tag_is_bound_to_its_slot_and_generation() {
+        let _guard = serial();
+        let mut a = ConnectionBridge::for_slot(0);
+        let mut b = ConnectionBridge::for_slot(1);
+        a.connected(info_for(1)).unwrap();
+        b.connected(info_for(2)).unwrap();
+        // Both slots open their first link, so only the slot distinguishes the
+        // identical generations.
+        assert_eq!(a.link_key().slot, 0);
+        assert_eq!(b.link_key().slot, 1);
+        assert_ne!(a.link_key().generation, 0);
+        assert_eq!(a.link_key().generation, b.link_key().generation);
+
+        a.enqueue_tx(&acl(1, &[0x5a])).unwrap();
+        let tag = a.take_tx_acl().unwrap().tag;
+        assert!(!b.ack_tx(tag), "a tag from another slot must not settle");
+        assert!(a.ack_tx(tag));
+    }
+
+    #[test]
+    fn a_handle_published_by_another_slot_is_rejected() {
+        let _guard = serial();
+        let mut a = ConnectionBridge::for_slot(0);
+        let mut b = ConnectionBridge::for_slot(1);
+        a.connected(info_for(7)).unwrap();
+        assert_eq!(b.connected(info_for(7)), Err(BridgeError::InvalidPacket));
+        assert!(b.handle().is_none());
+    }
+
+    #[test]
+    fn disconnect_clears_only_the_closing_link() {
+        let _guard = serial();
+        let mut a = ConnectionBridge::for_slot(0);
+        let mut b = ConnectionBridge::for_slot(1);
+        a.connected(info_for(1)).unwrap();
+        b.connected(info_for(2)).unwrap();
+        a.enqueue_tx(&acl(1, &[0xaa])).unwrap();
+        b.enqueue_tx(&acl(2, &[0xbb])).unwrap();
+        let b_tag = b.take_tx_acl().unwrap().tag;
+
+        // Queued output for both links: ACL, completed-packets, ACL, completed.
+        transport::try_send_controller_packet(acl(1, &[1])).unwrap();
+        transport::try_send_controller_packet(acl(2, &[2])).unwrap();
+        transport::try_send_controller_packet(event_packet(0x13, &[1, 1, 0, 1, 0])).unwrap();
+        transport::try_send_controller_packet(event_packet(0x13, &[1, 2, 0, 1, 0])).unwrap();
+        // Stale Host data for the closing link only: the Host→Controller queue
+        // holds a single packet.
+        transport::try_send_host_packet(acl(1, &[3])).unwrap();
+
+        a.disconnected(0x13);
+
+        let surviving: [Packet; 2] = [
+            transport::try_receive_controller_packet().unwrap(),
+            transport::try_receive_controller_packet().unwrap(),
+        ];
+        assert!(transport::try_receive_controller_packet().is_none());
+        assert!(surviving
+            .iter()
+            .all(|packet| packet.kind == PacketKind::AclData || packet.payload()[0] == 0x13));
+        assert_eq!(surviving[0].payload()[..2], [2, 0]);
+        assert_eq!(surviving[1].payload()[2..5], [1, 2, 0]);
+        assert!(transport::try_receive_host_packet().is_none());
+
+        // The remaining link keeps its credit and identity.
+        assert!(b.ack_tx(b_tag));
+        assert!(b.is_connected());
+        assert!(a.handle().is_none());
+    }
+
+    #[test]
+    fn reconnect_allocates_a_fresh_generation() {
+        let _guard = serial();
+        let mut bridge = ConnectionBridge::for_slot(1);
+        bridge.connected(info_for(3)).unwrap();
+        let first = bridge.link_key();
+        bridge.disconnected(0x16);
+        bridge.connected(info_for(3)).unwrap();
+        let second = bridge.link_key();
+        assert_eq!(second.slot, 1);
+        assert_ne!(second.generation, first.generation);
+        assert_ne!(second.generation, 0);
+    }
+
+    #[test]
+    fn generation_exhaustion_retires_the_slot() {
+        let _guard = serial();
+        let mut bridge = ConnectionBridge::for_slot(0);
+        bridge.epoch = u32::MAX - 1;
+        bridge.connected(info_for(5)).unwrap();
+        assert_eq!(bridge.link_key().generation, u32::MAX);
+        bridge.disconnected(0x13);
+        assert_eq!(
+            bridge.connected(info_for(5)),
+            Err(BridgeError::GenerationExhausted)
+        );
+    }
+
+    #[test]
+    fn a_fresh_bridge_cannot_connect_after_generation_overflow() {
+        let _guard = serial();
+        let mut bridge = ConnectionBridge::for_slot(0);
+        bridge.epoch = u32::MAX;
+        assert_eq!(
+            bridge.connected(info_for(5)),
+            Err(BridgeError::GenerationExhausted)
+        );
+        assert!(bridge.handle().is_none());
+        assert!(transport::published_key(5).is_none());
+    }
+
+    #[test]
+    fn reset_retires_the_key_and_link_data() {
+        let _guard = serial();
+        let mut bridge = ConnectionBridge::for_slot(0);
+        bridge.connected(info_for(1)).unwrap();
+        let old = bridge.link_key();
+        bridge.enqueue_tx(&acl(1, &[1])).unwrap();
+        let tag = bridge.take_tx_acl().unwrap().tag;
+        transport::try_send_controller_packet(acl(1, &[2])).unwrap();
+        transport::try_send_host_packet(acl(1, &[3])).unwrap();
+
+        bridge.request_reset();
+        assert_eq!(bridge.take_radio_request(), Some(RadioRequest::Reset));
+        bridge.reset_finished();
+
+        assert!(!bridge.ack_tx(tag), "a pre-Reset tag must not settle");
+        assert_ne!(bridge.link_key(), old);
+        assert!(bridge.handle().is_none());
+        assert!(transport::published_key(1).is_none());
+        assert!(transport::try_receive_controller_packet().is_none());
+        assert!(transport::try_receive_host_packet().is_none());
     }
 }

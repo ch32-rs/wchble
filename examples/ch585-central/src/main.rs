@@ -1277,6 +1277,7 @@ fn main() -> ! {
                     initiator = None;
                     soft.clear_pending_connect();
                     soft.bridge.reset_finished();
+                    soft.reset_radio_stopped();
                     put(2, STAGE_SCANNING);
                 }
                 RadioRequest::Disconnect { reason } => {

@@ -6,8 +6,9 @@
 //! for every HCI-backed Peripheral example.
 
 use crate::crypto::engine::AesEngine;
-use crate::hci::connection::{ConnectionInfo, RadioRequest, TxAcl, TxTag};
+use crate::hci::connection::{ConnectionBridge, ConnectionInfo, RadioRequest, TxAcl, TxTag};
 use crate::hci::runner::LtkReply;
+use crate::hci::transport::LinkKey;
 use crate::hci::SoftRunner;
 use crate::ll::link::{LinkHost, X1Snapshot};
 
@@ -75,11 +76,60 @@ pub trait LinkExtras {
 pub struct RunnerHost<'a, X: LinkExtras> {
     soft: &'a mut SoftRunner,
     extras: X,
+    slot: u8,
+    /// Full identity this host operates on. A slot rebuild (close, Reset)
+    /// changes it, so a host kept across the rebuild goes stale instead of
+    /// acting on the new link.
+    key: LinkKey,
 }
 
 impl<'a, X: LinkExtras> RunnerHost<'a, X> {
+    /// Slot 0, the N=1 wiring every existing example uses.
     pub fn new(soft: &'a mut SoftRunner, extras: X) -> Self {
-        Self { soft, extras }
+        Self::for_slot(0, soft, extras)
+    }
+
+    /// Bind this host to one transport slot and the identity that slot holds
+    /// now; a later publish within this host's life rebinds it to the new key.
+    pub fn for_slot(slot: u8, soft: &'a mut SoftRunner, extras: X) -> Self {
+        assert!(usize::from(slot) < crate::hci::transport::MAX_LINKS);
+        let key = soft.bridge_slot(slot).link_key();
+        Self {
+            soft,
+            extras,
+            slot,
+            key,
+        }
+    }
+
+    /// Pin an explicit identity, for an owner that stored the key when the
+    /// session was published.
+    pub fn for_link(key: LinkKey, soft: &'a mut SoftRunner, extras: X) -> Self {
+        assert!(usize::from(key.slot) < crate::hci::transport::MAX_LINKS);
+        Self {
+            soft,
+            extras,
+            slot: key.slot,
+            key,
+        }
+    }
+
+    fn bridge(&self) -> &ConnectionBridge {
+        self.soft.bridge_slot(self.slot)
+    }
+
+    fn bridge_mut(&mut self) -> &mut ConnectionBridge {
+        self.soft.bridge_slot_mut(self.slot)
+    }
+
+    /// Identity this host was constructed for.
+    pub fn key(&self) -> LinkKey {
+        self.key
+    }
+
+    /// True while the slot still holds the identity this host was built for.
+    fn live(&self) -> bool {
+        self.bridge().link_key() == self.key
     }
 }
 
@@ -157,26 +207,32 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
     }
 
     fn can_receive_acl(&mut self, llid: u8, len: usize) -> bool {
-        self.soft.bridge.can_receive_acl(llid, len)
+        self.live() && self.bridge().can_receive_acl(llid, len)
     }
     fn receive_acl(&mut self, llid: u8, payload: &[u8]) -> bool {
-        self.soft.bridge.receive_acl(llid, payload).is_ok()
+        self.live() && self.bridge_mut().receive_acl(llid, payload).is_ok()
     }
     fn take_tx_acl(&mut self) -> Option<TxAcl> {
-        self.soft.bridge.take_tx_acl()
+        if !self.live() {
+            return None;
+        }
+        self.bridge_mut().take_tx_acl()
     }
     fn ack_tx(&mut self, tag: TxTag) -> bool {
-        self.soft.bridge.ack_tx(tag)
+        self.live() && self.bridge_mut().ack_tx(tag)
     }
 
     fn is_connected(&self) -> bool {
-        self.soft.bridge.is_connected()
+        self.live() && self.bridge().is_connected()
     }
     fn publish_connection(&mut self, info: &mut ConnectionInfo) -> bool {
         self.extras.resolve_peer(self.soft, info);
-        if self.soft.bridge.connected(*info).is_err() {
+        if self.bridge_mut().connected(*info).is_err() {
             return false;
         }
+        // The successful publish is the one rebinding point; every later call
+        // must still match this exact generation.
+        self.key = self.bridge().link_key();
         self.extras.published_connection(self.soft);
         true
     }
@@ -184,16 +240,22 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         self.soft.ll.adv.enabled = false;
     }
     fn connection_closed(&mut self, reason: u8) {
-        self.soft.connection_closed(reason);
+        let key = self.key();
+        self.soft.connection_closed_on(key, reason);
     }
     fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8) {
-        let _ = self.soft.encryption_change(handle, status, enabled);
+        // Never route by handle alone: the same handle may live in the other
+        // slot or in a later generation.
+        if self.live() && self.bridge().handle() == Some(handle) {
+            let _ = self.soft.encryption_change(handle, status, enabled);
+        }
     }
     fn connection_updated(&mut self, interval: u16, latency: u16, timeout: u16) -> bool {
-        self.soft
-            .bridge
-            .connection_updated(interval, latency, timeout)
-            .is_ok()
+        self.live()
+            && self
+                .bridge_mut()
+                .connection_updated(interval, latency, timeout)
+                .is_ok()
     }
     fn data_length_change(
         &mut self,
@@ -202,20 +264,34 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         rx_octets: u16,
         rx_time: u16,
     ) -> bool {
-        self.soft
-            .bridge
-            .data_length_change(tx_octets, tx_time, rx_octets, rx_time)
-            .is_ok()
+        self.live()
+            && self
+                .bridge_mut()
+                .data_length_change(tx_octets, tx_time, rx_octets, rx_time)
+                .is_ok()
     }
 
     fn take_ltk_reply(&mut self) -> Option<LtkReply> {
-        self.soft.take_ltk_reply()
+        if !self.live() {
+            return None;
+        }
+        let key = self.key;
+        self.soft.take_ltk_reply_for(key)
     }
     fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool {
-        self.soft.push_ltk_request(rand, ediv)
+        if !self.live() {
+            return false;
+        }
+        let Some(handle) = self.bridge().handle() else {
+            return false;
+        };
+        self.soft.push_ltk_request_on(handle, rand, ediv)
     }
     fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
-        self.soft.take_data_length_request()
+        if !self.live() {
+            return None;
+        }
+        self.bridge_mut().take_data_length_request()
     }
 
     fn publish_x1(&mut self, snapshot: &X1Snapshot) {
@@ -229,7 +305,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         self.extras.after_close(self.soft);
     }
     fn on_reset(&mut self) {
-        self.soft.bridge.reset_finished();
+        if self.live() {
+            self.bridge_mut().reset_finished();
+        }
     }
     fn on_disconnect_request(&mut self, reason: u8) {
         self.extras.on_disconnect_request(reason);
@@ -238,7 +316,10 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         self.extras.pre_iteration();
     }
     fn take_radio_request(&mut self) -> Option<RadioRequest> {
-        self.soft.bridge.take_radio_request()
+        if !self.live() {
+            return None;
+        }
+        self.bridge_mut().take_radio_request()
     }
 }
 
@@ -695,5 +776,110 @@ mod tests {
             std::vec![(0x3e, 0x0001, 0), (0x05, 0x0001, 0x08)]
         );
         assert_eq!(closes.get(), 12);
+    }
+
+    fn info_on(handle: u16) -> ConnectionInfo {
+        ConnectionInfo {
+            handle,
+            role: crate::ll::Role::Peripheral,
+            peer_address_type: 1,
+            peer_address: [1, 2, 3, 4, 5, 0xc6],
+            interval: 24,
+            latency: 0,
+            supervision_timeout: 200,
+            master_clock_accuracy: 0,
+            peer_rpa: None,
+            local_rpa: None,
+            peer_identity: None,
+        }
+    }
+
+    fn acl_packet(handle: u16, data: &[u8]) -> crate::hci::transport::Packet {
+        let mut packet =
+            crate::hci::transport::Packet::empty(bt_hci::transport::PacketKind::AclData);
+        packet.bytes[..2].copy_from_slice(&handle.to_le_bytes());
+        packet.bytes[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        packet.bytes[4..4 + data.len()].copy_from_slice(data);
+        packet.len = data.len() + 4;
+        packet
+    }
+
+    #[test]
+    fn encryption_change_cannot_cross_slots() {
+        let _serial = serial();
+        let mut b = Bench::new();
+        b.soft.bridge_slot_mut(0).connected(info_on(1)).unwrap();
+        b.soft.bridge_slot_mut(1).connected(info_on(5)).unwrap();
+        while b.soft.pump_once() {
+            while transport::try_receive_controller_packet().is_some() {}
+        }
+        while transport::try_receive_controller_packet().is_some() {}
+
+        let extras = b.extras();
+        let mut host = RunnerHost::new(&mut b.soft, extras);
+        host.encryption_change(5, 0, 1);
+        drop(host);
+        assert!(
+            transport::try_receive_controller_packet().is_none(),
+            "slot 0's host must not report slot 1's encryption"
+        );
+
+        // The controller API still routes by handle for the slot's owner.
+        assert!(b.soft.encryption_change(5, 0, 1));
+        assert!(b.soft.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(event.payload()[0], 0x08);
+        assert_eq!(&event.payload()[3..5], &[5, 0]);
+    }
+
+    #[test]
+    fn a_stale_runner_host_cannot_touch_the_rebuilt_link() {
+        let _serial = serial();
+        let mut b = Bench::new();
+        b.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+        assert_eq!(b.event(), EventEnd::Continue);
+        let old = b.soft.bridge.link_key();
+
+        // The slot reopens with the same handle but a new identity.
+        b.soft.bridge.disconnected(0x13);
+        b.soft.bridge.connected(info_on(1)).unwrap();
+        let new = b.soft.bridge.link_key();
+        assert_ne!(old, new);
+        while transport::try_receive_controller_packet().is_some() {}
+        b.soft.bridge.enqueue_tx(&acl_packet(1, &[7])).unwrap();
+
+        let extras = b.extras();
+        let mut stale = RunnerHost::for_link(old, &mut b.soft, extras);
+        assert!(!stale.is_connected());
+        stale.encryption_change(1, 0, 1);
+        stale.connection_closed(0x13);
+        assert!(!stale.push_ltk_request([0; 8], 0));
+        drop(stale);
+
+        assert!(b.soft.bridge.is_connected(), "the stale close is a no-op");
+        assert_eq!(b.soft.bridge.link_key(), new);
+        assert!(transport::try_receive_controller_packet().is_none());
+    }
+
+    #[test]
+    fn a_stale_host_cannot_drain_the_new_links_acl() {
+        let _serial = serial();
+        let mut b = Bench::new();
+        b.radio.push(FakeRadio::bad_frame(bad_crc_frame(0x01, &[])));
+        assert_eq!(b.event(), EventEnd::Continue);
+        let old = b.soft.bridge.link_key();
+        b.soft.bridge.disconnected(0x13);
+        b.soft.bridge.connected(info_on(1)).unwrap();
+        while transport::try_receive_controller_packet().is_some() {}
+        b.soft.bridge.enqueue_tx(&acl_packet(1, &[7])).unwrap();
+
+        let extras = b.extras();
+        let mut stale = RunnerHost::for_link(old, &mut b.soft, extras);
+        assert!(stale.take_tx_acl().is_none(), "stale host drains nothing");
+        drop(stale);
+        assert!(
+            b.soft.bridge.take_tx_acl().is_some(),
+            "the new link keeps it"
+        );
     }
 }

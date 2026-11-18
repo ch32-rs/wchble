@@ -1029,7 +1029,7 @@ fn empty_with(nesn: bool, sn: bool) -> Vec<u8> {
 #[test]
 fn bad_crc_retransmits_the_outstanding_pdu_and_acks_only_once() {
     let mut h = Harness::new();
-    let tag = crate::hci::connection::test_tag(1, 7);
+    let tag = crate::hci::connection::test_tag(0, 1, 7);
     h.host.acl_tx.push_back(queued_data_acl(tag));
 
     // Peer accepts our data PDU but does not acknowledge it yet.
@@ -1072,7 +1072,7 @@ fn bad_crc_retransmits_the_outstanding_pdu_and_acks_only_once() {
 #[test]
 fn late_response_retransmits_the_outstanding_pdu_and_acks_only_once() {
     let mut h = Harness::new();
-    let tag = crate::hci::connection::test_tag(1, 9);
+    let tag = crate::hci::connection::test_tag(0, 1, 9);
     h.host.acl_tx.push_back(queued_data_acl(tag));
 
     h.radio.push(FakeRadio::frame(empty_with(false, false)));

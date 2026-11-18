@@ -1133,6 +1133,7 @@ fn main() -> ! {
                 RadioRequest::Reset => {
                     stop(&mut radio, &clock);
                     soft.bridge.reset_finished();
+                    soft.reset_radio_stopped();
                     put(2, 2);
                 }
                 RadioRequest::Disconnect { reason } => diag_disconnect(reason),

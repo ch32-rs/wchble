@@ -1,8 +1,9 @@
-//! Soft HCI command/ACL pump and bounded single-connection bridge.
+//! Soft HCI command/ACL pump and its fixed two-slot connection bridges.
 //!
 //! A cooperative RF owner calls [`SoftRunner::pump_once`] only while idle and
-//! synchronizes connection lifecycle through [`SoftRunner::bridge`]. LL radio
-//! timing, retransmission and sequence numbers remain outside this module.
+//! synchronizes connection lifecycle through [`SoftRunner::bridge`] (slot 0)
+//! and [`SoftRunner::link_bridge`]. LL radio timing, retransmission and
+//! sequence numbers remain outside this module.
 
 use bt_hci::transport::PacketKind;
 
@@ -16,7 +17,7 @@ use crate::ll::{scan, LinkLayer};
 use crate::rand::ChaCha20Drbg;
 
 use super::connection::{event_packet, BridgeError, ConnectionBridge};
-use super::transport::{self, HostPacket, Packet, PacketScope};
+use super::transport::{self, HostPacket, LinkKey, Packet, PacketScope, MAX_LINKS};
 
 /// HCI success.
 const HCI_SUCCESS: u8 = 0x00;
@@ -104,14 +105,23 @@ pub enum LtkReply {
 #[derive(Debug)]
 pub struct SoftRunner {
     pub ll: LinkLayer,
+    /// Slot 0. Kept as a named field so N=1 callers keep their wiring.
     pub bridge: ConnectionBridge,
+    /// Slot 1, used by the second link. Idle until a session publishes into it.
+    slot1: ConnectionBridge,
+    /// Next slot to poll for output, so neither link starves the other.
+    flush_slot: u8,
     scan: ScanState,
     pending_connect: Option<CreateConnRequest>,
     adv_reports_dropped: u32,
     pending_reply: Option<Packet>,
-    /// Input held under backpressure, with the scope stamped at the producer.
-    pending_input: Option<HostPacket>,
+    /// Input held under backpressure per slot, with the scope stamped at the
+    /// producer so a blocked link cannot occupy the shared input path.
+    pending_input: [Option<HostPacket>; MAX_LINKS],
     reset_pending: bool,
+    /// The RF owner confirmed the radio is physically idle for a Reset that
+    /// had only advertising/scanning (no link to stop).
+    reset_radio_ack: bool,
     event_mask: u64,
     le_event_mask: u64,
     bd_addr: [u8; 6],
@@ -125,12 +135,12 @@ pub struct SoftRunner {
     drbg: ChaCha20Drbg,
     /// True once a HAL supplied a measured entropy seed.
     entropy_seeded: bool,
-    /// Pending `LE Enable Encryption` for the RF owner (Central role), tagged
-    /// with the connection epoch that created it.
-    pending_encryption: Option<(u32, EnableEncryption)>,
-    /// Host answer waiting for the RF owner (Peripheral role), tagged with the
-    /// connection epoch that requested it.
-    ltk_reply: Option<(u32, LtkReply)>,
+    /// Pending `LE Enable Encryption` per slot (Central role), tagged with the
+    /// link identity that created it.
+    pending_encryption: [Option<(LinkKey, EnableEncryption)>; MAX_LINKS],
+    /// Host answer per slot (Peripheral role), tagged with the link identity
+    /// that requested it.
+    ltk_reply: [Option<(LinkKey, LtkReply)>; MAX_LINKS],
     /// LE features advertised both through HCI and LL_FEATURE_RSP.
     le_features: [u8; 8],
     /// Host's `LE Write Suggested Default Data Length` values.
@@ -165,12 +175,15 @@ impl SoftRunner {
         Self {
             ll: LinkLayer::new(),
             bridge: ConnectionBridge::new(),
+            slot1: ConnectionBridge::for_slot(1),
+            flush_slot: 0,
             scan: ScanState::default(),
             pending_connect: None,
             adv_reports_dropped: 0,
             pending_reply: None,
-            pending_input: None,
+            pending_input: [None; MAX_LINKS],
             reset_pending: false,
+            reset_radio_ack: true,
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
             bd_addr: DEFAULT_BD_ADDR,
@@ -179,8 +192,8 @@ impl SoftRunner {
             privacy: Privacy::new(),
             drbg: ChaCha20Drbg::from_seed(&[0u8; 32]),
             entropy_seeded: false,
-            pending_encryption: None,
-            ltk_reply: None,
+            pending_encryption: [None; MAX_LINKS],
+            ltk_reply: [None; MAX_LINKS],
             le_features: [0; 8],
             suggested_tx_octets: LL_LEGACY_PAYLOAD,
             suggested_tx_time: LL_LEGACY_TIME_US,
@@ -191,6 +204,89 @@ impl SoftRunner {
             sent_log: [0; 8],
             sent_log_len: 0,
         }
+    }
+
+    /// Bridge for `slot`, or `None` when the slot is out of range. Slots are
+    /// fixed; only their links come and go.
+    pub fn link_bridge(&self, slot: u8) -> Option<&ConnectionBridge> {
+        match slot {
+            0 => Some(&self.bridge),
+            1 => Some(&self.slot1),
+            _ => None,
+        }
+    }
+
+    pub fn link_bridge_mut(&mut self, slot: u8) -> Option<&mut ConnectionBridge> {
+        match slot {
+            0 => Some(&mut self.bridge),
+            1 => Some(&mut self.slot1),
+            _ => None,
+        }
+    }
+
+    /// Internal accessors: callers only pass slots from a `LinkKey`.
+    pub(crate) fn bridge_slot(&self, slot: u8) -> &ConnectionBridge {
+        match slot {
+            1 => &self.slot1,
+            _ => &self.bridge,
+        }
+    }
+
+    pub(crate) fn bridge_slot_mut(&mut self, slot: u8) -> &mut ConnectionBridge {
+        match slot {
+            1 => &mut self.slot1,
+            _ => &mut self.bridge,
+        }
+    }
+
+    fn links(&self) -> [&ConnectionBridge; 2] {
+        [&self.bridge, &self.slot1]
+    }
+
+    fn links_mut(&mut self) -> [&mut ConnectionBridge; 2] {
+        [&mut self.bridge, &mut self.slot1]
+    }
+
+    /// Live link for `handle`, if any. Handles are shared by both slots.
+    pub(crate) fn live_key(&self, handle: u16) -> Option<LinkKey> {
+        self.links()
+            .into_iter()
+            .find(|bridge| bridge.handle() == Some(handle))
+            .map(ConnectionBridge::link_key)
+    }
+
+    /// True while `key` still names a connected link.
+    fn link_live(&self, key: LinkKey) -> bool {
+        self.links()
+            .into_iter()
+            .any(|bridge| bridge.is_connected() && bridge.link_key() == key)
+    }
+
+    fn link_key_mut(&mut self, key: LinkKey) -> Option<&mut ConnectionBridge> {
+        self.links_mut()
+            .into_iter()
+            .find(|bridge| bridge.is_connected() && bridge.link_key() == key)
+    }
+
+    fn any_connected(&self) -> bool {
+        self.links().into_iter().any(ConnectionBridge::is_connected)
+    }
+
+    /// Acknowledge Reset only when every slot has finished retiring its link
+    /// and the RF owner has confirmed the physical stop when one was needed.
+    fn take_reset_done(&mut self) -> bool {
+        // Do not consume the bridges' completion flags until the RF owner has
+        // confirmed the stop, or the one-shot flag would be lost.
+        if !self.reset_radio_ack {
+            return false;
+        }
+        let mut done = false;
+        let mut pending = false;
+        for bridge in self.links_mut() {
+            done |= bridge.take_reset_done();
+            pending |= bridge.is_resetting();
+        }
+        done && !pending
     }
 
     /// Opcode and status of the most recent failed HCI command, packed as
@@ -315,9 +411,19 @@ impl SoftRunner {
             .then_some((self.suggested_tx_octets, self.suggested_tx_time))
     }
 
-    /// Take a Host `LE Set Data Length` request (`TX_Octets`, `TX_Time`).
+    /// Take slot 0's Host `LE Set Data Length` request (`TX_Octets`,
+    /// `TX_Time`). The N=1 wiring; a dual-link owner uses
+    /// [`Self::take_data_length_request_on`].
     pub fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
         self.bridge.take_data_length_request()
+    }
+
+    /// Take `slot`'s DLE request, leaving any other link's untouched.
+    pub fn take_data_length_request_on(&mut self, slot: u8) -> Option<(u16, u16)> {
+        if usize::from(slot) >= MAX_LINKS {
+            return None;
+        }
+        self.bridge_slot_mut(slot).take_data_length_request()
     }
 
     /// A 32-bit random value for LL use (access address / CRCInit).
@@ -332,38 +438,96 @@ impl SoftRunner {
 
     /// Take the pending `LE Enable Encryption` request (Central role).
     ///
-    /// A request queued on an earlier connection is discarded: every link uses
-    /// handle 1, so without the epoch check the RF owner would start encryption
-    /// on the new link with the old key material.
+    /// Tied to slot 0, the N=1 wiring; a multi-link owner uses
+    /// [`Self::take_encryption_request_on`]. A request queued on an earlier
+    /// connection is discarded: handles are reused, so without the full
+    /// link-key check the RF owner could start encryption on the new link with
+    /// the old key material.
     pub fn take_encryption_request(&mut self) -> Option<EnableEncryption> {
-        let (epoch, request) = self.pending_encryption.take()?;
-        (epoch == self.bridge.epoch()).then_some(request)
+        self.take_encryption_request_on(0)
     }
 
-    /// Take the Host's answer to an `LE LTK Request` (Peripheral role).
+    /// Take the request queued by `slot`, leaving the other link's untouched.
+    pub fn take_encryption_request_on(&mut self, slot: u8) -> Option<EnableEncryption> {
+        let (key, request) = self.pending_encryption.get_mut(usize::from(slot))?.take()?;
+        self.link_live(key).then_some(request)
+    }
+
+    /// Take the Host's answer to an `LE LTK Request` (Peripheral role), slot 0
+    /// only so a dual-link owner cannot consume the other link's answer.
     pub fn take_ltk_reply(&mut self) -> Option<LtkReply> {
-        let (epoch, reply) = self.ltk_reply.take()?;
-        (epoch == self.bridge.epoch()).then_some(reply)
+        self.take_ltk_reply_on(0)
+    }
+
+    /// Take slot `slot`'s pending LTK answer.
+    pub fn take_ltk_reply_on(&mut self, slot: u8) -> Option<LtkReply> {
+        let (key, reply) = self.ltk_reply.get_mut(usize::from(slot))?.take()?;
+        self.link_live(key).then_some(reply)
+    }
+
+    /// Take the answer for one specific link, leaving any other link's reply
+    /// untouched.
+    pub(crate) fn take_ltk_reply_for(&mut self, key: LinkKey) -> Option<LtkReply> {
+        if !self.link_live(key) {
+            return None;
+        }
+        let entry = self.ltk_reply.get_mut(usize::from(key.slot))?;
+        let (tagged, reply) = entry.take()?;
+        if tagged == key {
+            return Some(reply);
+        }
+        *entry = Some((tagged, reply));
+        None
     }
 
     /// Drop encryption state when the link is gone or Reset is processed.
     pub fn clear_encryption(&mut self) {
-        self.pending_encryption = None;
-        self.ltk_reply = None;
+        self.pending_encryption = [None; MAX_LINKS];
+        self.ltk_reply = [None; MAX_LINKS];
     }
 
-    /// Close the active link and drop everything scoped to it: queued ACL,
-    /// completions, key material and the published link identity. Global
-    /// controller state (masks, address, privacy lists, features) survives;
-    /// only Reset clears that (X3.1 contract).
+    /// Drop only `key`'s security state; another link's pending reply survives.
+    pub(crate) fn clear_encryption_for(&mut self, key: LinkKey) {
+        let slot = usize::from(key.slot);
+        if self
+            .pending_encryption
+            .get(slot)
+            .is_some_and(|entry| entry.is_some_and(|(tagged, _)| tagged == key))
+        {
+            self.pending_encryption[slot] = None;
+        }
+        if self
+            .ltk_reply
+            .get(slot)
+            .is_some_and(|entry| entry.is_some_and(|(tagged, _)| tagged == key))
+        {
+            self.ltk_reply[slot] = None;
+        }
+    }
+
+    /// N=1 close entry: closes slot 0 only, and drops only that link's key
+    /// material. A dual-link owner must use [`Self::connection_closed_on`]
+    /// so this legacy call cannot retire the other link.
     pub fn connection_closed(&mut self, reason: u8) {
-        self.bridge.disconnected(reason);
-        self.clear_encryption();
+        let key = self.bridge.link_key();
+        if self.bridge.is_connected() {
+            self.bridge.disconnected(reason);
+        }
+        self.clear_encryption_for(key);
     }
 
-    /// Emit `LE LTK Request` for the connected handle. Returns false when the
-    /// Host has not enabled the event or the queue is full; the RF owner must
-    /// then reject `LL_ENC_REQ` instead of starting encryption.
+    /// Close the link `key` names. A stale key (the slot already retired and
+    /// reopened) is a no-op, even when the handle matches the new link.
+    pub(crate) fn connection_closed_on(&mut self, key: LinkKey, reason: u8) {
+        if let Some(bridge) = self.link_key_mut(key) {
+            bridge.disconnected(reason);
+        }
+        self.clear_encryption_for(key);
+    }
+
+    /// Emit `LE LTK Request` for slot 0's connected handle. Returns false when
+    /// the Host has not enabled the event or the queue is full; the RF owner
+    /// must then reject `LL_ENC_REQ` instead of starting encryption.
     pub fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool {
         let Some(handle) = self.bridge.handle() else {
             return false;
@@ -371,14 +535,29 @@ impl SoftRunner {
         self.bridge.ltk_request(handle, rand, ediv).is_ok()
     }
 
+    /// Emit `LE LTK Request` for `handle` only.
+    pub(crate) fn push_ltk_request_on(&mut self, handle: u16, rand: [u8; 8], ediv: u16) -> bool {
+        match self.live_key(handle) {
+            Some(key) => self
+                .bridge_slot_mut(key.slot)
+                .ltk_request(handle, rand, ediv)
+                .is_ok(),
+            None => false,
+        }
+    }
+
     /// Report the outcome of the start-encryption procedure.
     ///
     /// `enabled` is the HCI Encryption_Enabled value: 0x00 off, 0x01 on.
     /// Returns false if the handle is gone or the event queue is full.
     pub fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8) -> bool {
-        self.bridge
-            .encryption_change(handle, status, enabled)
-            .is_ok()
+        match self.live_key(handle) {
+            Some(key) => self
+                .bridge_slot_mut(key.slot)
+                .encryption_change(handle, status, enabled)
+                .is_ok(),
+            None => false,
+        }
     }
 
     /// Override the public address returned by `Read BD_ADDR`.
@@ -460,6 +639,15 @@ impl SoftRunner {
             1 => self.random_addr.is_some(),
             3 => self.random_addr.is_some() || self.ensure_local_rpa().is_some(),
             _ => true,
+        }
+    }
+
+    /// Confirm the RF owner physically stopped advertising/scanning after a
+    /// Reset. Without it a Reset issued with no live link would complete while
+    /// the radio still transmits.
+    pub fn reset_radio_stopped(&mut self) {
+        if self.reset_pending {
+            self.reset_radio_ack = true;
         }
     }
 
@@ -768,9 +956,12 @@ impl SoftRunner {
 
     /// Bounded, non-blocking idle-time pump. It never borrows the RF owner
     /// across an await, and retains owned input/output packets under backpressure.
+    ///
+    /// Each call moves at most one output and one input, so an always-busy
+    /// link cannot starve the other one's input or output.
     pub fn pump_once(&mut self) -> bool {
         let mut progressed = false;
-        if self.reset_pending && self.bridge.take_reset_done() {
+        if self.reset_pending && self.take_reset_done() {
             self.finish_reset();
             progressed = true;
         }
@@ -780,22 +971,69 @@ impl SoftRunner {
             }
             self.log_sent(&reply);
             self.pending_reply = None;
-            return true;
+            progressed = true;
         }
         if self.reset_pending {
             return progressed;
         }
-        // One output at most, with lifecycle events ahead of ACL data.
-        if self.bridge.flush_one() {
-            return true;
+        // One output at most, alternating slots so neither link starves.
+        for offset in 0..2 {
+            let slot = (self.flush_slot + offset) % 2;
+            if self.bridge_slot_mut(slot).flush_one() {
+                self.flush_slot = (slot + 1) % 2;
+                progressed = true;
+                break;
+            }
         }
-        let input = self
-            .pending_input
-            .take()
-            .filter(|host| self.scope_current(host.scope));
-        let Some(host) = input.or_else(transport::try_receive_host_packet) else {
-            return progressed;
+        if self.dispatch_input() {
+            progressed = true;
+        }
+        if let Some(reply) = self.pending_reply {
+            if transport::try_send_controller_packet(reply).is_ok() {
+                self.log_sent(&reply);
+                self.pending_reply = None;
+                progressed = true;
+            }
+        }
+        progressed
+    }
+
+    /// Move one Host packet in, retrying held packets before taking new ones.
+    /// A full link keeps its packet in `pending_input` without blocking the
+    /// other slot.
+    fn dispatch_input(&mut self) -> bool {
+        for slot in 0..MAX_LINKS {
+            let Some(host) = self.pending_input[slot].take() else {
+                continue;
+            };
+            if !self.scope_current(host.scope) {
+                if host.packet.kind == PacketKind::Cmd {
+                    self.reject_stale_command(&host.packet);
+                }
+                return true;
+            }
+            match self.try_dispatch(host) {
+                Ok(()) => return true,
+                Err(host) => {
+                    self.pending_input[slot] = Some(host);
+                }
+            }
+        }
+        let Some(host) = transport::try_receive_host_packet() else {
+            return false;
         };
+        // Keep producer order: with one channel slot, pushing the packet back
+        // is lossless and the held ACL is retried on the next pump.
+        if let PacketScope::Connection { key, .. } = host.scope {
+            if self
+                .pending_input
+                .get(usize::from(key.slot))
+                .is_some_and(Option::is_some)
+            {
+                let _ = transport::try_send_host_packet_scoped(host.packet, host.scope);
+                return false;
+            }
+        }
         if !self.scope_current(host.scope) {
             // The producer-time link no longer exists. ACL is dropped; a
             // command the Host is awaiting still gets its unknown-connection
@@ -803,25 +1041,42 @@ impl SoftRunner {
             if host.packet.kind == PacketKind::Cmd {
                 self.reject_stale_command(&host.packet);
             }
-        } else {
-            match host.packet.kind {
-                PacketKind::Cmd => self.handle_command(host.packet.payload()),
-                PacketKind::AclData => {
-                    if let Err(BridgeError::Full) = self.bridge.enqueue_tx(&host.packet) {
-                        self.pending_input = Some(host);
-                        return progressed;
-                    }
+            return true;
+        }
+        match self.try_dispatch(host) {
+            Ok(()) => true,
+            Err(host) => {
+                let slot = match host.scope {
+                    PacketScope::Connection { key, .. } => usize::from(key.slot),
+                    PacketScope::Global => 0,
+                };
+                self.pending_input[slot] = Some(host);
+                false
+            }
+        }
+    }
+
+    /// Apply one Host packet. `Err` means the link's TX queue is full and the
+    /// caller must hold the packet.
+    fn try_dispatch(&mut self, host: HostPacket) -> Result<(), HostPacket> {
+        match host.packet.kind {
+            PacketKind::Cmd => {
+                self.handle_command(host.packet.payload());
+                Ok(())
+            }
+            PacketKind::AclData => {
+                let slot = match host.scope {
+                    PacketScope::Connection { key, .. } => key.slot,
+                    PacketScope::Global => 0,
+                };
+                match self.bridge_slot_mut(slot).enqueue_tx(&host.packet) {
+                    Ok(()) | Err(BridgeError::InvalidPacket | BridgeError::NotConnected) => Ok(()),
+                    Err(BridgeError::Full) => Err(host),
+                    Err(_) => Ok(()),
                 }
-                _ => {}
             }
+            _ => Ok(()),
         }
-        if let Some(reply) = self.pending_reply {
-            if transport::try_send_controller_packet(reply).is_ok() {
-                self.log_sent(&reply);
-                self.pending_reply = None;
-            }
-        }
-        true
     }
 
     /// True while `scope` still names the live connection. A global command
@@ -830,9 +1085,7 @@ impl SoftRunner {
         match scope {
             PacketScope::Global => true,
             PacketScope::Connection { handle, key } => {
-                key.generation != 0
-                    && self.bridge.handle() == Some(handle)
-                    && key == self.bridge.link_key()
+                key.generation != 0 && self.live_key(handle) == Some(key)
             }
         }
     }
@@ -868,7 +1121,8 @@ impl SoftRunner {
     pub async fn serve_one(&mut self) {
         loop {
             let progressed = self.pump_once();
-            if self.pending_reply.is_some() || self.bridge.has_output() {
+            let has_output = self.links().into_iter().any(ConnectionBridge::has_output);
+            if self.pending_reply.is_some() || has_output {
                 transport::wait_for_output_space().await;
             } else if progressed {
                 return;
@@ -886,10 +1140,15 @@ impl SoftRunner {
 
     fn finish_reset(&mut self) {
         self.reset_pending = false;
-        self.pending_input = None;
+        self.reset_radio_ack = true;
+        self.pending_input = [None; MAX_LINKS];
+        self.flush_slot = 0;
         self.event_mask = u64::MAX;
         self.le_event_mask = 0x1f;
-        self.bridge.set_masks(self.event_mask, self.le_event_mask);
+        let (event_mask, le_event_mask) = (self.event_mask, self.le_event_mask);
+        for bridge in self.links_mut() {
+            bridge.set_masks(event_mask, le_event_mask);
+        }
         // ChSel is a controller capability configured by the RF owner, not
         // HCI state. The Host sends Reset before advertising; losing it here
         // silently downgrades every link to CSA #1.
@@ -927,8 +1186,13 @@ impl SoftRunner {
                 {
                     HCI_INVALID_PARAMETERS
                 } else {
-                    self.bridge
-                        .request_disconnect(u16::from_le_bytes([params[0], params[1]]), params[2])
+                    let handle = u16::from_le_bytes([params[0], params[1]]);
+                    self.live_key(handle)
+                        .map(|key| {
+                            self.bridge_slot_mut(key.slot)
+                                .request_disconnect(handle, params[2])
+                        })
+                        .unwrap_or(HCI_UNKNOWN_CONNECTION)
                 };
                 self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
@@ -955,13 +1219,31 @@ impl SoftRunner {
                 return;
             }
             0x0c03 if params.is_empty() => {
-                if self.bridge.is_connected() || self.ll.adv.enabled {
+                if self.any_connected() {
                     self.reset_pending = true;
+                    // Idle slots retire now; only the active link waits for
+                    // the RF owner to stop using its buffers.
+                    for bridge in self.links_mut() {
+                        bridge.request_reset();
+                        if !bridge.is_connected() {
+                            bridge.reset_finished();
+                        }
+                    }
+                } else if self.roles_active() {
+                    // Advertising/scanning has no link to ack the stop, so the
+                    // RF owner must confirm it before Reset completes. Slot 0
+                    // keeps the request visible; the other slot retires now.
+                    self.reset_pending = true;
+                    self.reset_radio_ack = false;
                     self.bridge.request_reset();
+                    self.slot1.request_reset();
+                    self.slot1.reset_finished();
                 } else {
-                    self.bridge.request_reset();
-                    self.bridge.reset_finished();
-                    self.bridge.take_reset_done();
+                    for bridge in self.links_mut() {
+                        bridge.request_reset();
+                        bridge.reset_finished();
+                        bridge.take_reset_done();
+                    }
                     self.finish_reset();
                 }
                 return;
@@ -981,7 +1263,10 @@ impl SoftRunner {
                 } else {
                     self.le_event_mask = mask;
                 }
-                self.bridge.set_masks(self.event_mask, self.le_event_mask);
+                let (event_mask, le_event_mask) = (self.event_mask, self.le_event_mask);
+                for bridge in self.links_mut() {
+                    bridge.set_masks(event_mask, le_event_mask);
+                }
                 Ok(&[][..])
             }
             // Set Event Mask Page 2
@@ -1051,7 +1336,12 @@ impl SoftRunner {
                 {
                     HCI_INVALID_PARAMETERS
                 } else {
-                    self.bridge.request_data_length(handle, octets, time)
+                    self.live_key(handle)
+                        .map(|key| {
+                            self.bridge_slot_mut(key.slot)
+                                .request_data_length(handle, octets, time)
+                        })
+                        .unwrap_or(HCI_UNKNOWN_CONNECTION)
                 };
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
@@ -1172,7 +1462,7 @@ impl SoftRunner {
             // LE Set Scan Enable
             0x200c if params.len() == 2 && params.iter().all(|value| *value <= 1) => {
                 let enable = params[0] != 0;
-                if enable && (self.bridge.is_connected() || self.pending_connect.is_some()) {
+                if enable && (self.any_connected() || self.pending_connect.is_some()) {
                     self.reply_status(opcode, HCI_COMMAND_DISALLOWED);
                     return;
                 }
@@ -1244,25 +1534,23 @@ impl SoftRunner {
             // return the connection handle in the Command Complete parameters
             // (Core 5.4 Vol 4 Part E §7.8.25/26); a Host that cannot decode it
             // reports `Invalid HCI Command Parameters` even on success.
-            0x201a if params.len() == 18 => {
-                if self.bridge.handle() != Some(le16_from(params)) {
-                    Err(HCI_UNKNOWN_CONNECTION)
-                } else {
+            0x201a if params.len() == 18 => match self.live_key(le16_from(params)) {
+                Some(key) => {
                     let mut ltk = [0u8; 16];
                     ltk.copy_from_slice(&params[2..18]);
-                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Key(ltk)));
+                    self.ltk_reply[usize::from(key.slot)] = Some((key, LtkReply::Key(ltk)));
                     Ok(&params[..2])
                 }
-            }
+                None => Err(HCI_UNKNOWN_CONNECTION),
+            },
             0x201a => Err(HCI_INVALID_PARAMETERS),
-            0x201b if params.len() == 2 => {
-                if self.bridge.handle() != Some(le16_from(params)) {
-                    Err(HCI_UNKNOWN_CONNECTION)
-                } else {
-                    self.ltk_reply = Some((self.bridge.epoch(), LtkReply::Rejected));
+            0x201b if params.len() == 2 => match self.live_key(le16_from(params)) {
+                Some(key) => {
+                    self.ltk_reply[usize::from(key.slot)] = Some((key, LtkReply::Rejected));
                     Ok(&params[..2])
                 }
-            }
+                None => Err(HCI_UNKNOWN_CONNECTION),
+            },
             0x201b => Err(HCI_INVALID_PARAMETERS),
             // LE Rand — DRBG output; the HAL seeds it from measured entropy.
             0x2018 if params.is_empty() => {
@@ -1355,7 +1643,7 @@ impl SoftRunner {
         if params.len() != 25 {
             return HCI_INVALID_PARAMETERS;
         }
-        if self.bridge.is_connected() || self.pending_connect.is_some() {
+        if self.any_connected() || self.pending_connect.is_some() {
             return HCI_COMMAND_DISALLOWED;
         }
         let le16 = |index: usize| u16::from_le_bytes([params[index], params[index + 1]]);
@@ -1417,28 +1705,30 @@ impl SoftRunner {
             return HCI_INVALID_PARAMETERS;
         }
         let handle = le16_from(params);
-        if self.bridge.handle() != Some(handle) || self.bridge.is_disconnecting() {
+        let Some(key) = self.live_key(handle) else {
+            return HCI_UNKNOWN_CONNECTION;
+        };
+        let bridge = self.bridge_slot(key.slot);
+        if bridge.is_disconnecting() {
             return HCI_UNKNOWN_CONNECTION;
         }
         // Only the Central starts encryption; a Peripheral waits for
         // LL_ENC_REQ and raises LE LTK Request instead.
-        if self.bridge.role() != Some(crate::ll::Role::Central) {
+        if bridge.role() != Some(crate::ll::Role::Central) {
             return HCI_COMMAND_DISALLOWED;
         }
-        // A request left over from an earlier connection must not block this
-        // one; overwrite it with the current epoch.
-        if self
-            .pending_encryption
-            .is_some_and(|(epoch, _)| epoch == self.bridge.epoch())
-        {
+        // A request already queued for this link must not be silently
+        // replaced; a stale one from an earlier generation is overwritten.
+        let slot = usize::from(key.slot);
+        if self.pending_encryption[slot].is_some_and(|(tagged, _)| tagged == key) {
             return HCI_COMMAND_DISALLOWED;
         }
         let mut rand = [0u8; 8];
         rand.copy_from_slice(&params[2..10]);
         let mut ltk = [0u8; 16];
         ltk.copy_from_slice(&params[12..28]);
-        self.pending_encryption = Some((
-            self.bridge.epoch(),
+        self.pending_encryption[slot] = Some((
+            key,
             EnableEncryption {
                 handle,
                 rand,
@@ -1805,6 +2095,27 @@ mod tests {
             expect_command_complete(0x2022, HCI_INVALID_PARAMETERS, &[1, 0]);
             assert_eq!(runner.take_data_length_request(), None);
         });
+    }
+
+    #[test]
+    fn data_length_requests_are_taken_per_link() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+
+        inject_cmd(0x2022, &[1, 0, 0xf7, 0, 0x48, 0x08]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2022, HCI_SUCCESS, &[1, 0]);
+        inject_cmd(0x2022, &[2, 0, 0xfa, 0, 0x40, 0x06]);
+        assert!(runner.pump_once());
+        expect_command_complete(0x2022, HCI_SUCCESS, &[2, 0]);
+
+        // Each link keeps its own request; the N=1 entry is slot 0 only.
+        assert_eq!(runner.take_data_length_request_on(1), Some((250, 1600)));
+        assert_eq!(runner.take_data_length_request(), Some((247, 2120)));
+        assert_eq!(runner.take_data_length_request_on(1), None);
+        assert_eq!(runner.take_data_length_request_on(5), None);
     }
 
     #[test]
@@ -2340,7 +2651,6 @@ mod tests {
             transport::try_receive_controller_packet().unwrap().bytes[0],
             0x3e
         );
-        assert!(runner.pump_once());
         assert_eq!(
             transport::try_receive_controller_packet().unwrap().kind,
             PacketKind::AclData
@@ -2416,9 +2726,10 @@ mod tests {
         assert!(!runner.pump_once());
         runner.bridge.reset_finished();
         assert!(transport::try_receive_controller_packet().is_none());
+        // The same pump completes Reset and dispatches the command queued
+        // behind it; both replies are now in the channel.
         assert!(runner.pump_once());
         expect_command_complete(0x0c03, 0, &[]);
-        assert!(runner.pump_once());
         expect_command_complete(0x1009, 0, &DEFAULT_BD_ADDR);
         assert!(!runner.bridge.ack_tx(old));
         assert!(!runner.bridge.is_connected());
@@ -2564,7 +2875,7 @@ mod tests {
         assert!(runner.pump_once());
         // §4.5: the handle follows Status even on an error response.
         expect_command_complete(0x201a, HCI_UNKNOWN_CONNECTION, &[1, 0]);
-        assert!(runner.ltk_reply.is_none());
+        assert!(runner.ltk_reply.iter().all(Option::is_none));
     }
 
     #[test]
@@ -3280,5 +3591,534 @@ mod tests {
         assert_eq!(payload[2], 0x01);
         assert_eq!(payload[6], 0); // Central (parameters[4])
         assert_eq!(payload[20], 3); // master clock accuracy (parameters[18])
+    }
+
+    fn info_h(handle: u16) -> super::super::connection::ConnectionInfo {
+        super::super::connection::ConnectionInfo {
+            handle,
+            ..connection_info()
+        }
+    }
+
+    fn connect_two(runner: &mut SoftRunner) {
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        runner.bridge_slot_mut(1).connected(info_h(2)).unwrap();
+        drain_controller(runner);
+    }
+
+    #[test]
+    fn two_slots_share_the_handle_namespace_but_keep_separate_tags() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        assert_eq!(
+            runner.bridge_slot_mut(1).connected(info_h(1)),
+            Err(BridgeError::InvalidPacket)
+        );
+        runner.bridge_slot_mut(1).connected(info_h(2)).unwrap();
+        drain_controller(&mut runner);
+
+        runner
+            .bridge_slot_mut(0)
+            .enqueue_tx(&acl(1, 0, &[0x11]))
+            .unwrap();
+        runner
+            .bridge_slot_mut(1)
+            .enqueue_tx(&acl(2, 0, &[0x22]))
+            .unwrap();
+        let t0 = runner.bridge_slot_mut(0).take_tx_acl().unwrap().tag;
+        let t1 = runner.bridge_slot_mut(1).take_tx_acl().unwrap().tag;
+        assert!(!runner.bridge_slot_mut(1).ack_tx(t0));
+        assert!(!runner.bridge_slot_mut(0).ack_tx(t1));
+        assert!(runner.bridge_slot_mut(0).ack_tx(t0));
+        assert!(runner.bridge_slot_mut(1).ack_tx(t1));
+    }
+
+    #[test]
+    fn closing_one_link_keeps_the_other_links_state() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        runner
+            .bridge_slot_mut(0)
+            .enqueue_tx(&acl(1, 0, &[1]))
+            .unwrap();
+        runner
+            .bridge_slot_mut(1)
+            .enqueue_tx(&acl(2, 0, &[2]))
+            .unwrap();
+        let t1 = runner.bridge_slot_mut(1).take_tx_acl().unwrap().tag;
+        assert!(runner.push_ltk_request_on(2, [7; 8], 0));
+
+        // Host answers slot 1's LTK request.
+        let mut cmd = [0u8; 21];
+        cmd[0..2].copy_from_slice(&0x201au16.to_le_bytes());
+        cmd[2] = 18;
+        cmd[3..5].copy_from_slice(&2u16.to_le_bytes());
+        cmd[5..21].copy_from_slice(&[0x44; 16]);
+        runner.handle_command(&cmd);
+
+        let key0 = runner.bridge_slot(0).link_key();
+        let key1 = runner.bridge_slot(1).link_key();
+        runner.connection_closed_on(key0, 0x13);
+
+        assert!(!runner.bridge_slot(0).is_connected());
+        assert!(runner.bridge_slot(1).is_connected());
+        assert!(runner.bridge_slot_mut(1).ack_tx(t1));
+        assert_eq!(
+            runner.take_ltk_reply_for(key1),
+            Some(LtkReply::Key([0x44; 16]))
+        );
+    }
+
+    #[test]
+    fn a_stale_close_does_not_touch_a_reused_handle() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        let old = runner.bridge_slot(0).link_key();
+        runner.connection_closed_on(old, 0x13);
+
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        runner
+            .bridge_slot_mut(0)
+            .enqueue_tx(&acl(1, 0, &[9]))
+            .unwrap();
+        runner.connection_closed_on(old, 0x13);
+
+        assert!(runner.bridge_slot(0).is_connected());
+        assert!(runner.bridge_slot_mut(0).take_tx_acl().is_some());
+    }
+
+    #[test]
+    fn pump_alternates_between_filled_links() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        runner.bridge_slot_mut(0).receive_acl(2, &[0xaa]).unwrap();
+        runner.bridge_slot_mut(1).receive_acl(2, &[0xbb]).unwrap();
+
+        let mut seen = [0u16; 2];
+        for entry in &mut seen {
+            assert!(runner.pump_once());
+            let packet = transport::try_receive_controller_packet().unwrap();
+            *entry = u16::from_le_bytes([packet.payload()[0], packet.payload()[1]]) & 0x0fff;
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2]);
+    }
+
+    #[test]
+    fn a_blocked_link_does_not_block_the_other_links_output() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        for _ in 0..5 {
+            runner
+                .bridge_slot_mut(0)
+                .enqueue_tx(&acl(1, 0, &[1]))
+                .unwrap();
+        }
+        transport::try_send_host_packet(acl(1, 0, &[9])).unwrap();
+        // The sixth ACL cannot enter: it is held instead of being dropped.
+        assert!(!runner.pump_once());
+        assert!(runner.pending_input[0].is_some());
+
+        // The blocked link must not stop the other link's queued response.
+        runner.bridge_slot_mut(1).receive_acl(2, &[7]).unwrap();
+        assert!(runner.pump_once());
+        let packet = transport::try_receive_controller_packet().unwrap();
+        let handle = u16::from_le_bytes([packet.payload()[0], packet.payload()[1]]) & 0x0fff;
+        assert_eq!(handle, 2);
+        assert!(runner.pending_input[0].is_some());
+    }
+
+    #[test]
+    fn a_full_link_does_not_starve_the_other() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        while runner
+            .bridge_slot_mut(0)
+            .connection_updated(30, 1, 300)
+            .is_ok()
+        {}
+        runner
+            .bridge_slot_mut(1)
+            .connection_updated(30, 1, 300)
+            .unwrap();
+
+        let mut handles = [0u16; 4];
+        for handle in &mut handles {
+            assert!(runner.pump_once());
+            let packet = transport::try_receive_controller_packet().unwrap();
+            *handle = u16::from_le_bytes([packet.payload()[4], packet.payload()[5]]);
+        }
+        // Slot 1's single event reaches the Host after one slot-0 event, not
+        // after slot 0's whole backlog.
+        assert_eq!(handles[..2], [1, 2]);
+    }
+
+    #[test]
+    fn reset_is_global_across_both_slots() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        runner
+            .bridge_slot_mut(0)
+            .enqueue_tx(&acl(1, 0, &[1]))
+            .unwrap();
+        runner
+            .bridge_slot_mut(1)
+            .enqueue_tx(&acl(2, 0, &[2]))
+            .unwrap();
+        let t0 = runner.bridge_slot_mut(0).take_tx_acl().unwrap().tag;
+        let t1 = runner.bridge_slot_mut(1).take_tx_acl().unwrap().tag;
+
+        inject_cmd(0x0c03, &[]);
+        assert!(runner.pump_once());
+        runner.bridge_slot_mut(0).reset_finished();
+        // Slot 1 has not stopped yet, so no Command Complete is allowed.
+        assert!(!runner.pump_once());
+        assert!(transport::try_receive_controller_packet().is_none());
+        runner.bridge_slot_mut(1).reset_finished();
+        assert!(runner.pump_once());
+        expect_command_complete(0x0c03, 0, &[]);
+
+        assert!(!runner.bridge_slot(0).is_connected());
+        assert!(!runner.bridge_slot(1).is_connected());
+        assert!(!runner.bridge_slot_mut(0).ack_tx(t0));
+        assert!(!runner.bridge_slot_mut(1).ack_tx(t1));
+        assert!(transport::published_key(1).is_none());
+        assert!(transport::published_key(2).is_none());
+    }
+
+    #[test]
+    fn a_handle_cannot_reopen_elsewhere_before_its_lifecycle_event_is_delivered() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        // Deliver the Connection Complete so only the disconnect is pending.
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload()[0],
+            0x3e
+        );
+
+        runner.bridge_slot_mut(0).disconnected(0x13);
+        // Slot rotation starts at slot 1: reusing the handle now would hand
+        // the Host a second connect before the promised disconnect.
+        runner.flush_slot = 1;
+        assert_eq!(
+            runner.bridge_slot_mut(1).connected(info_h(1)),
+            Err(BridgeError::HandleRetiring)
+        );
+        assert!(runner.bridge_slot(1).handle().is_none());
+
+        assert!(runner.pump_once());
+        let disconnect = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(disconnect.payload()[0], 0x05);
+        assert_eq!(&disconnect.payload()[3..5], &[1, 0]);
+
+        runner.bridge_slot_mut(1).connected(info_h(1)).unwrap();
+        assert!(runner.pump_once());
+        let connect = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(connect.payload()[0], 0x3e);
+        assert_eq!(&connect.payload()[4..6], &[1, 0]);
+    }
+
+    #[test]
+    fn a_handle_cannot_reopen_elsewhere_while_old_link_events_are_queued() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        // No Disconnection Complete is promised, so only the DLE event remains
+        // queued and it alone must delay the cross-slot reopen.
+        runner
+            .bridge_slot_mut(0)
+            .set_masks(u64::MAX & !(1u64 << 4), 0x1f);
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload()[0],
+            0x3e
+        );
+
+        runner
+            .bridge_slot_mut(0)
+            .set_masks(u64::MAX & !(1u64 << 4), 0x1f | (1 << 6));
+        runner
+            .bridge_slot_mut(0)
+            .data_length_change(27, 328, 27, 328)
+            .unwrap();
+        runner.bridge_slot_mut(0).disconnected(0x13);
+        assert_eq!(
+            runner.bridge_slot_mut(1).connected(info_h(1)),
+            Err(BridgeError::HandleRetiring)
+        );
+
+        assert!(runner.pump_once());
+        let stale = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(stale.payload()[0], 0x3e, "the old DLE event is delivered");
+        runner.bridge_slot_mut(1).connected(info_h(1)).unwrap();
+    }
+
+    #[test]
+    fn reconnecting_in_the_same_slot_keeps_its_events_in_order() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        runner.bridge_slot_mut(0).disconnected(0x13);
+        // Same-slot reuse is safe: one FIFO queue orders both events.
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+
+        let mut kinds = std::vec::Vec::new();
+        while runner.pump_once() {
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                kinds.push(packet.payload()[0]);
+            }
+        }
+        while let Some(packet) = transport::try_receive_controller_packet() {
+            kinds.push(packet.payload()[0]);
+        }
+        assert_eq!(kinds, std::vec![0x3e, 0x05, 0x3e]);
+    }
+
+    #[test]
+    fn security_pending_is_per_link_and_survives_the_other_close() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        let k0 = runner.bridge_slot(0).link_key();
+        let k1 = runner.bridge_slot(1).link_key();
+
+        // The Host answers the LTK request on both links.
+        let mut params = [0u8; 18];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x11; 16]);
+        inject_cmd(0x201a, &params);
+        assert!(runner.pump_once());
+        expect_command_complete(0x201a, 0, &[1, 0]);
+        params[0..2].copy_from_slice(&2u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x22; 16]);
+        inject_cmd(0x201a, &params);
+        assert!(runner.pump_once());
+        expect_command_complete(0x201a, 0, &[2, 0]);
+
+        // Each accessor sees one link only, and exactly once.
+        assert_eq!(
+            runner.take_ltk_reply(),
+            Some(LtkReply::Key([0x11; 16])),
+            "slot-0 accessor"
+        );
+        assert_eq!(
+            runner.take_ltk_reply_for(k1),
+            Some(LtkReply::Key([0x22; 16]))
+        );
+        assert_eq!(runner.take_ltk_reply_for(k1), None);
+        assert!(runner.take_ltk_reply().is_none());
+
+        // Queue again, then close link 0: link 1's answer must survive.
+        inject_cmd(0x201a, &params);
+        assert!(runner.pump_once());
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..18].copy_from_slice(&[0x11; 16]);
+        inject_cmd(0x201a, &params);
+        assert!(runner.pump_once());
+        runner.connection_closed_on(k0, 0x13);
+        assert_eq!(
+            runner.take_ltk_reply_for(k0),
+            None,
+            "closing link 0 clears it"
+        );
+        assert_eq!(
+            runner.take_ltk_reply_for(k1),
+            Some(LtkReply::Key([0x22; 16])),
+            "link 1's answer survives"
+        );
+        assert!(runner.take_ltk_reply().is_none());
+    }
+
+    #[test]
+    fn the_n1_close_entry_cannot_retire_the_other_link() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        let k1 = runner.bridge_slot(1).link_key();
+
+        // Both links queue an LTK answer through the real command path.
+        let mut params = [0u8; 18];
+        for (handle, byte) in [(1u16, 0x11u8), (2, 0x22)] {
+            params[0..2].copy_from_slice(&handle.to_le_bytes());
+            params[2..18].copy_from_slice(&[byte; 16]);
+            inject_cmd(0x201a, &params);
+            assert!(runner.pump_once());
+            expect_command_complete(0x201a, 0, &[handle as u8, 0]);
+        }
+
+        // The N=1 entry acts on slot 0 only.
+        runner.connection_closed(0x13);
+        assert!(!runner.bridge_slot(0).is_connected());
+        assert!(runner.bridge_slot(1).is_connected());
+        assert_eq!(
+            runner.take_ltk_reply_for(k1),
+            Some(LtkReply::Key([0x22; 16])),
+            "slot 1's answer survives the legacy close"
+        );
+
+        // Calling it again while slot 0 is idle is a no-op for slot 1.
+        runner.connection_closed(0x13);
+        assert!(runner.bridge_slot(1).is_connected());
+    }
+
+    #[test]
+    fn encryption_requests_are_queued_per_link() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        for (slot, handle) in [(0u8, 1u16), (1, 2)] {
+            let info = super::super::connection::ConnectionInfo {
+                role: crate::ll::Role::Central,
+                ..info_h(handle)
+            };
+            runner.bridge_slot_mut(slot).connected(info).unwrap();
+        }
+        drain_controller(&mut runner);
+
+        for handle in [1u16, 2] {
+            let mut params = [0u8; 28];
+            params[0..2].copy_from_slice(&handle.to_le_bytes());
+            params[2..10].copy_from_slice(&[handle as u8; 8]);
+            params[10..12].copy_from_slice(&0u16.to_le_bytes());
+            params[12..28].copy_from_slice(&[handle as u8 + 0x30; 16]);
+            inject_cmd(0x2019, &params);
+            assert!(runner.pump_once());
+            expect_command_status(0x2019, HCI_SUCCESS);
+        }
+
+        // Taking one link's request leaves the other in place.
+        assert_eq!(
+            runner
+                .take_encryption_request_on(1)
+                .map(|request| request.handle),
+            Some(2)
+        );
+        assert!(runner.take_encryption_request_on(1).is_none());
+        assert_eq!(
+            runner
+                .take_encryption_request()
+                .map(|request| request.handle),
+            Some(1),
+            "slot-0 accessor"
+        );
+        assert!(runner.take_encryption_request_on(0).is_none());
+    }
+
+    #[test]
+    fn a_busy_output_does_not_starve_input() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        // Keep slot 0's output queue non-empty for the whole window.
+        for _ in 0..8 {
+            let _ = runner.bridge_slot_mut(0).connection_updated(24, 0, 200);
+        }
+        inject_cmd(0x1009, &[]);
+
+        let mut answered = false;
+        for _ in 0..16 {
+            runner.pump_once();
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                let payload = packet.payload();
+                if payload[0] == 0x0e && u16::from_le_bytes([payload[3], payload[4]]) == 0x1009 {
+                    answered = true;
+                }
+            }
+        }
+        assert!(answered, "input starved behind continuous output");
+    }
+
+    #[test]
+    fn a_full_link_does_not_hold_the_shared_input() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        connect_two(&mut runner);
+        for _ in 0..5 {
+            runner
+                .bridge_slot_mut(0)
+                .enqueue_tx(&acl(1, 0, &[1]))
+                .unwrap();
+        }
+        transport::try_send_host_packet(acl(1, 0, &[9])).unwrap();
+        assert!(!runner.pump_once());
+        assert!(runner.pending_input[0].is_some());
+
+        // A command queued behind the held ACL is still answered.
+        inject_cmd(0x1009, &[]);
+        let mut answered = false;
+        for _ in 0..8 {
+            runner.pump_once();
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                let payload = packet.payload();
+                if payload[0] == 0x0e && u16::from_le_bytes([payload[3], payload[4]]) == 0x1009 {
+                    answered = true;
+                }
+            }
+        }
+        assert!(answered, "the blocked link wedged the shared input");
+        assert!(
+            runner.pending_input[0].is_some(),
+            "the held ACL is not dropped"
+        );
+    }
+
+    #[test]
+    fn reset_while_only_a_background_role_runs_waits_for_the_radio() {
+        let _guard = test_lock();
+        for scanning in [false, true] {
+            transport::drain_channels_for_test();
+            let mut runner = SoftRunner::new();
+            if scanning {
+                runner.scan.enabled = true;
+            } else {
+                runner.ll.adv.enabled = true;
+            }
+            inject_cmd(0x0c03, &[]);
+            assert!(runner.pump_once());
+            assert_eq!(
+                runner.bridge.take_radio_request(),
+                Some(super::super::connection::RadioRequest::Reset),
+                "the owner still gets the stop request"
+            );
+
+            // No Command Complete while the radio may still transmit.
+            assert!(!runner.pump_once());
+            assert!(transport::try_receive_controller_packet().is_none());
+
+            runner.reset_radio_stopped();
+            assert!(!runner.pump_once(), "the slot must retire as well");
+            runner.bridge.reset_finished();
+            assert!(runner.pump_once());
+            expect_command_complete(0x0c03, 0, &[]);
+            assert!(!runner.adv_enabled());
+            assert!(!runner.scan.enabled);
+        }
     }
 }
