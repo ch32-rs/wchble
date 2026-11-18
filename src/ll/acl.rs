@@ -253,7 +253,8 @@ mod tests {
         );
         let mut link = LinkSequence::new();
         assert_eq!(
-            link.on_rx(0x02, &[1; MAX_LEGACY_PAYLOAD + 1][..], true, true).status,
+            link.on_rx(0x02, &[1; MAX_LEGACY_PAYLOAD + 1][..], true, true)
+                .status,
             RxStatus::Invalid
         );
     }

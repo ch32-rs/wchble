@@ -235,6 +235,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         self.live() && self.bridge().is_connected()
     }
     fn publish_connection(&mut self, info: &mut ConnectionInfo) -> bool {
+        // One HCI label per live link: the engine reports one connection per
+        // slot, and two slots must not publish the same handle.
+        info.handle = 1 + u16::from(self.slot);
         self.extras.resolve_peer(self.soft, info);
         if self.bridge_mut().connected(*info).is_err() {
             return false;
@@ -788,6 +791,32 @@ mod tests {
             std::vec![(0x3e, 0x0001, 0), (0x05, 0x0001, 0x08)]
         );
         assert_eq!(closes.get(), 12);
+    }
+
+    /// Two live links must not publish the same HCI handle: the transport
+    /// routes ACL data by it, so slot 1 gets its own label.
+    #[test]
+    fn two_slots_publish_distinct_handles() {
+        let _serial = serial();
+        let mut soft = SoftRunner::new();
+        let counters = Rc::new(core::cell::RefCell::new(Counters {
+            stats: [0; 64],
+            sec: [0; 16],
+        }));
+        let now = Rc::new(Cell::new(0u32));
+        let closes = Rc::new(Cell::new(0));
+        for slot in 0..2u8 {
+            let extras = X {
+                counters: counters.clone(),
+                now: now.clone(),
+                closes: closes.clone(),
+            };
+            let mut host = RunnerHost::for_slot(slot, &mut soft, extras);
+            let mut info = info_on(1);
+            assert!(host.publish_connection(&mut info), "slot {slot} publishes");
+            assert_eq!(info.handle, 1 + u16::from(slot));
+            assert_eq!(host.bridge().handle(), Some(info.handle));
+        }
     }
 
     fn info_on(handle: u16) -> ConnectionInfo {

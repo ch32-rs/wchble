@@ -352,6 +352,14 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             exitNow(code: failure.0, reason: failure.1)
             return
         }
+        if options.mode == .pp, phase == "cancelling" {
+            guard expected, error == nil else {
+                fail(reason: "pp_disconnect_failed")
+                return
+            }
+            summarisePp()
+            return
+        }
         guard expected, error == nil else {
             fail(reason: "unexpected_disconnect")
             return
@@ -493,6 +501,12 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         if options.mode == .pp {
             guard peripheral.identifier == lockedID, changed === characteristic,
                   error == nil, let data = changed.value, data.count == 4 else {
+                // Name what the peer actually sent: an ATT error reads like a
+                // silent firmware stall without the code.
+                var detail: [String: Any] = ["phase": phase]
+                if let error = error { detail["error"] = String(describing: error) }
+                if let data = changed.value { detail["bytes"] = Array(data) }
+                emit("value_rejected", detail)
                 fail(reason: "pp_value_invalid")
                 return
             }
@@ -579,6 +593,15 @@ final class GATTTest: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func finishPp() {
+        // Close the link ourselves so the peer sees an expected disconnect
+        // before the process exits; the summary follows the callback.
+        phase = "cancelling"
+        cancelAt = monotonic()
+        emit("cancel_requested")
+        manager.cancelPeripheralConnection(target!)
+    }
+
+    func summarisePp() {
         phase = "pp_done"
         emit("summary", ["exit_code": 0, "reason": "pp_complete", "role": options.role,
                           "elapsed_seconds": monotonic() - started,

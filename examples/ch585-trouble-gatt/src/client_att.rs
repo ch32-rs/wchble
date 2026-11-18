@@ -11,8 +11,8 @@ use embassy_sync::blocking_mutex::raw::RawMutex;
 use heapless::Vec;
 use trouble_host::prelude::*;
 pub use wchble::storage::client_att::{
-    decode_client_att, encode_client_att, encoded_len, ClientAttRecord, MAX_CLIENT_ATT, MAX_PAYLOAD,
-    RECORD_OVERHEAD,
+    decode_client_att, encode_client_att, encoded_len, ClientAttRecord, MAX_CLIENT_ATT,
+    MAX_PAYLOAD, RECORD_OVERHEAD,
 };
 
 static mut BOOT_RECORDS: [ClientAttRecord; MAX_CLIENT_ATT] =
@@ -76,7 +76,12 @@ pub static mut CATT_STATS: [u32; CATT_STATS_WORDS] = [0; CATT_STATS_WORDS];
 fn word(index: usize) -> u32 {
     // SAFETY: single-threaded example; the RF loop and the Host poll never run
     // at the same time.
-    unsafe { core::ptr::addr_of!(CATT_STATS).cast::<u32>().add(index).read_volatile() }
+    unsafe {
+        core::ptr::addr_of!(CATT_STATS)
+            .cast::<u32>()
+            .add(index)
+            .read_volatile()
+    }
 }
 
 pub fn bump(index: usize) {

@@ -272,6 +272,13 @@ impl SoftRunner {
         self.links().into_iter().any(ConnectionBridge::is_connected)
     }
 
+    /// Every slot already holds a link. A single live link must not block the
+    /// other role's scanning or initiating (X3.5 CP), so those commands ask
+    /// this instead of [`any_connected`].
+    fn all_links_connected(&self) -> bool {
+        self.links().into_iter().all(ConnectionBridge::is_connected)
+    }
+
     /// Acknowledge Reset only when every slot has finished retiring its link
     /// and the RF owner has confirmed the physical stop when one was needed.
     fn take_reset_done(&mut self) -> bool {
@@ -1469,19 +1476,21 @@ impl SoftRunner {
                     self.set_scan_params(params)
                 }
             }
-            // LE Set Scan Enable
+            // LE Set Scan Enable. Enabled scanning is refused only when no
+            // free slot or initiator is left; the RF owner schedules the
+            // window in its gaps.
             0x200c if params.len() == 2 && params.iter().all(|value| *value <= 1) => {
                 let enable = params[0] != 0;
-                if enable && (self.any_connected() || self.pending_connect.is_some()) {
-                    self.reply_status(opcode, HCI_COMMAND_DISALLOWED);
-                    return;
+                if enable && (self.all_links_connected() || self.pending_connect.is_some()) {
+                    Err(HCI_COMMAND_DISALLOWED)
+                } else {
+                    if enable {
+                        self.sync_adv_addr(false);
+                    }
+                    self.scan.enabled = enable;
+                    self.scan.filter_duplicates = params[1] != 0;
+                    Ok(&[][..])
                 }
-                if enable {
-                    self.sync_adv_addr(false);
-                }
-                self.scan.enabled = enable;
-                self.scan.filter_duplicates = params[1] != 0;
-                Ok(&[][..])
             }
             // LE Create Connection Cancel — no pending initiation is a
             // synchronous Command Complete with Command Disallowed
@@ -1653,7 +1662,9 @@ impl SoftRunner {
         if params.len() != 25 {
             return HCI_INVALID_PARAMETERS;
         }
-        if self.any_connected() || self.pending_connect.is_some() {
+        // Only a full link set or an initiator already in flight refuses a
+        // new connection; one live link must not block the other role.
+        if self.all_links_connected() || self.pending_connect.is_some() {
             return HCI_COMMAND_DISALLOWED;
         }
         let le16 = |index: usize| u16::from_le_bytes([params[index], params[index + 1]]);
@@ -3050,6 +3061,49 @@ mod tests {
             runner.serve_one().await;
             expect_command_complete(0x200e, HCI_COMMAND_DISALLOWED, &[]);
         });
+    }
+
+    #[test]
+    fn one_connected_link_still_allows_scanning_and_initiating() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21]);
+        runner.bridge.connected(connection_info()).unwrap();
+        drain_controller(&mut runner);
+
+        pollster::block_on(async {
+            inject_cmd(0x200c, &[1, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_SUCCESS, &[]);
+            assert!(runner.scan_state().enabled);
+
+            inject_cmd(0x200d, &create_params([1, 2, 3, 4, 5, 6]));
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_SUCCESS);
+        });
+        assert!(runner.pending_connect().is_some());
+    }
+
+    #[test]
+    fn a_full_link_set_refuses_scanning_and_initiating() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21]);
+        connect_two(&mut runner);
+
+        pollster::block_on(async {
+            inject_cmd(0x200c, &[1, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_COMMAND_DISALLOWED, &[]);
+            assert!(!runner.scan_state().enabled);
+
+            inject_cmd(0x200d, &create_params([1, 2, 3, 4, 5, 6]));
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_COMMAND_DISALLOWED);
+        });
+        assert!(runner.pending_connect().is_none());
     }
 
     #[test]

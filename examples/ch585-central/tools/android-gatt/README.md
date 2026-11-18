@@ -12,6 +12,10 @@ controlled peripheral for the `ch585-central` firmware:
 - writes store the first four bytes as a little-endian u32 and are answered
   with success; reads return the current value at the requested offset and
   answer `0x07` (`GATT_INVALID_OFFSET`) for an out-of-range offset
+- the CCCD (`00002902-...`) is readable and writable per peer; a write of
+  `0x0001` subscribes that peer and `0x0000` unsubscribes it (`cccd_write`)
+- after a successful write while subscribed, the same value is notified back to
+  that peer (`notify`, with `sent` and a running `notifications` count)
 - a small delay after every disconnect restarts advertising (`readvertising`)
 
 ## Build
@@ -84,7 +88,8 @@ adb logcat -s WCHBLE
 One JSON object per line, all with `monotonic_ms` (milliseconds since the
 activity started). Events: `start`, `adapter_name`, `permission_request`,
 `advertising`, `advertise_failed`, `connected`, `disconnected`, `read`,
-`write`, `service_added`, `readvertising`, `error`, `summary`.
+`cccd_read`, `cccd_write`, `write`, `notify`, `service_added`,
+`readvertising`, `error`, `summary`.
 
 Example lines:
 

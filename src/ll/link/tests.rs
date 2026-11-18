@@ -12,8 +12,11 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::vec::Vec;
 
+use super::central::{CentralLink, PREPARE_LEAD_US};
+use super::cp::CpLink;
 use super::*;
 use crate::ll::conn::ConnectParams;
+use crate::ll::sched::{Decision, EventOutcome, LinkTable};
 use crate::rf::{Radio, RfCallback, RxState};
 
 /// Self-advancing microsecond clock: every read moves time forward.
@@ -82,6 +85,10 @@ pub(crate) struct FakeRadio {
     tx_deadlines: Vec<Option<u32>>,
     /// Clock at each `rx_basic` entry (the event's RX arm times).
     rx_entries: Vec<u32>,
+    /// Last access address programmed by the engine.
+    access_address: u32,
+    /// Last CRC init programmed by the engine.
+    crc_init: u32,
 }
 
 impl FakeRadio {
@@ -101,6 +108,8 @@ impl FakeRadio {
             windows_armed: Vec::new(),
             tx_deadlines: Vec::new(),
             rx_entries: Vec::new(),
+            access_address: 0x8e89_bed6,
+            crc_init: 0x55_5555,
         }
     }
     pub(crate) fn push(&mut self, window: Window) {
@@ -144,7 +153,10 @@ impl Radio for FakeRadio {
     fn channel(&self) -> crate::rf::Channel {
         self.channel
     }
-    fn set_aa_crc(&mut self, _access_address: u32, _crc_init: u32) {}
+    fn set_aa_crc(&mut self, access_address: u32, crc_init: u32) {
+        self.access_address = access_address;
+        self.crc_init = crc_init;
+    }
     fn set_phy(&mut self, _tx: crate::rf::PhyMode, _rx: crate::rf::PhyMode) {}
     fn set_whiten_disabled(&mut self, _disabled: bool) {}
     fn set_encrypt(&mut self, _enabled: bool) {}
@@ -257,6 +269,7 @@ struct RecHost {
     resets: u32,
     radio_requests: VecDeque<RadioRequest>,
     x1: Option<X1Snapshot>,
+    published: Vec<ConnectionInfo>,
 }
 
 impl RecHost {
@@ -296,6 +309,7 @@ impl RecHost {
             resets: 0,
             radio_requests: VecDeque::new(),
             x1: None,
+            published: Vec::new(),
         }
     }
 }
@@ -402,11 +416,12 @@ impl LinkHost for RecHost {
     fn is_connected(&self) -> bool {
         self.connected
     }
-    fn publish_connection(&mut self, _info: &mut ConnectionInfo) -> bool {
+    fn publish_connection(&mut self, info: &mut ConnectionInfo) -> bool {
         if self.reject_connection {
             self.log.push("publish_refused");
             return false;
         }
+        self.published.push(*info);
         self.connected = true;
         self.connections += 1;
         self.log.push("connect");
@@ -838,6 +853,47 @@ fn rf_stop_without_confirmation_does_not_close_or_rearm() {
 }
 
 #[test]
+fn step_restores_the_link_access_address_after_advertising() {
+    let mut h = Harness::new();
+    // An interleaved advertising fragment leaves its AA/CRC programmed.
+    h.radio.set_aa_crc(0x8e89_bed6, 0xaa_aaaa);
+    h.radio.push(FakeRadio::missed());
+    let _ = h.step(FINISH);
+    assert_eq!(h.radio.access_address, 0x1234_5678);
+    assert_eq!(h.radio.crc_init, 0x55_5555);
+}
+
+#[test]
+fn a_link_stops_advertising_once_so_a_second_slot_survives() {
+    let mut h = Harness::new_at(20_000);
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    // First event: the link establishes and stops the advertising that
+    // formed it.
+    let arm = h.session.conn.rx_start_us();
+    h.clock
+        .advance(arm.wrapping_sub(100).wrapping_sub(h.clock.now()));
+    h.radio.push(FakeRadio::frame(empty_pdu()));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.step(FINISH), Control::Continue);
+    assert!(!h.host.adv_enabled);
+    assert_eq!(h.host.log.iter().filter(|e| **e == "adv_off").count(), 1);
+
+    // The Host re-arms the second slot; later events leave it alone.
+    h.host.adv_enabled = true;
+    h.session.conn.next_event().unwrap();
+    let arm = h.session.conn.rx_start_us();
+    h.clock
+        .advance(arm.wrapping_sub(100).wrapping_sub(h.clock.now()));
+    h.radio.push(FakeRadio::frame(std::vec![0x0d, 0x00]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.step(FINISH), Control::Continue);
+    assert!(
+        h.host.adv_enabled,
+        "a live second advertising instance survives the link"
+    );
+}
+
+#[test]
 fn step_skips_missed_events_and_reset_does_not_publish_a_disconnect() {
     let mut h = Harness::new();
     // Three intervals behind: the catch-up path runs before the next event.
@@ -1151,6 +1207,41 @@ fn feature_request_exchange_replies_after_the_empty_ack() {
     h.radio.push(FakeRadio::missed());
     assert_eq!(h.event(FINISH), EventEnd::Continue);
     assert_eq!(h.radio.sent[3], std::vec![0x05, 0x00]);
+}
+
+#[test]
+fn table_dispatch_at_the_arm_boundary_still_answers_deferred_control() {
+    let mut h = Harness::new_at(20_000);
+    h.session.set_advance_owner(AdvanceOwner::Table);
+    // The scheduler dispatches at `prepare_us`, 100 us before RX arming, so
+    // the 4 ms pre-event service pass can never run there.
+    let arm = h.session.conn.rx_start_us();
+    let delta = arm.wrapping_sub(100).wrapping_sub(h.clock.now());
+    assert!(delta < 200_000);
+    h.clock.advance(delta);
+
+    let mut req = std::vec![0x03, 9];
+    req.extend_from_slice(&[0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
+    h.radio.push(FakeRadio::frame(req));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.step(FINISH), Control::Continue);
+    assert_eq!(h.radio.sent.len(), 1, "the event was served, not skipped");
+    assert_eq!(h.radio.sent[0], std::vec![0x05, 0x00], "empty ack first");
+
+    // `LinkTable::complete` advances the counter before the next dispatch.
+    h.session.conn.next_event().unwrap();
+    let arm = h.session.conn.rx_start_us();
+    let delta = arm.wrapping_sub(100).wrapping_sub(h.clock.now());
+    assert!(delta < 200_000);
+    h.clock.advance(delta);
+
+    h.radio.push(FakeRadio::frame(std::vec![0x0d, 0x00]));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.step(FINISH), Control::Continue);
+    assert_eq!(h.radio.sent.len(), 2, "the reply waits for the next event");
+    let mut rsp = std::vec![0x0b, 9, 0x09];
+    rsp.extend_from_slice(&h.host.local_features());
+    assert_eq!(h.radio.sent[1], rsp);
 }
 
 #[test]
@@ -1687,4 +1778,395 @@ fn table_mode_never_advances_during_the_late_catch_up() {
         before,
         "table mode must leave catching up to Skipped"
     );
+}
+
+// ---------------------------------------------------------------------------
+// X3.5 Central engine (CP). The table owns advancement in production, so the
+// harness mirrors `LinkTable::complete` with an explicit `advance_one`.
+// ---------------------------------------------------------------------------
+
+struct CentralHarness {
+    clock: FakeClock,
+    radio: FakeRadio,
+    host: RecHost,
+    link: CentralLink,
+    rx: DmaBuf<RX_DMA_MIN>,
+    tx: DmaBuf<MAX_PDU>,
+}
+
+impl CentralHarness {
+    fn new_at(start: u32) -> Self {
+        let clock = FakeClock::new(start);
+        let stops = Rc::new(Cell::new(0));
+        let radio = FakeRadio::new(&clock, stops.clone());
+        let mut host = RecHost::new(stops);
+        host.clock = Some(clock.now.clone());
+        let features = host.local_features();
+        let link = CentralLink::new(params(), start.wrapping_add(CONNECT_END), start, features);
+        Self {
+            clock,
+            radio,
+            host,
+            link,
+            rx: DmaBuf::zeroed(),
+            tx: DmaBuf::zeroed(),
+        }
+    }
+
+    /// Move the fake clock to an absolute time.
+    fn advance_to(&self, at: u32) {
+        let now = self.clock.now();
+        self.clock.advance(at.wrapping_sub(now));
+    }
+
+    fn prepare(&self) -> u32 {
+        self.link.window().prepare_us
+    }
+
+    fn event(&mut self) -> EventEnd {
+        central::connection_event(
+            &mut self.radio,
+            &self.clock,
+            &mut self.rx,
+            &mut self.tx,
+            &mut self.link,
+            &mut self.host,
+            FINISH,
+        )
+    }
+
+    fn step(&mut self) -> Control {
+        central::step(
+            &mut self.link,
+            &mut self.host,
+            &mut self.radio,
+            &self.clock,
+            &mut self.rx,
+            &mut self.tx,
+            FINISH,
+        )
+    }
+
+    /// The table advances the counter before the next dispatch.
+    fn complete(&mut self) {
+        self.link.advance_one().unwrap();
+        self.advance_to(self.prepare());
+    }
+}
+
+#[test]
+fn central_publishes_on_the_first_peer_reply_and_records_the_anchor() {
+    let mut h = CentralHarness::new_at(0);
+    let event_start = h.link.conn.event_start_us();
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+
+    assert_eq!(h.event(), EventEnd::Continue);
+    assert_eq!(h.radio.sent, std::vec![std::vec![0x01, 0x00]]);
+    assert_eq!(
+        h.radio.tx_deadlines[0],
+        Some(event_start.wrapping_sub(ARM_LEAD_US)),
+        "the anchor is the TX start; the table dispatches earlier"
+    );
+    assert_eq!(h.host.connections, 1);
+    assert_eq!(h.host.published.len(), 1);
+    assert_eq!(h.host.published[0].role, crate::ll::Role::Central);
+    assert_eq!(h.host.published[0].interval, params().interval);
+    assert_eq!(h.host.stats[STAT_EVENTS], 1);
+    assert_eq!(h.host.stats[STAT_FIRST_ANCHOR], 1);
+    assert_eq!(h.host.stats[STAT_FIRST_ANCHOR_US], event_start);
+    assert_eq!(h.host.stats[STAT_TX_OK], 1);
+    assert_eq!(h.host.acked, std::vec![], "no Host ACL was in flight");
+}
+
+#[test]
+fn central_starts_dle_once_the_peer_features_arrive() {
+    let mut h = CentralHarness::new_at(0);
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+    assert!(h.link.take_event_served());
+    assert_eq!(h.host.connections, 1);
+
+    // The peer answers with LL_FEATURE_RSP (bit 5 = DLE).
+    h.complete();
+    let mut rsp = std::vec![0x0b, 9, 0x09];
+    rsp.extend_from_slice(&h.host.features);
+    h.radio.push(FakeRadio::frame(rsp));
+    assert_eq!(h.step(), Control::Continue);
+    assert!(h.host.stats[STAT_CONTROL_RX] >= 1);
+
+    // The post-event service queued LL_LENGTH_REQ for the next event.
+    h.complete();
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+    let sent = h.radio.sent.last().expect("a frame was sent");
+    assert_eq!(sent[0] & 3, 3, "LL control PDU");
+    assert_eq!(sent[2], 0x14, "LL_LENGTH_REQ");
+}
+
+#[test]
+fn central_termination_closes_on_the_peer_ack() {
+    let mut h = CentralHarness::new_at(0);
+    // Keep the feature exchange out of the way so the terminate PDU owns the
+    // next TX slot.
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+
+    h.host
+        .radio_requests
+        .push_back(RadioRequest::Disconnect { reason: 0x13 });
+    h.complete();
+    h.radio.push(FakeRadio::frame(empty_with(false, true)));
+    assert_eq!(h.step(), Control::Closed(0x13));
+    let sent = h.radio.sent.last().unwrap();
+    assert_eq!(sent[0] & 3, 3);
+    assert_eq!(&sent[2..], &[0x02, 0x13], "LL_TERMINATE_IND");
+    assert_eq!(h.host.closes, std::vec![0x13]);
+    assert_eq!(h.host.stats[STAT_TERMINATED_ACK], 1);
+    assert_eq!(h.host.after_close, 1);
+}
+
+#[test]
+fn central_missed_events_close_establishment_with_0x3e() {
+    let mut h = CentralHarness::new_at(0);
+    let mut control = Control::Continue;
+    for _ in 0..8 {
+        h.advance_to(h.prepare());
+        control = h.step();
+        if matches!(control, Control::Closed(_)) {
+            break;
+        }
+        h.complete();
+    }
+    assert_eq!(control, Control::Closed(0x3e));
+    assert_eq!(h.host.connections, 0);
+    assert_eq!(h.host.stats[STAT_CONNECT_FAIL], 1);
+    assert_eq!(h.host.stats[STAT_EMPTY_EVENTS], 6);
+}
+
+#[test]
+fn central_late_transmit_is_counted_and_never_publishes() {
+    let mut h = CentralHarness::new_at(0);
+    h.advance_to(h.prepare());
+    h.radio.late = true;
+    assert_eq!(h.step(), Control::Continue);
+    assert_eq!(h.host.stats[STAT_TX_LATE], 1);
+    assert_eq!(h.host.connections, 0);
+    assert!(h.radio.sent.is_empty());
+}
+
+#[test]
+fn central_window_reports_supervision_until_termination_starts() {
+    let mut h = CentralHarness::new_at(0);
+    let window = h.link.window();
+    assert_eq!(window.deadline_cause, CloseCause::EstablishmentTimeout);
+    assert_eq!(window.latest_start_us, h.link.conn.event_start_us());
+    assert_eq!(
+        window.prepare_us.wrapping_add(PREPARE_LEAD_US),
+        window.latest_start_us
+    );
+    assert!(
+        PREPARE_LEAD_US > ARM_LEAD_US,
+        "the dispatch lead must leave room for the pre-TX setup"
+    );
+    assert_eq!(window.validate(window.prepare_us), Ok(()));
+    assert!(h.link.expiry(window.prepare_us).is_none());
+    let expiry = h.link.expiry(window.deadline_us).expect("deadline reached");
+    assert_eq!(expiry.cause, CloseCause::EstablishmentTimeout);
+    assert_eq!(expiry.reason, 0x3e);
+
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+    h.complete();
+    h.host
+        .radio_requests
+        .push_back(RadioRequest::Disconnect { reason: 0x13 });
+    let window = {
+        let _ = h.step();
+        h.link.window()
+    };
+    assert_eq!(window.deadline_cause, CloseCause::Termination);
+    assert_eq!(
+        window.deadline_reason,
+        CloseCause::Termination.default_reason()
+    );
+}
+
+#[test]
+fn cp_link_forwards_the_scheduled_contract_of_either_role() {
+    let stops = Rc::new(Cell::new(0));
+    let host = RecHost::new(stops);
+    let features = host.local_features();
+    let mut link: CpLink<crate::crypto::aes::Aes128> =
+        CpLink::central(CentralLink::new(params(), CONNECT_END, 0, features));
+    let before = link.window();
+    assert_eq!(before.validate(before.prepare_us), Ok(()));
+    assert!(link.expiry(0).is_none());
+    link.advance_one().unwrap();
+    let after = link.window();
+    assert_eq!(after.event, before.event.wrapping_add(1));
+    assert_eq!(
+        after.prepare_us.wrapping_sub(before.prepare_us),
+        u32::from(params().interval) * 1250
+    );
+    assert!(!link.take_event_served());
+    assert!(link.as_central().is_some());
+    assert!(link.as_session().is_none());
+
+    // The peripheral arm forwards the shared session's window unchanged.
+    let session = Session::new(params(), false, CONNECT_END, 0, [0x11; 12], features);
+    let reference: SessionLink<crate::crypto::aes::Aes128> = SessionLink::new(Session::new(
+        params(),
+        false,
+        CONNECT_END,
+        0,
+        [0x11; 12],
+        features,
+    ));
+    let mut link: CpLink<crate::crypto::aes::Aes128> = CpLink::peripheral(session);
+    assert_eq!(link.window().prepare_us, reference.window().prepare_us);
+    assert_eq!(link.window().event, reference.window().event);
+    link.advance_one().unwrap();
+    assert_eq!(
+        link.window().event,
+        reference.window().event.wrapping_add(1)
+    );
+    assert!(link.as_session().is_some());
+    assert!(link.as_central().is_none());
+}
+
+#[test]
+fn a_two_slot_table_dispatches_cp_links_by_their_windows() {
+    let stops = Rc::new(Cell::new(0));
+    let host = RecHost::new(stops);
+    let features = host.local_features();
+    let mut table = LinkTable::<CpLink<crate::crypto::aes::Aes128>, 2>::new(300);
+    let early = table
+        .insert(CpLink::central(CentralLink::new(
+            params(),
+            CONNECT_END,
+            0,
+            features,
+        )))
+        .unwrap();
+    let late = table
+        .insert(CpLink::central(CentralLink::new(
+            params(),
+            CONNECT_END + 60_000,
+            0,
+            features,
+        )))
+        .unwrap();
+    assert_eq!((early.slot(), late.slot()), (0, 1));
+    let early_window = table.link(early).unwrap().window();
+    let late_window = table.link(late).unwrap().window();
+    assert!(early_window.prepare_us < late_window.prepare_us);
+
+    let Decision::Run { ticket, .. } = table.select(early_window.prepare_us, FINISH) else {
+        panic!("expected the earlier link to run");
+    };
+    assert_eq!(ticket.id(), early);
+    table.begin(ticket, early_window.prepare_us).unwrap();
+
+    // Each slot advances on its own window.
+    table.link_mut(early).unwrap().advance_one().unwrap();
+    let advanced = table.link(early).unwrap().window();
+    assert_eq!(advanced.event, early_window.event.wrapping_add(1));
+    assert_eq!(table.link(late).unwrap().window().event, late_window.event);
+}
+
+#[test]
+fn central_answers_a_peer_terminate_with_an_empty_pdu_and_closes() {
+    let mut h = CentralHarness::new_at(0);
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+
+    // LL_TERMINATE_IND (0x02, reason) acknowledging our previous PDU.
+    h.complete();
+    h.radio
+        .push(FakeRadio::frame(std::vec![0x0b, 2, 0x02, 0x13]));
+    assert_eq!(h.step(), Control::Closed(0x13));
+    assert_eq!(
+        h.radio.sent.last().unwrap(),
+        &std::vec![0x01, 0x00],
+        "empty PDU acknowledges the peer's terminate"
+    );
+    assert_eq!(h.host.closes, std::vec![0x13]);
+}
+
+#[test]
+fn central_without_the_encryption_bit_answers_ll_enc_req_with_unknown_rsp() {
+    let mut h = CentralHarness::new_at(0);
+    h.advance_to(h.prepare());
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+
+    // LL_ENC_REQ arrives; the engine must not fake LL_ENC_RSP.
+    h.complete();
+    let mut req = std::vec![0x0b, 23, 0x03];
+    req.extend_from_slice(&[0x11; 22]);
+    h.radio.push(FakeRadio::frame(req));
+    assert_eq!(h.step(), Control::Continue);
+
+    h.complete();
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    assert_eq!(h.step(), Control::Continue);
+    let sent = h.radio.sent.last().unwrap();
+    assert_eq!(&sent[2..4], &[0x07, 0x03], "LL_UNKNOWN_RSP for 0x03");
+    assert!(h.host.closes.is_empty());
+}
+
+#[test]
+fn a_two_slot_table_dispatches_one_peripheral_and_one_central() {
+    let stops = Rc::new(Cell::new(0));
+    let host = RecHost::new(stops);
+    let features = host.local_features();
+    let mut table = LinkTable::<CpLink<crate::crypto::aes::Aes128>, 2>::new(300);
+    let peripheral = table
+        .insert(CpLink::peripheral(Session::new(
+            params(),
+            false,
+            CONNECT_END,
+            0,
+            [0x11; 12],
+            features,
+        )))
+        .unwrap();
+    let central = table
+        .insert(CpLink::central(CentralLink::new(
+            params(),
+            CONNECT_END + 60_000,
+            0,
+            features,
+        )))
+        .unwrap();
+    assert_eq!((peripheral.slot(), central.slot()), (0, 1));
+    assert!(table.link(peripheral).unwrap().as_session().is_some());
+    assert!(table.link(central).unwrap().as_central().is_some());
+
+    let early = table.link(peripheral).unwrap().window();
+    let late = table.link(central).unwrap().window();
+    assert!(early.prepare_us < late.prepare_us);
+    let Decision::Run { ticket, .. } = table.select(early.prepare_us, FINISH) else {
+        panic!("expected the peripheral to run first");
+    };
+    assert_eq!(ticket.id(), peripheral);
+    table.begin(ticket, early.prepare_us).unwrap();
+    table
+        .complete(
+            ticket,
+            EventOutcome::Done {
+                consumed_event: true,
+                idle_at_us: early.prepare_us,
+            },
+        )
+        .unwrap();
+    let advanced = table.link(peripheral).unwrap().window();
+    assert_eq!(advanced.event, early.event.wrapping_add(1));
+    assert_eq!(table.link(central).unwrap().window().event, late.event);
 }

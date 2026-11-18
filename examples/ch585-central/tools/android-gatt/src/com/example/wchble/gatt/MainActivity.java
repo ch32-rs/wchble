@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattServerCallback;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.BluetoothStatusCodes;
 import android.bluetooth.le.AdvertiseCallback;
 import android.bluetooth.le.AdvertiseData;
 import android.bluetooth.le.AdvertiseSettings;
@@ -88,6 +89,9 @@ public final class MainActivity extends Activity {
     // down while a request is outstanding.
     private int holdMs;
     private int value = INITIAL_VALUE;
+    // One address per subscribed peer; the CP fixture subscribes once.
+    private final java.util.Set<String> subscribers = new java.util.HashSet<>();
+    private int notifications;
     private int reads;
     private int writes;
     private int connections;
@@ -159,6 +163,7 @@ public final class MainActivity extends Activity {
                         + ",\"status\":" + status
                         + ",\"connections\":" + connections);
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                subscribers.remove(address);
                 disconnections++;
                 logEvent("\"event\":\"disconnected\",\"address\":" + quote(address)
                         + ",\"status\":" + status
@@ -296,6 +301,16 @@ public final class MainActivity extends Activity {
                     + ",\"response_needed\":" + responseNeeded
                     + ",\"status\":" + BluetoothGatt.GATT_SUCCESS
                     + ",\"writes\":" + writes);
+            // The CP client writes while subscribed and waits for the echo.
+            // Send after the write response so the client sees ATT, then the
+            // notification, on the same channel.
+            if (subscribers.contains(address)) {
+                handler.post(() -> {
+                    if (!finished && !stopping) {
+                        notifyValue(device, address);
+                    }
+                });
+            }
         }
 
         @Override
@@ -304,7 +319,17 @@ public final class MainActivity extends Activity {
             if (finished || stopping) {
                 return;
             }
+            String address = addressOf(device);
+            if (CCCD_UUID.equals(descriptor.getUuid()) && offset == 0) {
+                respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset,
+                        cccdBytes(subscribers.contains(address)));
+                logEvent("\"event\":\"cccd_read\",\"address\":" + quote(address)
+                        + ",\"subscribed\":" + subscribers.contains(address));
+                return;
+            }
             respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null);
+            logEvent("\"event\":\"cccd_read\",\"address\":" + quote(address)
+                    + ",\"status\":" + BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED);
         }
 
         @Override
@@ -314,10 +339,31 @@ public final class MainActivity extends Activity {
             if (finished || stopping) {
                 return;
             }
-            if (responseNeeded) {
-                respond(device, requestId,
-                        BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null);
+            String address = addressOf(device);
+            if (!CCCD_UUID.equals(descriptor.getUuid()) || offset != 0
+                    || requestValue == null || requestValue.length != 2) {
+                if (responseNeeded) {
+                    respond(device, requestId,
+                            BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null);
+                }
+                logEvent("\"event\":\"cccd_write\",\"address\":" + quote(address)
+                        + ",\"status\":" + BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED);
+                return;
             }
+            int cccd = (requestValue[0] & 0xFF) | ((requestValue[1] & 0xFF) << 8);
+            if ((cccd & 0x0001) != 0) {
+                subscribers.add(address);
+            } else {
+                subscribers.remove(address);
+            }
+            descriptor.setValue(cccdBytes((cccd & 0x0001) != 0));
+            if (responseNeeded) {
+                respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null);
+            }
+            logEvent("\"event\":\"cccd_write\",\"address\":" + quote(address)
+                    + ",\"value\":" + cccd
+                    + ",\"subscribed\":" + subscribers.contains(address)
+                    + ",\"subscribers\":" + subscribers.size());
         }
     };
 
@@ -672,6 +718,7 @@ public final class MainActivity extends Activity {
                 + ",\"no_service\":" + noService
                 + ",\"reads\":" + reads
                 + ",\"writes\":" + writes
+                + ",\"notifications\":" + notifications
                 + ",\"connections\":" + connections
                 + ",\"disconnections\":" + disconnections
                 + ",\"readvertisings\":" + readvertisings
@@ -745,6 +792,37 @@ public final class MainActivity extends Activity {
         } catch (RuntimeException error) {
             return "";
         }
+    }
+
+    private static byte[] cccdBytes(boolean subscribed) {
+        return subscribed ? new byte[] { 1, 0 } : new byte[] { 0, 0 };
+    }
+
+    // Echo the current value to one subscribed peer.
+    private void notifyValue(BluetoothDevice device, String address) {
+        if (gattServer == null || characteristic == null) {
+            return;
+        }
+        byte[] bytes = valueBytes();
+        characteristic.setValue(bytes);
+        boolean sent;
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                sent = gattServer.notifyCharacteristicChanged(device, characteristic, false, bytes) == BluetoothStatusCodes.SUCCESS;
+            } else {
+                sent = gattServer.notifyCharacteristicChanged(device, characteristic, false);
+            }
+        } catch (RuntimeException error) {
+            sent = false;
+        }
+        if (sent) {
+            notifications++;
+        }
+        logEvent("\"event\":\"notify\",\"address\":" + quote(address)
+                + ",\"value\":" + value
+                + ",\"value_hex\":" + quote(hex32(value))
+                + ",\"sent\":" + sent
+                + ",\"notifications\":" + notifications);
     }
 
     private byte[] valueBytes() {

@@ -323,10 +323,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
                 }
                 let len = header.payload_len as usize;
                 if out.len() < len {
-                    return Err(StoreError::BufferTooSmall {
-                        len,
-                        needed: len,
-                    });
+                    return Err(StoreError::BufferTooSmall { len, needed: len });
                 }
                 self.region
                     .read(self.slots[slot] + HEADER_LEN as u32, &mut out[..len])?;
@@ -339,7 +336,11 @@ impl<R: FlashRegion> DualCopyStore<R> {
         let offset = self.slots[slot];
         self.region.erase(offset)?;
         let header = Header {
-            flags: if payload.is_empty() { FLAG_TOMBSTONE } else { 0 },
+            flags: if payload.is_empty() {
+                FLAG_TOMBSTONE
+            } else {
+                0
+            },
             seq,
             payload_len: payload.len() as u16,
             payload_crc: crc32(payload),
@@ -347,8 +348,7 @@ impl<R: FlashRegion> DualCopyStore<R> {
         let raw = header.encode();
         self.region.program(offset, &raw)?;
         if !payload.is_empty() {
-            self.region
-                .program(offset + HEADER_LEN as u32, payload)?;
+            self.region.program(offset + HEADER_LEN as u32, payload)?;
         }
         let mut check = [0u8; HEADER_LEN];
         self.region.read(offset, &mut check)?;
@@ -797,7 +797,10 @@ mod tests {
             payload_len: 8,
             payload_crc: crc32(b"new-data"),
         };
-        store.region.program((target * PAGE) as u32, &header.encode()).unwrap();
+        store
+            .region
+            .program((target * PAGE) as u32, &header.encode())
+            .unwrap();
         store
             .region
             .program((target * PAGE + HEADER_LEN) as u32, b"new")
@@ -813,7 +816,10 @@ mod tests {
         let mut store = store();
         store.save(b"old").unwrap();
         let seq = store.seq();
-        assert_eq!(store.save_with_fault(b"new-data", 3), Err(StoreError::Injected));
+        assert_eq!(
+            store.save_with_fault(b"new-data", 3),
+            Err(StoreError::Injected)
+        );
         assert_eq!(store.seq(), seq);
         let mut out = [0u8; 16];
         assert_eq!(store.load(&mut out), Ok(Some(3)));
@@ -853,7 +859,10 @@ mod tests {
         let mut out = [0u8; 4];
         assert_eq!(
             store.load(&mut out),
-            Err(StoreError::BufferTooSmall { len: 10, needed: 10 })
+            Err(StoreError::BufferTooSmall {
+                len: 10,
+                needed: 10
+            })
         );
     }
 
@@ -872,10 +881,7 @@ mod tests {
     fn erase_failure_propagates() {
         let mut store = store();
         store.region.fail_erase = Some(0);
-        assert_eq!(
-            store.save(b"x"),
-            Err(StoreError::Flash(FlashError::Busy))
-        );
+        assert_eq!(store.save(b"x"), Err(StoreError::Flash(FlashError::Busy)));
         assert_eq!(store.active_slot(), None);
     }
 
@@ -956,10 +962,7 @@ mod tests {
         let active = store.active_slot().unwrap();
         // The old record's page cannot be erased, so the tombstone must stay.
         store.region.fail_erase = Some(active);
-        assert_eq!(
-            store.erase_all(),
-            Err(StoreError::Flash(FlashError::Busy))
-        );
+        assert_eq!(store.erase_all(), Err(StoreError::Flash(FlashError::Busy)));
         store.region.fail_erase = None;
         let mut out = [0u8; 16];
         assert_eq!(store.load(&mut out), Ok(None));

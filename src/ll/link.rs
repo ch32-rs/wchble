@@ -506,6 +506,8 @@ pub struct Session<E: AesEngine> {
     advance_owner: AdvanceOwner,
     /// The last `step` ran a connection event body.
     event_served: bool,
+    /// This link already stopped the advertising that formed it.
+    adv_stopped: bool,
 }
 
 impl<E: AesEngine> Session<E> {
@@ -572,6 +574,7 @@ impl<E: AesEngine> Session<E> {
             own_rpa: None,
             advance_owner: AdvanceOwner::SelfRun,
             event_served: false,
+            adv_stopped: false,
         }
     }
 
@@ -1888,6 +1891,26 @@ pub fn close_session<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Instan
     true
 }
 
+/// Everything that only queues work for the next event: encryption setup,
+/// deferred control replies, DLE and prebuilt ciphertext.
+fn service_pending<E: AesEngine, H: LinkHost<Aes = E>>(
+    host: &mut H,
+    s: &mut Session<E>,
+    now: u32,
+) -> Option<u8> {
+    let mut reason = service_encryption(host, s);
+    if reason.is_none() {
+        reason = service_control(host, s, now);
+    }
+    if reason.is_none() {
+        reason = service_dle(host, s);
+    }
+    if reason.is_none() {
+        reason = prefetch_encrypted(host, s);
+    }
+    reason
+}
+
 /// One outer-loop iteration while a session is active.
 ///
 /// Covers the missed-event catch-up, deferred services, the idle gap, the
@@ -1978,17 +2001,10 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
             s.request_terminate(host, 0x1e, clock.now_us());
         }
     }
+    let mut serviced = false;
     if reason.is_none() && !reached(clock.now_us().wrapping_add(4000), prepare) {
-        reason = service_encryption(host, s);
-        if reason.is_none() {
-            reason = service_control(host, s, clock.now_us());
-        }
-        if reason.is_none() {
-            reason = service_dle(host, s);
-        }
-        if reason.is_none() {
-            reason = prefetch_encrypted(host, s);
-        }
+        serviced = true;
+        reason = service_pending(host, s, clock.now_us());
     }
     if let Some((interval, latency, timeout)) = s.update_report {
         if host.connection_updated(interval, latency, timeout) {
@@ -1999,6 +2015,11 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     // final 100 us RF arming allowance.
     if reason.is_none() && radio.channel() != s.conn.channel() {
         radio.set_channel(s.conn.channel()).unwrap();
+    }
+    // Advertising between events reprograms the AA/CRC; restore ours before
+    // arming, or every later event is heard on the wrong access address.
+    if reason.is_none() {
+        radio.set_aa_crc(s.conn.params.access_addr, s.conn.params.crc_init);
     }
     if reason.is_none() && !reached(clock.now_us().wrapping_add(2000), prepare) {
         let mut until = earlier(prepare, earlier(finish, s.conn.supervision_deadline_us()));
@@ -2020,11 +2041,21 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
             }
             EventEnd::Stopped => return Control::StopTimeout,
         };
-        if s.conn.established() {
+        if s.conn.established() && !s.adv_stopped {
+            // Stop the advertising that formed this link once. A Host that
+            // keeps a second advertising instance alive re-arms it after the
+            // connection; disarming every event would silence that slot.
+            s.adv_stopped = true;
             host.disable_adv();
         }
         if reason.is_none() {
             reason = finish_deferred(host, s);
+        }
+        // A scheduler dispatches `step` once, at the arm boundary, so the
+        // 4 ms pre-event pass never runs there. Catch up in the long gap
+        // after the event; these services only queue work for the next one.
+        if !serviced && reason.is_none() {
+            reason = service_pending(host, s, clock.now_us());
         }
         host.publish_x1(&s.x1_snapshot());
         if s.enc_change_pending {
@@ -2044,6 +2075,9 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
     }
     Control::Continue
 }
+
+pub mod central;
+pub mod cp;
 
 #[cfg(test)]
 pub(crate) mod tests;

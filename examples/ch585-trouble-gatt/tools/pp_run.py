@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""X3.4a PP round: flash the pp image, hold two Mac centrals, archive, restore smoke.
+"""X3.4a PP round: flash the pp image, hold two centrals, archive, restore smoke.
 
-Both clients run `central --mode pp --role 1|2`: connect, read, subscribe, then
-write a role-specific sequence until their timeout and count notifications.
+The default hybrid round pairs the Mac `central --mode pp --role 1` with the
+adb-driven `dev.wchble.probe` phone app (role 2 over the NUS pipe). With
+`--no-phone` both centrals are Mac clients, the earlier two-laptop shape.
 """
 import argparse
 import hashlib
 import importlib.util
 import json
+import struct
 import subprocess
 import sys
 import time
@@ -15,6 +17,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE = ROOT / 'examples/ch585-trouble-gatt'
+sys.path.insert(0, str(EXAMPLE / 'tools'))
+import secure_run as secure  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     'ch585_gatt_run', EXAMPLE / 'tools/run.py')
@@ -33,12 +37,22 @@ NAME = 'wch585-p4'
 HOST_NAMES = gatt.HOST_NAMES
 FAILURES = gatt.FAILURES
 
-# Counters added by the pp loop; indices 54..58 are otherwise reserved.
-PP_FRAGMENT_FAILURES = 54
-PP_FRAGMENTS = 55
-PP_SKIPS = 56
-PP_CAPACITY_REJECTS = 57
-PP_BACKGROUND_OVERRUNS = 58
+# Phone probe: the same apk used for the pairing work, pointed at the pp app's
+# random address and the NUS pipe. Its 4-byte write carries role 2.
+PROBE_APK = ROOT / 'local-docs/research/android-probe/build/wchble-probe.apk'
+PROBE_PACKAGE = 'dev.wchble.probe'
+PROBE_ACTIVITY = PROBE_PACKAGE + '/.ProbeActivity'
+PP_ADDRESS = 'C1:FF:EE:00:00:1A'
+MAC_ROLE = 1
+PHONE_ROLE = 2
+PHONE_PAYLOAD = struct.pack('<I', PHONE_ROLE * 1000 + 1).hex()
+
+# pp-loop counters in slots the legacy paths never write under `pp`.
+PP_CAPACITY_REJECTS = 33
+PP_BACKGROUND_OVERRUNS = 34
+PP_FRAGMENT_FAILURES = 45
+PP_FRAGMENTS = 46
+PP_SKIPS = 47
 
 
 def evaluate_client(role, rows, returncode, timeout):
@@ -86,6 +100,131 @@ def evaluate_client(role, rows, returncode, timeout):
     return errors, (start, end)
 
 
+def adb(serial, *args, **kwargs):
+    try:
+        return secure.adb(serial, *args, **kwargs)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or '').strip()
+        raise RuntimeError(f'adb {" ".join(args[:3])} failed: {detail}') from error
+
+
+def start_phone(serial, repeats, repeat_ms, hold_ms, scan_ms, timeout_ms):
+    adb(serial, 'shell', 'am', 'force-stop', PROBE_PACKAGE)
+    adb(serial, 'logcat', '-c')
+    adb(serial, 'shell', 'am', 'start', '-W', '-n', PROBE_ACTIVITY,
+        '--es', 'addr', PP_ADDRESS,
+        '--es', 'payload', PHONE_PAYLOAD,
+        '--ez', 'subscribe', 'true',
+        '--ei', 'repeats', str(repeats),
+        '--el', 'repeat_ms', str(repeat_ms),
+        '--el', 'hold_ms', str(hold_ms),
+        '--el', 'scan_ms', str(scan_ms),
+        '--el', 'timeout_ms', str(timeout_ms))
+
+
+def phone_rows(serial):
+    text = adb(serial, 'logcat', '-d', '-s', 'WCHBLE:I', timeout=60)
+    return secure.read_log(text.splitlines())
+
+
+def await_phone_summary(serial, seconds=6.0):
+    """The probe writes and holds after the Mac leaves; wait for its summary."""
+    deadline = time.monotonic() + seconds
+    rows = phone_rows(serial)
+    while not any(row.get('event') == 'summary' for row in rows):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+        rows = phone_rows(serial)
+    return rows
+
+
+PHONE_FATAL = {'watchdog', 'scan_timeout', 'scan_failed', 'no_bluetooth',
+               'no_scanner', 'connect_gatt_null', 'bad_address', 'no_service',
+               'no_cccd'}
+
+
+def wait_phone_connected(serial, timeout):
+    """Poll logcat until the probe reports a live connection or a fatal exit."""
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = phone_rows(serial)
+        events = {row.get('event') for row in rows}
+        if any(row.get('event') == 'connection' and row.get('state') == 2
+               for row in rows):
+            return rows, True
+        if events & PHONE_FATAL or time.monotonic() >= deadline:
+            return rows, False
+        time.sleep(0.5)
+
+
+def decode_le_hex(text):
+    try:
+        raw = bytes.fromhex(text or '')
+    except ValueError:
+        return None
+    return int.from_bytes(raw, 'little') if raw else None
+
+
+def evaluate_phone(rows, repeats):
+    """The phone's own logcat proof: connected over NUS, wrote, saw the Mac."""
+    errors = []
+    if not rows:
+        return ['phone: no probe events']
+    fatal = [row.get('event') for row in rows if row.get('event') in PHONE_FATAL]
+    if any(row.get('event') == 'connection' and row.get('state') == 2
+           for row in rows):
+        # The probe's scan timer keeps running past the match; only a scan
+        # that never matched is fatal.
+        fatal = [event for event in fatal if event != 'scan_timeout']
+    if fatal:
+        errors.append(f'phone: fatal events {fatal}')
+    start = next((row for row in rows if row.get('event') == 'start'), None)
+    if (start is None or start.get('addr') != PP_ADDRESS
+            or not start.get('subscribe')):
+        errors.append('phone: start row missing, wrong address, or unsubscribed')
+    connections = [row for row in rows
+                   if row.get('event') == 'connection' and row.get('state') == 2]
+    if len(connections) != 1:
+        errors.append(f'phone: saw {len(connections)} connected states')
+    services = next((row for row in rows if row.get('event') == 'services'), None)
+    if services is None or services.get('status') != 0:
+        errors.append('phone: service discovery did not succeed')
+    chars = next((row for row in rows if row.get('event') == 'characteristics'), None)
+    if chars is None or not chars.get('rx') or not chars.get('tx'):
+        errors.append('phone: NUS RX/TX not both present')
+    subscribe = next((row for row in rows
+                      if row.get('event') == 'subscribe_local'), None)
+    if subscribe is None or not subscribe.get('ok'):
+        errors.append('phone: local notify enable failed')
+    cccd = [row for row in rows if row.get('event') == 'cccd_write']
+    if len(cccd) != 1 or cccd[0].get('status') != 0:
+        errors.append(f'phone: CCCD write rows {cccd}')
+    requested = [row for row in rows if row.get('event') == 'write_requested']
+    if any(not row.get('ok') for row in requested):
+        errors.append('phone: a write request was refused')
+    callbacks = [row for row in rows if row.get('event') == 'write_callback']
+    if any(row.get('status') != 0 for row in callbacks):
+        errors.append('phone: a write callback reported an error')
+    if len(callbacks) < repeats:
+        errors.append(f'phone: {len(callbacks)} acknowledged writes, expected {repeats}')
+    notifications = [decode_le_hex(row.get('hex')) for row in rows
+                     if row.get('event') == 'notification']
+    peer = [value for value in notifications
+            if value is not None and value // 1000 == MAC_ROLE]
+    summary = next((row for row in reversed(rows) if row.get('event') == 'summary'), None)
+    if summary is None:
+        errors.append('phone: no summary')
+    elif not summary.get('notifications'):
+        errors.append('phone: summary counted no notifications')
+    if not peer:
+        errors.append('phone: no notification carried the Mac role\'s value')
+    if not any(row.get('event') == 'disconnect' for row in rows):
+        errors.append('phone: no disconnect event')
+    return errors, {'writes': len(callbacks), 'notifications': len(notifications),
+                    'mac_values': sorted(set(peer))}
+
+
 def evaluate_stats(stats, host, run_seconds):
     errors = []
     if len(stats) != 64:
@@ -122,9 +261,15 @@ def evaluate_stats(stats, host, run_seconds):
 
 def execute(args):
     args.out.mkdir(parents=True, exist_ok=False)
-    errors, metadata = [], {'probe': PROBE, 'scope': 'pp two-central plaintext GATT',
+    shape = 'mac+phone NUS' if args.phone else 'mac+mac'
+    # The phone preflight eats flash-relative seconds; keep the Mac inside the
+    # finite firmware window.
+    client_seconds = min(args.client_seconds, 12.0) if args.phone else args.client_seconds
+    errors, metadata = [], {'probe': PROBE,
+                            'scope': f'pp two-central plaintext GATT ({shape})',
+                            'serial': args.serial if args.phone else None,
                             'run_seconds': args.run_seconds,
-                            'client_seconds': args.client_seconds}
+                            'client_seconds': client_seconds}
     clients, logs = [], []
     touched, safe_read_at, symbols = False, 0.0, None
     try:
@@ -145,35 +290,98 @@ def execute(args):
         _copy(EXAMPLE / 'tools' / 'central.swift', source)
         io.command(['swiftc', '-O', str(source), '-o', str(binary)],
                    args.out / 'central-build.log', timeout=180)
+        # Install and unlock before the flash: the firmware window starts at
+        # flash return, so no adb install may eat into it.
+        if args.phone:
+            if not args.probe_apk.is_file():
+                raise ValueError(f'probe apk missing: {args.probe_apk}')
+            adb(args.serial, 'get-state')
+            adb(args.serial, 'shell', 'am', 'force-stop', PROBE_PACKAGE)
+            adb(args.serial, 'install', '-g', '-r', str(args.probe_apk), timeout=120)
+            adb(args.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP')
+            adb(args.serial, 'shell', 'wm', 'dismiss-keyguard')
+            adb(args.serial, 'shell', 'svc', 'power', 'stayon', 'true')
         touched = True
         try:
             io.flash(archived, args.out, 'pp', check_idle=False)
         finally:
-            safe_read_at = time.monotonic() + embedded + 3
-        for role in (1, 2):
+            flash_at = time.monotonic()
+            safe_read_at = flash_at + embedded + 3
+        phone_connected = False
+        if args.phone:
+            phone_started_at = time.monotonic()
+            scan_ms = int(args.phone_scan_seconds * 1000)
+            start_phone(args.serial, args.phone_repeats, args.phone_repeat_ms,
+                        args.phone_hold_ms, scan_ms, args.phone_timeout_ms)
+            metadata['phone_payload'] = PHONE_PAYLOAD
+            connected_rows, phone_connected = wait_phone_connected(
+                args.serial, args.phone_scan_seconds + 3)
+            (args.out / 'phone-preflight.jsonl').write_text(
+                '\n'.join(json.dumps(row, sort_keys=True) for row in connected_rows) + '\n')
+            metadata['phone_connected_before_mac'] = phone_connected
+            if not phone_connected:
+                errors.append('phone did not connect before the Mac client started')
+        roles = (MAC_ROLE,) if args.phone else (1, 2)
+        mac_started_at = time.monotonic()
+        if args.phone:
+            metadata['mac_start_after_flash_s'] = round(mac_started_at - flash_at, 2)
+        for role in roles:
             command = [str(binary), '--mode', 'pp', '--role', str(role),
-                       '--timeout', str(args.client_seconds), '--name', NAME]
+                       '--timeout', str(client_seconds), '--name', NAME]
             (args.out / f'central-{role}.command.json').write_text(json.dumps(command) + '\n')
             log = (args.out / f'central-{role}.jsonl').open('w')
             logs.append(log)
             clients.append(subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True))
         windows = {}
         for index, client in enumerate(clients):
-            role = index + 1
+            role = roles[index]
             try:
-                client.wait(timeout=args.client_seconds + 8)
+                client.wait(timeout=client_seconds + 8)
             except subprocess.TimeoutExpired:
                 errors.append(f'role {role}: exceeded timeout plus cleanup')
                 stop_client(client)
             metadata[f'client_{role}_exit'] = client.returncode
             rows = read_client(args.out / f'central-{role}.jsonl')
-            result = evaluate_client(role, rows, client.returncode, args.client_seconds)
+            result = evaluate_client(role, rows, client.returncode, client_seconds)
             if isinstance(result, tuple):
                 found, window = result
                 errors.extend(found)
                 windows[role] = window
+                if args.phone and window[0] is not None and window[1] is not None:
+                    # central.swift stamps absolute uptime; anchor on its own
+                    # first row so only durations cross the two clocks.
+                    origin = rows[0].get('monotonic_seconds', 0)
+                    offset = mac_started_at - flash_at
+                    metadata[f'client_{role}_window_after_flash_s'] = [
+                        round(offset + window[0] - origin, 2),
+                        round(offset + window[1] - origin, 2)]
             else:
                 errors.extend(result)
+        if args.phone:
+            rows = await_phone_summary(args.serial)
+            (args.out / 'phone.jsonl').write_text(
+                '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
+            result = evaluate_phone(rows, args.phone_repeats)
+            if isinstance(result, tuple):
+                found, detail = result
+                errors.extend(found)
+                metadata['phone'] = detail
+            else:
+                errors.extend(result)
+            if phone_connected:
+                # Log-relative offsets from flash, so a short window can be
+                # told apart from a protocol failure.
+                offset = phone_started_at - flash_at
+                marks = []
+                for event, state in (('connection', 2), ('disconnect', None)):
+                    row = next((row for row in rows if row.get('event') == event
+                                and (state is None or row.get('state') == state)), None)
+                    if row is not None and isinstance(row.get('elapsed_ms'), (int, float)):
+                        marks.append(round(offset + row['elapsed_ms'] / 1000, 2))
+                metadata['phone_window_after_flash_s'] = marks
+            # Live-link fan-out is proven by cross-observed values, not by
+            # comparing two unsynchronised clocks.
+            metadata['overlap_seconds'] = None
         if len(windows) == 2:
             overlap = min(windows[1][1], windows[2][1]) - max(windows[1][0], windows[2][0])
             metadata['overlap_seconds'] = overlap
@@ -189,6 +397,12 @@ def execute(args):
                 pass
         for log in logs:
             log.close()
+        if args.phone:
+            try:
+                adb(args.serial, 'shell', 'am', 'force-stop', PROBE_PACKAGE,
+                    timeout=15)
+            except FAILURES:
+                pass
         if touched:
             while True:
                 try:
@@ -207,6 +421,42 @@ def execute(args):
                             json.dumps(dict(zip(names, words)), indent=2) + '\n')
                     except FAILURES as error:
                         errors.append(f'{name} observations: {error}')
+                if 'SEC_DIAG' in symbols:
+                    # The HCI rings name the commands behind a silent slot,
+                    # e.g. whether a second LE Set Advertising Enable landed.
+                    try:
+                        diagnostic = io.read32(symbols['SEC_DIAG'], 64,
+                                               args.out / 'sec_diag.txt')
+                        metadata['sec_diag'] = {
+                            'hci_failure': diagnostic[40],
+                            'hci_log': diagnostic[41:49],
+                            'hci_log_len': diagnostic[49],
+                            'hci_sent': diagnostic[50:58],
+                            'hci_sent_len': diagnostic[58],
+                        }
+                    except FAILURES as error:
+                        errors.append(f'SEC_DIAG observations: {error}')
+                if 'TRACE' in symbols:
+                    try:
+                        words = io.read32(symbols['TRACE'], 128 * 8,
+                                          args.out / 'trace.txt')
+                    except FAILURES as error:
+                        errors.append(f'TRACE observations: {error}')
+                    else:
+                        rows = []
+                        for index in range(128):
+                            row = words[index * 8:index * 8 + 8]
+                            if not any(row):
+                                continue
+                            rows.append({
+                                'slot': index, 'now_us': row[0], 'kind': row[1],
+                                'event': row[2] & 0xffff, 'channel': row[3] & 0xff,
+                                'header': row[4] & 0xff, 'len': row[5] & 0xff,
+                                'a': row[6], 'b': row[7],
+                            })
+                        rows.sort(key=lambda row: row['now_us'])
+                        (args.out / 'trace.jsonl').write_text(
+                            '\n'.join(json.dumps(row, sort_keys=True) for row in rows) + '\n')
                 found, detail = evaluate_stats(observations.get('STATS', []),
                                                observations.get('HOST_STATS', []),
                                                args.run_seconds)
@@ -241,6 +491,18 @@ def options(argv=None):
     parser.add_argument('--nm', default=NM)
     parser.add_argument('--run-seconds', type=int, choices=(25, 360), default=25)
     parser.add_argument('--client-seconds', type=float, default=16.0)
+    parser.add_argument('--no-phone', dest='phone', action='store_false',
+                        help='use two Mac clients instead of the adb phone probe')
+    parser.add_argument('--serial', default=secure.ADB_SERIAL)
+    parser.add_argument('--probe-apk', type=Path, default=PROBE_APK)
+    # A write plus its notification takes ~450 ms, so 20 repeats plus the hold
+    # end near 14 s, inside the Mac's 12 s window and the 25 s image.
+    parser.add_argument('--phone-repeats', type=int, default=20)
+    parser.add_argument('--phone-repeat-ms', type=int, default=300)
+    parser.add_argument('--phone-hold-ms', type=int, default=3000)
+    # The Host needs ~4 s after flash before it advertises at all.
+    parser.add_argument('--phone-scan-seconds', type=float, default=8.0)
+    parser.add_argument('--phone-timeout-ms', type=int, default=24000)
     return parser.parse_args(argv)
 
 

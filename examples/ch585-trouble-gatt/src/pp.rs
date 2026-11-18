@@ -20,11 +20,16 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
     stats.phase(host::PHASE_STARTING);
     let mut resources: HostResources<DefaultPacketPool, 2, 2, 1, BOND_CAPACITY> =
         HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources).build();
+    let stack = trouble_host::new(controller, &mut resources)
+        // The phone probe scans for this fixed static address.
+        .set_random_address(Address::random(host::PP_RANDOM_ADDRESS))
+        .build();
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
     let mut storage = [0u8; 4];
+    let mut uart_rx_storage = [0u8; 4];
+    let mut uart_tx_storage = [0u8; 4];
     let mut table: AttributeTable<'_, NoopRawMutex, 24> = AttributeTable::new();
     // The macOS client matches the advertised local name.
     let mut gap = table.add_service(Service::new(0x1800u16));
@@ -45,6 +50,25 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
         )
         .build();
     service.build();
+    // NUS pipe for the adb-driven phone probe: RX accepts writes, TX notifies.
+    let mut uart = table.add_service(Service::new(host::UART_SERVICE_UUID));
+    let uart_rx: Characteristic<u32> = uart
+        .add_characteristic(
+            host::UART_RX_UUID,
+            &[CharacteristicProp::Write],
+            0u32,
+            &mut uart_rx_storage,
+        )
+        .build();
+    let uart_tx: Characteristic<u32> = uart
+        .add_characteristic(
+            host::UART_TX_UUID,
+            &[CharacteristicProp::Read, CharacteristicProp::Notify],
+            0u32,
+            &mut uart_tx_storage,
+        )
+        .build();
+    uart.build();
     let server = AttributeServer::<NoopRawMutex, DefaultPacketPool, 24, 2>::new(table);
 
     let app = async {
@@ -56,7 +80,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             // Keep advertising for the second slot while serving the first.
             let second = match select(
                 accept(&mut peripheral, &server),
-                serve(&value, &first, None, stats),
+                serve(&value, &uart_rx, &uart_tx, &first, None, stats),
             )
             .await
             {
@@ -68,19 +92,19 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             };
             stats.inc(host::STAT_CONNECTIONS);
             match select(
-                serve(&value, &first, Some(&second), stats),
-                serve(&value, &second, Some(&first), stats),
+                serve(&value, &uart_rx, &uart_tx, &first, Some(&second), stats),
+                serve(&value, &uart_rx, &uart_tx, &second, Some(&first), stats),
             )
             .await
             {
                 Either::First(()) => {
                     stats.inc(host::STAT_DISCONNECTS);
-                    serve(&value, &second, None, stats).await;
+                    serve(&value, &uart_rx, &uart_tx, &second, None, stats).await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
                 Either::Second(()) => {
                     stats.inc(host::STAT_DISCONNECTS);
-                    serve(&value, &first, None, stats).await;
+                    serve(&value, &uart_rx, &uart_tx, &first, None, stats).await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
             }
@@ -119,6 +143,8 @@ async fn accept<'d, 's, C: Controller>(
 /// Serve one connection until it disconnects, notifying every live link.
 async fn serve<P: PacketPool>(
     value: &Characteristic<u32>,
+    uart_rx: &Characteristic<u32>,
+    uart_tx: &Characteristic<u32>,
     connection: &GattConnection<'_, '_, P>,
     peer: Option<&GattConnection<'_, '_, P>>,
     stats: &HostStats,
@@ -134,6 +160,11 @@ async fn serve<P: PacketPool>(
                         updated = write.value(value).ok();
                         event.accept()
                     }
+                    GattEvent::Write(write) if write.handle() == uart_rx.handle => {
+                        stats.inc(host::STAT_WRITES);
+                        updated = write.value(uart_rx).ok();
+                        event.accept()
+                    }
                     GattEvent::Read(read) if read.handle() == value.handle => {
                         stats.inc(host::STAT_READS);
                         event.accept()
@@ -145,12 +176,15 @@ async fn serve<P: PacketPool>(
                 }
                 if let Some(updated) = updated {
                     stats.set(host::STAT_VALUE, updated);
-                    let ok = value.notify(connection, &updated, false).await.is_ok();
-                    let peer_ok = match peer {
-                        Some(peer) => value.notify(peer, &updated, false).await.is_ok(),
-                        None => false,
-                    };
-                    if ok || peer_ok {
+                    // Both notify characteristics on every live link; each CCCD
+                    // gates delivery, so the Mac (0x1001) and the phone (NUS)
+                    // can subscribe independently.
+                    let mut delivered = false;
+                    for target in [Some(connection), peer].into_iter().flatten() {
+                        delivered |= value.notify(target, &updated, false).await.is_ok();
+                        delivered |= uart_tx.notify(target, &updated, false).await.is_ok();
+                    }
+                    if delivered {
                         stats.inc(host::STAT_NOTIFICATIONS);
                     }
                 }
