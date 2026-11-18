@@ -574,6 +574,36 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 - [ ] **The example duplicates the ~2100-line P4/P5 pump.** Extraction belongs
   to L0; the copied example is a validation artefact, not a second driver.
 
+## X3 dual-link open items (2026-11-18)
+
+The PP/CP subsets are closed in `local-docs/results/x3-6-closeout.md`. These
+remain open and must not be read as verified:
+- [ ] **`pp+secure` (two encrypted links).** The feature combination builds
+  (flash 310,126 B, RAM 44,308 B) but has no hardware round; PP acceptance is
+  plaintext only.
+- [ ] **CP reverse connect order (peripheral first, then central).** Starting
+  the phone after the Mac link failed: the fixture advertises about 11 s after
+  boot while the app's scan budget is about 10 s and a live link leaves roughly
+  2.8 % scan duty. Needs a longer scan budget or a denser background policy.
+- [ ] **CP Create Connection Cancel with a live link.** The command gate and
+  initiator teardown are covered offline; hardware only exercised the
+  no-target scan timeout.
+- [ ] **CP inbound existing-bond reconnect (X3.5c).**
+- [ ] **Total ACL credits per connection.** X3.3 stays a limited HCI subset;
+  the end-to-end credit total is not accepted.
+- [ ] **HID encrypted report.** The unencrypted refusal gate passes; encrypted
+  reports remain NOT VERIFIED.
+- [ ] **Concurrent new pairing.** Pairing while two links are live is rejected
+  at SMP with Pairing Failed 0x05 by design; a multi-link pairing path has no
+  acceptance evidence.
+- [ ] **Host poll budget in security windows.** The HID 60 s refusal-gate run
+  recorded `max_host_poll_us=562,467` with `host_poll_overrun=1`; the gate
+  passed, but the Host poll budget inside pairing/security windows is not
+  verified.
+- [ ] **Fresh-bond Gate 0.** Clearing the phone bond needs a manual Unpair
+  (Settings → gear → Unpair); the merged engine has no fresh-bond run yet.
+- [ ] **CC (two DUT centrals) and MultiCentPeri.** Outside the verified scope.
+
 ## Explicitly outside this milestone
 
 Multiple connections, 2M/Coded PHY and product profiles beyond HOGP are not
