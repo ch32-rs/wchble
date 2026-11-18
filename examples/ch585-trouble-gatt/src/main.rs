@@ -33,6 +33,8 @@ use wchble::time::{ExtendingTicks, InstantUs, TickRate};
 use {panic_halt as _, portable_atomic as _};
 
 mod host;
+#[cfg(feature = "pp")]
+mod pp;
 #[cfg(feature = "secure")]
 mod bond;
 #[cfg(feature = "secure")]
@@ -66,6 +68,7 @@ pub static RUN_SECONDS: u32 = if cfg!(feature = "long-run") {
     25
 };
 /// S4 acceptance: 5 s under `rpa-fast`, otherwise the 900 s default.
+#[cfg_attr(feature = "pp", allow(dead_code))]
 const RPA_TIMEOUT_SECS: u32 = if cfg!(feature = "rpa-fast") { 5 } else { 900 };
 #[no_mangle]
 static mut STATS: [u32; 64] = [0; 64];
@@ -878,6 +881,452 @@ fn idle<F: Future>(
     host_snapshot(stats);
 }
 
+#[cfg(feature = "pp")]
+enum PpAdv {
+    /// Nothing to report: no usable packet, a scan request was answered, or
+    /// the transmit failed.
+    Idle,
+    /// CONNECT_IND admitted; the caller builds the Session.
+    Connect(ConnectParams, u32),
+    /// Admission (privacy) refused the initiator.
+    #[cfg(feature = "privacy")]
+    Rejected,
+    /// The run budget ended before the fragment started.
+    Finished,
+}
+
+/// One advertising channel: ADV_IND, then a bounded scan-request window.
+#[cfg(feature = "pp")]
+#[allow(clippy::too_many_arguments)]
+fn pp_adv_fragment<F: Future>(
+    radio: &mut Ch585Radio,
+    clock: &Clock,
+    soft: &mut SoftRunner,
+    channel: u8,
+    adv_buf: &mut DmaBuf<64>,
+    rsp_buf: &mut DmaBuf<64>,
+    rx: &mut DmaBuf<RX_DMA_MIN>,
+    mut app: Pin<&mut F>,
+    app_stats: &host::HostStats,
+    #[cfg(feature = "secure")] store: &mut DualCopyStore<Ch585DataFlash>,
+    #[cfg(feature = "secure")] att_store: &mut DualCopyStore<Ch585DataFlash>,
+    finish: u32,
+) -> PpAdv {
+    if reached(clock.now_us(), finish) {
+        return PpAdv::Finished;
+    }
+    radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
+    #[cfg(feature = "privacy")]
+    soft.poll_privacy(clock.now_us());
+    let Some(adv_len) = soft.build_adv_pdu(&mut adv_buf.0) else {
+        return PpAdv::Idle;
+    };
+    let Some(rsp_len) = soft.ll.adv.build_scan_rsp(&mut rsp_buf.0) else {
+        inc(63);
+        return PpAdv::Finished;
+    };
+    radio.set_channel(channel).unwrap();
+    inc(3);
+    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+    // the engine on error; the frame only has to live for the call.
+    if unsafe { radio.tx_basic(clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
+        inc(5);
+        stop(radio, clock);
+        return PpAdv::Idle;
+    }
+    inc(4);
+    let packet = {
+        let mut host = wchble::hci::link::RunnerHost::for_slot(
+            0,
+            soft,
+            Extra {
+                app: app.as_mut(),
+                app_stats,
+                clock,
+                #[cfg(feature = "secure")]
+                store,
+                #[cfg(feature = "secure")]
+                att_store,
+            },
+        );
+        wchble::ll::link::receive(
+            radio,
+            clock,
+            &mut host,
+            rx,
+            clock.now_us().wrapping_add(600),
+            finish,
+            700,
+            &mut [0; 2],
+        )
+    };
+    let packet = match packet {
+        wchble::ll::link::RxResult::Packet(packet) => packet,
+        wchble::ll::link::RxResult::Missed => return PpAdv::Idle,
+        wchble::ll::link::RxResult::Stopped => {
+            inc(22);
+            put(2, 0xee);
+            park();
+        }
+    };
+    let pdu = &rx.0[..packet.len];
+    if soft.ll.adv.validate_scan_req(pdu, packet.crc_ok) {
+        // Network-mode peers must scan us at an RPA (Vol 6 Part B §6.2.1).
+        let scanner = [pdu[2], pdu[3], pdu[4], pdu[5], pdu[6], pdu[7]];
+        if soft.scan_request_allowed(scanner, pdu[0] & 0x40 != 0) {
+            inc(10);
+            // SAFETY: as above; the response frame outlives the call.
+            match unsafe {
+                radio.tx_basic(
+                    clock,
+                    &rsp_buf.0[..rsp_len],
+                    0,
+                    Some(packet.end.wrapping_add(120)),
+                )
+            } {
+                Ok(()) => inc(11),
+                Err(wchble::Error::Late) => inc(12),
+                Err(_) => inc(5),
+            }
+            stop(radio, clock);
+        }
+        return PpAdv::Idle;
+    }
+    if pdu[0] & 0x0f != 5 {
+        inc(9);
+        return PpAdv::Idle;
+    }
+    inc(13);
+    match ConnectParams::parse(
+        pdu,
+        packet.crc_ok,
+        soft.ll.adv.own_addr,
+        soft.ll.adv.random_addr,
+    ) {
+        Ok(params) => {
+            #[cfg(feature = "privacy")]
+            {
+                let started = clock.now_us();
+                let accepted = soft.admit_connection(params.peer_addr, params.peer_random);
+                privacy::note_admit(clock.now_us().wrapping_sub(started));
+                if !accepted {
+                    return PpAdv::Rejected;
+                }
+            }
+            inc(14);
+            PpAdv::Connect(params, packet.end)
+        }
+        Err(_) => {
+            inc(9);
+            PpAdv::Idle
+        }
+    }
+}
+
+/// Next advertising channel that the current map allows.
+#[cfg(feature = "pp")]
+fn pp_adv_channel(soft: &SoftRunner, index: &mut u8) -> u8 {
+    for _ in 0..3 {
+        let channel = 37 + *index;
+        *index = (*index + 1) % 3;
+        if soft.ll.adv.channel_map & (1 << (channel - 37)) != 0 {
+            return channel;
+        }
+    }
+    37
+}
+
+/// X3.4a RF loop: the scheduler interleaves up to two links with a
+/// one-channel advertising fragment per interval.
+#[cfg(feature = "pp")]
+#[allow(clippy::too_many_arguments)]
+fn pp_loop<F: Future>(
+    radio: &mut Ch585Radio,
+    clock: &Clock,
+    soft: &mut SoftRunner,
+    adv_buf: &mut DmaBuf<64>,
+    rsp_buf: &mut DmaBuf<64>,
+    rx: &mut DmaBuf<RX_DMA_MIN>,
+    tx: &mut DmaBuf<MAX_PDU>,
+    mut app: Pin<&mut F>,
+    app_stats: &host::HostStats,
+    #[cfg(feature = "secure")] store: &mut DualCopyStore<Ch585DataFlash>,
+    #[cfg(feature = "secure")] att_store: &mut DualCopyStore<Ch585DataFlash>,
+    started: u32,
+    finish: u32,
+) {
+    use wchble::ll::link::{Control, SessionLink};
+    use wchble::ll::sched::{
+        BackgroundKind, BackgroundWindow, Decision, EventOutcome, LinkTable, WorkId,
+    };
+    // One TX + bounded scan window + stop, admitted only inside a link gap.
+    const ADV_SPAN_US: u32 = 900;
+    const ADV_EXIT_US: u32 = 160;
+    const SWITCH_GUARD_US: u32 = 300;
+
+    let mut links: LinkTable<SessionLink<Ch585Aes>, 2> = LinkTable::new(SWITCH_GUARD_US);
+    let mut adv_work: Option<WorkId> = None;
+    let mut adv_channel = 0u8;
+    let mut next_adv = started;
+    while !reached(clock.now_us(), finish) {
+        if adv_work.is_none() && soft.ll.adv.enabled {
+            let window = BackgroundWindow {
+                kind: BackgroundKind::Advertising,
+                start_us: next_adv,
+                end_us: next_adv.wrapping_add(ADV_SPAN_US),
+                exit_us: ADV_EXIT_US,
+                priority: 0,
+            };
+            match links.insert_background(window, clock.now_us()) {
+                Ok(id) => adv_work = Some(id),
+                Err(_) => {
+                    inc(54);
+                    next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                }
+            }
+        }
+        let now = clock.now_us();
+        match links.select(now, finish) {
+            Decision::Run { ticket, .. } => {
+                // A refused begin leaves the ticket reserved; cancel it so the
+                // next select cannot spin on Busy.
+                if links.begin(ticket, now).is_err() {
+                    let _ = links.cancel(ticket);
+                    continue;
+                }
+                let slot = ticket.id().slot();
+                let (control, served, idle) = {
+                    let link = links.link_mut(ticket.id()).expect("dispatched link");
+                    let mut host = wchble::hci::link::RunnerHost::for_slot(
+                        slot,
+                        soft,
+                        Extra {
+                            app: app.as_mut(),
+                            app_stats,
+                            clock,
+                            #[cfg(feature = "secure")]
+                            store,
+                            #[cfg(feature = "secure")]
+                            att_store,
+                        },
+                    );
+                    let control = wchble::ll::link::step(
+                        &mut link.session,
+                        &mut host,
+                        radio,
+                        clock,
+                        rx,
+                        tx,
+                        ticket.hard_end_us(),
+                    );
+                    let served = link.session.take_event_served();
+                    (control, served, clock.now_us())
+                };
+                let outcome = EventOutcome::Done {
+                    consumed_event: served,
+                    idle_at_us: idle,
+                };
+                match control {
+                    Control::Continue => {
+                        let _ = links.complete(ticket, outcome);
+                    }
+                    Control::Closed(_) => {
+                        let _ = links.complete(ticket, outcome);
+                        let _ = links.remove(ticket.id());
+                        put(2, 2);
+                        next_adv = clock.now_us();
+                    }
+                    Control::Reset => {
+                        let _ = links.complete(ticket, outcome);
+                        // Reset is global: retire every slot, not just this one.
+                        stop(radio, clock);
+                        let _ = links.reset();
+                        soft.bridge.reset_finished();
+                        if let Some(slot1) = soft.link_bridge_mut(1) {
+                            slot1.reset_finished();
+                        }
+                        soft.reset_radio_stopped();
+                        put(2, 2);
+                        next_adv = clock.now_us();
+                    }
+                    Control::Finish => break,
+                    Control::StopTimeout => {
+                        let _ = links.complete(ticket, EventOutcome::StopUnconfirmed);
+                        inc(22);
+                        put(2, 0xee);
+                        park();
+                    }
+                }
+            }
+            Decision::RunBackground { ticket, .. } => {
+                if links.begin_background(ticket, now).is_err() {
+                    let _ = links.cancel_background(ticket);
+                    adv_work = None;
+                    inc(54);
+                    next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                    continue;
+                }
+                let channel = pp_adv_channel(soft, &mut adv_channel);
+                let step = pp_adv_fragment(
+                    radio,
+                    clock,
+                    soft,
+                    channel,
+                    adv_buf,
+                    rsp_buf,
+                    rx,
+                    app.as_mut(),
+                    app_stats,
+                    #[cfg(feature = "secure")]
+                    store,
+                    #[cfg(feature = "secure")]
+                    att_store,
+                    finish,
+                );
+                let idle = clock.now_us();
+                if let Ok(wchble::ll::sched::CompleteResult::Overrun { .. }) =
+                    links.complete_background(
+                        ticket,
+                        EventOutcome::Done {
+                            consumed_event: false,
+                            idle_at_us: idle,
+                        },
+                    )
+                {
+                    inc(58);
+                }
+                adv_work = None;
+                inc(55);
+                match step {
+                    PpAdv::Connect(params, end) => {
+                        let mut enc_rsp_random = [0u8; 12];
+                        soft.fill_random(&mut enc_rsp_random);
+                        let mut s = Session::new(
+                            params,
+                            soft.ll.adv.chsel,
+                            end,
+                            clock.now_us(),
+                            enc_rsp_random,
+                            LOCAL_FEATURES,
+                        );
+                        #[cfg(feature = "privacy")]
+                        {
+                            if soft.ll.adv.random_addr
+                                && wchble::ll::privacy::is_resolvable(soft.ll.adv.own_addr)
+                            {
+                                s.set_own_rpa(soft.ll.adv.own_addr);
+                            }
+                        }
+                        if let Some((octets, time)) = soft.suggested_data_length_explicit() {
+                            s.set_suggested_data_length(octets, time);
+                        }
+                        put(49, s.event_start_us());
+                        put(50, u32::from(params.win_size) * 1250);
+                        put(53, u32::from(s.channel()));
+                        radio.set_aa_crc(params.access_addr, params.crc_init);
+                        match links.insert(SessionLink::new(s)) {
+                            Ok(_) => put(2, 3),
+                            Err(_) => {
+                                inc(57);
+                                put(2, 2);
+                            }
+                        }
+                    }
+                    #[cfg(feature = "privacy")]
+                    PpAdv::Rejected => {
+                        inc(57);
+                        put(2, 2);
+                    }
+                    PpAdv::Idle => {}
+                    PpAdv::Finished => break,
+                }
+                next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+            }
+            Decision::Skipped { .. } => {
+                inc(56);
+            }
+            Decision::BackgroundMissed { .. } => {
+                adv_work = None;
+                inc(54);
+                next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+            }
+            Decision::Close { id, reason, .. } => {
+                stop(radio, clock);
+                let _ = links.remove(id);
+                // Keyed close: also clears this link's security work.
+                soft.close_link_slot(id.slot(), reason);
+                #[cfg(feature = "privacy")]
+                privacy::snapshot(soft);
+                #[cfg(feature = "secure")]
+                flush_bonds(store, att_store, clock, None);
+                put(2, 2);
+                next_adv = clock.now_us();
+            }
+            Decision::Invalid { id, .. } => {
+                stop(radio, clock);
+                let _ = links.remove(id);
+                soft.close_link_slot(id.slot(), 0x3e);
+                #[cfg(feature = "privacy")]
+                privacy::snapshot(soft);
+                #[cfg(feature = "secure")]
+                flush_bonds(store, att_store, clock, None);
+                put(2, 2);
+            }
+            Decision::Busy { .. } => {
+                // Synchronous completes make this unreachable; never sleep to
+                // hard_end and miss the next link's prepare.
+                idle(
+                    soft,
+                    app.as_mut(),
+                    app_stats,
+                    clock,
+                    clock.now_us().wrapping_add(100),
+                );
+            }
+            Decision::Idle { until_us } => {
+                #[cfg(feature = "secure")]
+                flush_bonds(store, att_store, clock, None);
+                idle(
+                    soft,
+                    app.as_mut(),
+                    app_stats,
+                    clock,
+                    earlier(finish, until_us),
+                );
+            }
+            Decision::Budget => break,
+            Decision::Faulted => {
+                inc(22);
+                put(2, 0xee);
+                park();
+            }
+            Decision::Exhausted => break,
+        }
+        // A Reset or Disconnect that stops all RF needs no link to run.
+        if links.is_empty() {
+            let request = soft
+                .bridge
+                .take_radio_request()
+                .or_else(|| soft.link_bridge_mut(1).and_then(|b| b.take_radio_request()));
+            if let Some(request) = request {
+                match request {
+                    RadioRequest::Reset => {
+                        stop(radio, clock);
+                        soft.bridge.reset_finished();
+                        if let Some(slot1) = soft.link_bridge_mut(1) {
+                            slot1.reset_finished();
+                        }
+                        soft.reset_radio_stopped();
+                        put(2, 2);
+                        next_adv = clock.now_us();
+                    }
+                    RadioRequest::Disconnect { reason } => diag_disconnect(reason),
+                }
+            }
+        }
+    }
+}
+
 #[entry]
 #[link_section = ".highcode"]
 fn main() -> ! {
@@ -963,6 +1412,7 @@ fn main() -> ! {
     soft.ll.adv.chsel = true;
     // S3: restore bonds before the Host advertises. The read is a flash-engine
     // command, so it happens here with the radio stopped.
+    #[allow(unused_mut, unused_variables)]
     let mut privacy_irk: Option<[u8; 16]> = None;
     #[cfg(feature = "secure")]
     let mut store = DualCopyStore::new(Ch585DataFlash, Ch585DataFlash::BOND_SLOTS);
@@ -1079,6 +1529,9 @@ fn main() -> ! {
     }
     let app_stats = host::HostStats::new();
     set_peripheral_address(&peripheral_address);
+    #[cfg(feature = "pp")]
+    let mut app = core::pin::pin!(pp::run(controller, &app_stats));
+    #[cfg(not(feature = "pp"))]
     let mut app = core::pin::pin!(host::run(
         controller,
         &app_stats,
@@ -1089,9 +1542,32 @@ fn main() -> ! {
     let started = clock.now_us();
     let budget = *core::hint::black_box(&RUN_SECONDS) * 1_000_000;
     let finish = started.wrapping_add(budget);
+    #[cfg(not(feature = "pp"))]
     let mut session: Option<Session> = None;
+    #[cfg(not(feature = "pp"))]
     let mut next_adv = started;
     put(2, 2);
+    #[cfg(feature = "pp")]
+    {
+        pp_loop(
+            &mut radio,
+            &clock,
+            &mut soft,
+            adv_buf,
+            rsp_buf,
+            rx,
+            data,
+            app.as_mut(),
+            &app_stats,
+            #[cfg(feature = "secure")]
+            &mut store,
+            #[cfg(feature = "secure")]
+            &mut att_store,
+            started,
+            finish,
+        );
+    }
+    #[cfg(not(feature = "pp"))]
     while !reached(clock.now_us(), finish) {
         if let Some(s) = session.as_mut() {
             let mut host = wchble::hci::link::RunnerHost::new(

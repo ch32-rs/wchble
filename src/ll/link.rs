@@ -192,6 +192,10 @@ pub trait LinkHost {
     fn publish_connection(&mut self, info: &mut ConnectionInfo) -> bool;
     fn disable_adv(&mut self);
     fn connection_closed(&mut self, reason: u8);
+    /// HCI handle of the live link, when this host fronts one.
+    fn local_handle(&self) -> Option<u16> {
+        None
+    }
     fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8);
     fn connection_updated(&mut self, interval: u16, latency: u16, timeout: u16) -> bool;
     fn data_length_change(
@@ -2027,7 +2031,9 @@ pub fn step<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: InstantUs>(
             // Our encrypted START_ENC_RSP is on air: tell the Host the link is
             // encrypted. HCI work stays outside the event.
             s.enc_change_pending = false;
-            host.encryption_change(1, 0, 1);
+            if let Some(handle) = host.local_handle() {
+                host.encryption_change(handle, 0, 1);
+            }
         }
     }
     if let Some(reason) = reason {

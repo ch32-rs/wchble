@@ -1,4 +1,5 @@
 //! Real Trouble GATT host, cooperatively polled outside RF deadlines.
+#![cfg_attr(feature = "pp", allow(dead_code))]
 
 use core::cell::Cell;
 use core::convert::Infallible;
@@ -312,15 +313,15 @@ impl HostStats {
         self.words.get(index).map_or(0, Cell::get)
     }
 
-    fn set(&self, index: usize, value: u32) {
+    pub(crate) fn set(&self, index: usize, value: u32) {
         self.words[index].set(value);
     }
 
-    fn inc(&self, index: usize) {
+    pub(crate) fn inc(&self, index: usize) {
         self.set(index, self.word(index).wrapping_add(1));
     }
 
-    fn phase(&self, phase: u32) {
+    pub(crate) fn phase(&self, phase: u32) {
         if self.word(STAT_PHASE) != PHASE_FATAL {
             self.set(STAT_PHASE, phase);
         }

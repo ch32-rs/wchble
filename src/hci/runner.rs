@@ -518,6 +518,16 @@ impl SoftRunner {
 
     /// Close the link `key` names. A stale key (the slot already retired and
     /// reopened) is a no-op, even when the handle matches the new link.
+    /// Close one slot from the RF owner after a scheduler-level retirement
+    /// (supervision expiry, invalid window) that bypassed the link engine.
+    pub fn close_link_slot(&mut self, slot: u8, reason: u8) {
+        let Some(bridge) = self.link_bridge(slot) else {
+            return;
+        };
+        let key = bridge.link_key();
+        self.connection_closed_on(key, reason);
+    }
+
     pub(crate) fn connection_closed_on(&mut self, key: LinkKey, reason: u8) {
         if let Some(bridge) = self.link_key_mut(key) {
             bridge.disconnected(reason);
@@ -4027,6 +4037,41 @@ mod tests {
             "slot-0 accessor"
         );
         assert!(runner.take_encryption_request_on(0).is_none());
+    }
+
+    #[test]
+    fn close_link_slot_retires_only_that_links_security_work() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        for (slot, handle) in [(0u8, 1u16), (1, 2)] {
+            let info = super::super::connection::ConnectionInfo {
+                role: crate::ll::Role::Central,
+                ..info_h(handle)
+            };
+            runner.bridge_slot_mut(slot).connected(info).unwrap();
+        }
+        drain_controller(&mut runner);
+        for handle in [1u16, 2] {
+            let mut params = [0u8; 28];
+            params[0..2].copy_from_slice(&handle.to_le_bytes());
+            params[2..10].copy_from_slice(&[handle as u8; 8]);
+            params[10..12].copy_from_slice(&0u16.to_le_bytes());
+            params[12..28].copy_from_slice(&[handle as u8 + 0x30; 16]);
+            inject_cmd(0x2019, &params);
+            assert!(runner.pump_once());
+            expect_command_status(0x2019, HCI_SUCCESS);
+        }
+
+        // The RF owner retires slot 1 after a scheduler-level close.
+        runner.close_link_slot(1, 0x08);
+        assert!(!runner.bridge_slot(1).is_connected());
+        assert!(runner.take_encryption_request_on(1).is_none());
+        assert!(runner.bridge_slot(0).is_connected());
+        assert!(
+            runner.take_encryption_request_on(0).is_some(),
+            "the other link keeps its queued request"
+        );
     }
 
     #[test]

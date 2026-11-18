@@ -31,6 +31,9 @@ privacy = ["secure"]
 rpa-fast = ["privacy"]
 # S4b: Filter Accept List connection filtering (S4b).
 fal-filter = ["privacy"]
+# X3.4a PP acceptance: two simultaneous Peripheral links with advertising
+# kept up while a slot is free.
+pp = []
 # Test-only: ask the central for a fixed connection interval over L2CAP.
 conn-params-30 = []
 conn-params-48 = []

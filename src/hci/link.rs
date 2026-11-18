@@ -122,6 +122,15 @@ impl<'a, X: LinkExtras> RunnerHost<'a, X> {
         self.soft.bridge_slot_mut(self.slot)
     }
 
+    /// Handle of this slot's live link, if the pinned key still matches.
+    fn live_handle(&self) -> Option<u16> {
+        if self.live() {
+            self.bridge().handle()
+        } else {
+            None
+        }
+    }
+
     /// Identity this host was constructed for.
     pub fn key(&self) -> LinkKey {
         self.key
@@ -242,6 +251,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
     fn connection_closed(&mut self, reason: u8) {
         let key = self.key();
         self.soft.connection_closed_on(key, reason);
+    }
+    fn local_handle(&self) -> Option<u16> {
+        self.live_handle()
     }
     fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8) {
         // Never route by handle alone: the same handle may live in the other
