@@ -82,7 +82,7 @@ pub async fn run(controller: SoftController, stats: &Stats) -> ! {
             // connection must work even if no peer ever follows.
             let second = match select(
                 accept(&mut peripheral, &server),
-                serve(&value, &first, stats),
+                serve(&value, &first, None, stats),
             )
             .await
             {
@@ -95,15 +95,20 @@ pub async fn run(controller: SoftController, stats: &Stats) -> ! {
             stats.connections.fetch_add(1, Ordering::SeqCst);
             stats.phase.store(PHASE_TWO_CONNECTED, Ordering::SeqCst);
 
-            match select(serve(&value, &first, stats), serve(&value, &second, stats)).await {
+            match select(
+                serve(&value, &first, Some(&second), stats),
+                serve(&value, &second, Some(&first), stats),
+            )
+            .await
+            {
                 Either::First(()) => {
                     stats.disconnects.fetch_add(1, Ordering::SeqCst);
-                    serve(&value, &second, stats).await;
+                    serve(&value, &second, None, stats).await;
                     stats.disconnects.fetch_add(1, Ordering::SeqCst);
                 }
                 Either::Second(()) => {
                     stats.disconnects.fetch_add(1, Ordering::SeqCst);
-                    serve(&value, &first, stats).await;
+                    serve(&value, &first, None, stats).await;
                     stats.disconnects.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -138,25 +143,37 @@ async fn accept<'d, 's, C: Controller>(
     connection.with_attribute_server(server).unwrap()
 }
 
-/// Serve one connection until it disconnects.
+/// Serve one connection until it disconnects. `peer` is the other live link,
+/// if any: a write is notified to every connection, and each connection's
+/// CCCD decides delivery.
 async fn serve<P: PacketPool>(
     value: &Characteristic<u32>,
     connection: &GattConnection<'_, '_, P>,
+    peer: Option<&GattConnection<'_, '_, P>>,
     stats: &Stats,
 ) {
     loop {
         match connection.next().await {
             GattConnectionEvent::Disconnected { .. } => return,
             GattConnectionEvent::Gatt { event } => {
+                let mut updated = None;
                 let reply = match &event {
                     GattEvent::Write(write) if write.handle() == value.handle => {
                         stats.writes.fetch_add(1, Ordering::SeqCst);
+                        updated = write.value(value).ok();
                         event.accept()
                     }
                     _ => event.accept(),
                 };
                 if let Ok(reply) = reply {
                     let _ = reply.send().await;
+                }
+                // Notify every link; each connection's CCCD gates delivery.
+                if let Some(updated) = updated {
+                    let _ = value.notify(connection, &updated, false).await;
+                    if let Some(peer) = peer {
+                        let _ = value.notify(peer, &updated, false).await;
+                    }
                 }
             }
             _ => {}
@@ -360,13 +377,71 @@ mod tests {
             replies[0][1..].to_vec()
         }
 
-        fn write(&mut self, slot: u8, handle: u16, value: &[u8]) {
+        fn write(&mut self, slot: u8, handle: u16, value: &[u8]) -> Vec<Vec<u8>> {
             let [lo, hi] = handle.to_le_bytes();
             let mut request = vec![0x12, lo, hi];
             request.extend_from_slice(value);
             let replies = self.exchange(slot, &request, 1);
             assert_eq!(replies[0], [0x13]);
+            replies
         }
+
+        fn subscribe(&mut self, slot: u8, cccd: u16, enable: bool) {
+            let [lo, hi] = cccd.to_le_bytes();
+            let value = u16::from(enable).to_le_bytes();
+            let request = [0x12, lo, hi, value[0], value[1]];
+            let replies = self.exchange(slot, &request, 1);
+            assert_eq!(replies[0], [0x13]);
+        }
+
+        /// Pump until the link has been quiet for a few rounds and return every
+        /// ATT PDU it produced.
+        fn collect(&mut self, slot: u8) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut quiet = 0;
+            for _ in 0..PUMP_LIMIT {
+                self.pump();
+                if self.take_replies(slot, &mut out) {
+                    quiet = 0;
+                } else {
+                    quiet += 1;
+                }
+                if quiet >= 8 {
+                    break;
+                }
+            }
+            out
+        }
+
+        /// Hand one raw ACL fragment to a link, retrying while its queue is full.
+        fn inject_fragment(&mut self, slot: u8, llid: u8, payload: &[u8]) {
+            for _ in 0..PUMP_LIMIT {
+                match self
+                    .controller
+                    .link_bridge_mut(slot)
+                    .unwrap()
+                    .receive_acl(llid, payload)
+                {
+                    Ok(()) => return,
+                    Err(BridgeError::Full) => self.pump(),
+                    Err(error) => panic!("receive_acl: {error:?}"),
+                }
+            }
+            panic!("bridge never accepted a fragment");
+        }
+    }
+
+    /// Value carried by an ATT Handle Value Notification (0x1b) for a u32.
+    fn notification_value(pdu: &[u8]) -> Option<u32> {
+        (pdu.len() >= 7 && pdu[0] == 0x1b)
+            .then(|| u32::from_le_bytes([pdu[3], pdu[4], pdu[5], pdu[6]]))
+    }
+
+    fn l2cap(att: &[u8]) -> Vec<u8> {
+        let mut l2cap = Vec::from((att.len() as u16).to_le_bytes());
+        l2cap.extend_from_slice(&4u16.to_le_bytes());
+        l2cap.extend_from_slice(att);
+        l2cap
     }
 
     #[test]
@@ -446,5 +521,132 @@ mod tests {
         fixture.connect(0, 3);
         assert_eq!(fixture.read(0, handle_a), 9u32.to_le_bytes());
         assert_eq!(fixture.stats.connections(), 3);
+    }
+
+    #[test]
+    fn notifications_and_cccd_stay_per_connection() {
+        let _guard = crate::serialize();
+        let stats = Stats::new();
+        let controller = SoftRunner::new();
+        let mut future = pin!(run(wchble::hci::new(), &stats));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+        };
+
+        fixture.until("Host starts advertising", |f| f.controller.adv_enabled());
+        fixture.connect(0, CONNECT_A);
+        fixture.until("Host advertises the second slot", |f| {
+            f.stats.phase() == PHASE_WAIT_SECOND && f.controller.adv_enabled()
+        });
+        fixture.connect(1, CONNECT_B);
+        assert_eq!(fixture.stats.phase(), PHASE_TWO_CONNECTED);
+
+        let handle = fixture.find_value_handle(0);
+        let cccd = handle + 1;
+        fixture.subscribe(0, cccd, true);
+        fixture.subscribe(1, cccd, true);
+
+        // A write is notified to every subscribed link, whoever wrote.
+        let mut on_a = fixture.write(0, handle, &11u32.to_le_bytes());
+        on_a.extend(fixture.collect(0));
+        let mut on_b = fixture.collect(1);
+        assert!(
+            on_a.iter().any(|pdu| notification_value(pdu) == Some(11)),
+            "the writing link must be notified: {on_a:02x?}"
+        );
+        assert!(
+            on_b.iter().any(|pdu| notification_value(pdu) == Some(11)),
+            "the other subscribed link must be notified: {on_b:02x?}"
+        );
+
+        on_b = fixture.write(1, handle, &12u32.to_le_bytes());
+        on_b.extend(fixture.collect(1));
+        on_a = fixture.collect(0);
+        assert!(on_b.iter().any(|pdu| notification_value(pdu) == Some(12)));
+        assert!(on_a.iter().any(|pdu| notification_value(pdu) == Some(12)));
+
+        // Unsubscribing A leaves B's CCCD state intact.
+        fixture.subscribe(0, cccd, false);
+        let mut off_a = fixture.write(0, handle, &13u32.to_le_bytes());
+        off_a.extend(fixture.collect(0));
+        assert!(
+            off_a.iter().all(|pdu| notification_value(pdu).is_none()),
+            "an unsubscribed link gets no notification"
+        );
+        let mut still_b = fixture.collect(1);
+        assert!(
+            still_b
+                .iter()
+                .any(|pdu| notification_value(pdu) == Some(13)),
+            "B is still subscribed and must see A's write"
+        );
+        still_b = fixture.write(1, handle, &14u32.to_le_bytes());
+        still_b.extend(fixture.collect(1));
+        assert!(still_b
+            .iter()
+            .any(|pdu| notification_value(pdu) == Some(14)));
+        assert!(fixture
+            .collect(0)
+            .iter()
+            .all(|pdu| notification_value(pdu).is_none()));
+
+        // Closing A must not clear B's subscription.
+        fixture
+            .controller
+            .link_bridge_mut(0)
+            .unwrap()
+            .disconnected(0x13);
+        fixture.until("Host notices A closing", |f| f.stats.disconnects() == 1);
+        let mut after = fixture.write(1, handle, &15u32.to_le_bytes());
+        after.extend(fixture.collect(1));
+        assert!(
+            after.iter().any(|pdu| notification_value(pdu) == Some(15)),
+            "B keeps its subscription after A closes"
+        );
+    }
+
+    #[test]
+    fn interleaved_fragments_reassemble_per_link() {
+        let _guard = crate::serialize();
+        let stats = Stats::new();
+        let controller = SoftRunner::new();
+        let mut future = pin!(run(wchble::hci::new(), &stats));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+        };
+
+        fixture.until("Host starts advertising", |f| f.controller.adv_enabled());
+        fixture.connect(0, CONNECT_A);
+        fixture.until("Host advertises the second slot", |f| {
+            f.stats.phase() == PHASE_WAIT_SECOND && f.controller.adv_enabled()
+        });
+        fixture.connect(1, CONNECT_B);
+        assert_eq!(fixture.stats.phase(), PHASE_TWO_CONNECTED);
+
+        let handle = fixture.find_value_handle(0);
+        fixture.write(0, handle, &0x1122_3344u32.to_le_bytes());
+        let [lo, hi] = handle.to_le_bytes();
+
+        // Split the same Read Request differently and interleave the halves:
+        // each L2CAP channel must reassemble its own fragments.
+        let request = l2cap(&[0x0a, lo, hi]);
+        fixture.inject_fragment(0, 2, &request[..6]);
+        fixture.inject_fragment(1, 2, &request[..5]);
+        fixture.inject_fragment(0, 1, &request[6..]);
+        fixture.inject_fragment(1, 1, &request[5..]);
+
+        for slot in 0..2 {
+            let replies = fixture.collect(slot);
+            assert!(
+                replies.iter().any(|pdu| pdu.len() == 5
+                    && pdu[0] == 0x0b
+                    && pdu[1..] == 0x1122_3344u32.to_le_bytes()),
+                "slot {slot} did not reassemble its read: {replies:02x?}"
+            );
+        }
     }
 }
