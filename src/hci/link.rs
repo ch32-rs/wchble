@@ -50,6 +50,7 @@ pub trait LinkExtras {
     );
 
     fn diag_acl_raw(&mut self, llid: u8, payload: &[u8], ciphertext: bool);
+    fn diag_acl_tx(&mut self, _llid: u8, _payload: &[u8]) {}
     fn diag_acl_plain(&mut self, llid: u8, payload: &[u8]);
     fn diag_control_opcode(&mut self, opcode: u8);
     fn note_bad_pdu(&mut self, header: u8, len: usize);
@@ -190,6 +191,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
     fn diag_acl_raw(&mut self, llid: u8, payload: &[u8], ciphertext: bool) {
         self.extras.diag_acl_raw(llid, payload, ciphertext);
     }
+    fn diag_acl_tx(&mut self, llid: u8, payload: &[u8]) {
+        self.extras.diag_acl_tx(llid, payload);
+    }
     fn diag_acl_plain(&mut self, llid: u8, payload: &[u8]) {
         self.extras.diag_acl_plain(llid, payload);
     }
@@ -307,6 +311,21 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
             return None;
         }
         self.bridge_mut().take_data_length_request()
+    }
+    fn take_phy_request(&mut self) -> Option<(u8, u8)> {
+        if !self.live() {
+            return None;
+        }
+        self.bridge_mut().take_phy_request()
+    }
+    fn phy_update_complete(&mut self, status: u8, tx: u8, rx: u8) {
+        if !self.live() {
+            return;
+        }
+        let handle = self.bridge().handle();
+        if let Some(handle) = handle {
+            let _ = self.soft.phy_update_complete_on(handle, status, tx, rx);
+        }
     }
 
     fn publish_x1(&mut self, snapshot: &X1Snapshot) {

@@ -83,6 +83,9 @@ X1_NAMES = '''magic version algorithm event_counter adv_chsel init_chsel length_
     length_rsp_rx length_req_tx length_rsp_tx tx_octets rx_octets tx_time rx_time
     max_tx_pdu max_rx_pdu rx_over_27 tx_over_27 host_packets_segmented host_fragments
     tx_pdus rx_pdus feature_exchange last_error'''.split()
+PHY_NAMES = '''tx rx req_tx req_rx rsp_tx rsp_rx update_rx changes invalid
+    read_tx read_rx last_status ind_m2s ind_s2m ind_instant ind_counter'''.split()
+PHY_STATS_WORDS = len(PHY_NAMES)
 BULK_LEN = 200
 BULK_WRITE_SUM = sum(255 - index for index in range(BULK_LEN))
 BURST_LEN = 121
@@ -369,7 +372,51 @@ def evaluate_att_transcript(rows):
     return errors
 
 
-def evaluate_x1(x1, require_dle=False):
+def evaluate_phy(phy, required=False, peer=False):
+    """X1b: the LL applied 2M and the Host read it back over HCI."""
+    if len(phy) != len(PHY_NAMES):
+        return [f'invalid PHY_STATS: {len(phy)} words']
+    word = dict(zip(PHY_NAMES, phy))
+    if not any(phy):
+        return ['PHY_STATS was never written'] if required else []
+    errors = []
+    if word['invalid']:
+        errors.append(f"PHY invalid PDUs: {word['invalid']}")
+    if not required:
+        return errors
+    if word['changes'] < 1:
+        errors.append('no PHY update was applied')
+    if word['tx'] != 2 or word['rx'] != 2:
+        errors.append(f"LL PHY is {word['tx']}/{word['rx']}, not 2M/2M")
+    # LL_PHY_RSP is slave-to-central only: a slave-initiated REQ is answered
+    # with the IND alone, so `rsp_rx` may legitimately stay zero.
+    host_started = word['req_tx'] >= 1 and word['update_rx'] >= 1
+    peer_started = (word['req_rx'] >= 1 and word['rsp_tx'] >= 1
+                    and word['update_rx'] >= 1)
+    if peer:
+        # X1b-3: the phone owns the procedure; the Host image must not race it.
+        if word['req_tx']:
+            errors.append('Host requested 2M in a peer-initiated run')
+        if not peer_started:
+            errors.append(
+                "peer PHY procedure incomplete: "
+                f"req_rx={word['req_rx']} rsp_tx={word['rsp_tx']} "
+                f"update_rx={word['update_rx']}")
+    elif not (host_started or peer_started):
+        errors.append(
+            "PHY procedure incomplete: "
+            f"req_tx={word['req_tx']} rsp_rx={word['rsp_rx']} "
+            f"req_rx={word['req_rx']} rsp_tx={word['rsp_tx']} "
+            f"update_rx={word['update_rx']}")
+    if word['read_tx'] != 2 or word['read_rx'] != 2:
+        errors.append(
+            f"LE Read PHY returned {word['read_tx']}/{word['read_rx']}")
+    if word['last_status']:
+        errors.append(f"PHY completion status 0x{word['last_status']:02x}")
+    return errors
+
+
+def evaluate_x1(x1, require_dle=False, att_mtu=None):
     """Firmware-side X1 proof: CSA #2 selection and bidirectional DLE."""
     if len(x1) != 24 or x1[0] != X1_MAGIC or x1[1] != 1:
         return [f'invalid X1_STATS: {x1[:2]}']
@@ -400,7 +447,13 @@ def evaluate_x1(x1, require_dle=False):
         if word['rx_over_27'] < 1:
             errors.append('no received PDU above the legacy 27 octets')
         if word['host_packets_segmented'] < 1:
-            errors.append('no Host ACL packet needed more than one LL fragment')
+            # A Host ACL packet is at most ATT_MTU+4 octets. With MTU 124 that
+            # is 128, exactly one post-DLE plaintext PDU (132-4), so a split
+            # is only possible while a large packet races the DLE exchange.
+            split_possible = (att_mtu is None
+                              or att_mtu + 4 > word['max_tx_pdu'] - 4)
+            if split_possible:
+                errors.append('no Host ACL packet needed more than one LL fragment')
     return errors
 
 
@@ -838,7 +891,7 @@ def execute(args):
         symbols = p4.symbols_from(nm_text)
         wanted = ['HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES', 'HOST_ERROR',
                   'BOND_STATS', 'BOND_ECHO', 'CATT_STATS', 'X4_STATS', 'X1_STATS',
-                  'PERIPHERAL_ADDRESS']
+                  'PHY_STATS', 'PERIPHERAL_ADDRESS']
         if args.mode in ('privacy', 'fal') or args.expect_irk_fingerprint is not None:
             wanted.append('PRIVACY_STATS')
         if args.mode == 'fal':
@@ -849,7 +902,7 @@ def execute(args):
             if len(matches) != 1:
                 raise ValueError(f'missing or ambiguous {name} symbol')
             symbols[name] = int(matches[0][0], 16)
-        extra = [('X4_STATS', 16), ('X1_STATS', 24)]
+        extra = [('X4_STATS', 16), ('X1_STATS', 24), ('PHY_STATS', 16)]
         if args.mode in ('privacy', 'fal') or args.expect_irk_fingerprint is not None:
             extra.append(('PRIVACY_STATS', 24))
         symbols = validate_observation_buffers(image, symbols, extra=extra)
@@ -924,8 +977,12 @@ def execute(args):
             print('PROBE', json.dumps(report, sort_keys=True), flush=True)
         # `fal` only adds the Mac probe; the phone still runs the reconnect phase.
         app_mode = 'reconnect' if args.mode == 'fal' else args.mode
-        adb(args.serial, 'shell', 'am', 'start', '-W', '-n', ACTIVITY,
-            '--es', 'mode', app_mode)
+        launch = ['shell', 'am', 'start', '-W', '-n', ACTIVITY,
+                  '--es', 'mode', app_mode]
+        if args.peer_phy:
+            # X1b-3: the phone sends LE Set PHY and owns the procedure.
+            launch += ['--ez', 'peer_phy', 'true']
+        adb(args.serial, *launch)
         deadline = time.monotonic() + args.timeout
         metadata['pairing_consent'] = []
         while time.monotonic() < deadline:
@@ -1042,6 +1099,10 @@ def execute(args):
         metadata['x1_stats'] = dict(zip(X1_NAMES, x1_words))
         (args.out / 'x1_stats.json').write_text(
             json.dumps(metadata['x1_stats'], indent=2) + '\n')
+        phy_words = io.read32(symbols['PHY_STATS'], 16, args.out / 'phy_stats.txt')
+        metadata['phy_stats'] = dict(zip(PHY_NAMES, phy_words))
+        (args.out / 'phy_stats.json').write_text(
+            json.dumps(metadata['phy_stats'], indent=2) + '\n')
         opcode_words = io.read32(symbols['SEC_OPCODES'], 96, args.out / 'sec_opcodes.txt')
         metadata['sec_opcodes'] = decode_opcodes(opcode_words)
         metadata['sec_opcodes']['slow_polls_over_100ms'] = diag_words[36]
@@ -1071,7 +1132,10 @@ def execute(args):
         (args.out / 'trace.json').write_text(json.dumps(trace_rows, indent=2) + '\n')
         print('SMP', json.dumps(metadata['sec_opcodes']['smp'], sort_keys=True))
         print('ATT', json.dumps(metadata['sec_opcodes']['att'], sort_keys=True))
-        errors.extend(evaluate_x1(x1_words, args.require_dle))
+        errors.extend(evaluate_x1(x1_words, args.require_dle,
+                                  metadata['x4_stats']['mtu'] if args.mode == 'att' else None))
+        errors.extend(evaluate_phy(phy_words, args.require_phy or args.peer_phy,
+                                   peer=args.peer_phy))
         if args.mode == 'att':
             delivered = sum(1 for row in rows if row.get('event') == 'burst_notification')
             errors.extend(evaluate_att(x4_words, metadata['sec_opcodes'], delivered,
@@ -1120,6 +1184,11 @@ def options(argv=None):
                         help='seconds to wait for accept/reject after connecting (fal)')
     parser.add_argument('--require-dle', action='store_true',
                         help='require observed >27-byte PDUs and a fragmented Host packet')
+    parser.add_argument('--require-phy', action='store_true',
+                        help='require the LL and Host to have switched to LE 2M')
+    parser.add_argument('--peer-phy', action='store_true',
+                        help='let the phone start the PHY procedure and require '
+                             'the peer-initiated REQ/RSP/IND counters')
     parser.add_argument('--reject', action='store_true',
                         help='expect the reconnect to be refused after a delete')
     parser.add_argument('--build-apk', action='store_true')

@@ -1,6 +1,6 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-13. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-19. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
 failures or retroactively change archived results.
@@ -292,10 +292,16 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   App `att_mtu_long_burst_ok`, no refused PDU. Regressions after the change:
   S2 fresh-bond `encrypted_read_write_ok`, X4b payload and app rounds green.
   Still to record: a keyed capture of `LL_LENGTH_REQ/RSP` (they are encrypted
-  after `START_ENC_RSP`). 2M/Coded remain unadvertised.
-- [ ] **X1b: 2M/Coded PHY.** Both feature bits stay 0 because the PHY switch and
-  its timing are not implemented. Claim either only after a measured air
-  comparison against a controlled peer.
+  after `START_ENC_RSP`). 2M/Coded stay unadvertised in that build.
+- [ ] **X1b: 2M/Coded PHY (2M peripheral subset, 2026-11-19).** `--features
+  secure,x1b-2m` sets the LE 2M feature bit and runs
+  `LL_PHY_REQ`/`RSP`/`UPDATE_IND` on one peripheral link. Both initiators passed
+  N=1 on hardware (`x1b-2m-att-20261119f`, `x1b-2m-peer-20261119d`): LE Read PHY
+  2/2, encrypted ATT MTU 124 reads/writes/notifications at 2M, `bad_crc=0`,
+  `supervision=0`. Still open: 1M-only peer fallback (offline only), Coded PHY
+  (request path and air timing), and Central-side PHY, so `pp`/`cp` builds keep
+  both bits clear. Evidence and boundaries:
+  `local-docs/results/x1b-2m-20261119.md`.
 - [ ] **Burst drops are silent by design.** `try_notify_raw` returns
   `OutOfMemory` when the 8-deep notification queue is full; the X4 fixture
   counts it and moves on rather than waiting or retrying. This proves the
@@ -606,9 +612,10 @@ remain open and must not be read as verified:
 
 ## Explicitly outside this milestone
 
-Multiple connections, 2M/Coded PHY and product profiles beyond HOGP are not
+Multiple connections, Coded PHY and product profiles beyond HOGP are not
 implemented or accepted by the current peripheral or central examples. DLE and
 CSA #2 have since moved out of this list (X1 implementation above; its hardware
-round is still open). They are future scope decisions, not compatibility
-claims. Pairing/encryption (S2/S3) and long attributes (X4a) moved out earlier
-with the evidence above.
+round is still open); LE 2M moved out for the single peripheral link only (X1b
+subset above). They are future scope decisions, not compatibility claims.
+Pairing/encryption (S2/S3) and long attributes (X4a) moved out earlier with the
+evidence above.

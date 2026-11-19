@@ -34,6 +34,8 @@ use {panic_halt as _, portable_atomic as _};
 compile_error!("`pp` and `cp` are separate acceptance images; enable one");
 #[cfg(all(feature = "cp", feature = "secure"))]
 compile_error!("`cp` is a plaintext acceptance image; it cannot advertise LE encryption");
+#[cfg(all(feature = "x1b-2m", any(feature = "pp", feature = "cp")))]
+compile_error!("`x1b-2m` opens the Peripheral-only PHY procedure; Central links cannot claim 2M");
 
 #[cfg(feature = "secure")]
 mod bond;
@@ -96,14 +98,26 @@ const SEC_MAGIC: u32 = 0x5332_3538;
 // SECURE_STATS slots 2..16 are written by `wchble::ll::link` through the
 // `LinkHost` counters; the numerical layout is unchanged.
 
+/// X1b-2 only: advertise LE 2M PHY so the Host can ask for it.
+#[cfg(feature = "x1b-2m")]
+const fn with_phy(mut bits: [u8; 8]) -> [u8; 8] {
+    bits[1] |= 1;
+    bits
+}
+#[cfg(not(feature = "x1b-2m"))]
+const fn with_phy(bits: [u8; 8]) -> [u8; 8] {
+    bits
+}
+
 #[cfg(feature = "secure")]
-const LOCAL_FEATURES: [u8; 8] = feature_bits(&[
+const LOCAL_FEATURES: [u8; 8] = with_phy(feature_bits(&[
     FEATURE_LE_ENCRYPTION,
     FEATURE_LE_DATA_LENGTH_EXTENSION,
     FEATURE_LE_CSA2,
-]);
+]));
 #[cfg(not(feature = "secure"))]
-const LOCAL_FEATURES: [u8; 8] = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]);
+const LOCAL_FEATURES: [u8; 8] =
+    with_phy(feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]));
 
 fn put(i: usize, v: u32) {
     unsafe {
@@ -454,6 +468,9 @@ impl<'a, F: Future> wchble::hci::link::LinkExtras for Extra<'a, F> {
             diag_acl(true, llid, payload);
         }
     }
+    fn diag_acl_tx(&mut self, llid: u8, payload: &[u8]) {
+        diag_acl(false, llid, payload);
+    }
     fn diag_acl_plain(&mut self, llid: u8, payload: &[u8]) {
         diag_acl(true, llid, payload);
     }
@@ -576,6 +593,23 @@ fn publish_x1(x: &X1Snapshot) {
     x1_put(X1_RX_PDUS, x.rx_pdus);
     x1_put(X1_FEATURE_EXCHANGE, u32::from(x.feature_exchange));
     x1_put(X1_LAST_ERROR, x.last_error);
+    use host::{
+        phy_put, PHY_CHANGES, PHY_IND_COUNTER, PHY_IND_INSTANT, PHY_IND_M2S, PHY_IND_S2M,
+        PHY_INVALID, PHY_REQ_RX, PHY_REQ_TX, PHY_RSP_RX, PHY_RSP_TX, PHY_RX, PHY_TX, PHY_UPDATE_RX,
+    };
+    phy_put(PHY_TX, u32::from(x.phy_tx));
+    phy_put(PHY_RX, u32::from(x.phy_rx));
+    phy_put(PHY_REQ_TX, x.phy_req_tx);
+    phy_put(PHY_REQ_RX, x.phy_req_rx);
+    phy_put(PHY_RSP_TX, x.phy_rsp_tx);
+    phy_put(PHY_RSP_RX, x.phy_rsp_rx);
+    phy_put(PHY_UPDATE_RX, x.phy_update_rx);
+    phy_put(PHY_CHANGES, x.phy_changes);
+    phy_put(PHY_INVALID, x.phy_invalid);
+    phy_put(PHY_IND_M2S, u32::from(x.phy_ind.0));
+    phy_put(PHY_IND_S2M, u32::from(x.phy_ind.1));
+    phy_put(PHY_IND_INSTANT, u32::from(x.phy_ind_instant));
+    phy_put(PHY_IND_COUNTER, u32::from(x.phy_ind_counter));
 }
 
 fn host_snapshot(stats: &host::HostStats) {

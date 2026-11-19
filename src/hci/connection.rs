@@ -181,6 +181,13 @@ pub struct ConnectionBridge {
     /// Pending Host `LE Set Data Length` (`TX_Octets`, `TX_Time`) for the RF
     /// owner to negotiate on the link.
     data_length_request: Option<(u16, u16)>,
+    /// Pending Host `LE Set PHY` preference masks for the RF owner.
+    phy_request: Option<(u8, u8)>,
+    /// True from `take_phy_request` until the LL procedure completes.
+    phy_pending: bool,
+    /// Current TX/RX PHY codes (1 = 1M, 2 = 2M), reported by the LL owner.
+    phy_tx: u8,
+    phy_rx: u8,
 }
 
 impl Default for ConnectionBridge {
@@ -214,6 +221,10 @@ impl ConnectionBridge {
             event_mask: u64::MAX,
             le_event_mask: 0x1f,
             data_length_request: None,
+            phy_request: None,
+            phy_pending: false,
+            phy_tx: 1,
+            phy_rx: 1,
         }
     }
 
@@ -234,6 +245,88 @@ impl ConnectionBridge {
     /// link is idle enough to send `LL_LENGTH_REQ`.
     pub fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
         self.data_length_request.take()
+    }
+
+    /// Queue a Host `LE Set PHY` request for the RF owner. Returns an HCI
+    /// status: 0x00 accepted, 0x02 unknown connection, 0x0c disallowed.
+    pub(crate) fn request_phy(&mut self, handle: u16, tx_phys: u8, rx_phys: u8) -> u8 {
+        if self.handle() != Some(handle) {
+            return 0x02;
+        }
+        if self.disconnecting || self.resetting || self.info.is_none() {
+            return 0x0c;
+        }
+        // One procedure at a time; a second command must not overwrite it.
+        if self.phy_request.is_some() || self.phy_pending {
+            return 0x0c;
+        }
+        self.phy_request = Some((tx_phys, rx_phys));
+        0
+    }
+
+    /// Take the pending PHY request; from here the LL procedure owns it.
+    pub fn take_phy_request(&mut self) -> Option<(u8, u8)> {
+        let request = self.phy_request.take();
+        if request.is_some() {
+            self.phy_pending = true;
+        }
+        request
+    }
+
+    /// Current PHY codes reported by `LE Read PHY`.
+    pub fn phy_codes(&self) -> (u8, u8) {
+        (self.phy_tx, self.phy_rx)
+    }
+
+    /// `LE Set PHY` with no preference in either direction: no procedure runs,
+    /// but the Host still gets a completion. Returns an HCI status.
+    pub(crate) fn complete_phy_now(&mut self, handle: u16) -> u8 {
+        if self.handle() != Some(handle) {
+            return 0x02;
+        }
+        if self.disconnecting || self.resetting || self.info.is_none() {
+            return 0x0c;
+        }
+        if self.phy_request.is_some() || self.phy_pending {
+            return 0x0c;
+        }
+        let (tx, rx) = self.phy_codes();
+        let _ = self.phy_update_complete(0, tx, rx);
+        0
+    }
+
+    /// Emit `LE PHY Update Complete` (LE Meta subevent 0x0C) and remember the
+    /// new PHYs. A non-zero status leaves the current PHYs unchanged.
+    pub fn phy_update_complete(
+        &mut self,
+        status: u8,
+        tx_phy: u8,
+        rx_phy: u8,
+    ) -> Result<(), BridgeError> {
+        self.phy_pending = false;
+        let handle = self.info.as_ref().ok_or(BridgeError::NotConnected)?.handle;
+        if self.resetting {
+            return Err(BridgeError::NotConnected);
+        }
+        if status == 0 {
+            self.phy_tx = tx_phy;
+            self.phy_rx = rx_phy;
+        }
+        if !self.le_event_enabled(0x0c) {
+            return Ok(());
+        }
+        // Keep one slot reserved for Disconnection Complete.
+        if self.events.iter().filter(|slot| slot.is_none()).count() < 2 {
+            return Err(BridgeError::Full);
+        }
+        let mut parameters = [0; 6];
+        parameters[0] = 0x0c;
+        parameters[1] = status;
+        parameters[2..4].copy_from_slice(&handle.to_le_bytes());
+        parameters[4] = tx_phy;
+        parameters[5] = rx_phy;
+        self.push_link_event(event_packet(0x3e, &parameters), handle);
+        Ok(())
     }
 
     pub fn is_connected(&self) -> bool {
@@ -700,6 +793,10 @@ impl ConnectionBridge {
         self.rx = [None; RX_CAPACITY];
         self.completed = 0;
         self.data_length_request = None;
+        self.phy_request = None;
+        self.phy_pending = false;
+        self.phy_tx = 1;
+        self.phy_rx = 1;
         match handle {
             Some(handle) => transport::discard_connection_data(handle, key),
             None => transport::discard_all_connection_data(),
@@ -809,6 +906,29 @@ mod tests {
             local_rpa: Some(LOCAL_RPA),
             peer_identity: Some((1, IDENTITY)),
         }
+    }
+
+    #[test]
+    fn phy_request_is_owned_until_the_link_reports_the_outcome() {
+        let mut bridge = ConnectionBridge::new();
+        bridge.set_masks(u64::MAX, 0x1f | (1 << 11));
+        bridge.connected(info()).unwrap();
+        assert_eq!(bridge.request_phy(0x0041, 2, 2), 0);
+        assert_eq!(bridge.request_phy(0x0041, 1, 1), 0x0c);
+        assert_eq!(bridge.take_phy_request(), Some((2, 2)));
+        // Handed to the LL: a new command is disallowed until it completes.
+        assert_eq!(bridge.request_phy(0x0041, 1, 1), 0x0c);
+        bridge.phy_update_complete(0, 2, 2).unwrap();
+        assert_eq!(bridge.phy_codes(), (2, 2));
+        assert_eq!(bridge.request_phy(0x0041, 1, 1), 0);
+        assert_eq!(bridge.take_phy_request(), Some((1, 1)));
+        // A failed procedure leaves the PHYs unchanged but frees the slot.
+        bridge.phy_update_complete(0x2a, 1, 1).unwrap();
+        assert_eq!(bridge.phy_codes(), (2, 2));
+        assert_eq!(bridge.request_phy(0x0041, 2, 2), 0);
+        bridge.disconnected(0x08);
+        assert_eq!(bridge.phy_codes(), (1, 1));
+        assert_eq!(bridge.request_phy(0x0041, 2, 2), 0x02);
     }
 
     #[test]

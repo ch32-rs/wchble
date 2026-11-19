@@ -5,7 +5,7 @@
 //! this module deliberately does not handle encryption: the Host (LTK) and the
 //! radio owner must sequence those exchanges, so they are driven explicitly.
 
-use super::conn::{le16, ConnError, ConnectionUpdate, LinkTiming};
+use super::conn::{le16, ConnError, ConnectionUpdate, LinkTiming, PhyUpdate};
 use super::dle::{DataLength, LengthParams};
 
 /// Subset of LL Control opcodes used during bring-up.
@@ -33,6 +33,9 @@ pub enum LlCtrlOpcode {
     RejectExtInd = 0x11,
     LengthReq = 0x14,
     LengthRsp = 0x15,
+    PhyReq = 0x16,
+    PhyRsp = 0x17,
+    PhyUpdateInd = 0x18,
 }
 
 /// Identity must be supplied by the application, not copied from a vendor
@@ -140,6 +143,21 @@ impl ControlPdu {
         bytes[0] = LlCtrlOpcode::LengthRsp as u8;
         bytes[1..9].copy_from_slice(&params.clamped().to_octets());
         Self::new(&bytes)
+    }
+
+    /// PHY preferences are masks: bit0 = 1M, bit1 = 2M.
+    pub fn phy_req(tx: u8, rx: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::PhyReq as u8, tx & 0x03, rx & 0x03])
+    }
+
+    pub fn phy_rsp(tx: u8, rx: u8) -> Self {
+        Self::new(&[LlCtrlOpcode::PhyRsp as u8, tx & 0x03, rx & 0x03])
+    }
+
+    /// `LL_PHY_UPDATE_IND` fields are single PHY codes, not masks.
+    pub fn phy_update_ind(m_to_s: u8, s_to_m: u8, instant: u16) -> Self {
+        let [lo, hi] = instant.to_le_bytes();
+        Self::new(&[LlCtrlOpcode::PhyUpdateInd as u8, m_to_s, s_to_m, lo, hi])
     }
 
     /// `LL_ENC_REQ`, sent by the Central. All fields are in wire order.
@@ -261,10 +279,11 @@ pub enum ControlAction {
 /// LSB-first across the eight response octets, so index 14 is octet 1 bit 6.
 pub const FEATURE_LE_ENCRYPTION: u8 = 0;
 pub const FEATURE_LE_DATA_LENGTH_EXTENSION: u8 = 5;
+pub const FEATURE_LE_2M_PHY: u8 = 8;
 pub const FEATURE_LE_CSA2: u8 = 14;
 
-/// Build a feature bitmap with exactly `bits` set. Bit 37 (LE Coded PHY) and
-/// the 2M bit stay clear until those PHYs are actually implemented.
+/// Build a feature bitmap with exactly `bits` set. The 2M/Coded bits stay
+/// clear unless the RF owner enables the matching LL procedure.
 pub const fn feature_bits(bits: &[u8]) -> [u8; 8] {
     let mut out = [0u8; 8];
     let mut i = 0;
@@ -276,6 +295,18 @@ pub const fn feature_bits(bits: &[u8]) -> [u8; 8] {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhyState {
+    #[default]
+    Idle,
+    /// We sent LL_PHY_REQ and wait for the Central's RSP and IND.
+    ReqSent,
+    /// We answered LL_PHY_REQ; the Central's IND is pending.
+    RspSent,
+    /// An IND was accepted; apply at its Instant.
+    UpdatePending,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ControlState {
     pub peer_version: Option<LocalVersion>,
@@ -285,6 +316,23 @@ pub struct ControlState {
     pub local_features: [u8; 8],
     /// DLE negotiation state for this link.
     pub data_length: DataLength,
+    /// PHY preferences (masks) advertised in LL_PHY_REQ/RSP.
+    pub phy_pref_tx: u8,
+    pub phy_pref_rx: u8,
+    pub phy_req_tx: u32,
+    pub phy_req_rx: u32,
+    pub phy_rsp_tx: u32,
+    pub phy_rsp_rx: u32,
+    pub phy_update_rx: u32,
+    pub phy_changes: u32,
+    pub phy_invalid: u32,
+    /// Last `LL_PHY_UPDATE_IND`: (m_to_s, s_to_m), its Instant, and the local
+    /// connection event counter when it was parsed.
+    pub phy_ind: (u8, u8),
+    pub phy_ind_instant: u16,
+    pub phy_ind_counter: u16,
+    phy_state: PhyState,
+    phy_status: Option<u8>,
     version_sent: bool,
     feature_req_sent: bool,
     termination_deadline_us: Option<u32>,
@@ -297,10 +345,61 @@ impl ControlState {
             peer_features: None,
             local_features: [0; 8],
             data_length: DataLength::new(),
+            phy_pref_tx: 0x03,
+            phy_pref_rx: 0x03,
+            phy_req_tx: 0,
+            phy_req_rx: 0,
+            phy_rsp_tx: 0,
+            phy_rsp_rx: 0,
+            phy_update_rx: 0,
+            phy_changes: 0,
+            phy_invalid: 0,
+            phy_ind: (0, 0),
+            phy_ind_instant: 0,
+            phy_ind_counter: 0,
+            phy_state: PhyState::Idle,
+            phy_status: None,
             version_sent: false,
             feature_req_sent: false,
             termination_deadline_us: None,
         }
+    }
+
+    /// The 2M feature bit must be set by the owner for the PHY procedure to be
+    /// advertised or accepted.
+    pub fn phy_supported(&self) -> bool {
+        self.local_features[1] & 1 != 0
+    }
+
+    pub fn phy_state(&self) -> PhyState {
+        self.phy_state
+    }
+
+    pub fn phy_busy(&self) -> bool {
+        self.phy_state != PhyState::Idle
+    }
+
+    /// Start a Host-requested PHY update. `tx`/`rx` are preference masks.
+    pub fn start_phy_request(&mut self, tx: u8, rx: u8) -> Option<ControlPdu> {
+        if !self.phy_supported() || self.phy_busy() {
+            return None;
+        }
+        self.phy_pref_tx = tx & 0x03;
+        self.phy_pref_rx = rx & 0x03;
+        self.phy_state = PhyState::ReqSent;
+        self.phy_req_tx += 1;
+        Some(ControlPdu::phy_req(self.phy_pref_tx, self.phy_pref_rx))
+    }
+
+    /// Drain a PHY completion that is not tied to an Instant (collision).
+    pub fn take_phy_status(&mut self) -> Option<u8> {
+        self.phy_status.take()
+    }
+
+    /// The Instant was applied; the caller reports status 0 and returns to idle.
+    pub fn on_phy_applied(&mut self) {
+        self.phy_state = PhyState::Idle;
+        self.phy_changes += 1;
     }
 
     /// Queue the role-appropriate feature request once, but only while the
@@ -466,6 +565,57 @@ impl ControlState {
                 let peer = LengthParams::from_octets(&payload[1..9]).ok_or(ConnError::Length)?;
                 self.data_length.clear_awaiting_rsp();
                 self.data_length.on_peer_length(peer);
+                return Ok(ControlAction::None);
+            }
+            0x16 => {
+                if !self.phy_supported() {
+                    return Ok(ControlAction::Reply(ControlPdu::unknown(0x16)));
+                }
+                exact_len(payload, 3)?;
+                self.phy_req_rx += 1;
+                // If our own request is outstanding, the peer's request wins:
+                // our Host command fails with 0x2A and we become the responder.
+                if self.phy_state == PhyState::ReqSent {
+                    self.phy_status = Some(0x2a);
+                }
+                self.phy_state = PhyState::RspSent;
+                self.phy_rsp_tx += 1;
+                ControlPdu::phy_rsp(self.phy_pref_tx, self.phy_pref_rx)
+            }
+            0x17 => {
+                // A response is never answered; only one to our request counts.
+                if !self.phy_supported() || self.phy_state != PhyState::ReqSent {
+                    return Ok(ControlAction::None);
+                }
+                exact_len(payload, 3)?;
+                self.phy_rsp_rx += 1;
+                return Ok(ControlAction::None);
+            }
+            0x18 => {
+                // The Central owns LL_PHY_UPDATE_IND; without the feature bit
+                // the packet is not ours to interpret.
+                if !self.phy_supported() {
+                    return Ok(ControlAction::None);
+                }
+                exact_len(payload, 5)?;
+                self.phy_ind = (payload[1], payload[2]);
+                self.phy_ind_instant = le16(&payload[3..]);
+                self.phy_ind_counter = conn.event_counter();
+                // A second IND before the first Instant cannot move the change;
+                // ignore it instead of killing the link.
+                if self.phy_state == PhyState::UpdatePending {
+                    self.phy_invalid += 1;
+                    return Ok(ControlAction::None);
+                }
+                let update = PhyUpdate::new(payload[1], payload[2], le16(&payload[3..]));
+                // A bad IND is ignored, never fatal: Core only forbids a past
+                // Instant, and the Central owns that choice.
+                if conn.schedule_phy(update).is_err() {
+                    self.phy_invalid += 1;
+                    return Ok(ControlAction::None);
+                }
+                self.phy_update_rx += 1;
+                self.phy_state = PhyState::UpdatePending;
                 return Ok(ControlAction::None);
             }
             // Unsupported encryption, connection parameter request, PHY and
@@ -837,5 +987,143 @@ mod tests {
             Err(ConnError::Parameters)
         );
         assert_eq!(termination_reason(ConnError::InstantPassed), 0x28);
+    }
+
+    fn phy_control() -> ControlState {
+        let mut ctrl = ControlState::new();
+        ctrl.local_features[1] |= 1;
+        ctrl
+    }
+
+    #[test]
+    fn phy_feature_bit_gates_the_whole_procedure() {
+        let mut c = connection();
+        let mut ctrl = ControlState::new();
+        // Without the bit the REQ is an unknown opcode and nothing starts.
+        assert_eq!(
+            reply(ctrl.on_pdu(&mut c, &[0x16, 1, 2], LOCAL).unwrap()).as_bytes(),
+            &[0x07, 0x16]
+        );
+        assert_eq!(ctrl.start_phy_request(2, 2), None);
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        assert_eq!(ctrl.phy_req_tx, 0);
+        // An IND is not ours to interpret without the feature bit either.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 2, 2, 6, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_update_rx, 0);
+    }
+
+    #[test]
+    fn phy_req_is_answered_with_local_preferences() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        ctrl.phy_pref_tx = 1;
+        ctrl.phy_pref_rx = 2;
+        let rsp = reply(ctrl.on_pdu(&mut c, &[0x16, 1, 3], LOCAL).unwrap());
+        assert_eq!(rsp.as_bytes(), &[0x17, 1, 2]);
+        assert_eq!(ctrl.phy_state(), PhyState::RspSent);
+        assert_eq!((ctrl.phy_req_rx, ctrl.phy_rsp_tx), (1, 1));
+    }
+
+    #[test]
+    fn phy_collision_ends_the_host_request_with_0x2a() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        let req = ctrl.start_phy_request(2, 2).unwrap();
+        assert_eq!(req.as_bytes(), &[0x16, 2, 2]);
+        assert_eq!(ctrl.phy_state(), PhyState::ReqSent);
+        // The peer's REQ wins; our Host command must fail with 0x2A.
+        assert_eq!(
+            reply(ctrl.on_pdu(&mut c, &[0x16, 2, 2], LOCAL).unwrap()).as_bytes(),
+            &[0x17, 2, 2]
+        );
+        assert_eq!(ctrl.take_phy_status(), Some(0x2a));
+        assert_eq!(ctrl.phy_state(), PhyState::RspSent);
+        assert_eq!(ctrl.take_phy_status(), None, "reported once");
+    }
+
+    #[test]
+    fn phy_rsp_counts_only_while_a_request_is_outstanding() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x17, 2, 2], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_rsp_rx, 0, "unsolicited RSP is ignored");
+        ctrl.start_phy_request(2, 2).unwrap();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x17, 2, 2], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_rsp_rx, 1);
+        assert_eq!(ctrl.phy_state(), PhyState::ReqSent, "IND still pending");
+    }
+
+    #[test]
+    fn phy_ind_rejects_coded_fields_and_past_instants() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        // Coded PHY (3) is not implemented: ignored, not a link error.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 3, 2, 6, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_invalid, 1);
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        // The current event is already too late: ignored, not fatal.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 2, 2, 0, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_invalid, 2);
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        // Five events out is what Android's controller sends after
+        // setPreferredPhy; the receiver must not kill the link over it.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 2, 2, 5, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_update_rx, 1);
+        assert_eq!(ctrl.phy_state(), PhyState::UpdatePending);
+    }
+
+    #[test]
+    fn phy_ind_switches_the_connection_at_its_instant() {
+        use crate::rf::PhyMode;
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        // M_TO_S is our RX PHY, S_TO_M our TX PHY.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 2, 1, 6, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::UpdatePending);
+        // A second IND before the Instant is ignored, not fatal.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 1, 1, 8, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_invalid, 1);
+        assert_eq!(ctrl.phy_update_rx, 1);
+        // The last IND seen is kept for hardware diagnostics, accepted or not.
+        assert_eq!(ctrl.phy_ind, (1, 1));
+        assert_eq!(ctrl.phy_ind_instant, 8);
+        assert_eq!(ctrl.phy_ind_counter, c.event_counter());
+        assert_eq!((c.tx_phy(), c.rx_phy()), (PhyMode::Rate1m, PhyMode::Rate1m));
+        for _ in 0..6 {
+            c.next_event().unwrap();
+        }
+        assert_eq!(
+            c.take_phy_applied(),
+            Some((PhyMode::Rate1m, PhyMode::Rate2m))
+        );
+        assert_eq!((c.tx_phy(), c.rx_phy()), (PhyMode::Rate1m, PhyMode::Rate2m));
+        ctrl.on_phy_applied();
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        assert_eq!(ctrl.phy_changes, 1);
+        assert_eq!(c.take_phy_applied(), None, "applied once");
     }
 }

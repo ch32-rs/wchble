@@ -26,7 +26,7 @@ use crate::ll::enc::{
 use crate::ll::sched::{CloseCause, Expiry, LinkWindow, ScheduledLink, ARM_LEAD_US, EVENT_TAIL_US};
 use crate::ll::Role;
 use crate::rf::txrx::{DmaBuf, MAX_PDU, RX_DMA_MIN};
-use crate::rf::LinkRadio;
+use crate::rf::{LinkRadio, PhyMode};
 use crate::time::InstantUs;
 
 /// `LL_VERSION_IND` this controller reports.
@@ -171,6 +171,8 @@ pub trait LinkHost {
 
     /// Raw received ACL fragment. `ciphertext` is set when not yet decrypted.
     fn diag_acl_raw(&mut self, llid: u8, payload: &[u8], ciphertext: bool);
+    /// Host ACL fragment about to be sent, before encryption.
+    fn diag_acl_tx(&mut self, _llid: u8, _payload: &[u8]) {}
     fn diag_acl_plain(&mut self, llid: u8, payload: &[u8]);
     fn diag_control_opcode(&mut self, opcode: u8);
     fn note_bad_pdu(&mut self, header: u8, len: usize);
@@ -209,6 +211,13 @@ pub trait LinkHost {
     fn take_ltk_reply(&mut self) -> Option<LtkReply>;
     fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool;
     fn take_data_length_request(&mut self) -> Option<(u16, u16)>;
+
+    /// Host `LE Set PHY` preference masks (1M bit0, 2M bit1).
+    fn take_phy_request(&mut self) -> Option<(u8, u8)> {
+        None
+    }
+    /// Report one PHY completion: status, TX PHY code, RX PHY code.
+    fn phy_update_complete(&mut self, _status: u8, _tx: u8, _rx: u8) {}
 
     fn publish_x1(&mut self, snapshot: &X1Snapshot);
 
@@ -278,6 +287,20 @@ pub struct X1Snapshot {
     pub rx_pdus: u32,
     pub feature_exchange: bool,
     pub last_error: u32,
+    /// Current PHY codes (1 = 1M, 2 = 2M) and the PHY procedure counters.
+    pub phy_tx: u8,
+    pub phy_rx: u8,
+    pub phy_req_tx: u32,
+    pub phy_req_rx: u32,
+    pub phy_rsp_tx: u32,
+    pub phy_rsp_rx: u32,
+    pub phy_update_rx: u32,
+    pub phy_changes: u32,
+    pub phy_invalid: u32,
+    /// Last `LL_PHY_UPDATE_IND` fields and the local counter at parse time.
+    pub phy_ind: (u8, u8),
+    pub phy_ind_instant: u16,
+    pub phy_ind_counter: u16,
 }
 
 /// One received frame.
@@ -364,7 +387,7 @@ struct DeferredRx {
 
 /// Control PDUs that carry no Instant and may be answered one event later.
 fn deferrable_control(opcode: u8) -> bool {
-    matches!(opcode, 0x08 | 0x09 | 0x0c | 0x14 | 0x15)
+    matches!(opcode, 0x08 | 0x09 | 0x0c | 0x14 | 0x15 | 0x16 | 0x17)
 }
 
 fn reached(now: u32, deadline: u32) -> bool {
@@ -376,6 +399,13 @@ fn earlier(a: u32, b: u32) -> u32 {
         b
     } else {
         a
+    }
+}
+
+fn phy_code(phy: PhyMode) -> u8 {
+    match phy {
+        PhyMode::Rate2m => 2,
+        _ => 1,
     }
 }
 
@@ -722,6 +752,18 @@ impl<E: AesEngine> Session<E> {
             rx_pdus: self.rx_pdus,
             feature_exchange: self.control.peer_features.is_some() || data_length.negotiated(),
             last_error: self.x1_last_error,
+            phy_tx: phy_code(self.conn.tx_phy()),
+            phy_rx: phy_code(self.conn.rx_phy()),
+            phy_req_tx: self.control.phy_req_tx,
+            phy_req_rx: self.control.phy_req_rx,
+            phy_rsp_tx: self.control.phy_rsp_tx,
+            phy_rsp_rx: self.control.phy_rsp_rx,
+            phy_update_rx: self.control.phy_update_rx,
+            phy_changes: self.control.phy_changes,
+            phy_invalid: self.control.phy_invalid,
+            phy_ind: self.control.phy_ind,
+            phy_ind_instant: self.control.phy_ind_instant,
+            phy_ind_counter: self.control.phy_ind_counter,
         }
     }
 }
@@ -899,6 +941,13 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
     if let Some(reason) = s.expiration(host, clock.now_us()) {
         return EventEnd::Close(reason);
     }
+    // The Instant may have fired while advancing here or in the scheduler;
+    // report it once, before this event's RX is armed.
+    if let Some((tx, rx)) = s.conn.take_phy_applied() {
+        s.control.on_phy_applied();
+        host.phy_update_complete(0, phy_code(tx), phy_code(rx));
+    }
+    radio.set_phy(s.conn.tx_phy(), s.conn.rx_phy());
     // The caller's catch-up can cross the limit inside one step, so the check
     // lives here, before any RX is armed.
     if !s.conn.established() {
@@ -1453,7 +1502,7 @@ fn queue_next_host_fragment<H: LinkHost, E: AesEngine>(host: &mut H, s: &mut Ses
             let _ = host.ack_tx(acl.tag);
             return;
         }
-        host.diag_acl_raw(acl.llid, &acl.bytes[..acl.len], false);
+        host.diag_acl_tx(acl.llid, &acl.bytes[..acl.len]);
         s.pending_host = Some(PendingHost {
             acl,
             offset: 0,
@@ -1643,6 +1692,48 @@ pub fn service_dle<E: AesEngine, H: LinkHost<Aes = E>>(
     None
 }
 
+/// Start a Host-requested PHY update once the link can carry a control PDU.
+pub fn service_phy<E: AesEngine, H: LinkHost<Aes = E>>(
+    host: &mut H,
+    s: &mut Session<E>,
+) -> Option<u8> {
+    // An empty response keeps `has_outstanding` true after every event of a
+    // live link, so only a queued control PDU blocks a new request. The TX
+    // selector sends it once the peer acknowledges our last packet.
+    if !s.conn.established() || s.pending_control.is_some() || !s.encryption_idle() {
+        return None;
+    }
+    // A request that arrives while a procedure is live cannot be queued: the
+    // HCI layer should have returned Command Disallowed, but if it did not,
+    // end it as a collision instead of silently starting it later.
+    if s.control.phy_busy() {
+        if host.take_phy_request().is_some() {
+            host.phy_update_complete(0x2a, phy_code(s.conn.tx_phy()), phy_code(s.conn.rx_phy()));
+        }
+        return None;
+    }
+    if !s.control.phy_supported() {
+        // No advertised 2M bit: end the request instead of leaving it queued
+        // forever behind a procedure that can never start.
+        if host.take_phy_request().is_some() {
+            host.phy_update_complete(0x1f, phy_code(s.conn.tx_phy()), phy_code(s.conn.rx_phy()));
+        }
+        return None;
+    }
+    let (tx, rx) = host.take_phy_request()?;
+    if let Some(pdu) = s.control.start_phy_request(tx, rx) {
+        s.pending_control = Some(DataPdu::new(3, pdu.as_bytes()).unwrap());
+    }
+    None
+}
+
+/// Report a PHY completion that is not tied to an Instant (collision).
+fn service_phy_report<E: AesEngine, H: LinkHost<Aes = E>>(host: &mut H, s: &mut Session<E>) {
+    if let Some(status) = s.control.take_phy_status() {
+        host.phy_update_complete(status, phy_code(s.conn.tx_phy()), phy_code(s.conn.rx_phy()));
+    }
+}
+
 /// Produce at most one prepared ciphertext PDU before the next event.
 pub fn prefetch_encrypted<E: AesEngine, H: LinkHost<Aes = E>>(
     host: &mut H,
@@ -1685,7 +1776,7 @@ pub fn prefetch_encrypted<E: AesEngine, H: LinkHost<Aes = E>>(
                 if acl.len == 0 {
                     let _ = host.ack_tx(acl.tag);
                 } else {
-                    host.diag_acl_raw(acl.llid, &acl.bytes[..acl.len], false);
+                    host.diag_acl_tx(acl.llid, &acl.bytes[..acl.len]);
                     s.pending_host = Some(PendingHost {
                         acl,
                         offset: 0,
@@ -1902,8 +1993,14 @@ fn service_pending<E: AesEngine, H: LinkHost<Aes = E>>(
     if reason.is_none() {
         reason = service_control(host, s, now);
     }
+    // After `service_control`: a deferred 0x16 that collided with our own
+    // request must report 0x2A in the same tick.
+    service_phy_report(host, s);
     if reason.is_none() {
         reason = service_dle(host, s);
+    }
+    if reason.is_none() {
+        reason = service_phy(host, s);
     }
     if reason.is_none() {
         reason = prefetch_encrypted(host, s);

@@ -204,7 +204,10 @@ pub(crate) fn link_event_pending_elsewhere(slot: u8, handle: u16) -> bool {
 
 /// HCI commands whose first parameter is a connection handle.
 fn connection_command(opcode: u16) -> bool {
-    matches!(opcode, 0x0406 | 0x2019 | 0x201a | 0x201b | 0x2022)
+    matches!(
+        opcode,
+        0x0406 | 0x2019 | 0x201a | 0x201b | 0x2022 | 0x2030 | 0x2032
+    )
 }
 
 /// Controller→Host scope. Only ACL and completed-packets belong to a link;

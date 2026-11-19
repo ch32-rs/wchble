@@ -75,6 +75,16 @@ class X1Tests(unittest.TestCase):
         self.assertTrue(any('received PDU' in error for error in errors))
         self.assertTrue(any('Host ACL packet' in error for error in errors))
 
+    def test_fragmentation_is_skipped_when_the_mtu_fits_one_pdu(self):
+        words = x1(feature_exchange=1, tx_over_27=4, rx_over_27=2,
+                   max_tx_pdu=132, max_rx_pdu=132)
+        # 124+4 octets fit the 128-octet post-DLE plaintext PDU exactly.
+        self.assertEqual(secure.evaluate_x1(words, require_dle=True,
+                                            att_mtu=124), [])
+        # A larger MTU must still prove the fragmenter ran.
+        self.assertTrue(any('Host ACL packet' in error
+                            for error in secure.evaluate_x1(words, True, att_mtu=200)))
+
     def test_bad_magic_is_rejected(self):
         self.assertTrue(secure.evaluate_x1([0] * 24))
         self.assertTrue(secure.evaluate_x1([0] * 16))
@@ -360,6 +370,56 @@ class FalTests(unittest.TestCase):
                             for error in capture.evaluate(assessed, 'fal')))
 
 
+class PhyTests(unittest.TestCase):
+    def test_phy_stats_require_the_two_mega_switch(self):
+        words = [0] * secure.PHY_STATS_WORDS
+        for name, value in (('tx', 2), ('rx', 2), ('req_tx', 1), ('rsp_rx', 1),
+                            ('update_rx', 1), ('changes', 1),
+                            ('read_tx', 2), ('read_rx', 2)):
+            words[secure.PHY_NAMES.index(name)] = value
+        self.assertEqual(secure.evaluate_phy(words, True), [])
+        self.assertEqual(secure.evaluate_phy(words, False), [])
+        # A peer-started procedure needs no Host REQ.
+        peer = [0] * secure.PHY_STATS_WORDS
+        for name, value in (('tx', 2), ('rx', 2), ('req_rx', 1), ('rsp_tx', 1),
+                            ('update_rx', 1), ('changes', 1),
+                            ('read_tx', 2), ('read_rx', 2)):
+            peer[secure.PHY_NAMES.index(name)] = value
+        self.assertEqual(secure.evaluate_phy(peer, True), [])
+        # A slave-initiated REQ is answered by the IND alone; no RSP is legal.
+        lone = [0] * secure.PHY_STATS_WORDS
+        for name, value in (('tx', 2), ('rx', 2), ('req_tx', 1),
+                            ('update_rx', 1), ('changes', 1),
+                            ('read_tx', 2), ('read_rx', 2)):
+            lone[secure.PHY_NAMES.index(name)] = value
+        self.assertEqual(secure.evaluate_phy(lone, True), [])
+        self.assertEqual(secure.evaluate_phy([0] * secure.PHY_STATS_WORDS, False), [])
+        self.assertTrue(any('never written' in error
+                            for error in secure.evaluate_phy([0] * secure.PHY_STATS_WORDS, True)))
+        words[secure.PHY_NAMES.index('read_rx')] = 1
+        self.assertTrue(any('LE Read PHY' in error
+                            for error in secure.evaluate_phy(words, True)))
+        words[secure.PHY_NAMES.index('invalid')] = 1
+        self.assertTrue(any('invalid PDUs' in error
+                            for error in secure.evaluate_phy(words, False)))
+
+    def test_peer_run_rejects_a_host_started_procedure(self):
+        peer = [0] * secure.PHY_STATS_WORDS
+        for name, value in (('tx', 2), ('rx', 2), ('req_rx', 1), ('rsp_tx', 1),
+                            ('update_rx', 1), ('changes', 1),
+                            ('read_tx', 2), ('read_rx', 2)):
+            peer[secure.PHY_NAMES.index(name)] = value
+        self.assertEqual(secure.evaluate_phy(peer, True, peer=True), [])
+        host = list(peer)
+        host[secure.PHY_NAMES.index('req_rx')] = 0
+        host[secure.PHY_NAMES.index('rsp_tx')] = 0
+        host[secure.PHY_NAMES.index('req_tx')] = 1
+        errors = secure.evaluate_phy(host, True, peer=True)
+        self.assertTrue(any('Host requested' in error for error in errors))
+        self.assertTrue(any('peer PHY procedure incomplete' in error
+                            for error in errors))
+
+
 class PreflightTests(unittest.TestCase):
     def test_missing_manifest_never_touches_hardware(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -368,7 +428,7 @@ class PreflightTests(unittest.TestCase):
             elf.write_bytes(b'\x7fELF-test')
             wanted = ('HOST_STATS', 'SECURE_STATS', 'SEC_DIAG', 'SEC_OPCODES',
                       'HOST_ERROR', 'BOND_STATS', 'BOND_ECHO', 'CATT_STATS',
-                      'X4_STATS', 'X1_STATS', 'PERIPHERAL_ADDRESS')
+                      'X4_STATS', 'X1_STATS', 'PHY_STATS', 'PERIPHERAL_ADDRESS')
             text = '\n'.join(f'20000200 T {name}' for name in wanted)
             text += '\n20000300 T _embassy_crypto_aes128ecb_encrypt_blocks'
             args = argparse.Namespace(out=root / 'out', elf=elf, smoke_elf=elf,
