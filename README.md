@@ -182,6 +182,16 @@ These are verified plaintext subsets, not full multilink: `pp+secure`, the
 reverse CP connect order, encrypted outbound links, the total ACL-credit claim
 and the full X3.3 scope remain open (see `BACKLOG.md`).
 
+**CH585 X1b LE 2M PHY subset** (2026-11-19):
+[`examples/ch585-trouble-gatt`](examples/ch585-trouble-gatt) with `--features
+secure,x1b-2m` advertises the LE 2M feature bit and moves one peripheral link
+through `LL_PHY_REQ`/`RSP`/`UPDATE_IND`. Both initiators passed N=1 on hardware
+(Host `LE Set PHY` and an Android `setPreferredPhy`): `LE Read PHY` 2/2, and
+encrypted ATT MTU 124 reads/writes/notifications ran at 2M with no CRC or
+supervision errors. Verified subset only: one peripheral link to a 2M-capable
+central. The 1M-only peer fallback, Coded PHY and Central-side PHY remain
+uncovered, and `pp`/`cp` builds keep both bits clear (see `BACKLOG.md`).
+
 **Soft HCI Phase B verified on air** (2026-11-08): `hci::new()` is
 `bt_hci::ExternalController` over bounded embassy channels; `SoftRunner`
 answers Reset / ReadBdAddr / event masks / LE buffer size / legacy adv cmds.
