@@ -505,6 +505,14 @@ impl ControlState {
             }
             0x07 => {
                 exact_len(payload, 2)?;
+                // LL_UNKNOWN_RSP naming 0x16 ends a PHY procedure we started
+                // (Core 5.4 Vol 6 Part B 5.1.10): the peer cannot run it.
+                if self.phy_state == PhyState::ReqSent && payload[1] == 0x16 {
+                    self.phy_state = PhyState::Idle;
+                    // No reason byte on LL_UNKNOWN_RSP; unspecified is the
+                    // honest failure code for the Host.
+                    self.phy_status = Some(0x1f);
+                }
                 return Ok(ControlAction::None);
             }
             0x08 | 0x09 | 0x0e => {
@@ -539,7 +547,13 @@ impl ControlState {
                 return Ok(ControlAction::None);
             }
             0x11 => {
-                exact_len(payload, 3)?; // LL_REJECT_EXT_IND.
+                // LL_REJECT_EXT_IND naming 0x16 ends a PHY procedure we
+                // started; its reason is the Host completion status.
+                exact_len(payload, 3)?;
+                if self.phy_state == PhyState::ReqSent && payload[1] == 0x16 {
+                    self.phy_state = PhyState::Idle;
+                    self.phy_status = Some(payload[2]);
+                }
                 return Ok(ControlAction::None);
             }
             0x14 => {
@@ -605,6 +619,18 @@ impl ControlState {
                 // ignore it instead of killing the link.
                 if self.phy_state == PhyState::UpdatePending {
                     self.phy_invalid += 1;
+                    return Ok(ControlAction::None);
+                }
+                // Both PHY fields zero: no change and no Instant (Core 5.4
+                // Vol 6 Part B 2.4.2.23 reserves it). The procedure completes
+                // on receipt.
+                if payload[1] == 0 && payload[2] == 0 {
+                    self.phy_update_rx += 1;
+                    // Notify only a Host-initiated procedure: no PHY changed.
+                    if self.phy_state == PhyState::ReqSent {
+                        self.phy_status = Some(0);
+                    }
+                    self.phy_state = PhyState::Idle;
                     return Ok(ControlAction::None);
                 }
                 let update = PhyUpdate::new(payload[1], payload[2], le16(&payload[3..]));
@@ -1125,5 +1151,76 @@ mod tests {
         assert_eq!(ctrl.phy_state(), PhyState::Idle);
         assert_eq!(ctrl.phy_changes, 1);
         assert_eq!(c.take_phy_applied(), None, "applied once");
+    }
+
+    #[test]
+    fn phy_ind_without_change_completes_without_an_instant() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        ctrl.start_phy_request(2, 2).unwrap();
+        assert_eq!(ctrl.phy_state(), PhyState::ReqSent);
+        // Both fields zero: no change, the Instant is reserved (Core 5.4
+        // Vol 6 Part B 2.4.2.23) and the procedure completes on receipt.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 0, 0, 0, 0], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        assert_eq!(ctrl.phy_update_rx, 1);
+        assert_eq!(ctrl.phy_changes, 0, "no PHY changed");
+        assert_eq!(ctrl.take_phy_status(), Some(0), "host request completes");
+        // A second procedure is accepted again immediately.
+        assert!(ctrl.start_phy_request(2, 2).is_some());
+        assert_eq!(ctrl.take_phy_status(), None, "reported once");
+    }
+
+    #[test]
+    fn phy_ind_without_change_ends_a_peer_initiated_procedure() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        ctrl.on_pdu(&mut c, &[0x16, 1, 3], LOCAL).unwrap();
+        assert_eq!(ctrl.phy_state(), PhyState::RspSent);
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x18, 0, 0, 0xff, 0x7f], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        // No PHY changed and the Host did not ask: nothing is reported.
+        assert_eq!(ctrl.take_phy_status(), None);
+    }
+
+    #[test]
+    fn phy_unknown_or_reject_ends_the_host_request() {
+        let mut c = connection();
+        let mut ctrl = phy_control();
+        ctrl.start_phy_request(2, 2).unwrap();
+        // A legacy peer answers LL_UNKNOWN_RSP for 0x16 (Core 5.4 Vol 6
+        // Part B 5.1.10): the procedure ends, the Host learns of it.
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x07, 0x16], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        assert_eq!(ctrl.take_phy_status(), Some(0x1f));
+        // A reject naming 0x16 carries the reject reason to the Host.
+        ctrl.start_phy_request(2, 2).unwrap();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x11, 0x16, 0x23], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::Idle);
+        assert_eq!(ctrl.take_phy_status(), Some(0x23));
+        // Responses naming other opcodes leave a live PHY request alone.
+        ctrl.start_phy_request(2, 2).unwrap();
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x07, 0x14], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(
+            ctrl.on_pdu(&mut c, &[0x11, 0x14, 0x23], LOCAL),
+            Ok(ControlAction::None)
+        );
+        assert_eq!(ctrl.phy_state(), PhyState::ReqSent);
+        assert_eq!(ctrl.take_phy_status(), None);
     }
 }
