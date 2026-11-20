@@ -3,6 +3,9 @@
 //! `cargo test --manifest-path tests/trouble-host/Cargo.toml --locked`.
 
 #[cfg(test)]
+#[path = "../../../examples/ch585-trouble-gatt/src/beacon.rs"]
+mod beacon;
+#[cfg(test)]
 mod dual;
 #[cfg(test)]
 #[path = "../../../examples/ch585-trouble-gatt/src/host.rs"]
@@ -24,7 +27,7 @@ mod tests {
     use trouble_host::attribute::Uuid;
     use wchble::hci::{BridgeError, ConnectionInfo, RadioRequest, SoftRunner, TxAcl, TxTag};
 
-    use super::host;
+    use super::{beacon, host};
 
     const PUMP_LIMIT: usize = 2048;
     const HANDLE: u16 = 1;
@@ -265,10 +268,7 @@ mod tests {
 
         fn find_service(&mut self, uuid: u16) -> (u16, u16) {
             let [lo, hi] = uuid.to_le_bytes();
-            let replies = self.exchange(
-                &[0x06, 1, 0, 0xff, 0xff, 0x00, 0x28, lo, hi],
-                1,
-            );
+            let replies = self.exchange(&[0x06, 1, 0, 0xff, 0xff, 0x00, 0x28, lo, hi], 1);
             assert_eq!(replies[0][0], 0x07);
             (
                 u16::from_le_bytes([replies[0][1], replies[0][2]]),
@@ -318,7 +318,12 @@ mod tests {
         }
 
         /// Returns value handle, properties and optional CCCD handle.
-        fn find_characteristic(&mut self, start: u16, end: u16, uuid: u16) -> (u16, u8, Option<u16>) {
+        fn find_characteristic(
+            &mut self,
+            start: u16,
+            end: u16,
+            uuid: u16,
+        ) -> (u16, u8, Option<u16>) {
             let [sl, sh] = start.to_le_bytes();
             let [el, eh] = end.to_le_bytes();
             let [lo, hi] = uuid.to_le_bytes();
@@ -401,7 +406,13 @@ mod tests {
         // the Host hands over full ACL packets and the LL (not the Host) owns
         // segmentation after negotiation.
         let controller = SoftRunner::new();
-        let mut future = pin!(host::run(wchble::hci::new(), &stats, host::RANDOM_ADDRESS, None, 900));
+        let mut future = pin!(host::run(
+            wchble::hci::new(),
+            &stats,
+            host::RANDOM_ADDRESS,
+            None,
+            900
+        ));
         let mut fixture = Fixture {
             host: future.as_mut(),
             stats: &stats,
@@ -477,7 +488,8 @@ mod tests {
 
         // Nordic UART pipe: a write to RX is echoed once as a TX notification.
         let (uart_start, uart_end) = fixture.find_service_long(&host::UART_SERVICE_UUID);
-        let (uart_rx, rx_props, _) = fixture.find_characteristic_long(uart_start, uart_end, &host::UART_RX_UUID);
+        let (uart_rx, rx_props, _) =
+            fixture.find_characteristic_long(uart_start, uart_end, &host::UART_RX_UUID);
         assert_eq!(rx_props & 0x08, 0x08);
         // MTU 23 fits one 128-bit declaration per response, so continue after RX.
         let (uart_tx, tx_props, tx_cccd) =
@@ -558,7 +570,11 @@ mod tests {
         // and notification-queue pressure, all at 23-byte ACL fragments.
         fixture.connect(3);
         let replies = fixture.exchange(&[0x02, 0xf7, 0x00], 1);
-        assert_eq!(replies[0], [0x03, 0x7c, 0x00], "MTU 247 must be capped at 124");
+        assert_eq!(
+            replies[0],
+            [0x03, 0x7c, 0x00],
+            "MTU 247 must be capped at 124"
+        );
 
         let (vendor_start, vendor_end) = fixture.find_service_long(&host::SERVICE_UUID);
         let (bulk, bulk_props, _) =
@@ -587,8 +603,9 @@ mod tests {
             read_value.extend_from_slice(&more[0][1..]);
         }
         assert_eq!(read_value.len(), host::BULK_LEN);
-        assert!((0..host::BULK_LEN)
-            .all(|index| read_value[index] == host::x4_bulk_read_byte(index)));
+        assert!(
+            (0..host::BULK_LEN).all(|index| read_value[index] == host::x4_bulk_read_byte(index))
+        );
 
         // Exactly what Android's reliable-write path sends for a value longer
         // than MTU-3: Prepare Write chunks followed by Execute Write.
@@ -630,7 +647,13 @@ mod tests {
         let mut request = Vec::from([0x12, xl, xh]);
         request.extend_from_slice(b"BST!");
         let replies = fixture.exchange_burst(&request);
-        assert_eq!(replies.iter().filter(|row| row.as_slice() == [0x13]).count(), 1);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|row| row.as_slice() == [0x13])
+                .count(),
+            1
+        );
         let notifications: Vec<_> = replies.iter().filter(|row| row[0] == 0x1b).collect();
         assert!(!notifications.is_empty());
         for note in &notifications {
@@ -660,6 +683,67 @@ mod tests {
         // counts PDUs rather than LL fragments. The full MTU-23 UART write adds
         // the request and its echo.
         assert_eq!(fixture.acknowledged, 114);
+    }
+
+    /// X2a: the beacon's `advertise_ext` drives the whole 0x2035-0x2039
+    /// surface through the real Host and lands in the controller's set 0.
+    #[test]
+    fn beacon_advertise_ext_configures_and_enables_set0() {
+        let _guard = crate::serialize();
+        let stats = host::HostStats::new();
+        let address = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01];
+        let controller = SoftRunner::new();
+        let mut future = pin!(beacon::run(wchble::hci::new(), &stats, address));
+        let mut fixture = Fixture {
+            host: future.as_mut(),
+            stats: &stats,
+            controller,
+            acknowledged: 0,
+        };
+        fixture.until("extended advertising set enabled", |f| {
+            f.controller.ll.ext_adv.enabled
+        });
+        let ext = &fixture.controller.ll.ext_adv;
+        assert!(ext.configured);
+        // 160 ms fixed interval in 0.625 ms slots.
+        assert_eq!(ext.interval_slots, 256);
+        assert_eq!(ext.channel_map, 0x07);
+        // The fixture builds the 1M mirror (no `x2-ext-adv-2m` feature here).
+        assert_eq!(ext.aux_phy, 0x01);
+        assert_eq!(ext.data_len, beacon::EXT_ADV_DATA_LEN);
+        assert_eq!(&ext.data[..ext.data_len], &beacon::marker()[..]);
+        // The set runs until the firmware budget ends.
+        assert_eq!(ext.duration_10ms, 0);
+        assert_eq!(ext.max_events, 0);
+        assert_eq!(ext.own_addr, address);
+        assert!(ext.random_addr);
+        // Trouble hardcodes advertising SID 0 in LeSetExtAdvParams.
+        assert_eq!(ext.adv_sid, 0);
+        // The Complete data rolled the DID off its initial zero.
+        assert_ne!(ext.did, 0);
+        // The beacon never touches the legacy set.
+        assert!(!fixture.controller.adv_enabled());
+
+        // The primary PDU points at a data channel with a 600-us AuxPtr.
+        let mut out = [0u8; 64];
+        let len = ext
+            .build_adv_ext_ind(&mut out, wchble::ll::adv::ExtAdvState::aux_channel(0))
+            .expect("beacon primary PDU");
+        assert_eq!(len, 9);
+        // Header (TxAdd set: random own address), ExtHdrLen 6, flags
+        // ADI|AuxPtr, then the ADI itself.
+        assert_eq!(&out[..4], &[0x47, 7, 0x06, 0x18]);
+        assert_eq!(&out[4..6], &ext.adi());
+        // The Advertiser must stay held: dropping it cancels the operation and
+        // disables the set. Keep pumping past the enable edge and require the
+        // set to survive (the cancel's disable would land in these pumps).
+        for _ in 0..64 {
+            fixture.pump();
+        }
+        assert!(
+            fixture.controller.ll.ext_adv.enabled,
+            "the set was disabled after advertise_ext returned"
+        );
     }
 }
 
@@ -744,8 +828,10 @@ mod shared_driver {
         fn push_bad(&mut self, header: u8, payload: &[u8]) {
             let mut bytes = vec![header, payload.len() as u8];
             bytes.extend_from_slice(payload);
-            self.windows
-                .push_back(Some(Frame { bytes, crc_ok: false }));
+            self.windows.push_back(Some(Frame {
+                bytes,
+                crc_ok: false,
+            }));
         }
         fn push_missed(&mut self) {
             self.windows.push_back(None);
@@ -876,11 +962,7 @@ mod shared_driver {
         pdu
     }
 
-    fn pump<F: Future>(
-        soft: &mut SoftRunner,
-        future: &mut Pin<&mut F>,
-        stats: &host::HostStats,
-    ) {
+    fn pump<F: Future>(soft: &mut SoftRunner, future: &mut Pin<&mut F>, stats: &host::HostStats) {
         soft.pump_once();
         if let Some(request) = soft.bridge.take_radio_request() {
             match request {
@@ -916,7 +998,12 @@ mod shared_driver {
         session: &mut Session<wchble::crypto::Aes128>,
         finish: u32,
     ) -> Control {
-        let mut host = RunnerHost::new(soft, Extras { now: clock.handle() });
+        let mut host = RunnerHost::new(
+            soft,
+            Extras {
+                now: clock.handle(),
+            },
+        );
         let control = link::step(session, &mut host, radio, clock, rx, tx, finish);
         drop(host);
         pump(soft, future, stats);
@@ -951,8 +1038,7 @@ mod shared_driver {
         for cycle in 1..=2u32 {
             let now = clock.now();
             let params = ConnectParams::parse(&connect_pdu(), true, [0xc0; 6], true).unwrap();
-            let features =
-                feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]);
+            let features = feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]);
             let mut session = Session::new(params, false, now + 1_000, now, [0x55; 12], features);
             radio.push_bad(0x01, &[]);
 
@@ -1029,5 +1115,4 @@ mod shared_driver {
             );
         }
     }
-
 }

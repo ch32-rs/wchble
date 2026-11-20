@@ -79,6 +79,9 @@ public class MainActivity extends Activity {
     // The privacy mode drops the first link, waits for the peer to rotate its
     // RPA at least twice (rpa-fast uses 5 s), then reconnects.
     private static final int ROTATION_WAIT_MS = 14_000;
+    // X2a: how long the ext_scan beacon window stays open. The runner flashes
+    // the beacon first, so the window only has to cover the firmware run.
+    private static final int EXT_SCAN_WINDOW_MS = 20_000;
     // `--es mode` selects the S3 acceptance phase. `pair` is the S2 flow.
     private String mode = "pair";
     // X1b-3: the phone sends LE Set PHY so the peer-initiated path runs.
@@ -102,6 +105,9 @@ public class MainActivity extends Activity {
     private boolean done;
     private int reads;
     private int scanReports;
+    // ext_scan: raw extended-advertisement reports and marker-head matches.
+    private int extReports;
+    private int extMatches;
     private boolean authRetried;
     private boolean serviceMissing;
     private boolean scanOnly;
@@ -193,6 +199,28 @@ public class MainActivity extends Activity {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             if (scanning && result.getDevice() != null) {
+                if ("ext_scan".equals(mode)) {
+                    // X2a beacon: dump the raw extended record; the runner
+                    // byte-compares the marker offline.
+                    byte[] record = result.getScanRecord() != null
+                            ? result.getScanRecord().getBytes() : null;
+                    boolean marker = record != null && record.length >= 4
+                            && record[0] == (byte) 0x7f && record[1] == (byte) 0xff
+                            && record[2] == 'W' && record[3] == 'C';
+                    extReports += 1;
+                    if (marker) {
+                        extMatches += 1;
+                    }
+                    if (marker || extReports <= 16) {
+                        logEvent("\"event\":\"ext_report\",\"address\":\"%s\",\"rssi\":%d,"
+                                        + "\"len\":%d,\"marker\":%s,\"primary_phy\":%d,"
+                                        + "\"secondary_phy\":%d,\"hex\":\"%s\"",
+                                result.getDevice().getAddress(), result.getRssi(),
+                                record == null ? 0 : record.length, marker ? "true" : "false",
+                                result.getPrimaryPhy(), result.getSecondaryPhy(), hex(record));
+                    }
+                    return;
+                }
                 String name = result.getScanRecord() != null
                         ? result.getScanRecord().getDeviceName() : null;
                 if (name == null) {
@@ -499,7 +527,7 @@ public class MainActivity extends Activity {
         }
         String requestedMode = getIntent().getStringExtra("mode");
         if (requestedMode != null) {
-            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid|att|privacy")) {
+            if (!requestedMode.matches("pair|reconnect|delete|wipe|fault|hid|att|privacy|ext_scan")) {
                 finishRun(false, "unknown_mode");
                 return;
             }
@@ -533,7 +561,10 @@ public class MainActivity extends Activity {
         registerReceiver(pairingReceiver, new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST),
                 Context.RECEIVER_EXPORTED);
         scanOnly = getIntent().getBooleanExtra("scan_only", false);
-        if (scanOnly) {
+        if ("ext_scan".equals(mode)) {
+            // The beacon is non-connectable: the window closes on its own.
+            handler.postDelayed(() -> finishRun(true, "ext_scan_done"), EXT_SCAN_WINDOW_MS);
+        } else if (scanOnly) {
             // Address discovery only: the vendor differential needs the peer's
             // public address for the sniffer's --follow before connecting.
             handler.postDelayed(() -> finishRun(true, "scan_only_done"), 10_000);
@@ -558,12 +589,17 @@ public class MainActivity extends Activity {
                 return;
             }
         }
-        ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build();
+        ScanSettings.Builder builder = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY);
+        if ("ext_scan".equals(mode)) {
+            // Extended advertising: report AUX_ADV_IND contents, not legacy
+            // advertising PDUs. Without this the stack drops the beacon set.
+            builder.setLegacy(false);
+        }
         scanning = true;
-        logEvent("\"event\":\"scan_started\",\"target\":\"%s\"", targetName);
-        scanner.startScan(null, settings, scanCallback);
+        logEvent("\"event\":\"scan_started\",\"target\":\"%s\",\"legacy\":%s",
+                targetName, "ext_scan".equals(mode) ? "false" : "true");
+        scanner.startScan(null, builder.build(), scanCallback);
     }
 
     private BluetoothDevice findBondedPeer(BluetoothAdapter bluetooth, String name) {
@@ -1163,6 +1199,10 @@ public class MainActivity extends Activity {
         done = true;
         handler.removeCallbacks(timeout);
         logInputDevices();
+        if ("ext_scan".equals(mode)) {
+            logEvent("\"event\":\"ext_summary\",\"reports\":%d,\"matches\":%d",
+                    extReports, extMatches);
+        }
         logEvent("\"event\":\"summary\",\"pass\":%s,\"reason\":\"%s\",\"bonder\":%s,"
                         + "\"bonded\":%s,\"reads\":%d,\"wrote\":%s,\"mtu\":%d,"
                         + "\"notifications\":%d,\"connections\":%d",

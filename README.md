@@ -182,6 +182,24 @@ These are verified plaintext subsets, not full multilink: `pp+secure`, the
 reverse CP connect order, encrypted outbound links, the total ACL-credit claim
 and the full X3.3 scope remain open (see `BACKLOG.md`).
 
+**CH585 X2a extended advertising (advertiser subset)** (2026-11-20):
+[`examples/ch585-trouble-gatt`](examples/ch585-trouble-gatt) with
+`--features x2-ext-adv[-2m]` runs a real Trouble `advertise_ext` beacon:
+ADV_EXT_IND on 37/38/39 pointing at a data-channel AUX_ADV_IND 600 µs out
+(same scheduled-TX path, so the air gap equals the AuxPtr), rotating aux
+channel, DID rotation and the LE extended advertising feature bit. Both N=1
+rounds passed on hardware (1M and 2M secondary): `adv_tx==aux_tx==rounds`
+(453/456), `aux_late==0`, `events` matching the 160 ms interval, aux air time
+exactly 80+8n / 44+4n µs, and the Android non-legacy scanner received the full
+128-byte CRC-32 marker byte-for-byte (`secondary_phy:2` on the 2M image);
+nRF Connect corroborates the 1M round. The first hardware round exposed a real
+defect: the `Advertiser` returned by `advertise_ext` was dropped, and its Drop
+guard disabled the set right after enabling (a doubled `0x2039` in the
+controller log); fixed by holding the Advertiser with a mutation-checked
+fixture gate. Verified subset only: non-connectable, non-scannable, one set,
+128-byte data; coexistence against a live link, periodic advertising and
+PAwR remain open (see `BACKLOG.md`).
+
 **CH585 X1b LE 2M PHY subset** (2026-11-19):
 [`examples/ch585-trouble-gatt`](examples/ch585-trouble-gatt) with `--features
 secure,x1b-2m` advertises the LE 2M feature bit and moves one peripheral link

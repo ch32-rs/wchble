@@ -16,9 +16,13 @@ trouble-host = { path = "../../../trouble/host", default-features = false, featu
     # X4: MTU 124 and queued writes, matching the example.
     "default-packet-pool-mtu-128",
     "att-queued-writes",
+    # X2a: `advertise_ext` for the extended advertising beacon fixture.
+    "extended-advertising",
 ] }
 embassy-sync = { version = "0.8", default-features = false }
 embassy-futures = "0.1"
+# beacon.rs mirrors the example's AdvertisementSet construction.
+embassy-time = { version = "0.5", default-features = false }
 heapless = "0.9"
 critical-section = { version = "1", features = ["std"] }
 portable-atomic = { version = "1.11", features = ["critical-section"] }

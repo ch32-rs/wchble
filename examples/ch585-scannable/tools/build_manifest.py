@@ -23,6 +23,7 @@ ROLE_SYMBOLS = {
     'central': ('STATS', 'TRACE', 'RUN_SECONDS'),
     'secure': ('STATS', 'SECURE_STATS', 'BOND_STATS', 'RUN_SECONDS'),
     'hid': ('STATS', 'SECURE_STATS', 'HID_STATS', 'RUN_SECONDS'),
+    'ext-adv': ('STATS', 'EXT_ADV_STATS', 'RUN_SECONDS'),
 }
 # Demangled item names of the RAM-resident entry points. The RX/response roots
 # are separate highcode functions, not necessarily inlined into `main`.
@@ -32,6 +33,7 @@ ROLE_ROOTS = {
                 'receive_response'),
     'secure': ('main', 'receive', 'transmit'),
     'hid': ('main', 'receive', 'transmit'),
+    'ext-adv': ('ext_adv_event', 'main'),
 }
 # Radio/LL entry points a reviewer expects on the RX/TX hot path. `None` means
 # no standalone symbol: read the root's disassembly for inlining or aliasing.
@@ -43,6 +45,7 @@ REQUIRED_PATH_INPUTS = {
     'central': ('ch5xx-hal', 'trouble'),
     'secure': ('ch5xx-hal', 'trouble'),
     'hid': ('ch5xx-hal', 'trouble'),
+    'ext-adv': ('ch5xx-hal', 'trouble'),
 }
 CONTROL = {'jal', 'jalr', 'call', 'tail', 'j', 'jr', 'c.j', 'c.jal', 'c.jr', 'c.jalr',
            'beq', 'bne', 'blt', 'bge', 'bltu', 'bgeu', 'c.beqz', 'c.bnez'}

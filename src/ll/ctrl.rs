@@ -280,6 +280,7 @@ pub enum ControlAction {
 pub const FEATURE_LE_ENCRYPTION: u8 = 0;
 pub const FEATURE_LE_DATA_LENGTH_EXTENSION: u8 = 5;
 pub const FEATURE_LE_2M_PHY: u8 = 8;
+pub const FEATURE_LE_EXTENDED_ADVERTISING: u8 = 12;
 pub const FEATURE_LE_CSA2: u8 = 14;
 
 /// Build a feature bitmap with exactly `bits` set. The 2M/Coded bits stay

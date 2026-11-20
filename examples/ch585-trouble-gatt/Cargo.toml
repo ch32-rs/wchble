@@ -45,6 +45,10 @@ x1b-2m = []
 # X1b-3 peer-initiated acceptance: the phone sends LE Set PHY, so the Host
 # must not race it with its own request.
 x1b-2m-peer = ["x1b-2m"]
+# X2a: non-connectable extended advertising beacon (ADV_EXT_IND + AUX_ADV_IND).
+x2-ext-adv = ["trouble-host/extended-advertising"]
+# X2a second acceptance round: the AUX_ADV_IND carries LE 2M.
+x2-ext-adv-2m = ["x2-ext-adv"]
 
 [dependencies]
 ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }
