@@ -12,6 +12,7 @@ use qingke_rt::entry;
 use static_cell::StaticCell;
 use wchble::hci::connection::{ConnectionInfo, RadioRequest};
 use wchble::hci::SoftRunner;
+#[cfg(not(feature = "x2-ext-adv"))]
 use wchble::ll::conn::ConnectParams;
 #[cfg(feature = "secure")]
 use wchble::ll::ctrl::FEATURE_LE_ENCRYPTION;
@@ -36,7 +37,13 @@ compile_error!("`pp` and `cp` are separate acceptance images; enable one");
 compile_error!("`cp` is a plaintext acceptance image; it cannot advertise LE encryption");
 #[cfg(all(feature = "x1b-2m", any(feature = "pp", feature = "cp")))]
 compile_error!("`x1b-2m` opens the Peripheral-only PHY procedure; Central links cannot claim 2M");
+#[cfg(all(feature = "x2-ext-adv", any(feature = "pp", feature = "cp")))]
+compile_error!(
+    "`x2-ext-adv` is a non-connectable beacon; `pp`/`cp` accept links that cannot arrive"
+);
 
+#[cfg(feature = "x2-ext-adv")]
+mod beacon;
 #[cfg(feature = "secure")]
 mod bond;
 #[cfg(feature = "secure")]
@@ -81,7 +88,10 @@ pub static RUN_SECONDS: u32 = if cfg!(feature = "long-run") {
     25
 };
 /// S4 acceptance: 5 s under `rpa-fast`, otherwise the 900 s default.
-#[cfg_attr(any(feature = "pp", feature = "cp"), allow(dead_code))]
+#[cfg_attr(
+    any(feature = "pp", feature = "cp", feature = "x2-ext-adv"),
+    allow(dead_code)
+)]
 const RPA_TIMEOUT_SECS: u32 = if cfg!(feature = "rpa-fast") { 5 } else { 900 };
 #[no_mangle]
 static mut STATS: [u32; 64] = [0; 64];
@@ -93,6 +103,67 @@ static mut TRACE: [u32; 128 * 8] = [0; 128 * 8];
 /// existing runner remain untouched.
 #[no_mangle]
 static mut SECURE_STATS: [u32; 16] = [0; 16];
+
+// X2a beacon evidence, written by the RF owner. `rounds` counts completed
+// primary+AUX pairs and `events` the whole extended advertising events (one
+// Terminated `Num_Completed` unit); the two differ by the channel sweep.
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_ADV_STATS_WORDS: usize = 16;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_ADV_TX: usize = 0;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_AUX_TX: usize = 1;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_AUX_LATE: usize = 2;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_ROUNDS: usize = 3;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_EVENTS: usize = 4;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_LAST_AUX_CHANNEL: usize = 5;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_LAST_AUX_PHY: usize = 6;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_TERMINATED: usize = 7;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_DID: usize = 8;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_DATA_LEN: usize = 9;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_AUX_AIR_US: usize = 10;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_AUX_SKIP: usize = 11;
+#[cfg(feature = "x2-ext-adv")]
+#[no_mangle]
+static mut EXT_ADV_STATS: [u32; EXT_ADV_STATS_WORDS] = [0; EXT_ADV_STATS_WORDS];
+/// The AUX_ADV_IND frame (2 + 10 + 245 payload bytes) needs its own DMA
+/// buffer: `ADV` (64 B) only fits the ADV_EXT_IND.
+#[cfg(feature = "x2-ext-adv")]
+static EXT_AUX: StaticCell<DmaBuf<257>> = StaticCell::new();
+
+// Inlined so the `.highcode` round path never calls back into flash.
+#[cfg(feature = "x2-ext-adv")]
+#[inline(always)]
+fn ext_put(i: usize, v: u32) {
+    // SAFETY: single-threaded example; only the RF owner writes EXT_ADV_STATS.
+    unsafe {
+        core::ptr::addr_of_mut!(EXT_ADV_STATS)
+            .cast::<u32>()
+            .add(i)
+            .write_volatile(v)
+    }
+}
+#[cfg(feature = "x2-ext-adv")]
+#[inline(always)]
+fn ext_inc(i: usize) {
+    let current = unsafe {
+        core::ptr::addr_of!(EXT_ADV_STATS)
+            .cast::<u32>()
+            .add(i)
+            .read_volatile()
+    };
+    ext_put(i, current.wrapping_add(1));
+}
 
 const SEC_MAGIC: u32 = 0x5332_3538;
 // SECURE_STATS slots 2..16 are written by `wchble::ll::link` through the
@@ -109,15 +180,28 @@ const fn with_phy(bits: [u8; 8]) -> [u8; 8] {
     bits
 }
 
+/// X2a only: the extended advertising feature bit (index 12 = octet 1 bit 4).
+#[cfg(feature = "x2-ext-adv")]
+const fn with_ext_adv(mut bits: [u8; 8]) -> [u8; 8] {
+    bits[1] |= 1 << 4;
+    bits
+}
+#[cfg(not(feature = "x2-ext-adv"))]
+const fn with_ext_adv(bits: [u8; 8]) -> [u8; 8] {
+    bits
+}
+
 #[cfg(feature = "secure")]
-const LOCAL_FEATURES: [u8; 8] = with_phy(feature_bits(&[
+const LOCAL_FEATURES: [u8; 8] = with_ext_adv(with_phy(feature_bits(&[
     FEATURE_LE_ENCRYPTION,
     FEATURE_LE_DATA_LENGTH_EXTENSION,
     FEATURE_LE_CSA2,
-]));
+])));
 #[cfg(not(feature = "secure"))]
-const LOCAL_FEATURES: [u8; 8] =
-    with_phy(feature_bits(&[FEATURE_LE_DATA_LENGTH_EXTENSION, FEATURE_LE_CSA2]));
+const LOCAL_FEATURES: [u8; 8] = with_ext_adv(with_phy(feature_bits(&[
+    FEATURE_LE_DATA_LENGTH_EXTENSION,
+    FEATURE_LE_CSA2,
+])));
 
 fn put(i: usize, v: u32) {
     unsafe {
@@ -409,6 +493,84 @@ fn stop(radio: &mut Ch585Radio, clock: &Clock) {
     unsafe {
         core::arch::asm!("fence iorw, iorw", options(nostack));
     }
+}
+
+/// One X2a extended advertising event: an ADV_EXT_IND on each enabled primary
+/// channel, each scheduled so its AUX_ADV_IND follows exactly 600 µs later on
+/// the rotating data channel at the set's secondary PHY. The whole path stays
+/// in RAM: the 600-µs window leaves ~430 µs for the AUX programming after the
+/// primary is on air.
+#[cfg(feature = "x2-ext-adv")]
+#[cfg_attr(target_arch = "riscv32", link_section = ".highcode")]
+#[inline(never)]
+fn ext_adv_event(
+    radio: &mut Ch585Radio,
+    clock: &Clock,
+    ext: &wchble::ll::adv::ExtAdvState,
+    round: &mut u32,
+    adv_buf: &mut DmaBuf<64>,
+    aux_buf: &mut DmaBuf<257>,
+) {
+    const PRIMARY_PREP_US: u32 = 300;
+    const AUX_OFFSET_US: u32 = 600;
+    radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
+    let aux_phy = if ext.aux_phy & 0x02 != 0 {
+        PhyMode::Rate2m
+    } else {
+        PhyMode::Rate1m
+    };
+    for channel in [37u8, 38, 39] {
+        if ext.channel_map & (1 << (channel - 37)) == 0 {
+            continue;
+        }
+        let aux_channel = wchble::ll::adv::ExtAdvState::aux_channel(*round);
+        let Some(adv_len) = ext.build_adv_ext_ind(&mut adv_buf.0, aux_channel) else {
+            break;
+        };
+        radio.set_channel(channel).unwrap();
+        let primary_start = clock.now_us().wrapping_add(PRIMARY_PREP_US);
+        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+        // the engine on error; the frame only has to live for the call.
+        if unsafe { radio.tx_basic(clock, &adv_buf.0[..adv_len], 0, Some(primary_start)) }.is_err()
+        {
+            stop(radio, clock);
+            continue;
+        }
+        ext_inc(EXT_ADV_TX);
+        // Both packets ride the same scheduled-TX path, so the on-air gap is
+        // exactly the AuxPtr offset the scanner expects.
+        let Some(aux_len) = ext.build_aux_adv_ind(&mut aux_buf.0) else {
+            break;
+        };
+        radio.set_channel(aux_channel).unwrap();
+        radio.set_phy(aux_phy, aux_phy);
+        match unsafe {
+            radio.tx_basic(
+                clock,
+                &aux_buf.0[..aux_len],
+                0,
+                Some(primary_start.wrapping_add(AUX_OFFSET_US)),
+            )
+        } {
+            Ok(()) => ext_inc(EXT_AUX_TX),
+            Err(wchble::Error::Late) => ext_inc(EXT_AUX_LATE),
+            Err(_) => stop(radio, clock),
+        }
+        // The next primary is always 1M.
+        radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
+        ext_inc(EXT_ROUNDS);
+        ext_put(EXT_LAST_AUX_CHANNEL, u32::from(aux_channel));
+        *round = round.wrapping_add(1);
+    }
+    ext_put(
+        EXT_LAST_AUX_PHY,
+        if matches!(aux_phy, PhyMode::Rate2m) {
+            2
+        } else {
+            1
+        },
+    );
+    ext_put(EXT_AUX_AIR_US, ext.aux_air_us());
 }
 
 type Session = wchble::ll::link::Session<Ch585Aes>;
@@ -2030,7 +2192,11 @@ fn main() -> ! {
     let scratch = SCRATCH.init(DmaBuf::zeroed());
     let rx = RX.init(DmaBuf::zeroed());
     let adv_buf = ADV.init(DmaBuf::zeroed());
+    // The beacon never answers a scan request, so `rsp_buf` is unused there.
+    #[cfg_attr(feature = "x2-ext-adv", allow(unused_variables))]
     let rsp_buf = RSP.init(DmaBuf::zeroed());
+    #[cfg(feature = "x2-ext-adv")]
+    let aux_buf = EXT_AUX.init(DmaBuf::zeroed());
     let data = DATA.init(DmaBuf::zeroed());
     let mut radio = new_radio_with_dma(&mut scratch.0).unwrap();
     if radio.init(&clock).is_err() {
@@ -2223,7 +2389,9 @@ fn main() -> ! {
     let mut app = core::pin::pin!(pp::run(controller, &app_stats));
     #[cfg(feature = "cp")]
     let mut app = core::pin::pin!(cp::run(controller, &app_stats));
-    #[cfg(not(any(feature = "pp", feature = "cp")))]
+    #[cfg(feature = "x2-ext-adv")]
+    let mut app = core::pin::pin!(beacon::run(controller, &app_stats, peripheral_address));
+    #[cfg(not(any(feature = "pp", feature = "cp", feature = "x2-ext-adv")))]
     let mut app = core::pin::pin!(host::run(
         controller,
         &app_stats,
@@ -2281,6 +2449,13 @@ fn main() -> ! {
             finish,
         );
     }
+    #[cfg(not(any(feature = "pp", feature = "cp")))]
+    // X2a: round counter feeding the aux-channel rotation, plus the enable
+    // edge that seeds the duration countdown.
+    #[cfg(feature = "x2-ext-adv")]
+    let mut ext_round: u32 = 0;
+    #[cfg(feature = "x2-ext-adv")]
+    let mut ext_seen_enabled = false;
     #[cfg(not(any(feature = "pp", feature = "cp")))]
     while !reached(clock.now_us(), finish) {
         if let Some(s) = session.as_mut() {
@@ -2340,6 +2515,13 @@ fn main() -> ! {
                 .iter()
                 .all(|&(kind, address, irk)| soft.privacy_has_peer(kind, address, &irk)),
         );
+        #[cfg(feature = "x2-ext-adv")]
+        let idle_until = if soft.ll.ext_adv.enabled && !reached(now, next_adv) {
+            next_adv
+        } else {
+            now.wrapping_add(3000)
+        };
+        #[cfg(not(feature = "x2-ext-adv"))]
         let idle_until = if soft.adv_enabled() && !reached(now, next_adv) {
             next_adv
         } else {
@@ -2352,181 +2534,220 @@ fn main() -> ! {
             &clock,
             earlier(finish, idle_until),
         );
+        // X2a beacon: one extended advertising event per interval, three
+        // primary channels each pointing at its own AUX_ADV_IND.
+        #[cfg(feature = "x2-ext-adv")]
+        {
+            if !soft.ll.ext_adv.enabled || !reached(clock.now_us(), next_adv) {
+                continue;
+            }
+            // Seed the duration countdown once per enable.
+            if !ext_seen_enabled {
+                soft.ext_adv_started(clock.now_us());
+                ext_seen_enabled = true;
+            }
+            ext_adv_event(
+                &mut radio,
+                &clock,
+                &soft.ll.ext_adv,
+                &mut ext_round,
+                adv_buf,
+                aux_buf,
+            );
+            ext_put(EXT_DID, u32::from(soft.ll.ext_adv.did));
+            ext_put(EXT_DATA_LEN, soft.ll.ext_adv.data_len as u32);
+            if soft.ext_adv_round_done(clock.now_us()) {
+                // Duration or event cap ended the set; the Terminated event
+                // is already queued on the bridge.
+                ext_inc(EXT_TERMINATED);
+                ext_seen_enabled = false;
+            } else {
+                ext_inc(EXT_EVENTS);
+            }
+            next_adv = clock
+                .now_us()
+                .wrapping_add(u32::from(soft.ll.ext_adv.interval_slots) * 625);
+            continue;
+        }
+        #[cfg(not(feature = "x2-ext-adv"))]
         if !soft.adv_enabled() || !reached(clock.now_us(), next_adv) {
             continue;
         }
-        radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
-        #[cfg(feature = "privacy")]
-        soft.poll_privacy(clock.now_us());
-        let Some(adv_len) = soft.build_adv_pdu(&mut adv_buf.0) else {
-            continue;
-        };
-        let Some(rsp_len) = soft.ll.adv.build_scan_rsp(&mut rsp_buf.0) else {
-            inc(63);
-            break;
-        };
-        for channel in [37u8, 38, 39] {
-            if soft.ll.adv.channel_map & (1 << (channel - 37)) == 0 {
+        #[cfg(not(feature = "x2-ext-adv"))]
+        {
+            radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
+            #[cfg(feature = "privacy")]
+            soft.poll_privacy(clock.now_us());
+            let Some(adv_len) = soft.build_adv_pdu(&mut adv_buf.0) else {
                 continue;
-            }
-            if reached(clock.now_us(), finish) {
+            };
+            let Some(rsp_len) = soft.ll.adv.build_scan_rsp(&mut rsp_buf.0) else {
+                inc(63);
                 break;
-            }
-            radio.set_channel(channel).unwrap();
-            inc(3);
-            // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
-            // the engine on error; the frame only has to live for the call.
-            if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
-                inc(5);
-                stop(&mut radio, &clock);
-                continue;
-            }
-            inc(4);
-            let packet = {
-                let mut host = wchble::hci::link::RunnerHost::new(
-                    &mut soft,
-                    Extra {
-                        app: app.as_mut(),
-                        app_stats: &app_stats,
-                        clock: &clock,
-                        #[cfg(feature = "secure")]
-                        store: &mut store,
-                        #[cfg(feature = "secure")]
-                        att_store: &mut att_store,
-                    },
-                );
-                wchble::ll::link::receive(
-                    &mut radio,
-                    &clock,
-                    &mut host,
-                    rx,
-                    clock.now_us().wrapping_add(600),
-                    finish,
-                    700,
-                    &mut [0; 2],
-                )
             };
-            let packet = match packet {
-                wchble::ll::link::RxResult::Packet(packet) => packet,
-                wchble::ll::link::RxResult::Missed => continue,
-                wchble::ll::link::RxResult::Stopped => {
-                    inc(22);
-                    put(2, 0xee);
-                    park();
+            for channel in [37u8, 38, 39] {
+                if soft.ll.adv.channel_map & (1 << (channel - 37)) == 0 {
+                    continue;
                 }
-            };
-            let pdu = &rx.0[..packet.len];
-            if soft.ll.adv.validate_scan_req(pdu, packet.crc_ok) {
-                // Network-mode peers must scan us at an RPA (Vol 6 Part B §6.2.1).
-                let scanner = [pdu[2], pdu[3], pdu[4], pdu[5], pdu[6], pdu[7]];
-                if soft.scan_request_allowed(scanner, pdu[0] & 0x40 != 0) {
-                    inc(10);
-                    // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
-                    // engine on error; the response frame only has to live for the call.
-                    match unsafe {
-                        radio.tx_basic(
-                            &clock,
-                            &rsp_buf.0[..rsp_len],
-                            0,
-                            Some(packet.end.wrapping_add(120)),
-                        )
-                    } {
-                        Ok(()) => inc(11),
-                        Err(wchble::Error::Late) => inc(12),
-                        Err(_) => inc(5),
-                    }
+                if reached(clock.now_us(), finish) {
+                    break;
+                }
+                radio.set_channel(channel).unwrap();
+                inc(3);
+                // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops
+                // the engine on error; the frame only has to live for the call.
+                if unsafe { radio.tx_basic(&clock, &adv_buf.0[..adv_len], 0, None) }.is_err() {
+                    inc(5);
                     stop(&mut radio, &clock);
+                    continue;
                 }
-            } else if pdu[0] & 0x0f == 5 {
-                inc(13);
-                match ConnectParams::parse(
-                    pdu,
-                    packet.crc_ok,
-                    soft.ll.adv.own_addr,
-                    soft.ll.adv.random_addr,
-                ) {
-                    Ok(params) => {
-                        #[cfg(feature = "privacy")]
-                        {
-                            let started = clock.now_us();
-                            let accepted =
-                                soft.admit_connection(params.peer_addr, params.peer_random);
-                            privacy::note_admit(clock.now_us().wrapping_sub(started));
-                            if !accepted {
-                                // S4b rejected this initiator: no CONNECT_IND
-                                // goes back, so the link is never established.
-                                break;
-                            }
-                        }
-                        inc(14);
-                        put(45, u32::from(params.interval));
-                        put(46, u32::from(params.hop));
-                        put(
-                            47,
-                            u32::from_le_bytes(params.channel_map[..4].try_into().unwrap()),
-                        );
-                        put(48, u32::from(params.channel_map[4]));
-                        let mut enc_rsp_random = [0u8; 12];
-                        soft.fill_random(&mut enc_rsp_random);
-                        let mut s = Session::new(
-                            params,
-                            soft.ll.adv.chsel,
-                            packet.end,
-                            clock.now_us(),
-                            enc_rsp_random,
-                            LOCAL_FEATURES,
-                        );
-                        #[cfg(feature = "privacy")]
-                        {
-                            if soft.ll.adv.random_addr
-                                && wchble::ll::privacy::is_resolvable(soft.ll.adv.own_addr)
-                            {
-                                s.set_own_rpa(soft.ll.adv.own_addr);
-                            }
-                        }
-                        if let Some((octets, time)) = soft.suggested_data_length_explicit() {
-                            s.set_suggested_data_length(octets, time);
-                        }
-                        let (pref_tx, pref_rx) = soft.default_phy();
-                        s.set_phy_prefs(pref_tx, pref_rx);
-                        put(49, s.event_start_us());
-                        put(50, u32::from(params.win_size) * 1250);
-                        put(53, u32::from(s.channel()));
-                        trace(
-                            clock.now_us(),
-                            1,
-                            0,
-                            channel,
-                            pdu[0],
-                            pdu[1],
-                            params.access_addr,
-                            packet.end,
-                        );
-                        trace(
-                            clock.now_us(),
-                            7,
-                            0,
-                            channel,
-                            u8::from(params.peer_random),
-                            6,
-                            u32::from_le_bytes(params.peer_addr[..4].try_into().unwrap()),
-                            u32::from(u16::from_le_bytes([
-                                params.peer_addr[4],
-                                params.peer_addr[5],
-                            ])),
-                        );
-                        radio.set_aa_crc(params.access_addr, params.crc_init);
-                        session = Some(s);
-                        put(2, 3);
-                        break;
+                inc(4);
+                let packet = {
+                    let mut host = wchble::hci::link::RunnerHost::new(
+                        &mut soft,
+                        Extra {
+                            app: app.as_mut(),
+                            app_stats: &app_stats,
+                            clock: &clock,
+                            #[cfg(feature = "secure")]
+                            store: &mut store,
+                            #[cfg(feature = "secure")]
+                            att_store: &mut att_store,
+                        },
+                    );
+                    wchble::ll::link::receive(
+                        &mut radio,
+                        &clock,
+                        &mut host,
+                        rx,
+                        clock.now_us().wrapping_add(600),
+                        finish,
+                        700,
+                        &mut [0; 2],
+                    )
+                };
+                let packet = match packet {
+                    wchble::ll::link::RxResult::Packet(packet) => packet,
+                    wchble::ll::link::RxResult::Missed => continue,
+                    wchble::ll::link::RxResult::Stopped => {
+                        inc(22);
+                        put(2, 0xee);
+                        park();
                     }
-                    Err(_) => inc(9),
+                };
+                let pdu = &rx.0[..packet.len];
+                if soft.ll.adv.validate_scan_req(pdu, packet.crc_ok) {
+                    // Network-mode peers must scan us at an RPA (Vol 6 Part B §6.2.1).
+                    let scanner = [pdu[2], pdu[3], pdu[4], pdu[5], pdu[6], pdu[7]];
+                    if soft.scan_request_allowed(scanner, pdu[0] & 0x40 != 0) {
+                        inc(10);
+                        // SAFETY: `tx_basic` completes the DMA, starts none on `Late`, or stops the
+                        // engine on error; the response frame only has to live for the call.
+                        match unsafe {
+                            radio.tx_basic(
+                                &clock,
+                                &rsp_buf.0[..rsp_len],
+                                0,
+                                Some(packet.end.wrapping_add(120)),
+                            )
+                        } {
+                            Ok(()) => inc(11),
+                            Err(wchble::Error::Late) => inc(12),
+                            Err(_) => inc(5),
+                        }
+                        stop(&mut radio, &clock);
+                    }
+                } else if pdu[0] & 0x0f == 5 {
+                    inc(13);
+                    match ConnectParams::parse(
+                        pdu,
+                        packet.crc_ok,
+                        soft.ll.adv.own_addr,
+                        soft.ll.adv.random_addr,
+                    ) {
+                        Ok(params) => {
+                            #[cfg(feature = "privacy")]
+                            {
+                                let started = clock.now_us();
+                                let accepted =
+                                    soft.admit_connection(params.peer_addr, params.peer_random);
+                                privacy::note_admit(clock.now_us().wrapping_sub(started));
+                                if !accepted {
+                                    // S4b rejected this initiator: no CONNECT_IND
+                                    // goes back, so the link is never established.
+                                    break;
+                                }
+                            }
+                            inc(14);
+                            put(45, u32::from(params.interval));
+                            put(46, u32::from(params.hop));
+                            put(
+                                47,
+                                u32::from_le_bytes(params.channel_map[..4].try_into().unwrap()),
+                            );
+                            put(48, u32::from(params.channel_map[4]));
+                            let mut enc_rsp_random = [0u8; 12];
+                            soft.fill_random(&mut enc_rsp_random);
+                            let mut s = Session::new(
+                                params,
+                                soft.ll.adv.chsel,
+                                packet.end,
+                                clock.now_us(),
+                                enc_rsp_random,
+                                LOCAL_FEATURES,
+                            );
+                            #[cfg(feature = "privacy")]
+                            {
+                                if soft.ll.adv.random_addr
+                                    && wchble::ll::privacy::is_resolvable(soft.ll.adv.own_addr)
+                                {
+                                    s.set_own_rpa(soft.ll.adv.own_addr);
+                                }
+                            }
+                            if let Some((octets, time)) = soft.suggested_data_length_explicit() {
+                                s.set_suggested_data_length(octets, time);
+                            }
+                            let (pref_tx, pref_rx) = soft.default_phy();
+                            s.set_phy_prefs(pref_tx, pref_rx);
+                            put(49, s.event_start_us());
+                            put(50, u32::from(params.win_size) * 1250);
+                            put(53, u32::from(s.channel()));
+                            trace(
+                                clock.now_us(),
+                                1,
+                                0,
+                                channel,
+                                pdu[0],
+                                pdu[1],
+                                params.access_addr,
+                                packet.end,
+                            );
+                            trace(
+                                clock.now_us(),
+                                7,
+                                0,
+                                channel,
+                                u8::from(params.peer_random),
+                                6,
+                                u32::from_le_bytes(params.peer_addr[..4].try_into().unwrap()),
+                                u32::from(u16::from_le_bytes([
+                                    params.peer_addr[4],
+                                    params.peer_addr[5],
+                                ])),
+                            );
+                            radio.set_aa_crc(params.access_addr, params.crc_init);
+                            session = Some(s);
+                            put(2, 3);
+                            break;
+                        }
+                        Err(_) => inc(9),
+                    }
+                } else {
+                    inc(9);
                 }
-            } else {
-                inc(9);
             }
+            next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
         }
-        next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
     }
     stop(&mut radio, &clock);
     // A pairing that completed in the last event may still be pending.

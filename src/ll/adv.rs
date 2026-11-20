@@ -261,7 +261,7 @@ impl ExtAdvState {
     }
 
     /// ADI field bytes: DID in the low 12 bits, SID in the high 4 (Fig 2.18).
-    fn adi(&self) -> [u8; 2] {
+    pub fn adi(&self) -> [u8; 2] {
         (((self.adv_sid as u16) << 12) | (self.did & 0x0fff)).to_le_bytes()
     }
 
