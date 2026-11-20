@@ -83,11 +83,16 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats, add
             address: None,
         }];
         let mut handles = AdvertisementSet::handles(&sets);
-        if let Err(_) = peripheral.advertise_ext(&sets, &mut handles).await {
-            stats.set(STAT_PHASE, PHASE_FATAL);
-        }
-        // The advertiser must stay alive or its drop guard disables the set.
-        pending::<()>().await
+        // Held for the beacon's lifetime: dropping the Advertiser cancels the
+        // advertise operation and the controller receives a disable.
+        let _advertiser = match peripheral.advertise_ext(&sets, &mut handles).await {
+            Ok(advertiser) => advertiser,
+            Err(_) => {
+                stats.set(STAT_PHASE, PHASE_FATAL);
+                return;
+            }
+        };
+        let () = pending().await;
     };
     // The Host's HCI round trips only advance while `runner.run()` is polled.
     let _ = embassy_futures::join::join(runner.run(), beacon_task).await;

@@ -734,6 +734,16 @@ mod tests {
         // ADI|AuxPtr, then the ADI itself.
         assert_eq!(&out[..4], &[0x47, 7, 0x06, 0x18]);
         assert_eq!(&out[4..6], &ext.adi());
+        // The Advertiser must stay held: dropping it cancels the operation and
+        // disables the set. Keep pumping past the enable edge and require the
+        // set to survive (the cancel's disable would land in these pumps).
+        for _ in 0..64 {
+            fixture.pump();
+        }
+        assert!(
+            fixture.controller.ll.ext_adv.enabled,
+            "the set was disabled after advertise_ext returned"
+        );
     }
 }
 
