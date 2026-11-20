@@ -610,6 +610,21 @@ remain open and must not be read as verified:
   (Settings → gear → Unpair); the merged engine has no fresh-bond run yet.
 - [ ] **CC (two DUT centrals) and MultiCentPeri.** Outside the verified scope.
 
+## X2a extended advertising open items (2026-11-20)
+
+The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
+These remain open and must not be read as verified:
+- [ ] **X2a-3 coexistence round.** `aux_skip` keeps its stats slot but the N=1
+  runner only exercises the radio-exclusive path (counter stays 0); admission
+  and skip against a live link have no hardware round.
+- [ ] **2M nRF Connect manual corroboration.** The 2M round is backed by the
+  APK `secondary_phy=2` plus firmware `last_aux_phy=2`; no second-face manual
+  capture was taken.
+- [ ] **`scan_req_rx` observation.** The feature bit promises no AUX_SCAN_REQ
+  answer by design; scanner retry behavior was not separately captured.
+- [ ] **Periodic advertising, SYNC_ADV/SYNC_SCAN and PAwR** are untouched X2
+  scope.
+
 ## Explicitly outside this milestone
 
 Multiple connections, Coded PHY and product profiles beyond HOGP are not
