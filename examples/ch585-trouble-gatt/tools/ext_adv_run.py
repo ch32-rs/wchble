@@ -152,6 +152,10 @@ def read_ext_logcat(path, feature):
             errors.append('phone saw no extended advertisements at all')
         if int(summary.group(2)) == 0:
             errors.append('phone never matched the marker head')
+    if summary is not None and int(summary.group(2)) > 0 and not byte_exact:
+        # Head matches were logged but none survived to a byte-exact record:
+        # fail closed on incomplete logcat rather than trusting the head gate.
+        errors.append('summary claims matches but no byte-exact record was captured')
     if matches and not byte_exact and not truncated:
         errors.append('marker matched but the payload bytes differ from the fixture')
     if truncated:

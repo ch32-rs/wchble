@@ -135,6 +135,16 @@ class LogcatTests(unittest.TestCase):
         self.assertTrue(any('never matched the marker head' in error for error in errors), errors)
         Path(log).unlink()
 
+    def test_summary_claims_matches_without_records(self):
+        # Phone counted head matches but no byte-exact record survived in
+        # logcat: fail closed instead of trusting the summary count.
+        log = self.__class__.__name__ + '-lost.txt'
+        self.write_log(log, [noise_report(), summary(40, 2)])
+        errors, _ = ext_adv_run.read_ext_logcat(log, 'x2-ext-adv')
+        self.assertTrue(
+            any('no byte-exact record' in error for error in errors), errors)
+        Path(log).unlink()
+
     def test_two_m_round_requires_secondary_phy_2(self):
         marker = ext_adv_run.fixture_marker()
         log = self.__class__.__name__ + '-2m.txt'
