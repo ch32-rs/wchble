@@ -652,6 +652,13 @@ impl<E: AesEngine> Session<E> {
         self.control.data_length.set_suggested_tx(octets, time);
     }
 
+    /// Seed this link's PHY preference masks from LE Set Default PHY before
+    /// the link runs; they feed LL_PHY_REQ/RSP when the 2M bit is set.
+    pub fn set_phy_prefs(&mut self, tx: u8, rx: u8) {
+        self.control.phy_pref_tx = tx & 0x03;
+        self.control.phy_pref_rx = rx & 0x03;
+    }
+
     pub fn event_start_us(&self) -> u32 {
         self.conn.event_start_us()
     }
@@ -1716,7 +1723,7 @@ pub fn service_phy<E: AesEngine, H: LinkHost<Aes = E>>(
         // No advertised 2M bit: end the request instead of leaving it queued
         // forever behind a procedure that can never start.
         if host.take_phy_request().is_some() {
-            host.phy_update_complete(0x1f, phy_code(s.conn.tx_phy()), phy_code(s.conn.rx_phy()));
+            host.phy_update_complete(0x11, phy_code(s.conn.tx_phy()), phy_code(s.conn.rx_phy()));
         }
         return None;
     }
@@ -1962,6 +1969,9 @@ pub fn close_session<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Instan
     if !radio.stop(clock) {
         return false;
     }
+    // The connection owned the radio's PHY; advertising and scanning only
+    // run at 1M, so hand the radio back at 1M instead of leaving 2M armed.
+    radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
     let duration = clock.now_us().wrapping_sub(s.began);
     if duration > host.stat_get(STAT_MAX_CONNECTION_US) {
         host.stat_put(STAT_MAX_CONNECTION_US, duration);

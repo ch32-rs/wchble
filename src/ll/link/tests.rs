@@ -1025,6 +1025,25 @@ fn microsecond_clock_wrap_keeps_the_close_ordered() {
 }
 
 #[test]
+fn close_session_hands_the_radio_back_at_1m() {
+    let mut h = Harness::new();
+    // The end of a 2M link: the event loop last programmed 2M. Advertising
+    // and scanning only run at 1M, so the close must restore it.
+    h.radio.set_phy(PhyMode::Rate2m, PhyMode::Rate2m);
+    assert!(close_session(
+        &mut h.host,
+        &mut h.radio,
+        &h.clock,
+        &h.session,
+        0x13
+    ));
+    assert_eq!(
+        h.radio.phys.last(),
+        Some(&(PhyMode::Rate1m, PhyMode::Rate1m))
+    );
+}
+
+#[test]
 fn receive_reports_two_accessible_bytes_for_a_large_crc_bad_header() {
     for air_len in [252u8, 255] {
         let mut h = Harness::new();
@@ -2355,5 +2374,24 @@ fn phy_request_is_ended_when_the_feature_bit_is_off() {
     service_phy(&mut h.host, &mut h.session);
     assert!(h.session.pending_control.is_none(), "no LL_PHY_REQ");
     assert_eq!(h.session.control.phy_req_tx, 0);
-    assert_eq!(h.host.phy_events, std::vec![(0x1f, 1, 1)]);
+    assert_eq!(h.host.phy_events, std::vec![(0x11, 1, 1)]);
+}
+
+#[test]
+fn set_phy_prefs_seeds_the_link_preferences() {
+    let features = crate::ll::ctrl::feature_bits(&[crate::ll::ctrl::FEATURE_LE_2M_PHY]);
+    let mut h = Harness::new_with_features(features);
+    // LE Set Default PHY seeds each new link before it runs; the responder
+    // path (LL_PHY_RSP) then carries these masks.
+    h.session.set_phy_prefs(1, 1);
+    assert_eq!(
+        (h.session.control.phy_pref_tx, h.session.control.phy_pref_rx),
+        (1, 1)
+    );
+    // Out-of-range bits are masked, not stored raw.
+    h.session.set_phy_prefs(0x07, 0x05);
+    assert_eq!(
+        (h.session.control.phy_pref_tx, h.session.control.phy_pref_rx),
+        (3, 1)
+    );
 }

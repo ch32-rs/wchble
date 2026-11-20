@@ -1252,6 +1252,8 @@ fn pp_loop<F: Future>(
                         if let Some((octets, time)) = soft.suggested_data_length_explicit() {
                             s.set_suggested_data_length(octets, time);
                         }
+                        let (pref_tx, pref_rx) = soft.default_phy();
+                        s.set_phy_prefs(pref_tx, pref_rx);
                         put(49, s.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(s.channel()));
@@ -1907,6 +1909,8 @@ fn cp_loop<F: Future>(
                         if let Some((octets, time)) = soft.suggested_data_length_explicit() {
                             s.set_suggested_data_length(octets, time);
                         }
+                        let (pref_tx, pref_rx) = soft.default_phy();
+                        s.set_phy_prefs(pref_tx, pref_rx);
                         put(49, s.event_start_us());
                         radio.set_aa_crc(params.access_addr, params.crc_init);
                         match links.insert(CpLink::peripheral(s)) {
@@ -2483,6 +2487,8 @@ fn main() -> ! {
                         if let Some((octets, time)) = soft.suggested_data_length_explicit() {
                             s.set_suggested_data_length(octets, time);
                         }
+                        let (pref_tx, pref_rx) = soft.default_phy();
+                        s.set_phy_prefs(pref_tx, pref_rx);
                         put(49, s.event_start_us());
                         put(50, u32::from(params.win_size) * 1250);
                         put(53, u32::from(s.channel()));

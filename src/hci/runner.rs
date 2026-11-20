@@ -31,8 +31,8 @@ const HCI_COMMAND_DISALLOWED: u8 = 0x0c;
 const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 /// Memory capacity exceeded (resolving or filter accept list full).
 const HCI_MEMORY_CAPACITY_EXCEEDED: u8 = 0x07;
-/// Unsupported feature or parameter value.
-const HCI_UNSUPPORTED_FEATURE: u8 = 0x1f;
+/// Unsupported Feature or Parameter Value.
+const HCI_UNSUPPORTED_FEATURE: u8 = 0x11;
 
 /// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
@@ -1823,9 +1823,10 @@ impl SoftRunner {
         if all_phys & !0x03 != 0 {
             return HCI_INVALID_PARAMETERS;
         }
-        // Phy_Options is only defined for LE Coded; 1M/2M require zero.
-        if options != 0 {
-            return HCI_UNSUPPORTED_FEATURE;
+        // Phy_Options is a Coded coding preference; Core 5.4 7.8.49 allows
+        // it even without Coded in the masks. Only reserved bits fail.
+        if options & !0x03 != 0 {
+            return HCI_INVALID_PARAMETERS;
         }
         let no_tx = all_phys & 0x01 != 0;
         let no_rx = all_phys & 0x02 != 0;
@@ -1836,8 +1837,10 @@ impl SoftRunner {
                 .map(|key| self.bridge_slot_mut(key.slot).complete_phy_now(handle))
                 .unwrap_or(HCI_UNKNOWN_CONNECTION);
         }
-        let tx = if no_tx { self.default_phy.0 } else { params[3] };
-        let rx = if no_rx { self.default_phy.1 } else { params[4] };
+        // "No preference" covers every supported PHY (Core 5.4 7.8.49): Set
+        // PHY overrides the Set Default PHY masks, so they do not apply.
+        let tx = if no_tx { 0x03 } else { params[3] };
+        let rx = if no_rx { 0x03 } else { params[4] };
         if tx == 0 || tx & !0x03 != 0 || rx == 0 || rx & !0x03 != 0 {
             return HCI_UNSUPPORTED_FEATURE;
         }
@@ -2979,7 +2982,7 @@ mod tests {
             transport::try_receive_controller_packet()
                 .unwrap()
                 .payload(),
-            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+            &[0x0f, 4, 0x11, 1, 0x32, 0x20]
         );
         assert_eq!(runner.bridge.take_phy_request(), None);
     }
@@ -3007,28 +3010,43 @@ mod tests {
                 .payload(),
             &[0x0f, 4, 0x02, 1, 0x32, 0x20]
         );
-        // Coded PHY in the mask, and non-zero options, are unsupported.
+        // Coded PHY in the mask is unsupported (Core 5.4 7.8.49: 0x11).
         inject_cmd(0x2032, &[1, 0, 0, 0x04, 0x02, 0, 0]);
         assert!(runner.pump_once());
         assert_eq!(
             transport::try_receive_controller_packet()
                 .unwrap()
                 .payload(),
-            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+            &[0x0f, 4, 0x11, 1, 0x32, 0x20]
         );
+        // A Coded coding preference is legal even without Coded in the masks
+        // (Core 5.4 7.8.49); reserved option bits are invalid parameters.
         inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0x01, 0]);
         assert!(runner.pump_once());
         assert_eq!(
             transport::try_receive_controller_packet()
                 .unwrap()
                 .payload(),
-            &[0x0f, 4, 0x1f, 1, 0x32, 0x20]
+            &[0x0f, 4, 0, 1, 0x32, 0x20]
+        );
+        assert_eq!(runner.bridge.take_phy_request(), Some((2, 2)));
+        // End that procedure before the next command; its event is masked.
+        runner.bridge.set_masks(u64::MAX, 0x7ff & !(1 << 11));
+        runner.bridge.phy_update_complete(0, 2, 2).unwrap();
+        inject_cmd(0x2032, &[1, 0, 0, 0x02, 0x02, 0x04, 0]);
+        assert!(runner.pump_once());
+        assert_eq!(
+            transport::try_receive_controller_packet()
+                .unwrap()
+                .payload(),
+            &[0x0f, 4, 0x12, 1, 0x32, 0x20]
         );
         // Set Default PHY: a zero mask without "no preference" is unsupported.
         inject_cmd(0x2031, &[0, 0, 0x02]);
         assert!(runner.pump_once());
-        expect_command_complete(0x2031, 0x1f, &[]);
-        // A default of 2M in both directions fills the "no preference" side.
+        expect_command_complete(0x2031, 0x11, &[]);
+        // A 2M default must not leak into a Set PHY "no preference"
+        // direction: that covers every PHY the controller supports.
         inject_cmd(0x2031, &[0, 0x02, 0x02]);
         assert!(runner.pump_once());
         expect_command_complete(0x2031, 0, &[]);
@@ -3040,7 +3058,7 @@ mod tests {
                 .payload(),
             &[0x0f, 4, 0, 1, 0x32, 0x20]
         );
-        assert_eq!(runner.bridge.take_phy_request(), Some((2, 2)));
+        assert_eq!(runner.bridge.take_phy_request(), Some((0x03, 0x02)));
         runner.bridge.set_masks(u64::MAX, 0x7ff & !(1 << 11));
         runner.bridge.phy_update_complete(0, 2, 2).unwrap();
 
