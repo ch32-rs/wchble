@@ -8,6 +8,7 @@
 use bt_hci::transport::PacketKind;
 
 use crate::crypto::Aes128;
+use crate::ll::adv::DataOp;
 use crate::ll::dle::{LL_LEGACY_PAYLOAD, LL_LEGACY_TIME_US, LL_MAX_PLAINTEXT, LL_MAX_TIME_US};
 use crate::ll::privacy::{
     is_resolvable, Poll, Privacy, PrivacyStats, ResolvingEntry, MAX_FILTER_ACCEPT_LIST,
@@ -33,6 +34,12 @@ const HCI_UNKNOWN_CONNECTION: u8 = 0x02;
 const HCI_MEMORY_CAPACITY_EXCEEDED: u8 = 0x07;
 /// Unsupported Feature or Parameter Value.
 const HCI_UNSUPPORTED_FEATURE: u8 = 0x11;
+/// Unknown advertising identifier.
+const HCI_UNKNOWN_ADV_IDENTIFIER: u8 = 0x42;
+/// Advertising timeout (`LE Advertising Set Terminated` for duration).
+const HCI_ADVERTISING_TIMEOUT: u8 = 0x3c;
+/// Limit reached (`LE Advertising Set Terminated` for the event cap).
+const HCI_LIMIT_REACHED: u8 = 0x43;
 
 /// ACL data packet length reported by `LE Read Buffer Size`: the DLE maximum.
 const ACL_DATA_PACKET_LENGTH: u16 = super::connection::ACL_DATA_PACKET_LENGTH as u16;
@@ -147,6 +154,8 @@ pub struct SoftRunner {
     le_features: [u8; 8],
     /// `LE Set Default PHY` preferences for future connections (masks).
     default_phy: (u8, u8),
+    /// Own address type stored by `LE Set Extended Advertising Parameters`.
+    ext_own_addr_type: u8,
     /// Host's `LE Write Suggested Default Data Length` values.
     suggested_tx_octets: u16,
     suggested_tx_time: u16,
@@ -193,6 +202,7 @@ impl SoftRunner {
             bd_addr: DEFAULT_BD_ADDR,
             random_addr: None,
             adv_own_addr_type: OWN_ADDR_UNSET,
+            ext_own_addr_type: OWN_ADDR_UNSET,
             privacy: Privacy::new(),
             drbg: ChaCha20Drbg::from_seed(&[0u8; 32]),
             entropy_seeded: false,
@@ -622,14 +632,13 @@ impl SoftRunner {
 
     /// Selects the local address for the requested own address type
     /// (Core 5.4 Vol 4 Part E §7.8.5).
-    fn sync_adv_addr(&mut self, for_adv: bool) {
-        let own_type = self.adv_own_addr_type;
+    fn resolve_own_addr(&mut self, own_type: u8) -> ([u8; 6], bool, bool, bool) {
         let mut fallback = false;
         let mut uses_rpa = false;
         let (address, random) = match own_type {
             0 => (self.bd_addr, false),
             1 => (self.random_addr.unwrap_or([0; 6]), true),
-            2 | 3 => match self.ensure_local_rpa() {
+            2 | 3 => match self.ensure_local_rpa(own_type) {
                 Some(rpa) => {
                     uses_rpa = true;
                     (rpa, true)
@@ -649,6 +658,11 @@ impl SoftRunner {
                 None => (self.bd_addr, false),
             },
         };
+        (address, random, uses_rpa, fallback)
+    }
+
+    fn sync_adv_addr(&mut self, for_adv: bool) {
+        let (address, random, uses_rpa, fallback) = self.resolve_own_addr(self.adv_own_addr_type);
         self.ll.adv.own_addr = address;
         self.ll.adv.random_addr = random;
         if for_adv {
@@ -656,9 +670,16 @@ impl SoftRunner {
         }
     }
 
+    /// Resolve AdvA for the extended advertising set before use.
+    fn sync_ext_adv_addr(&mut self) {
+        let (address, random, _, _) = self.resolve_own_addr(self.ext_own_addr_type);
+        self.ll.ext_adv.own_addr = address;
+        self.ll.ext_adv.random_addr = random;
+    }
+
     /// Generates the first local RPA if the selected own type needs one.
-    fn ensure_local_rpa(&mut self) -> Option<[u8; 6]> {
-        if !matches!(self.adv_own_addr_type, 2 | 3) {
+    fn ensure_local_rpa(&mut self, own_type: u8) -> Option<[u8; 6]> {
+        if !matches!(own_type, 2 | 3) {
             return None;
         }
         for _ in 0..4 {
@@ -676,7 +697,17 @@ impl SoftRunner {
         match self.adv_own_addr_type {
             0 | 2 => true,
             1 => self.random_addr.is_some(),
-            3 => self.random_addr.is_some() || self.ensure_local_rpa().is_some(),
+            3 => self.random_addr.is_some() || self.ensure_local_rpa(3).is_some(),
+            _ => true,
+        }
+    }
+
+    /// Same readiness check for the extended set's own address.
+    fn ext_adv_address_available(&mut self) -> bool {
+        match self.ext_own_addr_type {
+            0 | 2 => true,
+            1 => self.random_addr.is_some(),
+            3 => self.random_addr.is_some() || self.ensure_local_rpa(3).is_some(),
             _ => true,
         }
     }
@@ -1206,6 +1237,9 @@ impl SoftRunner {
         // Revert to the documented defaults: empty resolving and filter accept
         // lists, resolution disabled, 900 s timeout.
         self.adv_own_addr_type = OWN_ADDR_UNSET;
+        // All advertising sets are cleared on HCI reset (Core 7.8.60 note).
+        self.ext_own_addr_type = OWN_ADDR_UNSET;
+        self.ll.ext_adv = crate::ll::adv::ExtAdvState::default();
         self.privacy = Privacy::new();
         // `LinkLayer::new` resets AdvA to a zero random address; restore the
         // selected own address even when only a public BD_ADDR is known.
@@ -1270,6 +1304,81 @@ impl SoftRunner {
                 };
                 self.log_command(opcode, status);
                 self.pending_reply = Some(transport::command_status_packet(opcode, status));
+                return;
+            }
+            // LE Set Extended Advertising Parameters (X2a: set 0 only).
+            0x2036 => {
+                let (status, selected) = self.set_ext_adv_params(params);
+                self.log_command(opcode, status);
+                let data: &[u8] = if status == HCI_SUCCESS {
+                    &[selected]
+                } else {
+                    &[]
+                };
+                self.pending_reply =
+                    Some(transport::command_complete_packet(opcode, status, &data));
+                return;
+            }
+            // LE Set Extended Advertising Data.
+            0x2037 => {
+                let status = self.set_ext_adv_data(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Set Extended Scan Response Data.
+            0x2038 => {
+                let status = self.set_ext_scan_rsp_data(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Set Extended Advertising Enable.
+            0x2039 => {
+                let status = self.set_ext_adv_enable(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Read Maximum Advertising Data Length: one AUX_ADV_IND.
+            0x203a => {
+                self.log_command(opcode, HCI_SUCCESS);
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &(crate::ll::adv::EXT_ADV_DATA_MAX as u16).to_le_bytes(),
+                ));
+                return;
+            }
+            // LE Read Number of Supported Advertising Sets.
+            0x203b => {
+                self.log_command(opcode, HCI_SUCCESS);
+                self.pending_reply = Some(transport::command_complete_packet(
+                    opcode,
+                    HCI_SUCCESS,
+                    &[1],
+                ));
+                return;
+            }
+            // LE Remove Advertising Set.
+            0x203c => {
+                let status = self.remove_adv_set(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Clear Advertising Sets.
+            0x203d => {
+                let status = self.clear_adv_sets(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
+                return;
+            }
+            // LE Set Advertising Set Random Address.
+            0x2035 => {
+                let status = self.set_adv_set_random_addr(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_complete_packet(opcode, status, &[]));
                 return;
             }
             0x0c03 if params.is_empty() => {
@@ -1523,7 +1632,10 @@ impl SoftRunner {
             // LE Set Advertise Enable
             0x200a if params.len() == 1 && params[0] <= 1 => {
                 let enable = params[0] != 0;
-                if enable && !self.adv_address_available() {
+                // Legacy and extended advertising are mutually exclusive.
+                if enable && self.ll.ext_adv.enabled {
+                    Err(HCI_COMMAND_DISALLOWED)
+                } else if enable && !self.adv_address_available() {
                     Err(HCI_INVALID_PARAMETERS)
                 } else {
                     if enable {
@@ -1650,8 +1762,8 @@ impl SoftRunner {
                 ));
                 return;
             }
-            // LE Set Ext Advertising / Scan Enable — legacy-only controller.
-            0x2039 | 0x2042 => Err(HCI_COMMAND_DISALLOWED),
+            // LE Set Extended Scan Enable — scanning is unimplemented.
+            0x2042 => Err(HCI_COMMAND_DISALLOWED),
             _ => Err(HCI_UNKNOWN_COMMAND),
         };
 
@@ -1849,6 +1961,260 @@ impl SoftRunner {
             .unwrap_or(HCI_UNKNOWN_CONNECTION)
     }
 
+    /// `LE Set Extended Advertising Parameters` (Core 7.8.53). X2a accepts
+    /// only set 0, non-connectable and non-scannable (Core 7.8.53):
+    /// handle(1) props(2) int_min(3) int_max(3) map(1) own(1) peer(1)
+    /// peer_addr(6) filter(1) tx_power(1) primary_phy(1) max_skip(1)
+    /// secondary_phy(1) adv_sid(1) scan_req_notify(1) = 25 octets.
+    fn set_ext_adv_params(&mut self, p: &[u8]) -> (u8, u8) {
+        if p.len() != 25 {
+            return (HCI_INVALID_PARAMETERS, 0);
+        }
+        if p[0] != 0 {
+            return (HCI_UNKNOWN_ADV_IDENTIFIER, 0);
+        }
+        if self.ll.ext_adv.enabled {
+            return (HCI_COMMAND_DISALLOWED, 0);
+        }
+        if u16::from_le_bytes([p[1], p[2]]) != 0 {
+            // Unsupported or invalid property combinations (7.8.53).
+            return (HCI_INVALID_PARAMETERS, 0);
+        }
+        let min = u32::from(p[3]) | u32::from(p[4]) << 8 | u32::from(p[5]) << 16;
+        let max = u32::from(p[6]) | u32::from(p[7]) << 8 | u32::from(p[8]) << 16;
+        // Core allows up to 0xFFFFFF; this stack keeps the legacy radio budget.
+        if !(0x20..=0x4000).contains(&min) || !(min..=0x4000).contains(&max) {
+            return (HCI_UNSUPPORTED_FEATURE, 0);
+        }
+        // Non-directed only: peer kind and address must be zero.
+        if p[11] != 0 || p[12..18] != [0; 6] {
+            return (HCI_INVALID_PARAMETERS, 0);
+        }
+        if p[9] == 0 || p[9] & !0x07 != 0 || p[10] > 3 || p[18] != 0 || p[23] > 0x0f || p[24] != 0 {
+            return (HCI_INVALID_PARAMETERS, 0);
+        }
+        // Primary stays 1M; the secondary channel carries 1M or 2M.
+        if p[20] != 0x01 || (p[22] != 0x01 && p[22] != 0x02) {
+            return (HCI_UNSUPPORTED_FEATURE, 0);
+        }
+        self.ext_own_addr_type = p[10];
+        let ext = &mut self.ll.ext_adv;
+        // No duty-cycle backoff: a min != max range runs at max.
+        ext.interval_slots = max as u16;
+        ext.channel_map = p[9];
+        ext.adv_sid = p[23];
+        ext.aux_phy = p[22];
+        ext.configured = true;
+        // Power is echoed, never programmed into the radio.
+        let selected = p[19];
+        (HCI_SUCCESS, selected)
+    }
+
+    /// Roll the Advertising DID randomly, never repeating the previous value
+    /// (Core Vol 6 Part B 4.4.2.11).
+    fn roll_ext_did(&mut self) {
+        let previous = self.ll.ext_adv.did;
+        for _ in 0..4 {
+            let mut bytes = [0u8; 2];
+            self.drbg.fill(&mut bytes);
+            let candidate = u16::from_le_bytes(bytes) & 0x0fff;
+            if candidate != previous {
+                self.ll.ext_adv.did = candidate;
+                return;
+            }
+        }
+        // The DRBG should not repeat four times; degrade to a step.
+        self.ll.ext_adv.did = (previous.wrapping_add(1)) & 0x0fff;
+    }
+
+    /// `LE Set Extended Advertising Data` (Core 7.8.54):
+    /// handle(1) operation(1) fragment_pref(1) len(1) data.
+    fn set_ext_adv_data(&mut self, p: &[u8]) -> u8 {
+        if p.len() < 4 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[0] != 0 || !self.ll.ext_adv.configured {
+            return HCI_UNKNOWN_ADV_IDENTIFIER;
+        }
+        let len = p[3] as usize;
+        if len != p.len() - 4 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        let op = match p[1] {
+            0x00 => Some(DataOp::Intermediate),
+            0x01 => Some(DataOp::First),
+            0x02 => Some(DataOp::Last),
+            0x03 => Some(DataOp::Complete),
+            0x04 => {
+                // Unchanged: enabled, no bytes, existing data (7.8.54); the
+                // point of the operation is a fresh DID.
+                if !self.ll.ext_adv.enabled || len != 0 || self.ll.ext_adv.data_len == 0 {
+                    return HCI_INVALID_PARAMETERS;
+                }
+                self.roll_ext_did();
+                return HCI_SUCCESS;
+            }
+            _ => None,
+        };
+        let Some(op) = op else {
+            return HCI_INVALID_PARAMETERS;
+        };
+        // Only Complete/Unchanged may carry data while enabled (7.8.54).
+        if self.ll.ext_adv.enabled && !matches!(op, DataOp::Complete) {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        // Any fragmenting operation needs at least one byte (7.8.54).
+        if !matches!(op, DataOp::Complete) && len == 0 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        match self.ll.ext_adv.append_adv_data(op, &p[4..4 + len]) {
+            Ok(()) => {}
+            Err(_) => return HCI_MEMORY_CAPACITY_EXCEEDED,
+        }
+        // Complete or Last finalize what the scanner receives; even an empty
+        // Complete is new data and must refresh the DID (4.4.2.11).
+        if matches!(op, DataOp::Complete | DataOp::Last) {
+            self.roll_ext_did();
+        }
+        HCI_SUCCESS
+    }
+
+    /// `LE Set Extended Scan Response Data`: this set is never scannable, so
+    /// non-empty data is invalid and empty data is a discard (7.8.55).
+    fn set_ext_scan_rsp_data(&mut self, p: &[u8]) -> u8 {
+        if p.len() < 4 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[0] != 0 || !self.ll.ext_adv.configured {
+            return HCI_UNKNOWN_ADV_IDENTIFIER;
+        }
+        let len = p[3] as usize;
+        if len != p.len() - 4 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if len != 0 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        HCI_SUCCESS
+    }
+
+    /// `LE Set Extended Advertising Enable` (Core 7.8.56):
+    /// enable(1) num_sets(1) [handle(1) duration(2) max_events(1)].
+    fn set_ext_adv_enable(&mut self, p: &[u8]) -> u8 {
+        if p.is_empty() {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[0] == 0 {
+            if p.len() != 2 || p[1] != 0 {
+                return HCI_INVALID_PARAMETERS;
+            }
+            self.ll.ext_adv.enabled = false;
+            return HCI_SUCCESS;
+        }
+        if p.len() != 6 || p[1] != 1 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[2] != 0 || !self.ll.ext_adv.configured {
+            return HCI_UNKNOWN_ADV_IDENTIFIER;
+        }
+        // Legacy and extended advertising are mutually exclusive.
+        if self.ll.adv.enabled {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        // A random own type needs a seeded address before going on air.
+        if !self.ext_adv_address_available() {
+            return HCI_INVALID_PARAMETERS;
+        }
+        self.sync_ext_adv_addr();
+        let ext = &mut self.ll.ext_adv;
+        ext.enabled = true;
+        ext.duration_10ms = u16::from_le_bytes([p[3], p[4]]);
+        ext.max_events = p[5];
+        ext.events_done = 0;
+        // The RF owner seeds the enable instant via `ext_adv_started`.
+        ext.enabled_at_us = 0;
+        HCI_SUCCESS
+    }
+
+    /// `LE Remove Advertising Set`.
+    fn remove_adv_set(&mut self, p: &[u8]) -> u8 {
+        if p.len() != 1 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[0] != 0 || !self.ll.ext_adv.configured {
+            return HCI_UNKNOWN_ADV_IDENTIFIER;
+        }
+        if self.ll.ext_adv.enabled {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        self.ll.ext_adv = crate::ll::adv::ExtAdvState::default();
+        HCI_SUCCESS
+    }
+
+    /// `LE Clear Advertising Sets`: refused while any set is enabled.
+    fn clear_adv_sets(&mut self, p: &[u8]) -> u8 {
+        if !p.is_empty() {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if self.ll.ext_adv.enabled {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        self.ll.ext_adv = crate::ll::adv::ExtAdvState::default();
+        HCI_SUCCESS
+    }
+
+    /// `LE Set Advertising Set Random Address`: handle(1) addr(6).
+    fn set_adv_set_random_addr(&mut self, p: &[u8]) -> u8 {
+        if p.len() != 7 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        if p[0] != 0 {
+            return HCI_UNKNOWN_ADV_IDENTIFIER;
+        }
+        self.random_addr = Some([p[1], p[2], p[3], p[4], p[5], p[6]]);
+        // A live set picks the new address up immediately (Core 7.8.52).
+        if self.ll.ext_adv.enabled {
+            self.sync_ext_adv_addr();
+        }
+        HCI_SUCCESS
+    }
+
+    /// Seed the enable instant for the extended-advertising duration
+    /// countdown; the RF owner calls this once when the set turns enabled.
+    pub fn ext_adv_started(&mut self, now_us: u32) {
+        self.ll.ext_adv.enabled_at_us = now_us;
+    }
+
+    /// Record a completed extended advertising event; true when the set
+    /// terminated (duration or event cap reached) and was disabled. The
+    /// `LE Advertising Set Terminated` event follows on termination.
+    pub fn ext_adv_round_done(&mut self, now_us: u32) -> bool {
+        let ext = &mut self.ll.ext_adv;
+        if !ext.round_done(now_us) {
+            return false;
+        }
+        // The event cap wins when both expire together.
+        let capped = ext.max_events != 0 && ext.events_done >= u32::from(ext.max_events);
+        let status = if capped {
+            HCI_LIMIT_REACHED
+        } else {
+            HCI_ADVERTISING_TIMEOUT
+        };
+        let num_completed = if ext.max_events != 0 {
+            ext.events_done as u8
+        } else {
+            0
+        };
+        ext.enabled = false;
+        if self.bridge.le_event_enabled(0x12) {
+            // Subevent 0x12: Status, Adv_Handle, Connection_Handle(2),
+            // Num_Completed_Extended_Advertising_Events (7.7.65.18).
+            let params = [0x12u8, status, 0, 0, 0, num_completed];
+            let _ = self.bridge.try_push_event(event_packet(0x3e, &params));
+        }
+        true
+    }
+
     fn enable_encryption(&mut self, params: &[u8]) -> u8 {
         // Connection_Handle 2 + Random_Number 8 + Encrypted_Diversifier 2 +
         // Long_Term_Key 16 = 28 octets (Core 5.4 Vol 4 Part E §7.8.24).
@@ -2036,6 +2402,416 @@ mod tests {
             assert_eq!(&pdu[2..8], &[0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01]);
             assert_eq!(&pdu[8..11], &[0x02, 0x01, 0x06]);
         });
+    }
+
+    /// Valid 0x2036 parameters: set 0, non-connectable, 1M primary, 2M AUX.
+    fn ext_adv_params_bytes(own_type: u8) -> [u8; 25] {
+        let mut p = [0u8; 25];
+        p[3..6].copy_from_slice(&[0x20, 0, 0]); // min interval (u24)
+        p[6..9].copy_from_slice(&[0x30, 0, 0]); // max interval
+        p[9] = 0x07; // channel map
+        p[10] = own_type;
+        p[19] = 0x7f; // tx power
+        p[20] = 0x01; // primary 1M
+        p[22] = 0x02; // secondary 2M
+        p[23] = 0x01; // SID
+        p
+    }
+
+    #[test]
+    fn ext_adv_params_validate_fields_and_echo_tx_power() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let params = ext_adv_params_bytes(0);
+
+        pollster::block_on(async {
+            let mut p = params;
+            p[0] = 1;
+            inject_cmd(0x2036, &p);
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2036, &params[..24]);
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_INVALID_PARAMETERS, &[]);
+
+            for (index, value, status) in [
+                (1, 0x01, HCI_INVALID_PARAMETERS),   // connectable property
+                (3, 0x10, HCI_UNSUPPORTED_FEATURE),  // min below 0x20
+                (9, 0x08, HCI_INVALID_PARAMETERS),   // bad channel map
+                (10, 0x04, HCI_INVALID_PARAMETERS),  // own address type
+                (11, 0x01, HCI_INVALID_PARAMETERS),  // directed peer type
+                (18, 0x01, HCI_INVALID_PARAMETERS),  // filter policy
+                (20, 0x03, HCI_UNSUPPORTED_FEATURE), // Coded primary
+                (22, 0x03, HCI_UNSUPPORTED_FEATURE), // Coded secondary
+                (23, 0x10, HCI_INVALID_PARAMETERS),  // SID range
+                (24, 0x01, HCI_INVALID_PARAMETERS),  // scan notification
+            ] {
+                let mut p = params;
+                p[index] = value;
+                inject_cmd(0x2036, &p);
+                runner.serve_one().await;
+                expect_command_complete(0x2036, status, &[]);
+            }
+            let mut p = params;
+            p[6..9].copy_from_slice(&[0x00, 0x50, 0x00]); // max 0x5000
+            inject_cmd(0x2036, &p);
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_UNSUPPORTED_FEATURE, &[]);
+
+            // Success echoes the requested tx power.
+            inject_cmd(0x2036, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+
+            // Parameters are immutable while the set is enabled.
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+            inject_cmd(0x2036, &params);
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_COMMAND_DISALLOWED, &[]);
+        });
+    }
+
+    #[test]
+    fn ext_adv_data_operations_overflow_and_did_rotation() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            // Before configuration the set does not exist.
+            inject_cmd(0x2037, &[0, 3, 0, 2, 0xAA, 0xBB]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+
+            // Declared length must match the payload.
+            inject_cmd(0x2037, &[0, 3, 0, 3, 0xAA, 0xBB]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_INVALID_PARAMETERS, &[]);
+
+            // Unknown operation, and fragments without bytes.
+            inject_cmd(0x2037, &[0, 5, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2037, &[0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_INVALID_PARAMETERS, &[]);
+
+            // Complete stores the fragment and rolls the DID (4.4.2.11).
+            let did_before = runner.ll.ext_adv.did;
+            inject_cmd(0x2037, &[0, 3, 0, 2, 0xAA, 0xBB]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_SUCCESS, &[]);
+            assert_eq!(runner.ll.ext_adv.data_len, 2);
+            assert_ne!(runner.ll.ext_adv.did, did_before);
+
+            // 240 + 6 exceeds the single-AUX limit of 245.
+            let mut big = [0u8; 244];
+            big[0] = 0;
+            big[1] = 3;
+            big[2] = 0;
+            big[3] = 240;
+            inject_cmd(0x2037, &big);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_SUCCESS, &[]);
+            inject_cmd(0x2037, &[0, 0, 0, 6, 1, 2, 3, 4, 5, 6]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_MEMORY_CAPACITY_EXCEEDED, &[]);
+            assert_eq!(runner.ll.ext_adv.data_len, 240);
+
+            // Unchanged requires the set to be enabled.
+            inject_cmd(0x2037, &[0, 4, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_INVALID_PARAMETERS, &[]);
+
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+
+            // First/Intermediate/Last would change on-air content mid-flight.
+            inject_cmd(0x2037, &[0, 1, 0, 1, 0xAA]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_COMMAND_DISALLOWED, &[]);
+            inject_cmd(0x2037, &[0, 0, 0, 1, 0xAA]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_COMMAND_DISALLOWED, &[]);
+            inject_cmd(0x2037, &[0, 2, 0, 1, 0xAA]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_COMMAND_DISALLOWED, &[]);
+
+            // Unchanged keeps the data and only refreshes the DID.
+            let data_len = runner.ll.ext_adv.data_len;
+            let did = runner.ll.ext_adv.did;
+            inject_cmd(0x2037, &[0, 4, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_SUCCESS, &[]);
+            assert_eq!(runner.ll.ext_adv.data_len, data_len);
+            assert_ne!(runner.ll.ext_adv.did, did);
+
+            // An empty Complete is still new data: it clears and rolls the DID.
+            let did = runner.ll.ext_adv.did;
+            inject_cmd(0x2037, &[0, 3, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_SUCCESS, &[]);
+            assert_eq!(runner.ll.ext_adv.data_len, 0);
+            assert_ne!(runner.ll.ext_adv.did, did);
+        });
+    }
+
+    #[test]
+    fn ext_adv_scan_rsp_data_accepts_only_empty() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x2038, &[0, 3, 0, 1, 0xAA]);
+            runner.serve_one().await;
+            expect_command_complete(0x2038, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+
+            inject_cmd(0x2038, &[0, 3, 0, 1, 0xAA]);
+            runner.serve_one().await;
+            expect_command_complete(0x2038, HCI_INVALID_PARAMETERS, &[]);
+
+            inject_cmd(0x2038, &[0, 3, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2038, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x2038, &[0, 3]);
+            runner.serve_one().await;
+            expect_command_complete(0x2038, HCI_INVALID_PARAMETERS, &[]);
+        });
+    }
+
+    #[test]
+    fn ext_adv_enable_guards_legacy_interlock_and_resolves_address() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let addr = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x01];
+
+        pollster::block_on(async {
+            // Enable before configuration.
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            // A random own type cannot go on air without a seeded address.
+            inject_cmd(0x2036, &ext_adv_params_bytes(1));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_INVALID_PARAMETERS, &[]);
+
+            // Random address: handle 0 only.
+            let mut p = [1u8, 0, 0, 0, 0, 0, 0];
+            p[0] = 1;
+            inject_cmd(0x2035, &p);
+            runner.serve_one().await;
+            expect_command_complete(0x2035, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+            let mut p = [0u8, 0, 0, 0, 0, 0, 0];
+            p[1..7].copy_from_slice(&addr);
+            inject_cmd(0x2035, &p);
+            runner.serve_one().await;
+            expect_command_complete(0x2035, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x2036, &ext_adv_params_bytes(1));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+
+            // One set only; enable form must be [enable, 1, handle, dur(2), max].
+            inject_cmd(0x2039, &[1, 2, 0, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2039, &[1, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_INVALID_PARAMETERS, &[]);
+            inject_cmd(0x2039, &[1, 1, 1, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+            assert!(runner.ll.ext_adv.enabled);
+            assert_eq!(runner.ll.ext_adv.own_addr, addr);
+            assert!(runner.ll.ext_adv.random_addr);
+
+            // Legacy and extended advertising are mutually exclusive.
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_COMMAND_DISALLOWED, &[]);
+            inject_cmd(0x2039, &[0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+
+            inject_cmd(0x200a, &[1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_COMMAND_DISALLOWED, &[]);
+            inject_cmd(0x200a, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x200a, HCI_SUCCESS, &[]);
+        });
+    }
+
+    #[test]
+    fn ext_adv_read_caps_remove_clear_and_reset_lifecycle() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+
+        pollster::block_on(async {
+            inject_cmd(0x203a, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x203a, HCI_SUCCESS, &(245u16).to_le_bytes());
+            inject_cmd(0x203b, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x203b, HCI_SUCCESS, &[1]);
+
+            // Remove/Clear on an unconfigured set.
+            inject_cmd(0x203c, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x203c, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+
+            inject_cmd(0x203c, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x203c, HCI_SUCCESS, &[]);
+            assert!(!runner.ll.ext_adv.configured);
+
+            // Remove also retires the unknown handle for later commands.
+            inject_cmd(0x2037, &[0, 3, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+
+            // Enabled sets refuse Remove and Clear (Core 7.8.57/7.8.60).
+            inject_cmd(0x203c, &[0]);
+            runner.serve_one().await;
+            expect_command_complete(0x203c, HCI_COMMAND_DISALLOWED, &[]);
+            inject_cmd(0x203d, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x203d, HCI_COMMAND_DISALLOWED, &[]);
+
+            inject_cmd(0x2039, &[0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+            inject_cmd(0x203d, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x203d, HCI_SUCCESS, &[]);
+            assert!(!runner.ll.ext_adv.configured);
+
+            // Reset retires the set too (Core 7.8.60 note).
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+            inject_cmd(0x0c03, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x0c03, HCI_SUCCESS, &[]);
+            inject_cmd(0x2037, &[0, 3, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2037, HCI_UNKNOWN_ADV_IDENTIFIER, &[]);
+        });
+    }
+
+    #[test]
+    fn ext_adv_terminated_event_reports_duration_limit_and_cap() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        // Subevent 0x12 rides the LE meta event: mask bit 17.
+        runner.bridge.set_masks(u64::MAX, 0x1f | (1 << 17));
+
+        pollster::block_on(async {
+            inject_cmd(0x2036, &ext_adv_params_bytes(0));
+            runner.serve_one().await;
+            expect_command_complete(0x2036, HCI_SUCCESS, &[0x7f]);
+            // Duration 1 x 10 ms, no event cap.
+            inject_cmd(0x2039, &[1, 1, 0, 1, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+        });
+
+        runner.ext_adv_started(1_000);
+        assert!(!runner.ext_adv_round_done(1_000 + 9_999));
+        assert!(transport::try_receive_controller_packet().is_none());
+        assert!(runner.ext_adv_round_done(1_000 + 10_000));
+        assert!(!runner.ll.ext_adv.enabled);
+        // The Terminated event rides the bridge queue until a pump.
+        assert!(runner.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(
+            &event.payload()[..8],
+            &[0x3e, 6, 0x12, HCI_ADVERTISING_TIMEOUT, 0, 0, 0, 0]
+        );
+
+        pollster::block_on(async {
+            // Three-event cap, unlimited duration.
+            inject_cmd(0x2039, &[1, 1, 0, 0, 0, 3]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+        });
+        runner.ext_adv_started(0);
+        assert!(!runner.ext_adv_round_done(1));
+        assert!(!runner.ext_adv_round_done(1));
+        assert!(runner.ext_adv_round_done(1));
+        assert!(runner.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(
+            &event.payload()[..8],
+            &[0x3e, 6, 0x12, HCI_LIMIT_REACHED, 0, 0, 0, 3]
+        );
+
+        // The cap wins when both limits expire together.
+        pollster::block_on(async {
+            inject_cmd(0x2039, &[1, 1, 0, 1, 0, 1]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+        });
+        runner.ext_adv_started(0);
+        assert!(runner.ext_adv_round_done(0));
+        assert!(runner.pump_once());
+        let event = transport::try_receive_controller_packet().unwrap();
+        assert_eq!(
+            &event.payload()[..8],
+            &[0x3e, 6, 0x12, HCI_LIMIT_REACHED, 0, 0, 0, 1]
+        );
+
+        // Without the LE meta mask bit the event is suppressed.
+        runner.bridge.set_masks(u64::MAX, 0x1f);
+        pollster::block_on(async {
+            inject_cmd(0x2039, &[1, 1, 0, 1, 0, 0]);
+            runner.serve_one().await;
+            expect_command_complete(0x2039, HCI_SUCCESS, &[]);
+        });
+        runner.ext_adv_started(0);
+        assert!(runner.ext_adv_round_done(10_000));
+        assert!(!runner.pump_once());
+        assert!(transport::try_receive_controller_packet().is_none());
     }
 
     fn connection_info() -> super::super::connection::ConnectionInfo {

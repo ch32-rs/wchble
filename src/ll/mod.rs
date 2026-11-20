@@ -28,6 +28,8 @@ pub enum Role {
 pub struct LinkLayer {
     pub role: Option<Role>,
     pub adv: adv::AdvState,
+    /// Extended advertising set 0 (X2a: non-connectable, non-scannable).
+    pub ext_adv: adv::ExtAdvState,
     pub conn: conn::ConnState,
 }
 

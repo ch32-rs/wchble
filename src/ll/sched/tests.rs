@@ -674,6 +674,62 @@ fn background_does_not_advance_link_events() {
     assert_eq!(table.link(link).unwrap().advances, 0);
 }
 
+#[test]
+fn ext_adv_dynamic_round_spans_admit_or_defer_against_a_link() {
+    // X2a §6: span = 600 µs offset + AUX air, dynamic in data length and
+    // AUX PHY; the scheduler window adds the 160 µs radio exit separately.
+    // The round runs only when its release clears the guard before the
+    // next link prepare, otherwise it defers to the link.
+    static DATA: [u8; 245] = [0; 245];
+    for (data_len, aux_phy, link_prepare, admitted) in [
+        (128, 0x01, 8_000, true),  // 1M: 600+1184
+        (245, 0x02, 8_000, true),  // 2M: 600+1064
+        (245, 0x01, 8_000, true),  // 1M: 600+2120
+        (245, 0x01, 3_000, false), // prepare lands inside the longest span
+        (128, 0x01, 2_500, false), // even the shortest span can be blocked
+    ] {
+        let mut state = crate::ll::adv::ExtAdvState::default();
+        state.enabled = true;
+        state.aux_phy = aux_phy;
+        state
+            .append_adv_data(crate::ll::adv::DataOp::Complete, &DATA[..data_len])
+            .unwrap();
+        let span = state.round_span_us(0);
+        match (data_len, aux_phy) {
+            (128, 0x01) => assert_eq!(span, 1_784),
+            (245, 0x02) => assert_eq!(span, 1_664),
+            _ => assert_eq!(span, 2_720),
+        }
+        let mut table = table();
+        insert(
+            &mut table,
+            FakeLink::new(
+                link_prepare,
+                link_prepare + 1_000,
+                link_prepare + 2_000,
+                50_000,
+            ),
+        );
+        table
+            .insert_background(background(1_000, 1_000 + span, 160), 0)
+            .unwrap();
+        let decision = table.select(1_000, 100_000);
+        if admitted {
+            let Decision::RunBackground { ticket, .. } = decision else {
+                panic!("expected background run for span {span}");
+            };
+            table.begin_background(ticket, 1_000).unwrap();
+        } else {
+            assert_eq!(
+                decision,
+                Decision::Idle {
+                    until_us: link_prepare
+                }
+            );
+        }
+    }
+}
+
 fn params(chsel: bool) -> ConnectParams {
     ConnectParams {
         peer_addr: [1, 2, 3, 4, 5, 6],
