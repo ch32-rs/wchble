@@ -2377,6 +2377,10 @@ fn main() -> ! {
     stop(&mut radio, &clock);
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
+    // X3 decision A: two-link pp builds advertise half the physical credit
+    // pool so two Host connections cannot overcommit the TX slots.
+    #[cfg(feature = "pp")]
+    soft.set_acl_credits_report(2);
     // The pp table is a different database; give it its own on-air identity so
     // a peer's cached GATT handles cannot cross the two layouts.
     #[cfg(any(feature = "pp", feature = "cp"))]
