@@ -28,17 +28,25 @@ def _load(name, path):
 
 gatt = _load('ch585_gatt_run', EXAMPLE / 'tools/run.py')
 io, PROBE, NM = gatt.io, gatt.PROBE, gatt.NM
+ext = _load('ch585_ext_adv_run', EXAMPLE / 'tools/ext_adv_run.py')
 SMOKE = gatt.SMOKE
 wait_until = gatt.wait_until
 read_client, stop_client = gatt.read_client, gatt.stop_client
 FAILURES = gatt.FAILURES
 STAT_NAMES, HOST_NAMES = gatt.STAT_NAMES, gatt.HOST_NAMES
+EXT_APK = ext.APK
+EXT_PACKAGE = ext.PACKAGE
 
 DEFAULT_ELF = EXAMPLE / 'target/riscv32imc-unknown-none-elf/release/ch585-trouble-gatt'
 NAME = 'wch585-p4'
 # PP background counters (example-owned slots, seen in pp_run.py).
 PP_FRAGMENT_FAILURES, PP_FRAGMENTS, PP_SKIPS = 45, 46, 47
+PP_BACKGROUND_OVERRUNS = 34
 FIRST_ANCHOR, EVENTS, RX_DONE, TX_LATE, CONNECT_FAIL = 15, 16, 7, 19, 30
+# Slot 39 is the TRACE row count under `pp` (written by trace() as
+# `put(39, count+1)`); secure_run's DIAG_START_RSP_QUEUED lives in SEC_DIAG,
+# a separate array. decode_trace expects this count.
+TRACE_COUNT = 39
 
 
 def evaluate_stats(obs, host, cycles):
@@ -58,6 +66,8 @@ def evaluate_stats(obs, host, cycles):
         errors.append('engine received no packets')
     if obs[TX_LATE] != 0:
         errors.append(f'TX_LATE={obs[TX_LATE]} (must be 0)')
+    if obs[PP_BACKGROUND_OVERRUNS] != 0:
+        errors.append(f'PP background overruns={obs[PP_BACKGROUND_OVERRUNS]} (must be 0)')
     if obs[CONNECT_FAIL] != 0:
         errors.append(f'CONNECT_FAIL={obs[CONNECT_FAIL]}')
     phase, connections, disconnects = host[0], host[1], host[2]
@@ -86,6 +96,7 @@ def execute(args):
     }
     client = None
     log = stderr_log = None
+    scan_started = None
     touched = False
     try:
         archived, smoke = args.out / 'firmware.elf', args.out / 'smoke.elf'
@@ -95,9 +106,11 @@ def execute(args):
         metadata['elf_sha256'] = hashlib.sha256(image).hexdigest()
         metadata['smoke_sha256'] = hashlib.sha256(smoke.read_bytes()).hexdigest()
         nm_text = io.command([NM, str(archived)], args.out / 'symbols.txt')
-        symbols = gatt.observation_symbols(nm_text, image)
+        symbols = (ext.observation_symbols(nm_text) if args.coex
+                   else gatt.observation_symbols(nm_text, image))
         metadata['symbols'] = symbols
-        metadata['ram_layout'] = gatt.validate_ram_layout(image, symbols)
+        metadata['ram_layout'] = (ext.validate_ram_layout(image, symbols) if args.coex
+                                  else gatt.validate_ram_layout(image, symbols))
         embedded = gatt.embedded_u32(image, symbols['RUN_SECONDS'])
         metadata['embedded_run_seconds'] = embedded
         if embedded != args.run_seconds:
@@ -111,9 +124,20 @@ def execute(args):
 
         touched = True
         try:
+            if args.coex:
+                ext.secure.adb(args.serial, 'get-state')
+                ext.secure.adb(args.serial, 'install', '-g', '-r', str(EXT_APK), timeout=120)
+                ext.secure.adb(args.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP')
+                ext.secure.adb(args.serial, 'shell', 'wm', 'dismiss-keyguard')
+                ext.secure.adb(args.serial, 'shell', 'logcat', '-c')
             io.flash(archived, args.out, 'test', check_idle=False)
         finally:
             safe_read_at = time.monotonic() + embedded + 3
+        if args.coex:
+            ext.secure.adb(args.serial, 'shell', 'am', 'start', '-n',
+                           f'{EXT_PACKAGE}/.MainActivity', '--es', 'mode', 'ext_scan')
+            scan_started = time.monotonic()
+            metadata['phone_scan_started'] = True
 
         client_args = [str(binary), '--cycles', str(args.cycles),
                        '--timeout', str(args.timeout), '--name', NAME]
@@ -135,6 +159,14 @@ def execute(args):
         metadata['client_summary'] = next(
             (row for row in reversed(rows) if row.get('event') == 'summary'), None)
         errors.extend(gatt.evaluate_client(rows, args.cycles, args.timeout, client.returncode))
+        if args.coex:
+            wait_until(scan_started + 22)
+            phone_log = ext.secure.adb(args.serial, 'logcat', '-d', '-s', 'WCHBLE', timeout=60)
+            (args.out / 'phone-logcat.txt').write_text(phone_log)
+            phone_errors, phone_detail = ext.read_ext_logcat(
+                args.out / 'phone-logcat.txt', 'x2-ext-adv-coex')
+            metadata['phone'] = phone_detail
+            errors.extend(phone_errors)
 
         wait_until(safe_read_at)
         observations = {}
@@ -147,16 +179,36 @@ def execute(args):
                 json.dumps(metadata[name.lower()], indent=2) + '\n')
         host = observations.get('HOST_STATS', [])
         stats = observations.get('STATS', [])
+        if 'TRACE' in symbols and len(stats) == 64:
+            # Rows 0..127 linear, then a 64-row ring survives; decode with the
+            # count so a long run still yields its latest 64 rows in order.
+            trace_rows = ext.secure.decode_trace(
+                io.read32(symbols['TRACE'], 128 * 8, args.out / 'trace.txt'),
+                stats[TRACE_COUNT])
+            metadata['trace'] = trace_rows
+            (args.out / 'trace.json').write_text(
+                json.dumps(trace_rows, indent=2) + '\n')
         errors.extend(evaluate_stats(stats, host, args.cycles))
         if len(stats) == 64:
             metadata['pp_bridge'] = {
                 'fragment_failures': stats[PP_FRAGMENT_FAILURES],
                 'fragments': stats[PP_FRAGMENTS],
                 'skips': stats[PP_SKIPS],
+                'overruns': stats[PP_BACKGROUND_OVERRUNS],
             }
+        if args.coex:
+            ext_words = io.read32(symbols['EXT_ADV_STATS'], 16,
+                                  args.out / 'ext_adv_stats.txt')
+            metadata['ext_adv_stats'] = dict(zip(ext.EXT_NAMES, ext_words))
+            errors.extend(ext.evaluate_ext(ext_words, 'x2-ext-adv-coex'))
     except FAILURES as error:
         errors.append(f'{type(error).__name__}: {error}')
     finally:
+        if args.coex:
+            try:
+                ext.secure.adb(args.serial, 'shell', 'am', 'force-stop', EXT_PACKAGE, timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                pass
         try:
             stop_client(client)
         except FAILURES as error:
@@ -190,6 +242,9 @@ def options(argv=None):
     parser.add_argument('--run-seconds', type=int, default=25)
     parser.add_argument('--cycles', type=int, default=1)
     parser.add_argument('--timeout', type=float, default=20)
+    parser.add_argument('--coex', action='store_true',
+                        help='run Android ext_scan concurrently with the Mac GATT central; ELF must use x2-ext-adv-coex')
+    parser.add_argument('--serial', default=ext.ADB_SERIAL)
     return parser.parse_args(argv)
 
 

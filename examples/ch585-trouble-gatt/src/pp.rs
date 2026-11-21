@@ -8,6 +8,7 @@ use core::convert::Infallible;
 use core::future::pending;
 
 use embassy_futures::join::join;
+#[cfg(not(feature = "x2-ext-adv-coex"))]
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use trouble_host::prelude::*;
@@ -77,7 +78,42 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             let first = accept(&mut peripheral, &server).await;
             stats.inc(host::STAT_CONNECTIONS);
             stats.phase(host::PHASE_CONNECTED);
-            // Keep advertising for the second slot while serving the first.
+            #[cfg(feature = "x2-ext-adv-coex")]
+            {
+                // Start X2a only after the connectable legacy advertiser has
+                // been dropped by `accept`; the link table then owns all RF.
+                let ext_task = async {
+                    let data = crate::beacon::marker();
+                    let params = AdvertisementParameters {
+                        primary_phy: PhyKind::Le1M,
+                        secondary_phy: PhyKind::Le1M,
+                        interval_min: embassy_time::Duration::from_millis(160),
+                        interval_max: embassy_time::Duration::from_millis(160),
+                        ..AdvertisementParameters::default()
+                    };
+                    let sets = [AdvertisementSet {
+                        params,
+                        data: Advertisement::ExtNonconnectableNonscannableUndirected {
+                            adv_data: &data,
+                            anonymous: false,
+                        },
+                        address: None,
+                    }];
+                    let mut handles = AdvertisementSet::handles(&sets);
+                    match peripheral.advertise_ext(&sets, &mut handles).await {
+                        Ok(_advertiser) => core::future::pending::<()>().await,
+                        Err(_) => stats.set(host::STAT_PHASE, host::PHASE_FATAL),
+                    }
+                };
+                let _ = embassy_futures::select::select(
+                    serve(&value, &uart_rx, &uart_tx, &first, None, stats),
+                    ext_task,
+                )
+                .await;
+                stats.inc(host::STAT_DISCONNECTS);
+                continue;
+            }
+            #[cfg(not(feature = "x2-ext-adv-coex"))]
             let second = match select(
                 accept(&mut peripheral, &server),
                 serve(&value, &uart_rx, &uart_tx, &first, None, stats),
@@ -90,7 +126,9 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     continue;
                 }
             };
+            #[cfg(not(feature = "x2-ext-adv-coex"))]
             stats.inc(host::STAT_CONNECTIONS);
+            #[cfg(not(feature = "x2-ext-adv-coex"))]
             match select(
                 serve(&value, &uart_rx, &uart_tx, &first, Some(&second), stats),
                 serve(&value, &uart_rx, &uart_tx, &second, Some(&first), stats),

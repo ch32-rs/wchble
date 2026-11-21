@@ -613,10 +613,40 @@ remain open and must not be read as verified:
 ## X2a extended advertising open items (2026-11-20)
 
 The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
-These remain open and must not be read as verified:
-- [ ] **X2a-3 coexistence round.** `aux_skip` keeps its stats slot but the N=1
-  runner only exercises the radio-exclusive path (counter stays 0); admission
-  and skip against a live link have no hardware round.
+X2a-3 coexistence passed N=1 on `ch585-x2a-3-coex`
+(`local-docs/results/x2a-3-coex-20261121.md`): a complete Mac GATT cycle with
+`TX_LATE=0` while extended advertising ran against the live link (`aux_skip=11`
+admission skips, Android byte-exact marker). The first three rounds' failure was
+a build-recipe artifact, not firmware logic: opt-z+`--icf=all` breaks the pp
+RX→TX response deadline. **2026-11-21 follow-up: the recipe split itself is
+closed** — opt-3 pairing no longer fails on the shared-link engine, so
+opt-z+ICF is retired project-wide and every example builds plain release
+(`local-docs/results/single-recipe-20261121.md`, clean round
+`s4-redissect-opt3-pair2-20261121`). Remaining open items:
+- [x] **Per-role build-recipe enforcement — resolved by retirement.** No
+  per-role profiles remain to enforce; keep `TX_LATE=0` as the on-target gate
+  and add the offline `.highcode` nm ownership check (design doc L0b in
+  `local-docs/ch585-build-recipe-hardening.md`) if a static preflight is
+  wanted.
+- [ ] **OTA slot size under the single recipe.** opt-3 without ICF is larger
+  than the already-overflowing opt-z+icf images (secure,privacy,rpa-fast
+  `.text` ≈ 306 KiB vs the 221,184 B slot); X6b size closure now needs
+  feature-dieting or link-section work, and any future OTA-only opt-z
+  override must be recorded as a size-driven choice, not timing.
+- [x] **Coex branch shared-path changes — resolved by review.** Of the three
+  un-cfg'd pp_loop edits, two are one reservation-pattern redesign kept as
+  shared improvements (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`
+  request-at-due): a plain-pp regression round on the branch
+  (`x2a-coex-pp-regress-20261121`, `passed=true`) matched the old-pattern
+  control rounds byte-for-byte on the client GATT cycle (5/13/10) with
+  TX_LATE=0 while zeroing the 16–23 background-overrun noise and cutting
+  fragment failures 6→4. The third edit (`Decision::Skipped` clearing
+  `adv_work`) was reverted: Skipped carries a LinkId (a skipped *connection*
+  event; background expiry is BackgroundMissed), so clearing the local
+  handle without `remove_background` desyncs the reservation table — the
+  regression rounds never exercised it (skips=0). Evidence:
+  `local-docs/results/x2a-3-coex-20261121.md` §4 and
+  `local-docs/tmp/x2a-coex-impl-review.md` F1.
 - [ ] **2M nRF Connect manual corroboration.** The 2M round is backed by the
   APK `secondary_phy=2` plus firmware `last_aux_phy=2`; no second-face manual
   capture was taken.

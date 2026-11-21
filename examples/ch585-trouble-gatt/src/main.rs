@@ -12,7 +12,7 @@ use qingke_rt::entry;
 use static_cell::StaticCell;
 use wchble::hci::connection::{ConnectionInfo, RadioRequest};
 use wchble::hci::SoftRunner;
-#[cfg(not(feature = "x2-ext-adv"))]
+#[cfg(any(not(feature = "x2-ext-adv"), feature = "pp"))]
 use wchble::ll::conn::ConnectParams;
 #[cfg(feature = "secure")]
 use wchble::ll::ctrl::FEATURE_LE_ENCRYPTION;
@@ -37,10 +37,8 @@ compile_error!("`pp` and `cp` are separate acceptance images; enable one");
 compile_error!("`cp` is a plaintext acceptance image; it cannot advertise LE encryption");
 #[cfg(all(feature = "x1b-2m", any(feature = "pp", feature = "cp")))]
 compile_error!("`x1b-2m` opens the Peripheral-only PHY procedure; Central links cannot claim 2M");
-#[cfg(all(feature = "x2-ext-adv", any(feature = "pp", feature = "cp")))]
-compile_error!(
-    "`x2-ext-adv` is a non-connectable beacon; `pp`/`cp` accept links that cannot arrive"
-);
+#[cfg(all(feature = "x2-ext-adv", feature = "cp"))]
+compile_error!("`x2-ext-adv` coexistence currently uses the PP Peripheral scheduler");
 
 #[cfg(feature = "x2-ext-adv")]
 mod beacon;
@@ -133,6 +131,8 @@ pub const EXT_DATA_LEN: usize = 9;
 pub const EXT_AUX_AIR_US: usize = 10;
 #[cfg(feature = "x2-ext-adv")]
 pub const EXT_AUX_SKIP: usize = 11;
+#[cfg(feature = "x2-ext-adv")]
+pub const EXT_MAX_OVERRUN_US: usize = 12;
 #[cfg(feature = "x2-ext-adv")]
 #[no_mangle]
 static mut EXT_ADV_STATS: [u32; EXT_ADV_STATS_WORDS] = [0; EXT_ADV_STATS_WORDS];
@@ -508,11 +508,13 @@ fn ext_adv_event(
     clock: &Clock,
     ext: &wchble::ll::adv::ExtAdvState,
     round: &mut u32,
+    selected_channel: Option<u8>,
     adv_buf: &mut DmaBuf<64>,
     aux_buf: &mut DmaBuf<257>,
-) {
+) -> bool {
     const PRIMARY_PREP_US: u32 = 300;
     const AUX_OFFSET_US: u32 = 600;
+    let mut completed = false;
     radio.set_aa_crc(0x8e89_bed6, 0x55_5555);
     let aux_phy = if ext.aux_phy & 0x02 != 0 {
         PhyMode::Rate2m
@@ -520,7 +522,9 @@ fn ext_adv_event(
         PhyMode::Rate1m
     };
     for channel in [37u8, 38, 39] {
-        if ext.channel_map & (1 << (channel - 37)) == 0 {
+        if selected_channel.is_some_and(|selected| selected != channel)
+            || ext.channel_map & (1 << (channel - 37)) == 0
+        {
             continue;
         }
         let aux_channel = wchble::ll::adv::ExtAdvState::aux_channel(*round);
@@ -552,7 +556,10 @@ fn ext_adv_event(
                 Some(primary_start.wrapping_add(AUX_OFFSET_US)),
             )
         } {
-            Ok(()) => ext_inc(EXT_AUX_TX),
+            Ok(()) => {
+                ext_inc(EXT_AUX_TX);
+                completed = true;
+            }
             Err(wchble::Error::Late) => ext_inc(EXT_AUX_LATE),
             Err(_) => stop(radio, clock),
         }
@@ -571,6 +578,7 @@ fn ext_adv_event(
         },
     );
     ext_put(EXT_AUX_AIR_US, ext.aux_air_us());
+    completed
 }
 
 type Session = wchble::ll::link::Session<Ch585Aes>;
@@ -1227,6 +1235,18 @@ fn pp_adv_channel(soft: &SoftRunner, index: &mut u8) -> u8 {
     37
 }
 
+#[cfg(feature = "x2-ext-adv-coex")]
+fn ext_primary_channel(channel_map: u8, index: &mut u8) -> u8 {
+    for _ in 0..3 {
+        let channel = 37 + *index;
+        *index = (*index + 1) % 3;
+        if channel_map & (1 << (channel - 37)) != 0 {
+            return channel;
+        }
+    }
+    37
+}
+
 /// X3.4a RF loop: the scheduler interleaves up to two links with a
 /// one-channel advertising fragment per interval.
 #[cfg(feature = "pp")]
@@ -1239,6 +1259,7 @@ fn pp_loop<F: Future>(
     rsp_buf: &mut DmaBuf<64>,
     rx: &mut DmaBuf<RX_DMA_MIN>,
     tx: &mut DmaBuf<MAX_PDU>,
+    #[cfg(feature = "x2-ext-adv-coex")] aux_buf: &mut DmaBuf<257>,
     mut app: Pin<&mut F>,
     app_stats: &host::HostStats,
     #[cfg(feature = "secure")] store: &mut DualCopyStore<Ch585DataFlash>,
@@ -1252,8 +1273,11 @@ fn pp_loop<F: Future>(
     };
     // One TX + bounded scan window + stop, admitted only inside a link gap.
     const ADV_SPAN_US: u32 = 900;
-    const ADV_EXIT_US: u32 = 160;
+    // Leave enough time for radio PHY restoration and scheduler bookkeeping
+    // after the AUX fragment; repeated coex overruns showed 160 us was too short.
+    const ADV_EXIT_US: u32 = 1_000;
     const SWITCH_GUARD_US: u32 = 300;
+    const ADV_SCHEDULE_LEAD_US: u32 = 10_000;
     // Acceptance counters in slots no other `pp` path writes: 45 fragment
     // failures, 46 fragments, 47 skips, 33 capacity rejects, 34 overruns.
     // The legacy CMD/MODE snapshot of 33/34 is cfg'd out under `pp`.
@@ -1261,13 +1285,42 @@ fn pp_loop<F: Future>(
     let mut links: LinkTable<SessionLink<Ch585Aes>, 2> = LinkTable::new(SWITCH_GUARD_US);
     let mut adv_work: Option<WorkId> = None;
     let mut adv_channel = 0u8;
+    #[cfg(feature = "x2-ext-adv-coex")]
+    let mut ext_round = 0u32;
+    #[cfg(feature = "x2-ext-adv-coex")]
+    let mut ext_seen_enabled = false;
     let mut next_adv = started;
     while !reached(clock.now_us(), finish) {
-        if adv_work.is_none() && soft.ll.adv.enabled {
+        #[cfg(feature = "x2-ext-adv-coex")]
+        let ext_enabled = soft.ll.ext_adv.enabled;
+        #[cfg(feature = "x2-ext-adv-coex")]
+        if ext_enabled && !ext_seen_enabled {
+            soft.ext_adv_started(clock.now_us());
+            ext_put(EXT_DID, u32::from(soft.ll.ext_adv.did));
+            ext_put(EXT_DATA_LEN, soft.ll.ext_adv.data_len as u32);
+            ext_seen_enabled = true;
+        } else if !ext_enabled {
+            ext_seen_enabled = false;
+        }
+        #[cfg(feature = "x2-ext-adv-coex")]
+        let background_enabled = soft.ll.adv.enabled || ext_enabled;
+        #[cfg(not(feature = "x2-ext-adv-coex"))]
+        let background_enabled = soft.ll.adv.enabled;
+        let now = clock.now_us();
+        if adv_work.is_none() && background_enabled && reached(now, next_adv) {
+            #[cfg(feature = "x2-ext-adv-coex")]
+            let span_us = if ext_enabled {
+                300u32.wrapping_add(soft.ll.ext_adv.round_span_us(0))
+            } else {
+                ADV_SPAN_US
+            };
+            #[cfg(not(feature = "x2-ext-adv-coex"))]
+            let span_us = ADV_SPAN_US;
+            let start_us = now.wrapping_add(ADV_SCHEDULE_LEAD_US);
             let window = BackgroundWindow {
                 kind: BackgroundKind::Advertising,
-                start_us: next_adv,
-                end_us: next_adv.wrapping_add(ADV_SPAN_US),
+                start_us,
+                end_us: start_us.wrapping_add(span_us),
                 exit_us: ADV_EXIT_US,
                 priority: 0,
             };
@@ -1275,7 +1328,19 @@ fn pp_loop<F: Future>(
                 Ok(id) => adv_work = Some(id),
                 Err(_) => {
                     inc(45);
-                    next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                    #[cfg(feature = "x2-ext-adv-coex")]
+                    if ext_enabled {
+                        ext_inc(EXT_AUX_SKIP);
+                    }
+                    #[cfg(feature = "x2-ext-adv-coex")]
+                    let interval_us = if soft.ll.ext_adv.enabled {
+                        u32::from(soft.ll.ext_adv.interval_slots) * 625
+                    } else {
+                        soft.adv_interval_us()
+                    };
+                    #[cfg(not(feature = "x2-ext-adv-coex"))]
+                    let interval_us = soft.adv_interval_us();
+                    next_adv = clock.now_us().wrapping_add(interval_us);
                 }
             }
         }
@@ -1351,16 +1416,83 @@ fn pp_loop<F: Future>(
                         park();
                     }
                 }
+                #[cfg(feature = "x2-ext-adv-coex")]
+                if ext_enabled {
+                    if let Some(work) = adv_work.take() {
+                        let _ = links.remove_background(work);
+                        ext_inc(EXT_AUX_SKIP);
+                        next_adv = clock
+                            .now_us()
+                            .wrapping_add(u32::from(soft.ll.ext_adv.interval_slots) * 625);
+                    }
+                }
             }
             Decision::RunBackground { ticket, .. } => {
                 if links.begin_background(ticket, now).is_err() {
                     let _ = links.cancel_background(ticket);
                     adv_work = None;
                     inc(45);
-                    next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                    #[cfg(feature = "x2-ext-adv-coex")]
+                    if ext_enabled {
+                        ext_inc(EXT_AUX_SKIP);
+                    }
+                    #[cfg(feature = "x2-ext-adv-coex")]
+                    let interval_us = if soft.ll.ext_adv.enabled {
+                        u32::from(soft.ll.ext_adv.interval_slots) * 625
+                    } else {
+                        soft.adv_interval_us()
+                    };
+                    #[cfg(not(feature = "x2-ext-adv-coex"))]
+                    let interval_us = soft.adv_interval_us();
+                    next_adv = clock.now_us().wrapping_add(interval_us);
                     continue;
                 }
+                #[cfg(feature = "x2-ext-adv-coex")]
+                let channel = if ext_enabled {
+                    ext_primary_channel(soft.ll.ext_adv.channel_map, &mut adv_channel)
+                } else {
+                    pp_adv_channel(soft, &mut adv_channel)
+                };
+                #[cfg(not(feature = "x2-ext-adv-coex"))]
                 let channel = pp_adv_channel(soft, &mut adv_channel);
+                #[cfg(feature = "x2-ext-adv-coex")]
+                let step = if soft.ll.ext_adv.enabled {
+                    let completed = ext_adv_event(
+                        radio,
+                        clock,
+                        &soft.ll.ext_adv,
+                        &mut ext_round,
+                        Some(channel),
+                        adv_buf,
+                        aux_buf,
+                    );
+                    if completed {
+                        let terminated = soft.ext_adv_round_done(clock.now_us());
+                        ext_inc(EXT_EVENTS);
+                        if terminated {
+                            ext_inc(EXT_TERMINATED);
+                        }
+                    }
+                    PpAdv::Idle
+                } else {
+                    pp_adv_fragment(
+                        radio,
+                        clock,
+                        soft,
+                        channel,
+                        adv_buf,
+                        rsp_buf,
+                        rx,
+                        app.as_mut(),
+                        app_stats,
+                        #[cfg(feature = "secure")]
+                        store,
+                        #[cfg(feature = "secure")]
+                        att_store,
+                        finish,
+                    )
+                };
+                #[cfg(not(feature = "x2-ext-adv-coex"))]
                 let step = pp_adv_fragment(
                     radio,
                     clock,
@@ -1378,7 +1510,8 @@ fn pp_loop<F: Future>(
                     finish,
                 );
                 let idle = clock.now_us();
-                if let Ok(wchble::ll::sched::CompleteResult::Overrun { .. }) = links
+                let hard_end_us = ticket.hard_end_us();
+                if let Ok(wchble::ll::sched::CompleteResult::Overrun { actual_end_us, .. }) = links
                     .complete_background(
                         ticket,
                         EventOutcome::Done {
@@ -1388,6 +1521,19 @@ fn pp_loop<F: Future>(
                     )
                 {
                     inc(34);
+                    #[cfg(feature = "x2-ext-adv-coex")]
+                    if ext_enabled {
+                        let overrun_us = actual_end_us.wrapping_sub(hard_end_us);
+                        let max = unsafe {
+                            core::ptr::addr_of!(EXT_ADV_STATS)
+                                .cast::<u32>()
+                                .add(EXT_MAX_OVERRUN_US)
+                                .read_volatile()
+                        };
+                        if overrun_us > max {
+                            ext_put(EXT_MAX_OVERRUN_US, overrun_us);
+                        }
+                    }
                 }
                 adv_work = None;
                 inc(46);
@@ -1436,15 +1582,38 @@ fn pp_loop<F: Future>(
                     PpAdv::Idle => {}
                     PpAdv::Finished => break,
                 }
-                next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                #[cfg(feature = "x2-ext-adv-coex")]
+                let interval_us = if soft.ll.ext_adv.enabled {
+                    u32::from(soft.ll.ext_adv.interval_slots) * 625
+                } else {
+                    soft.adv_interval_us()
+                };
+                #[cfg(not(feature = "x2-ext-adv-coex"))]
+                let interval_us = soft.adv_interval_us();
+                next_adv = clock.now_us().wrapping_add(interval_us);
             }
+            // A link event was skipped, not a background expiry: the
+            // reservation (if any) stays in the table until RunBackground
+            // or BackgroundMissed resolves it.
             Decision::Skipped { .. } => {
                 inc(47);
             }
             Decision::BackgroundMissed { .. } => {
                 adv_work = None;
                 inc(45);
-                next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                #[cfg(feature = "x2-ext-adv-coex")]
+                if ext_enabled {
+                    ext_inc(EXT_AUX_SKIP);
+                }
+                #[cfg(feature = "x2-ext-adv-coex")]
+                let interval_us = if soft.ll.ext_adv.enabled {
+                    u32::from(soft.ll.ext_adv.interval_slots) * 625
+                } else {
+                    soft.adv_interval_us()
+                };
+                #[cfg(not(feature = "x2-ext-adv-coex"))]
+                let interval_us = soft.adv_interval_us();
+                next_adv = clock.now_us().wrapping_add(interval_us);
             }
             Decision::Close { id, reason, .. } => {
                 stop(radio, clock);
@@ -2037,7 +2206,8 @@ fn cp_loop<F: Future>(
                 if bg_is_scan {
                     next_scan = clock.now_us().wrapping_add(1_000);
                 } else {
-                    next_adv = clock.now_us().wrapping_add(soft.adv_interval_us());
+                    let interval_us = soft.adv_interval_us();
+                    next_adv = clock.now_us().wrapping_add(interval_us);
                 }
                 if let Some((params, end)) = connected {
                     if bg_is_scan {
@@ -2389,7 +2559,7 @@ fn main() -> ! {
     let mut app = core::pin::pin!(pp::run(controller, &app_stats));
     #[cfg(feature = "cp")]
     let mut app = core::pin::pin!(cp::run(controller, &app_stats));
-    #[cfg(feature = "x2-ext-adv")]
+    #[cfg(all(feature = "x2-ext-adv", not(any(feature = "pp", feature = "cp"))))]
     let mut app = core::pin::pin!(beacon::run(controller, &app_stats, peripheral_address));
     #[cfg(not(any(feature = "pp", feature = "cp", feature = "x2-ext-adv")))]
     let mut app = core::pin::pin!(host::run(
@@ -2417,6 +2587,8 @@ fn main() -> ! {
             rsp_buf,
             rx,
             data,
+            #[cfg(feature = "x2-ext-adv-coex")]
+            aux_buf,
             app.as_mut(),
             &app_stats,
             #[cfg(feature = "secure")]
@@ -2551,6 +2723,7 @@ fn main() -> ! {
                 &clock,
                 &soft.ll.ext_adv,
                 &mut ext_round,
+                None,
                 adv_buf,
                 aux_buf,
             );
