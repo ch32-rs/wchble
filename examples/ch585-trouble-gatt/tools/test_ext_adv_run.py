@@ -59,13 +59,24 @@ class GateTests(unittest.TestCase):
             'adv_tx': 60, 'aux_tx': 60, 'aux_late': 0, 'rounds': 60,
             'events': 20, 'last_aux_channel': 5, 'last_aux_phy': 1,
             'terminated': 0, 'did': 1234, 'data_len': 128,
-            'aux_air_us': 1184, 'aux_skip': 0,
+            'aux_air_us': 1184, 'aux_skip': 0, 'max_overrun_us': 0,
         }
 
     def test_passing_round(self):
         self.assertEqual(ext_adv_run.evaluate_ext(
             [self.base_word()[name] for name in ext_adv_run.EXT_NAMES]
             + [0] * (16 - len(ext_adv_run.EXT_NAMES)), 'x2-ext-adv'), [])
+
+    def test_coex_accepts_scheduler_skips_but_keeps_rf_gates(self):
+        word = self.base_word()
+        word['aux_skip'] = 17
+        self.assertEqual(ext_adv_run.evaluate_ext(
+            [word[n] for n in ext_adv_run.EXT_NAMES] + [0] * 3,
+            'x2-ext-adv-coex'), [])
+        word['aux_late'] = 1
+        self.assertTrue(any('600-us window' in error for error in ext_adv_run.evaluate_ext(
+            [word[n] for n in ext_adv_run.EXT_NAMES] + [0] * 3,
+            'x2-ext-adv-coex')))
 
     def test_never_written(self):
         self.assertEqual(ext_adv_run.evaluate_ext([0] * 16, 'x2-ext-adv'),
@@ -87,7 +98,7 @@ class GateTests(unittest.TestCase):
             word = self.base_word()
             word[name] = value
             errors = ext_adv_run.evaluate_ext(
-                [word[n] for n in ext_adv_run.EXT_NAMES] + [0] * 4, 'x2-ext-adv')
+                [word[n] for n in ext_adv_run.EXT_NAMES] + [0] * 3, 'x2-ext-adv')
             self.assertTrue(any(needle in error for error in errors),
                             f'{name} gate missing: {errors}')
 

@@ -613,10 +613,22 @@ remain open and must not be read as verified:
 ## X2a extended advertising open items (2026-11-20)
 
 The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
-These remain open and must not be read as verified:
-- [ ] **X2a-3 coexistence round.** `aux_skip` keeps its stats slot but the N=1
-  runner only exercises the radio-exclusive path (counter stays 0); admission
-  and skip against a live link have no hardware round.
+The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
+X2a-3 coexistence passed N=1 on `ch585-x2a-3-coex`
+(`local-docs/results/x2a-3-coex-20261121.md`): a complete Mac GATT cycle with
+`TX_LATE=0` while extended advertising ran against the live link (`aux_skip=11`
+admission skips, Android byte-exact marker). The first three rounds' failure was
+a build-recipe artifact, not firmware logic: opt-z+`--icf=all` breaks the pp
+RX→TX response deadline — coexistence rounds must flash plain-release images
+(secure/bond and beacon rounds keep opt-z+icf). These remain open and must not
+be read as verified:
+- [ ] **Per-role build-recipe enforcement.** The manifest records `build.env`
+  but no runner compares it against the role's expected profile; a wrong
+  profile costs hardware rounds to diagnose. Declare allowed/banned profiles
+  per role and check at preflight.
+- [ ] **Coex branch shared-path changes.** Three un-cfg'd pp_loop edits
+  (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`, `Decision::Skipped` clearing
+  `adv_work`) change plain-pp behavior; confirm or cfg-gate before merge.
 - [ ] **2M nRF Connect manual corroboration.** The 2M round is backed by the
   APK `secondary_phy=2` plus firmware `last_aux_phy=2`; no second-face manual
   capture was taken.

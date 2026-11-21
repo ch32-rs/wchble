@@ -49,6 +49,9 @@ x1b-2m-peer = ["x1b-2m"]
 x2-ext-adv = ["trouble-host/extended-advertising"]
 # X2a second acceptance round: the AUX_ADV_IND carries LE 2M.
 x2-ext-adv-2m = ["x2-ext-adv"]
+# X2a-3 coexistence acceptance: start extended advertising after the first
+# inbound Peripheral connection and schedule AUX rounds in the PP link table.
+x2-ext-adv-coex = ["x2-ext-adv", "pp"]
 
 [dependencies]
 ch5xx-hal = { path = "../../../ch5xx-hal", features = ["ch585", "rt", "memory-x"], default-features = false }

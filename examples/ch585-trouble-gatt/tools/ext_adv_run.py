@@ -47,8 +47,9 @@ ADB_SERIAL = secure.ADB_SERIAL
 # EXT_ADV_STATS words (see main.rs for the writer side).
 EXT_NAMES = ('adv_tx', 'aux_tx', 'aux_late', 'rounds', 'events',
              'last_aux_channel', 'last_aux_phy', 'terminated', 'did',
-             'data_len', 'aux_air_us', 'aux_skip')
-EXPECTED_PHY = {'x2-ext-adv': 1, 'x2-ext-adv-2m': 2}
+             'data_len', 'aux_air_us', 'aux_skip', 'max_overrun_us')
+EXPECTED_PHY = {'x2-ext-adv': 1, 'x2-ext-adv-2m': 2,
+                'x2-ext-adv-coex': 1}
 
 
 def fixture_marker():
@@ -117,7 +118,7 @@ def evaluate_ext(ext, feature):
                       f"{word['aux_tx']}/{word['rounds']}")
     if word['aux_late']:
         errors.append(f"aux packets missed the 600-us window: {word['aux_late']}")
-    if word['aux_skip']:
+    if word['aux_skip'] and feature != 'x2-ext-adv-coex':
         errors.append(f"rounds were skipped: {word['aux_skip']}")
     if word['events'] < 10:
         errors.append(f"too few extended advertising events: {word['events']}")
