@@ -613,7 +613,6 @@ remain open and must not be read as verified:
 ## X2a extended advertising open items (2026-11-20)
 
 The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
-The advertiser subset is closed in `local-docs/results/x2a-ext-adv-20261120.md`.
 X2a-3 coexistence passed N=1 on `ch585-x2a-3-coex`
 (`local-docs/results/x2a-3-coex-20261121.md`): a complete Mac GATT cycle with
 `TX_LATE=0` while extended advertising ran against the live link (`aux_skip=11`
