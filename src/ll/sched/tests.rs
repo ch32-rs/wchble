@@ -636,6 +636,32 @@ fn a_missed_background_fragment_is_reported_and_removed() {
 }
 
 #[test]
+fn a_link_skip_leaves_an_admitted_background_reservation_in_place() {
+    // X2a-3 review F1: Skipped is a link event, not background expiry. The
+    // caller must keep its local reservation handle; only RunBackground or
+    // BackgroundMissed resolves the table's background entry.
+    let mut table = table();
+    let id = insert(
+        &mut table,
+        FakeLink::new(1_000, 1_100, 2_000, 50_000).step(50_000),
+    );
+    let work = table
+        .insert_background(background(2_000, 3_000, 100), 0)
+        .unwrap();
+    assert_eq!(
+        table.select(1_900, 100_000),
+        Decision::Skipped {
+            id,
+            reason: SkipReason::Late
+        }
+    );
+    let Decision::RunBackground { ticket, .. } = table.select(2_000, 100_000) else {
+        panic!("the background reservation did not survive the link skip");
+    };
+    assert_eq!(ticket.id(), work);
+}
+
+#[test]
 fn background_begin_rechecks_the_gap_against_a_new_link() {
     let mut table = table();
     table
