@@ -634,9 +634,16 @@ opt-z+ICF is retired project-wide and every example builds plain release
   `.text` ≈ 306 KiB vs the 221,184 B slot); X6b size closure now needs
   feature-dieting or link-section work, and any future OTA-only opt-z
   override must be recorded as a size-driven choice, not timing.
-- [ ] **Coex branch shared-path changes.** Three un-cfg'd pp_loop edits
-  (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`, `Decision::Skipped` clearing
-  `adv_work`) change plain-pp behavior; confirm or cfg-gate before merge.
+- [x] **Coex branch shared-path changes — resolved as shared improvements.**
+  The three un-cfg'd pp_loop edits (`ADV_EXIT_US` 160→1000,
+  `ADV_SCHEDULE_LEAD_US`, `Decision::Skipped` clearing `adv_work`) are one
+  reservation-pattern redesign (fixed-end windows → request-at-due with lead
+  time, cancel-on-skip). A plain-pp regression round on the branch
+  (`x2a-coex-pp-regress-20261121`, `passed=true`) matched the old-pattern
+  control rounds byte-for-byte on the GATT cycle while zeroing the 16–23
+  background-overrun noise and cutting fragment failures 6→4, at a −5%
+  fragment count from the larger exit margin. Keep un-cfg'd; evidence in
+  `local-docs/results/x2a-3-coex-20261121.md` §4.
 - [ ] **2M nRF Connect manual corroboration.** The 2M round is backed by the
   APK `secondary_phy=2` plus firmware `last_aux_phy=2`; no second-face manual
   capture was taken.
