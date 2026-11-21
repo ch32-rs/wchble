@@ -4,6 +4,8 @@
 //! connect. Writes to the shared characteristic are notified to every link;
 //! each connection's CCCD decides delivery.
 
+#[cfg(feature = "secure")]
+use core::cell::Cell;
 use core::convert::Infallible;
 use core::future::pending;
 
@@ -41,7 +43,10 @@ const PP_MODE_DUAL_LINK: u32 = 1;
 /// encrypted links resume from the store.
 #[cfg(feature = "secure")]
 struct PairingOwner {
-    dual_link: bool,
+    // Flips to dual-link in the same boot once the second bond persists
+    // (spec §3: "until two bonds are persisted" is not reboot-only), so the
+    // persist path mutates it through a shared borrow.
+    dual_link: Cell<bool>,
 }
 
 #[cfg(feature = "secure")]
@@ -58,11 +63,17 @@ impl PairingOwner {
                 PP_MODE_COMMISSIONING
             },
         );
-        Self { dual_link }
+        Self {
+            dual_link: Cell::new(dual_link),
+        }
     }
 
     fn allows_new_pairing(&self) -> bool {
-        !self.dual_link
+        !self.dual_link.get()
+    }
+
+    fn promote(&self) {
+        self.dual_link.set(true);
     }
 }
 
@@ -125,8 +136,9 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             Err(_) => crate::bond::bump(crate::bond::STAT_ADD_BOND_FAIL),
         }
     }
-    // The pairing owner is fixed at boot from the persisted bond count; a
-    // reset with fewer than two bonds returns to commissioning mode.
+    // The pairing owner starts from the persisted bond count; a reset with
+    // fewer than two bonds returns to commissioning mode, and persist_bond
+    // promotes it once the second bond lands in this same boot.
     #[cfg(feature = "secure")]
     let owner = PairingOwner::from_boot_bonds();
     // Hand a completed bond to the RF owner, which persists the snapshot
@@ -142,6 +154,12 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
             list
         });
         crate::bond::set_rl_expected_from_snapshot(&snapshot);
+        // Two persisted bonds close commissioning in this same boot (spec
+        // §3); without this the owner would keep admitting new pairings
+        // until the next reboot (PR #25 review P1).
+        if snapshot.len() >= 2 {
+            owner.promote();
+        }
         crate::bond::signals().set_pending(snapshot);
     };
     let mut runner = stack.runner();
@@ -240,7 +258,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        ),
+                    ),
                     ext_task,
                 )
                 .await;
@@ -312,7 +330,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        )
+                    )
                     .await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
@@ -327,7 +345,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        )
+                    )
                     .await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
