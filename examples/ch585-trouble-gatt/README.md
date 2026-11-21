@@ -542,9 +542,10 @@ with the feature right before the run (`tools/secure_run.py` refuses an ELF
 without the crypto backend):
 
 ```sh
-# S4 acceptance images must be opt-z + ICF; an opt-level 3 image loses the link at pairing.
-CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
-  cargo build --release --features secure,privacy,rpa-fast
+# Single recipe: plain release (opt-3, no ICF) for every role; see
+# local-docs/results/single-recipe-20261121.md (the old opt-z+ICF pairing ban
+# was obsolete on the shared-link engine).
+cargo build --release --features secure,privacy,rpa-fast
 python3 tools/secure_capture.py \
   --out local-docs/results/s2-run-<unique> \
   --sniffer /tmp/wchble-nrfutil-state-20261109/bin/nrfutil-ble-sniffer \
@@ -560,8 +561,7 @@ S4b uses a non-`rpa-fast` image so the RPA is stable for the sniffer, and needs
 a bond that already exists on both sides:
 
 ```sh
-CARGO_PROFILE_RELEASE_OPT_LEVEL=z RUSTFLAGS="-Clink-arg=--icf=all" \
-  cargo build --release --features secure,privacy,fal-filter
+cargo build --release --features secure,privacy,fal-filter
 python3 tools/secure_run.py \
   --out local-docs/results/s4b-<unique> \
   --run-seconds 60 --timeout 40 --mode fal --fal-settle 2 \

@@ -619,13 +619,21 @@ X2a-3 coexistence passed N=1 on `ch585-x2a-3-coex`
 `TX_LATE=0` while extended advertising ran against the live link (`aux_skip=11`
 admission skips, Android byte-exact marker). The first three rounds' failure was
 a build-recipe artifact, not firmware logic: opt-z+`--icf=all` breaks the pp
-RX→TX response deadline — coexistence rounds must flash plain-release images
-(secure/bond and beacon rounds keep opt-z+icf). These remain open and must not
-be read as verified:
-- [ ] **Per-role build-recipe enforcement.** The manifest records `build.env`
-  but no runner compares it against the role's expected profile; a wrong
-  profile costs hardware rounds to diagnose. Declare allowed/banned profiles
-  per role and check at preflight.
+RX→TX response deadline. **2026-11-21 follow-up: the recipe split itself is
+closed** — opt-3 pairing no longer fails on the shared-link engine, so
+opt-z+ICF is retired project-wide and every example builds plain release
+(`local-docs/results/single-recipe-20261121.md`, clean round
+`s4-redissect-opt3-pair2-20261121`). Remaining open items:
+- [x] **Per-role build-recipe enforcement — resolved by retirement.** No
+  per-role profiles remain to enforce; keep `TX_LATE=0` as the on-target gate
+  and add the offline `.highcode` nm ownership check (design doc L0b in
+  `local-docs/ch585-build-recipe-hardening.md`) if a static preflight is
+  wanted.
+- [ ] **OTA slot size under the single recipe.** opt-3 without ICF is larger
+  than the already-overflowing opt-z+icf images (secure,privacy,rpa-fast
+  `.text` ≈ 306 KiB vs the 221,184 B slot); X6b size closure now needs
+  feature-dieting or link-section work, and any future OTA-only opt-z
+  override must be recorded as a size-driven choice, not timing.
 - [ ] **Coex branch shared-path changes.** Three un-cfg'd pp_loop edits
   (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`, `Decision::Skipped` clearing
   `adv_work`) change plain-pp behavior; confirm or cfg-gate before merge.
