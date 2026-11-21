@@ -43,8 +43,9 @@ NAME = 'wch585-p4'
 PP_FRAGMENT_FAILURES, PP_FRAGMENTS, PP_SKIPS = 45, 46, 47
 PP_BACKGROUND_OVERRUNS = 34
 FIRST_ANCHOR, EVENTS, RX_DONE, TX_LATE, CONNECT_FAIL = 15, 16, 7, 19, 30
-# Slot 39 (DIAG_START_RSP_QUEUED) is cfg'd out under `pp` and reused as the
-# TRACE row count, matching secure_run's decode contract.
+# Slot 39 is the TRACE row count under `pp` (written by trace() as
+# `put(39, count+1)`); secure_run's DIAG_START_RSP_QUEUED lives in SEC_DIAG,
+# a separate array. decode_trace expects this count.
 TRACE_COUNT = 39
 
 

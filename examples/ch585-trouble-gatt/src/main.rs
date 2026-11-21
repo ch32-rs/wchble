@@ -1433,6 +1433,10 @@ fn pp_loop<F: Future>(
                     adv_work = None;
                     inc(45);
                     #[cfg(feature = "x2-ext-adv-coex")]
+                    if ext_enabled {
+                        ext_inc(EXT_AUX_SKIP);
+                    }
+                    #[cfg(feature = "x2-ext-adv-coex")]
                     let interval_us = if soft.ll.ext_adv.enabled {
                         u32::from(soft.ll.ext_adv.interval_slots) * 625
                     } else {
@@ -1588,22 +1592,11 @@ fn pp_loop<F: Future>(
                 let interval_us = soft.adv_interval_us();
                 next_adv = clock.now_us().wrapping_add(interval_us);
             }
+            // A link event was skipped, not a background expiry: the
+            // reservation (if any) stays in the table until RunBackground
+            // or BackgroundMissed resolves it.
             Decision::Skipped { .. } => {
-                adv_work = None;
                 inc(47);
-                #[cfg(feature = "x2-ext-adv-coex")]
-                if ext_enabled {
-                    ext_inc(EXT_AUX_SKIP);
-                }
-                #[cfg(feature = "x2-ext-adv-coex")]
-                let interval_us = if ext_enabled {
-                    u32::from(soft.ll.ext_adv.interval_slots) * 625
-                } else {
-                    soft.adv_interval_us()
-                };
-                #[cfg(not(feature = "x2-ext-adv-coex"))]
-                let interval_us = soft.adv_interval_us();
-                next_adv = clock.now_us().wrapping_add(interval_us);
             }
             Decision::BackgroundMissed { .. } => {
                 adv_work = None;
@@ -2169,13 +2162,6 @@ fn cp_loop<F: Future>(
                         connected = Some((params, end));
                     }
                 } else {
-                    #[cfg(feature = "x2-ext-adv-coex")]
-                    let channel = if ext_enabled {
-                        ext_primary_channel(soft.ll.ext_adv.channel_map, &mut adv_channel)
-                    } else {
-                        pp_adv_channel(soft, &mut adv_channel)
-                    };
-                    #[cfg(not(feature = "x2-ext-adv-coex"))]
                     let channel = pp_adv_channel(soft, &mut adv_channel);
                     match pp_adv_fragment(
                         radio,
@@ -2220,13 +2206,6 @@ fn cp_loop<F: Future>(
                 if bg_is_scan {
                     next_scan = clock.now_us().wrapping_add(1_000);
                 } else {
-                    #[cfg(feature = "x2-ext-adv-coex")]
-                    let interval_us = if soft.ll.ext_adv.enabled {
-                        u32::from(soft.ll.ext_adv.interval_slots) * 625
-                    } else {
-                        soft.adv_interval_us()
-                    };
-                    #[cfg(not(feature = "x2-ext-adv-coex"))]
                     let interval_us = soft.adv_interval_us();
                     next_adv = clock.now_us().wrapping_add(interval_us);
                 }
