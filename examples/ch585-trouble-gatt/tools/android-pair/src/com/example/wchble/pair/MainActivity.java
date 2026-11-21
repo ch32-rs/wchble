@@ -104,6 +104,10 @@ public class MainActivity extends Activity {
     private boolean controlWrite;
     private boolean done;
     private int reads;
+    // X3 one-drop-one-keep: extra reconnect write/read-back cycles so the
+    // runner can hold the phone link across the peer's disconnect.
+    private int gattCycle;
+    private int gattCycles = 1;
     private int scanReports;
     // ext_scan: raw extended-advertisement reports and marker-head matches.
     private int extReports;
@@ -430,12 +434,30 @@ public class MainActivity extends Activity {
                 return;
             }
             if (verifyRead) {
-                if (value != WRITE_VALUE) {
+                // Only the first read-back must echo our own write: in dual
+                // hold cycles the Mac concurrently writes the shared value,
+                // so a later read may legitimately hold its value instead.
+                if (value != WRITE_VALUE && gattCycle == 0) {
                     finishRun(false, "verify_mismatch");
                     return;
                 }
                 if ("privacy".equals(mode) && !rotationReconnected) {
                     beginRotationWait(g);
+                    return;
+                }
+                if ("reconnect".equals(mode) && gattCycle + 1 < gattCycles) {
+                    // X3 hold: another write/notify/read-back cycle keeps the
+                    // link busy across the other central's disconnect.
+                    gattCycle += 1;
+                    logEvent("\"event\":\"cycle\",\"index\":%d", gattCycle);
+                    characteristic.setValue(le32(WRITE_VALUE));
+                    characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                    boolean sent = g.writeCharacteristic(characteristic);
+                    logEvent("\"event\":\"write_requested\",\"ok\":%s,\"value\":%d",
+                            sent, WRITE_VALUE);
+                    if (!sent) {
+                        finishRun(false, "write_start_failed");
+                    }
                     return;
                 }
                 finishRun(true, reason());
@@ -467,6 +489,17 @@ public class MainActivity extends Activity {
                 onAttDescriptorWrite(descriptor, status);
                 return;
             }
+            if ("reconnect".equals(mode)) {
+                logEvent("\"event\":\"value_subscribed\",\"status\":%d", status);
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    finishRun(false, "cccd_write_failed");
+                    return;
+                }
+                if (!gatt.readCharacteristic(valueCharacteristic)) {
+                    finishRun(false, "read_start_failed");
+                }
+                return;
+            }
             if (!"hid".equals(mode) || descriptor.getCharacteristic() != hidReport) {
                 return;
             }
@@ -485,6 +518,7 @@ public class MainActivity extends Activity {
         public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic characteristic) {
             handleAttNotification(characteristic, characteristic.getValue());
             handleHidNotification(characteristic, characteristic.getValue());
+            handleValueNotification(characteristic, characteristic.getValue());
         }
 
         @Override
@@ -492,6 +526,7 @@ public class MainActivity extends Activity {
                                             byte[] value) {
             handleAttNotification(characteristic, value);
             handleHidNotification(characteristic, value);
+            handleValueNotification(characteristic, value);
         }
 
         @Override
@@ -511,6 +546,16 @@ public class MainActivity extends Activity {
                 return;
             }
             verifyRead = true;
+            if ("reconnect".equals(mode)) {
+                // X3: the write's own notify follows within a connection
+                // event or two; hold the read-back so the transcript sees it.
+                handler.postDelayed(() -> {
+                    if (!gatt.readCharacteristic(valueCharacteristic)) {
+                        finishRun(false, "verify_read_start_failed");
+                    }
+                }, 1500);
+                return;
+            }
             if (!g.readCharacteristic(characteristic)) {
                 finishRun(false, "verify_read_start_failed");
             }
@@ -534,6 +579,23 @@ public class MainActivity extends Activity {
             mode = requestedMode;
         }
         peerPhy = getIntent().getBooleanExtra("peer_phy", false);
+        // The runner passes gatt_cycles as an int extra (--ei); keep the
+        // string form working for --es callers.
+        int requestedCycles = getIntent().getIntExtra("gatt_cycles", 0);
+        if (requestedCycles == 0) {
+            String requestedText = getIntent().getStringExtra("gatt_cycles");
+            if (requestedText != null && !requestedText.isEmpty()) {
+                try {
+                    requestedCycles = Integer.parseInt(requestedText);
+                } catch (NumberFormatException ignored) {
+                    finishRun(false, "unknown_gatt_cycles");
+                    return;
+                }
+            }
+        }
+        if (requestedCycles > 0) {
+            gattCycles = Math.max(1, requestedCycles);
+        }
         logEvent("\"event\":\"mode\",\"mode\":\"%s\"", mode);
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
@@ -674,6 +736,14 @@ public class MainActivity extends Activity {
         }
         started = true;
         logEvent("\"event\":\"encrypted_gatt_start\"");
+        if ("reconnect".equals(mode)) {
+            // X3 pp+secure: the reconnect link must also prove encrypted
+            // notify delivery, so subscribe before the read/write cycle.
+            if (!subscribeValue(gatt)) {
+                finishRun(false, "cccd_write_start_failed");
+            }
+            return;
+        }
         if (!gatt.readCharacteristic(valueCharacteristic)) {
             finishRun(false, "read_start_failed");
         }
@@ -717,6 +787,35 @@ public class MainActivity extends Activity {
 
     private int controlCommand() {
         return le32Of(controlName());
+    }
+
+    /** X3: enable value notifications on the reconnect link. */
+    private boolean subscribeValue(BluetoothGatt g) {
+        if (!g.setCharacteristicNotification(valueCharacteristic, true)) {
+            logEvent("\"event\":\"subscribe_local\",\"ok\":false");
+            return false;
+        }
+        android.bluetooth.BluetoothGattDescriptor cccd =
+                valueCharacteristic.getDescriptor(CCCD);
+        if (cccd == null) {
+            logEvent("\"event\":\"cccd_missing\"");
+            return false;
+        }
+        cccd.setValue(android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        logEvent("\"event\":\"subscribe_local\",\"ok\":true");
+        return g.writeDescriptor(cccd);
+    }
+
+    private void handleValueNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
+        if (!"reconnect".equals(mode) || !VALUE.equals(characteristic.getUuid()) || value == null) {
+            return;
+        }
+        if (value.length < 4) {
+            return;
+        }
+        int parsed = (value[0] & 0xff) | ((value[1] & 0xff) << 8)
+                | ((value[2] & 0xff) << 16) | ((value[3] & 0xff) << 24);
+        logEvent("\"event\":\"notification\",\"value\":%d", parsed);
     }
 
     private static int le32Of(String text) {
@@ -946,7 +1045,7 @@ public class MainActivity extends Activity {
     }
 
     private void handleHidNotification(BluetoothGattCharacteristic characteristic, byte[] value) {
-        if (!"hid".equals(mode) || characteristic.getUuid() != HID_REPORT || value == null) {
+        if (!"hid".equals(mode) || !HID_REPORT.equals(characteristic.getUuid()) || value == null) {
             return;
         }
         hidNotifications += 1;

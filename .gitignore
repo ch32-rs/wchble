@@ -10,3 +10,6 @@
 # Closed-lib leftovers must never re-enter the tree.
 *.a
 *BLE_LIB.h
+
+# Locally built macOS pairing app (see tools/mac_pair.swift header for build).
+examples/ch585-trouble-gatt/tools/MacPair.app/

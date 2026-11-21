@@ -129,8 +129,6 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
     // reset with fewer than two bonds returns to commissioning mode.
     #[cfg(feature = "secure")]
     let owner = PairingOwner::from_boot_bonds();
-    #[cfg(feature = "secure")]
-    let commissioning = owner.allows_new_pairing();
     // Hand a completed bond to the RF owner, which persists the snapshot
     // between connection events (same flow as the single-link host).
     #[cfg(feature = "secure")]
@@ -242,9 +240,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        #[cfg(feature = "secure")]
-                        commissioning,
-                    ),
+                        ),
                     ext_task,
                 )
                 .await;
@@ -268,8 +264,6 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     stats,
                     #[cfg(feature = "secure")]
                     &persist_bond,
-                    #[cfg(feature = "secure")]
-                    commissioning,
                 ),
             )
             .await
@@ -293,8 +287,6 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     stats,
                     #[cfg(feature = "secure")]
                     &persist_bond,
-                    #[cfg(feature = "secure")]
-                    commissioning,
                 ),
                 serve(
                     &value,
@@ -305,8 +297,6 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                     stats,
                     #[cfg(feature = "secure")]
                     &persist_bond,
-                    #[cfg(feature = "secure")]
-                    commissioning,
                 ),
             )
             .await
@@ -322,9 +312,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        #[cfg(feature = "secure")]
-                        commissioning,
-                    )
+                        )
                     .await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
@@ -339,9 +327,7 @@ pub async fn run(controller: wchble::hci::SoftController, stats: &HostStats) -> 
                         stats,
                         #[cfg(feature = "secure")]
                         &persist_bond,
-                        #[cfg(feature = "secure")]
-                        commissioning,
-                    )
+                        )
                     .await;
                     stats.inc(host::STAT_DISCONNECTS);
                 }
@@ -399,13 +385,14 @@ async fn serve<P: PacketPool>(
     peer: Option<&GattConnection<'_, '_, P>>,
     stats: &HostStats,
     #[cfg(feature = "secure")] persist: &dyn Fn(&BondInformation),
-    #[cfg(feature = "secure")] commissioning: bool,
 ) {
-    // Commissioning may need the delayed peripheral Security Request to make
-    // a macOS central pair (host.rs rationale). Dual-link never asks.
+    // Ask every unencrypted central to encrypt after the central's own flow
+    // settles (host.rs Android WAIT_APP_RSP rationale): macOS never initiates
+    // on reconnect, and a bond-less peer answers with a pairing attempt that
+    // the boot-time owner refuses in dual mode (spec §6 3a).
     #[cfg(feature = "secure")]
     let mut security_deadline =
-        commissioning.then(|| Instant::now() + Duration::from_millis(SECURITY_REQUEST_DELAY_MS));
+        Some(Instant::now() + Duration::from_millis(SECURITY_REQUEST_DELAY_MS));
     loop {
         #[cfg(feature = "secure")]
         let event = {
