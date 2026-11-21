@@ -606,8 +606,13 @@ remain open and must not be read as verified:
   recorded `max_host_poll_us=562,467` with `host_poll_overrun=1`; the gate
   passed, but the Host poll budget inside pairing/security windows is not
   verified.
-- [ ] **Fresh-bond Gate 0.** Clearing the phone bond needs a manual Unpair
-  (Settings → gear → Unpair); the merged engine has no fresh-bond run yet.
+- [x] **Fresh-bond Gate 0 — closed 2026-11-21.** A wipe → fresh-phone-unpair →
+  pair round on the shared-link engine passed with every gate green
+  (`s4-redissect-opt3-pair2-20261121`: `load_result=0`, `pairs_complete=1`,
+  `tx_late=0`, encrypted GATT 9T/13R, `mic_failure=0`, runner `errors=[]`,
+  smoke restored). The manual-Unpair objection is also gone: the
+  `android-bt-settings` skill automates the Settings unpair flow for future
+  fresh-bond rounds.
 - [ ] **CC (two DUT centrals) and MultiCentPeri.** Outside the verified scope.
 
 ## X2a extended advertising open items (2026-11-20)
@@ -628,11 +633,20 @@ opt-z+ICF is retired project-wide and every example builds plain release
   and add the offline `.highcode` nm ownership check (design doc L0b in
   `local-docs/ch585-build-recipe-hardening.md`) if a static preflight is
   wanted.
-- [ ] **OTA slot size under the single recipe.** opt-3 without ICF is larger
-  than the already-overflowing opt-z+icf images (secure,privacy,rpa-fast
-  `.text` ≈ 306 KiB vs the 221,184 B slot); X6b size closure now needs
-  feature-dieting or link-section work, and any future OTA-only opt-z
-  override must be recorded as a size-driven choice, not timing.
+- [ ] **OTA slot size — strategy settled 2026-11-21, not a squeeze project.**
+  Single-recipe measurement (`objdump -p` LOAD span from slot base 0x4000):
+  default 175,868 B, pp 175,808 B, x2-ext-adv-coex 182,540 B — **all fit the
+  221,184 B slot with 39–45 KiB headroom**; secure 345,384 B and
+  secure,privacy,rpa-fast 352,940 B overflow by 124–132 KiB. The overflow is
+  entirely the secure family (SMP + crypto + trouble-host security ≈ 170 KiB).
+  Direction (user decision, same day): do not invest in squeezing the full
+  secure image into a doubled slot; instead (a) **feature-dieted OTA carrier
+  image** — a non-secure or trimmed feature set already fits twice with room
+  for a boot manager; and (b) consider the **vendor scheme layout**: WCH's
+  own OTA keeps the Bluetooth function code at a fixed low region and swaps
+  only the high-address firmware — the fixed region never changes across
+  updates, so the slot math is "swap region fits", not "two full images fit".
+  Per this decision an opt-z size override for OTA is off the table entirely.
 - [x] **Coex branch shared-path changes — resolved by review.** Of the three
   un-cfg'd pp_loop edits, two are one reservation-pattern redesign kept as
   shared improvements (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`
