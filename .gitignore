@@ -1,6 +1,7 @@
 /target
 /tools/ch585-preflight/target/
 /local-docs/
+__pycache__/
 **/*.rs.bk
 .DS_Store
 *.pdb

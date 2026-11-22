@@ -82,7 +82,8 @@ Raw captures and experiment records remain local; they are not required to build
   (`tx_late=0` on P3/C1). One P3 round (`x3-n1-p3b`) failed to finish
   (stage 2, runtime 0) and is retained as an unexplained observation. CRC-first
   establishment and the two-CRC-error event close are not yet fixed-point
-  tested on air; HID encrypted reports are not verified.
+  tested on air. HID encrypted reports were verified on 2026-11-22
+  (`local-docs/results/x6b-boot-manager-20261122.md` §4).
 - [x] **B5 — supervision timer at connection-update instants.** The timer now
   restarts at the instant's transmit window (`next_event`), but a deadline that
   was already reached before the instant is not extended by the new timeout;
@@ -530,8 +531,8 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
   never writes the report CCCD again, so a same-bond run showed
   `subscription_edges=0`. The firmware now restores the stored client ATT table
   itself, so reports flow without a new CCCD write; `android_hid_run.py
-  --expect restored` gates that phase on `CATT_STATS.restored` plus sent
-  reports (hardware run pending).
+  --expect restored` gates that phase on `CATT_STATS.restore_ok` plus sent
+  reports (hardware PASS 2026-11-22: `restore_ok=1`, 58 reports).
 - [ ] **The Android HID host needs an explicit connect trigger.** A bonded peer
   gets no background connection after a reboot, and an adapter cycle did not
   bring the HID host back. Tapping the paired keyboard in Bluetooth Settings
@@ -597,8 +598,13 @@ remain open and must not be read as verified:
 - [ ] **CP inbound existing-bond reconnect (X3.5c).**
 - [ ] **Total ACL credits per connection.** X3.3 stays a limited HCI subset;
   the end-to-end credit total is not accepted.
-- [ ] **HID encrypted report.** The unencrypted refusal gate passes; encrypted
-  reports remain NOT VERIFIED.
+- [x] **HID encrypted report — closed 2026-11-22.** With the `secure,accept-control`
+  image (`738b74df…`), a fresh-bond Android round produced `reports_sent=22`,
+  `subscription_edges=1`, `HOST security=3`, `SECURE active=1` and
+  enc/start counters 1/1/1/1 (`x6-hid-enc-20261122/payload2`); the same-session
+  restored round produced `CATT restore_ok=1`, `reports_sent=58` and
+  `pairs_complete=0` with `ltk_request=1` (`…/restored`). The platform
+  privileged-GATT limitation above is unchanged.
 - [ ] **Concurrent new pairing.** Pairing while two links are live is rejected
   at SMP with Pairing Failed 0x05 by design; a multi-link pairing path has no
   acceptance evidence.
@@ -647,6 +653,16 @@ opt-z+ICF is retired project-wide and every example builds plain release
   only the high-address firmware — the fixed region never changes across
   updates, so the slot math is "swap region fits", not "two full images fit".
   Per this decision an opt-z size override for OTA is off the table entirely.
+- [x] **X6b boot manager + A/B slots — done 2026-11-22.** 16 KiB boot manager
+  at 0x0, slot A 0x4000 / slot B 0x3A000, 32 B stamped headers, dual-copy
+  metadata at DataFlash 0x70000/0x70100, N=2 rollback, host stamping and
+  runner tools. Hardware R1–R8 PASS (slot pick, bad magic, bad header CRC,
+  never-good rollback, truncated good write, double-invalid park); normal
+  boot 22–23 ms. Boot validates headers only: CH585's flash-algorithm crate
+  exposes no CodeFlash read for this chip and long engine reads are
+  nondeterministic, so image integrity moves to the writer (X6c), matching
+  WCH's `BackupUpgrade_*` verify-on-write model. Evidence
+  `local-docs/results/x6b-boot-manager-20261122.md`.
 - [x] **Coex branch shared-path changes — resolved by review.** Of the three
   un-cfg'd pp_loop edits, two are one reservation-pattern redesign kept as
   shared improvements (`ADV_EXIT_US` 160→1000, `ADV_SCHEDULE_LEAD_US`

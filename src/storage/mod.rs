@@ -127,11 +127,23 @@ pub trait FlashRegion {
 
 /// Reflected CRC32 (IEEE 802.3), bitwise to keep the code small.
 pub fn crc32(data: &[u8]) -> u32 {
-    !crc32_update(0xFFFF_FFFF, data)
+    crc32_finish(crc32_update_impl(CRC32_INIT, data))
 }
 
-/// Continue a reflected CRC32; the caller passes the un-inverted state.
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+/// Start state for a streamed CRC (`crc32_update`/`crc32_finish`).
+pub const CRC32_INIT: u32 = 0xFFFF_FFFF;
+
+/// Continue a reflected CRC32 across chunks; pass the un-inverted state.
+pub fn crc32_update(state: u32, data: &[u8]) -> u32 {
+    crc32_update_impl(state, data)
+}
+
+/// Invert a streamed CRC state into the conventional CRC32 value.
+pub fn crc32_finish(state: u32) -> u32 {
+    !state
+}
+
+fn crc32_update_impl(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
