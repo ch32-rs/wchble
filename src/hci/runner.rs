@@ -165,6 +165,10 @@ pub struct SoftRunner {
     /// Most recent command that answered with a non-success status:
     /// `(opcode << 8) | status`, for firmware-side diagnostics.
     last_command_failure: Option<u32>,
+    /// ACL credits advertised to the Host. Capped by the RF owner (X3
+    /// decision A: two-link builds report 2; the physical pool stays
+    /// `connection::ACL_CREDITS`).
+    acl_credits_report: u8,
     /// Newest eight commands, each `(opcode << 8) | status`; the firmware
     /// dumps this to explain a Host that stopped on an HCI error.
     command_log: [u32; 8],
@@ -214,10 +218,19 @@ impl SoftRunner {
             suggested_tx_time: LL_LEGACY_TIME_US,
             suggested_tx_explicit: false,
             last_command_failure: None,
+            acl_credits_report: ACL_CREDITS,
             command_log: [0; 8],
             command_log_len: 0,
             sent_log: [0; 8],
             sent_log_len: 0,
+        }
+    }
+
+    /// Cap the ACL credits reported by `LE Read Buffer Size`. Values above
+    /// the physical pool are refused; the pool itself is unchanged.
+    pub fn set_acl_credits_report(&mut self, credits: u8) {
+        if usize::from(credits) <= super::connection::ACL_CREDITS {
+            self.acl_credits_report = credits;
         }
     }
 
@@ -1474,7 +1487,7 @@ impl SoftRunner {
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
-                    &[lo, hi, ACL_CREDITS],
+                    &[lo, hi, self.acl_credits_report],
                 ));
                 return;
             }
@@ -3999,6 +4012,43 @@ mod tests {
                     ACL_DATA_PACKET_LENGTH as u8,
                     (ACL_DATA_PACKET_LENGTH >> 8) as u8,
                     ACL_CREDITS,
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn acl_credits_report_cap_rejects_values_above_the_pool() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        // X3 decision A: a two-link owner halves the report; the pool itself
+        // stays at `connection::ACL_CREDITS`, so a larger ask is refused.
+        runner.set_acl_credits_report(2);
+
+        pollster::block_on(async {
+            inject_cmd(0x2002, &[]);
+            runner.serve_one().await;
+            expect_command_complete(
+                0x2002,
+                HCI_SUCCESS,
+                &[
+                    ACL_DATA_PACKET_LENGTH as u8,
+                    (ACL_DATA_PACKET_LENGTH >> 8) as u8,
+                    2,
+                ],
+            );
+
+            runner.set_acl_credits_report(super::super::connection::ACL_CREDITS as u8 + 1);
+            inject_cmd(0x2002, &[]);
+            runner.serve_one().await;
+            expect_command_complete(
+                0x2002,
+                HCI_SUCCESS,
+                &[
+                    ACL_DATA_PACKET_LENGTH as u8,
+                    (ACL_DATA_PACKET_LENGTH >> 8) as u8,
+                    2,
                 ],
             );
         });

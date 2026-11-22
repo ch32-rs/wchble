@@ -35,6 +35,23 @@ tell application "System Events"
 end tell
 '''
 
+# Diagnostic only: every visible window title, to see what the pairing
+# prompt actually looks like when the affirmative-button search misses.
+LIST_SCRIPT = r'''
+tell application "System Events"
+    set titles to {}
+    repeat with p in (every process whose background only is false)
+        try
+            repeat with w in windows of p
+                set end of titles to ((name of p) as text) & ": " & ((name of w) as text)
+            end repeat
+        end try
+    end repeat
+    set AppleScript's text item delimiters to "; "
+    return titles as text
+end tell
+'''
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -42,14 +59,22 @@ def main():
     args = parser.parse_args()
     deadline = time.monotonic() + args.seconds
     clicks = []
+    polls = 0
     while time.monotonic() < deadline:
+        polls += 1
         result = subprocess.run(['osascript', '-e', SCRIPT],
-                                capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
+                                 capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f'OSA-ERROR {result.stderr.strip()[:160]}', flush=True)
+        elif result.stdout.strip():
             clicks.append(result.stdout.strip())
             print('CLICK', result.stdout.strip(), flush=True)
+        if polls % 4 == 0:
+            listing = subprocess.run(['osascript', '-e', LIST_SCRIPT],
+                                      capture_output=True, text=True)
+            print('WINDOWS', listing.stdout.strip()[:400], flush=True)
         time.sleep(0.5)
-    print(f'clicks={len(clicks)}')
+    print(f'clicks={len(clicks)} polls={polls}')
     return 0
 
 
