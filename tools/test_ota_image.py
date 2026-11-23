@@ -293,26 +293,53 @@ class VerifyElfTest(unittest.TestCase):
 
     def test_boot_role_accepts_small_image(self):
         elf = make_elf(0, [(0, jal_body(0x80)),
-                           (0x100, 0x20000000, b"\x00" * 4)])
+                           (0x100, 0x20000080, b"\x00" * 4)],
+                       {"BOOT_STATS": 0x20000000})
         self.assertEqual(self.verify("boot", elf), 0)
 
     def test_boot_role_rejects_non_jal_vector(self):
         elf = make_elf(0, [(0, b"\x00" * 0x100),
-                           (0x100, 0x20000000, b"\x00" * 4)])
+                           (0x100, 0x20000080, b"\x00" * 4)],
+                       {"BOOT_STATS": 0x20000000})
         self.assertEqual(self.verify("boot", elf), 1)
 
     def test_boot_role_requires_highcode(self):
-        self.assertEqual(self.verify("boot", make_elf(0, [(0, b"\x00" * 64)])), 1)
+        self.assertEqual(
+            self.verify("boot", make_elf(0, [(0, b"\x00" * 64)],
+                                         {"BOOT_STATS": 0x20000000})), 1)
+
+    def test_boot_role_requires_boot_stats_in_the_window(self):
+        elf = make_elf(0, [(0, jal_body(0x80)),
+                           (0x100, 0x20000080, b"\x00" * 4)],
+                       {"BOOT_STATS": 0x20000100})
+        self.assertEqual(self.verify("boot", elf), 1)
+        elf = make_elf(0, [(0, jal_body(0x80)),
+                           (0x100, 0x20000080, b"\x00" * 4)])
+        self.assertEqual(self.verify("boot", elf), 1)
 
     def test_boot_role_rejects_entry(self):
         elf = make_elf(0x20, [(0, b"\x00" * 64),
-                              (0x40, 0x20000000, b"\x00" * 4)])
+                              (0x40, 0x20000080, b"\x00" * 4)],
+                       {"BOOT_STATS": 0x20000000})
         self.assertEqual(self.verify("boot", elf), 1)
 
     def test_boot_role_rejects_oversize(self):
         elf = make_elf(0, [(0, b"\x00" * 0x4000),
-                           (0x4000, 0x20000000, b"\x00" * 4)])
+                           (0x4000, 0x20000080, b"\x00" * 4)],
+                       {"BOOT_STATS": 0x20000000})
         self.assertEqual(self.verify("boot", elf), 1)
+
+    def test_slot_rejects_sram_below_the_reserved_window(self):
+        base = ota.SLOT_A_BASE + ota.ENTRY_OFFSET
+        elf = make_elf(base, [(base, jal_body()),
+                              (base + 0x40, 0x20000000, b"\x00" * 4)])
+        self.assertEqual(self.verify("slot-a", elf), 1)
+
+    def test_slot_accepts_sram_at_the_window_edge(self):
+        base = ota.SLOT_A_BASE + ota.ENTRY_OFFSET
+        elf = make_elf(base, [(base, jal_body()),
+                              (base + 0x40, 0x20000080, b"\x00" * 4)])
+        self.assertEqual(self.verify("slot-a", elf), 0)
 
 
 if __name__ == "__main__":

@@ -132,6 +132,17 @@ fn metadata_rejects_corruption() {
     assert_eq!(Metadata::decode(&raw), None);
 }
 
+#[test]
+fn metadata_rejects_impossible_fields() {
+    for (offset, value) in [(6, 2u8), (9, 7), (7, MAX_ATTEMPTS + 1)] {
+        let mut raw = META_GOLDEN;
+        raw[offset] = value;
+        let crc = crc32(&raw[..28]);
+        raw[28..32].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(Metadata::decode(&raw), None, "offset {offset}");
+    }
+}
+
 fn good(a_seq: u32) -> Option<Metadata> {
     Some(on_good(None, SLOT_A, a_seq))
 }
@@ -315,6 +326,46 @@ fn select_does_not_persist_an_unchanged_good_boot() {
             rollback: false
         }
     );
+    assert_eq!(decision.persist, None);
+}
+
+#[test]
+fn recovery_prefers_the_factory_slot_over_the_newest() {
+    let decision = select_recovery([true, true], [2, 9]);
+    assert_eq!(
+        decision.action,
+        BootAction::Boot {
+            slot: SLOT_A,
+            sequence: 2,
+            attempts_done: 1,
+            rollback: false
+        }
+    );
+    let meta = decision.persist.unwrap();
+    assert_eq!(meta.candidate_slot, SLOT_A);
+    assert_eq!(meta.candidate_seq, 2);
+    assert_eq!(meta.attempts_done, 1);
+    assert_eq!((meta.failed_seq_a, meta.failed_seq_b), (0, 0));
+}
+
+#[test]
+fn recovery_uses_b_when_a_is_invalid() {
+    let decision = select_recovery([false, true], [0, 9]);
+    assert_eq!(
+        decision.action,
+        BootAction::Boot {
+            slot: SLOT_B,
+            sequence: 9,
+            attempts_done: 1,
+            rollback: false
+        }
+    );
+}
+
+#[test]
+fn recovery_parks_when_no_slot_is_valid() {
+    let decision = select_recovery([false, false], [0, 0]);
+    assert_eq!(decision.action, BootAction::Park(ParkReason::NoValidSlot));
     assert_eq!(decision.persist, None);
 }
 

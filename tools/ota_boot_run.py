@@ -77,13 +77,15 @@ def assert_monotonic(downloads, failed):
         slot = entry["slot"]
         sequence = entry["sequence"]
         by_slot.setdefault(slot, []).append((name, sequence))
-        if sequence <= failed.get(slot, 0):
+        # Same wrap-safe rule as the firmware's `select`; 0 means "none".
+        limit = failed.get(slot, 0)
+        if limit and not _newer(sequence, limit):
             raise RunError(
-                f"{name}: sequence {sequence} <= failed_seq[{slot}] "
-                f"{failed.get(slot)}")
+                f"{name}: sequence {sequence} is not above failed_seq[{slot}] "
+                f"{limit}")
     for slot, items in by_slot.items():
         for (first, a), (second, b) in zip(items, items[1:]):
-            if b <= a:
+            if not _newer(b, a):
                 raise RunError(f"{slot}: {second} seq {b} not above {first} {a}")
 
 
@@ -252,8 +254,9 @@ def meta_gate(key, expected):
     return ("meta", key, expected)
 
 
-# R6 (both metadata copies corrupt) stays offline; the old streaming-CRC
-# rounds R0/R9 were dropped with the boot-time read-back approach.
+# R6 overwrites both metadata pages from device code (`poison-meta`), since
+# DataFlash cannot be written from the probe. The old streaming-CRC rounds
+# R0/R9 were dropped with the boot-time read-back approach.
 ROUNDS = {
     "R1": Round([
         Dl("boot"), Blank(SLOT_BASES["b"]), Dl("wipe"), Reset(), Wait(4.0),
@@ -296,6 +299,16 @@ ROUNDS = {
         stat_gate("slot_b_state", 6), meta_gate("active_slot", 0),
         meta_gate("good_seq", 2), scan_gate(0, "wch585-ota-a"),
     ], note="header CRC rejects a damaged sequence; the body is untouched"),
+    "R6": Round([
+        Dl("poison"), Reset(), Wait(4.0), Reset(),
+        Scan("wch585-ota-a"), Stats(), Dump(),
+    ], [
+        stat_gate("action", 0), stat_gate("selected", 0),
+        stat_gate("meta_load", 3), stat_gate("meta_save", 1),
+        meta_gate("active_slot", 0), meta_gate("good_seq", 2),
+        meta_gate("failed_seq_b", 0),
+        scan_gate(0, "wch585-ota-a"),
+    ], note="untrusted metadata boots the factory slot, not the newest"),
     "R7": Round([
         Dl("b5-fault"), Reset(), Stats(), Dump(),
         Reset(), Stats(), Dump(),

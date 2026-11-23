@@ -187,6 +187,13 @@ impl Metadata {
         if crc != crc32(&raw[..28]) {
             return None;
         }
+        // A CRC-valid record with impossible fields is still corrupt.
+        if !matches!(raw[6], SLOT_A | SLOT_B | NO_SLOT)
+            || !matches!(raw[9], SLOT_A | SLOT_B | NO_SLOT)
+            || raw[7] > MAX_ATTEMPTS
+        {
+            return None;
+        }
         Some(Metadata {
             candidate_slot: raw[6],
             attempts_done: raw[7],
@@ -341,6 +348,36 @@ pub fn select(meta: Option<Metadata>, valid: [bool; 2], seq: [u32; 2]) -> Decisi
             rollback,
         },
         persist: (meta != original).then_some(meta),
+    }
+}
+
+/// Pick a slot when no metadata record can be trusted: the factory slot wins.
+///
+/// Lost failure marks must not revive a foreign slot, so this never returns
+/// the higher sequence. The returned record is fresh and replaces the
+/// unreadable pages once persisted.
+pub fn select_recovery(valid: [bool; 2], seq: [u32; 2]) -> Decision {
+    let chosen = [SLOT_A, SLOT_B]
+        .into_iter()
+        .find(|&slot| valid[slot as usize] && seq[slot as usize] != 0);
+    let Some(slot) = chosen else {
+        return Decision {
+            action: BootAction::Park(ParkReason::NoValidSlot),
+            persist: None,
+        };
+    };
+    let mut meta = Metadata::default();
+    meta.candidate_slot = slot;
+    meta.candidate_seq = seq[slot as usize];
+    meta.attempts_done = 1;
+    Decision {
+        action: BootAction::Boot {
+            slot,
+            sequence: meta.candidate_seq,
+            attempts_done: 1,
+            rollback: false,
+        },
+        persist: Some(meta),
     }
 }
 

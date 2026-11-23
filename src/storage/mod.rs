@@ -122,6 +122,9 @@ pub trait FlashRegion {
     /// Erase the page containing `offset`.
     fn erase(&mut self, offset: u32) -> Result<(), FlashError>;
     /// Program `data` at `offset`; flash must already be erased.
+    ///
+    /// `data` must live in RAM: on CH585 the engine window must not read
+    /// CodeFlash, so a promoted constant (e.g. `&[0u8; 32]`) writes garbage.
     fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), FlashError>;
 }
 
@@ -204,6 +207,17 @@ impl Header {
 /// Sequence comparison that survives a 32-bit wrap.
 fn seq_after(a: u32, b: u32) -> bool {
     a.wrapping_sub(b) < 0x8000_0000
+}
+
+/// Outcome of [`DualCopyStore::load_checked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// A valid record; the payload length.
+    Record(usize),
+    /// Both pages are erased: the store was never written.
+    Empty,
+    /// No valid record, but at least one page is not blank.
+    Untrusted,
 }
 
 /// Two-slot store: every save goes to the slot that is not the current one.
@@ -320,18 +334,32 @@ impl<R: FlashRegion> DualCopyStore<R> {
     /// Returns the payload length, or `None` when both slots are empty or the
     /// newest record is a tombstone. A page with a bad header or payload CRC is
     /// treated as absent, so an interrupted save falls back to the older copy.
+    /// [`load_checked`](Self::load_checked) additionally separates blank flash
+    /// from pages that were written but cannot be decoded.
     pub fn load(&mut self, out: &mut [u8]) -> Result<Option<usize>, StoreError> {
+        match self.load_checked(out)? {
+            LoadOutcome::Record(len) => Ok(Some(len)),
+            LoadOutcome::Empty | LoadOutcome::Untrusted => Ok(None),
+        }
+    }
+
+    /// Load with the blank/untrusted distinction kept.
+    pub fn load_checked(&mut self, out: &mut [u8]) -> Result<LoadOutcome, StoreError> {
         match self.scan()? {
             None => {
                 self.active = None;
                 self.seq = 0;
-                Ok(None)
+                if self.pages_written()? {
+                    Ok(LoadOutcome::Untrusted)
+                } else {
+                    Ok(LoadOutcome::Empty)
+                }
             }
             Some((slot, header)) => {
                 self.active = Some(slot);
                 self.seq = header.seq;
                 if header.is_tombstone() {
-                    return Ok(None);
+                    return Ok(LoadOutcome::Empty);
                 }
                 let len = header.payload_len as usize;
                 if out.len() < len {
@@ -339,9 +367,29 @@ impl<R: FlashRegion> DualCopyStore<R> {
                 }
                 self.region
                     .read(self.slots[slot] + HEADER_LEN as u32, &mut out[..len])?;
-                Ok(Some(len))
+                Ok(LoadOutcome::Record(len))
             }
         }
+    }
+
+    /// True when either page holds a non-0xFF byte.
+    fn pages_written(&mut self) -> Result<bool, StoreError> {
+        const CHUNK: usize = 64;
+        let page = self.region.page_size();
+        let mut scratch = [0u8; CHUNK];
+        for slot in 0..2 {
+            let mut offset = 0usize;
+            while offset < page {
+                let count = (page - offset).min(CHUNK);
+                self.region
+                    .read(self.slots[slot] + offset as u32, &mut scratch[..count])?;
+                if scratch[..count].iter().any(|&byte| byte != 0xFF) {
+                    return Ok(true);
+                }
+                offset += count;
+            }
+        }
+        Ok(false)
     }
 
     fn write_record(&mut self, slot: usize, seq: u32, payload: &[u8]) -> Result<(), StoreError> {
@@ -665,6 +713,37 @@ mod tests {
         let mut out = [0u8; 64];
         assert_eq!(store.load(&mut out), Ok(None));
         assert_eq!(store.active_slot(), None);
+    }
+
+    #[test]
+    fn load_checked_separates_blank_from_untrusted() {
+        let mut store = store();
+        let mut out = [0u8; 64];
+        assert_eq!(store.load_checked(&mut out), Ok(LoadOutcome::Empty));
+        // A stray byte with no readable header means a lost record, not a
+        // fresh device.
+        store.region.data[3] = 0x00;
+        assert_eq!(store.load_checked(&mut out), Ok(LoadOutcome::Untrusted));
+    }
+
+    #[test]
+    fn load_checked_reports_undecodable_versions_as_untrusted() {
+        let mut store = store();
+        store.save(b"data").unwrap();
+        let slot = store.active_slot().unwrap();
+        store.region.data[slot * PAGE + 4] = 4;
+        let mut out = [0u8; 16];
+        assert_eq!(store.load_checked(&mut out), Ok(LoadOutcome::Untrusted));
+        assert_eq!(store.load(&mut out), Ok(None));
+    }
+
+    #[test]
+    fn load_checked_reports_tombstones_as_empty() {
+        let mut store = store();
+        store.save(b"data").unwrap();
+        store.clear().unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(store.load_checked(&mut out), Ok(LoadOutcome::Empty));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use ch5xx_hal as hal;
 use ch5xx_hal::flash::Flash;
 use qingke_rt::entry;
 use wchble::ota::{self, BootAction, Metadata, ParkReason};
-use wchble::storage::DualCopyStore;
+use wchble::storage::{DualCopyStore, LoadOutcome};
 use {panic_halt as _, portable_atomic as _};
 
 mod dataflash;
@@ -46,30 +46,53 @@ fn main() -> ! {
     }
 
     // One DataFlash borrow covers load and save; a bad record is "none".
+    // meta_load: 0 blank, 1 loaded, 2 record but bad payload, 3 untrusted
+    // pages, 4 read error.
     let mut load_state = 0u32;
     let mut save_state = 0u32;
     let mut store = DualCopyStore::new(HalDataFlash::new(flash.data_flash()), ota::METADATA_SLOTS);
     let mut payload = [0u8; ota::METADATA_LEN];
     let mut meta = None;
-    match store.load(&mut payload) {
-        Ok(Some(len)) if len == ota::METADATA_LEN => {
+    let mut untrusted = false;
+    match store.load_checked(&mut payload) {
+        Ok(LoadOutcome::Record(len)) if len == ota::METADATA_LEN => {
             match Metadata::decode(payload[..ota::METADATA_LEN].try_into().unwrap()) {
                 Some(record) => {
                     meta = Some(record);
                     load_state = 1;
                 }
-                None => load_state = 2,
+                None => {
+                    load_state = 2;
+                    untrusted = true;
+                }
             }
         }
-        Ok(Some(_)) | Err(_) => load_state = 2,
-        Ok(None) => {}
+        Ok(LoadOutcome::Record(_)) => {
+            load_state = 2;
+            untrusted = true;
+        }
+        Ok(LoadOutcome::Empty) => {}
+        Ok(LoadOutcome::Untrusted) => {
+            load_state = 3;
+            untrusted = true;
+        }
+        Err(_) => {
+            load_state = 4;
+            untrusted = true;
+        }
     }
 
     // Header validation only: the engine read path is not reliable enough
     // for a full-image CRC at boot (see ch585-ota-spec §3.3). Image integrity
     // is established by the writer and carried by the metadata good mark.
     let valid = [states[0] == SlotState::Valid, states[1] == SlotState::Valid];
-    let decision = ota::select(meta, valid, seq);
+    // Lost metadata must not revive a failed slot, so the factory slot wins
+    // until a fresh record is on flash (see ch585-ota-spec §3.3).
+    let decision = if untrusted {
+        ota::select_recovery(valid, seq)
+    } else {
+        ota::select(meta, valid, seq)
+    };
 
     // Persist the decision; a failed save fails closed (no jump).
     if let Some(next) = decision.persist {

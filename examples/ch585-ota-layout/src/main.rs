@@ -14,7 +14,7 @@ use wchble::rf::family::ch585::Ch585DataFlash;
 use wchble::rf::txrx::{DmaBuf, RX_DMA_MIN};
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::storage::DualCopyStore;
-#[cfg(feature = "wipe-meta")]
+#[cfg(any(feature = "wipe-meta", feature = "poison-meta"))]
 use wchble::storage::FlashRegion;
 use wchble::time::InstantUs;
 use {panic_halt as _, portable_atomic as _};
@@ -159,11 +159,29 @@ fn wipe_metadata() -> ! {
     halt();
 }
 
+/// Replace both metadata pages with non-blank garbage, then park.
+#[cfg(feature = "poison-meta")]
+fn poison_metadata() -> ! {
+    let mut region = Ch585DataFlash;
+    let mut payload = [0xAAu8; 32];
+    // The engine window must not read CodeFlash; keep the buffer in RAM
+    // instead of letting a constant be promoted to rodata.
+    core::hint::black_box(&mut payload);
+    for offset in ota::METADATA_SLOTS {
+        let _ = region.erase(offset);
+        // A page that is not blank but holds no record is "untrusted".
+        let _ = region.program(offset, &payload);
+    }
+    halt();
+}
+
 #[entry]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
     #[cfg(feature = "wipe-meta")]
     wipe_metadata();
+    #[cfg(feature = "poison-meta")]
+    poison_metadata();
     let clock = UsClock::start();
 
     let rx_dma = RX_DMA.init(DmaBuf::zeroed());

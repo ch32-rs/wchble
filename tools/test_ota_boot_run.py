@@ -95,6 +95,13 @@ class MonotonicTest(unittest.TestCase):
         with self.assertRaises(run.RunError):
             run.assert_monotonic(self.images(("b3", "b", 3)), {"b": 3})
 
+    def test_uses_the_firmware_wrap_rule(self):
+        # B was re-stamped across the 32-bit wrap.
+        run.assert_monotonic(self.images(("old", "b", 0xFFFF_FFF0),
+                                         ("new", "b", 5)), {})
+        run.assert_monotonic(self.images(("b1", "b", 1)),
+                             {"b": 0xFFFF_FFFE})
+
 
 class MetadataTest(unittest.TestCase):
     def test_picks_newest_page(self):

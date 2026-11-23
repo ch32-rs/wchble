@@ -50,6 +50,7 @@ OTA_SEQUENCE=3 cargo build --release --no-default-features --features slot-b \
 | `no-good` | Skip the good-mark save, so the boot manager rolls the slot back |
 | `ota-fault-mark-good` | Truncated good-mark write (`save_with_fault`), then halt |
 | `wipe-meta` | Erase both metadata pages, then park (the runner resets) |
+| `poison-meta` | Write non-blank garbage over both metadata pages, then park |
 
 `wipe-meta` is the round reset: the probe cannot write DataFlash on a running
 target, so metadata test states are reached through device code.

@@ -30,6 +30,9 @@ STORE_HEADER_LEN = 24
 EM_RISCV = 243
 PT_LOAD = 1
 SHT_SYMTAB = 2
+# The boot manager reserves the bottom of SRAM for BOOT_STATS.
+BOOT_STATS_BASE = 0x2000_0000
+BOOT_STATS_LEN = 0x80
 
 
 class ElfError(ValueError):
@@ -60,11 +63,16 @@ def parse_elf(path):
         raise ElfError("expected an executable ELF")
 
     segments = []
+    loads = []
     for i in range(e_phnum):
         offset = e_phoff + i * e_phentsize
         (p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz,
          _p_flags, _align) = struct.unpack_from("<IIIIIIII", data, offset)
-        if p_type == PT_LOAD and p_filesz:
+        if p_type != PT_LOAD or not p_memsz:
+            continue
+        # Zero-filesz loads (.bss) matter for address checks, not for images.
+        loads.append({"vaddr": p_vaddr, "memsz": p_memsz})
+        if p_filesz:
             if p_offset + p_filesz > len(data):
                 raise ElfError("segment runs past the file")
             segments.append({
@@ -105,6 +113,7 @@ def parse_elf(path):
     return {
         "entry": e_entry,
         "segments": segments,
+        "loads": loads,
         "sections": sections,
         "symbols": symbols,
         "data": data,
@@ -116,6 +125,13 @@ def flatten(elf, base, role):
     entry = base + ENTRY_OFFSET
     if elf["entry"] != entry:
         raise ElfError(f"entry {elf['entry']:#x} != {entry:#x} for {role}")
+    # A carrier whose SRAM starts at 0x2000_0000 clears BOOT_STATS, so every
+    # evidence read would come back zero even though the image boots.
+    for load in elf["loads"]:
+        start = load["vaddr"]
+        if start < BOOT_STATS_BASE + BOOT_STATS_LEN and \
+                start + load["memsz"] > BOOT_STATS_BASE:
+            raise ElfError(f"{role} load at {start:#x} overlaps BOOT_STATS")
     limit = base + SLOT_LEN
     end = 0
     for segment in elf["segments"]:
@@ -282,6 +298,13 @@ def decode_metadata(page):
         raise ElfError("not an OTAM payload")
     if struct.unpack_from("<I", payload, 28)[0] != crc32(payload[:28]):
         raise ElfError("metadata CRC mismatch")
+    # Same range checks as `Metadata::decode` in Rust.
+    if candidate > 1 and candidate != 0xFF:
+        raise ElfError(f"candidate_slot {candidate} is not 0, 1 or 0xFF")
+    if active > 1 and active != 0xFF:
+        raise ElfError(f"active_slot {active} is not 0, 1 or 0xFF")
+    if attempts > 2:
+        raise ElfError(f"attempts_done {attempts} exceeds the N=2 limit")
     return {
         "store_seq": store_seq,
         "candidate_slot": candidate,
@@ -313,6 +336,10 @@ def verify_elf(args):
             raise ElfError("boot vector is not a JAL (`j handle_reset`)")
         if flash_end > 0x3C00:
             raise ElfError(f"boot image reaches {flash_end:#x}, gate is 0x3C00")
+        stats = elf["symbols"].get("BOOT_STATS")
+        if stats is None or not (BOOT_STATS_BASE
+                                 <= stats[0] < BOOT_STATS_BASE + BOOT_STATS_LEN):
+            raise ElfError("BOOT_STATS is outside the reserved 128 B window")
         # `.highcode` is VMA in RAM (0x2000_0000), LMA in flash.
         highcode = [s for s in elf["segments"]
                     if s["vaddr"] >= 0x2000_0000 and s["paddr"] < 0x2000_0000]
