@@ -27,8 +27,9 @@ pages.
 3. Load metadata (`DualCopyStore`): blank flash is a fresh device; pages that
    were written but cannot be decoded are untrusted
 4. `ota::select()`; untrusted metadata uses `ota::select_recovery()`, which
-   picks the factory slot instead of the highest sequence, so lost failure
-   marks cannot revive a failed slot
+   picks the factory slot instead of the highest sequence and marks the other
+   valid slot failed at its current sequence, so the lost marks cannot revive
+   a failed slot (only a new sequence can)
 5. Persist `attempts_done` **before** jumping, fill `BOOT_STATS`, then
    `csrci mstatus,8; fence.i; jr slot_base+0x20`
 

@@ -353,9 +353,9 @@ pub fn select(meta: Option<Metadata>, valid: [bool; 2], seq: [u32; 2]) -> Decisi
 
 /// Pick a slot when no metadata record can be trusted: the factory slot wins.
 ///
-/// Lost failure marks must not revive a foreign slot, so this never returns
-/// the higher sequence. The returned record is fresh and replaces the
-/// unreadable pages once persisted.
+/// The other valid slot is marked failed at its current sequence because the
+/// physical marks are gone; losing them must not read as "no failure". Only a
+/// new sequence can revive that slot.
 pub fn select_recovery(valid: [bool; 2], seq: [u32; 2]) -> Decision {
     let chosen = [SLOT_A, SLOT_B]
         .into_iter()
@@ -370,6 +370,12 @@ pub fn select_recovery(valid: [bool; 2], seq: [u32; 2]) -> Decision {
     meta.candidate_slot = slot;
     meta.candidate_seq = seq[slot as usize];
     meta.attempts_done = 1;
+    let other = if slot == SLOT_A { SLOT_B } else { SLOT_A };
+    if valid[other as usize] && seq[other as usize] != 0 {
+        if let Some(failed) = meta.failed_mut(other) {
+            *failed = seq[other as usize];
+        }
+    }
     Decision {
         action: BootAction::Boot {
             slot,

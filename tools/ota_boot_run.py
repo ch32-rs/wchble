@@ -302,20 +302,21 @@ ROUNDS = {
     "R6": Round([
         Dl("poison"), Reset(), Wait(4.0), Reset(),
         Scan("wch585-ota-a"), Stats(), Dump(),
+        Reset(), Scan("wch585-ota-a"), Stats(), Dump(),
     ], [
         stat_gate("action", 0), stat_gate("selected", 0),
-        stat_gate("meta_load", 3), stat_gate("meta_save", 1),
+        stat_gate("meta_load", 1), stat_gate("meta_save", 0),
         meta_gate("active_slot", 0), meta_gate("good_seq", 2),
-        meta_gate("failed_seq_b", 0),
-        scan_gate(0, "wch585-ota-a"),
-    ], note="untrusted metadata boots the factory slot, not the newest"),
+        meta_gate("failed_seq_b", 6),
+        scan_gate(0, "wch585-ota-a"), scan_gate(1, "wch585-ota-a"),
+    ], note="untrusted metadata boots the factory slot and keeps B out"),
     "R7": Round([
-        Dl("b5-fault"), Reset(), Stats(), Dump(),
+        Dl("b7-fault"), Reset(), Stats(), Dump(),
         Reset(), Stats(), Dump(),
         Reset(), Scan("wch585-ota-a"), Stats(), Dump(),
     ], [
         stat_gate("action", 0), stat_gate("selected", 0),
-        stat_gate("rollback", 1), meta_gate("failed_seq_b", 5),
+        stat_gate("rollback", 1), meta_gate("failed_seq_b", 7),
         scan_gate(0, "wch585-ota-a"),
     ], note="truncated good-mark stays unseen; the attempt count survives"),
     "R8": Round([

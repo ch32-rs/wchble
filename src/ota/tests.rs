@@ -345,7 +345,8 @@ fn recovery_prefers_the_factory_slot_over_the_newest() {
     assert_eq!(meta.candidate_slot, SLOT_A);
     assert_eq!(meta.candidate_seq, 2);
     assert_eq!(meta.attempts_done, 1);
-    assert_eq!((meta.failed_seq_a, meta.failed_seq_b), (0, 0));
+    // The other slot's marks are physically gone; keep it out anyway.
+    assert_eq!((meta.failed_seq_a, meta.failed_seq_b), (0, 9));
 }
 
 #[test]
@@ -357,6 +358,24 @@ fn recovery_uses_b_when_a_is_invalid() {
             slot: SLOT_B,
             sequence: 9,
             attempts_done: 1,
+            rollback: false
+        }
+    );
+    let meta = decision.persist.unwrap();
+    assert_eq!((meta.failed_seq_a, meta.failed_seq_b), (0, 0));
+}
+
+#[test]
+fn recovery_keeps_the_other_slot_out_after_the_good_mark() {
+    let decision = select_recovery([true, true], [2, 3]);
+    // A boots and marks itself good; B's sequence is still higher.
+    let meta = on_good(decision.persist, SLOT_A, 2);
+    assert_eq!(
+        select(Some(meta), [true, true], [2, 3]).action,
+        BootAction::Boot {
+            slot: SLOT_A,
+            sequence: 2,
+            attempts_done: 0,
             rollback: false
         }
     );
