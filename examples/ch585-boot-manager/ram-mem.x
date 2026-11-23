@@ -1,5 +1,5 @@
-/* Compiler-generated PDU copies are on the same deadline as the radio code.
- * Extend qingke-rt's contiguous startup copy, rather than override memcpy. */
+/* Flash-engine calls must not fetch from CodeFlash while it is unlocked.
+ * Keep memcpy/memset in RAM so flash operations stay inside the window. */
 SECTIONS
 {
     .highcode_mem : ALIGN(4)

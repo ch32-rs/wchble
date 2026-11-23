@@ -133,6 +133,12 @@ class HeaderVectorTest(unittest.TestCase):
                 with self.assertRaises(ota.ElfError):
                     ota.check_header(bytes(broken))
 
+    def test_check_header_rejects_nonzero_reserved_tail(self):
+        raw = bytearray(HEADER_GOLDEN + golden_body())
+        raw[30] = 1
+        with self.assertRaises(ota.ElfError):
+            ota.check_header(bytes(raw))
+
     def test_check_header_rejects_sequence_zero(self):
         raw = bytearray(HEADER_GOLDEN + golden_body())
         struct.pack_into("<I", raw, 16, 0)
@@ -169,6 +175,14 @@ class MetadataVectorTest(unittest.TestCase):
         self.assertEqual(info["active_slot"], 0)
         self.assertEqual(info["candidate_seq"], 3)
         self.assertEqual(info["good_seq"], 2)
+
+    def test_decode_rejects_a_tombstone_page(self):
+        dead = bytearray(self.encode())
+        struct.pack_into("<H", dead, 12, 0)
+        struct.pack_into("<I", dead, 16, 0)
+        struct.pack_into("<I", dead, 20, ota.crc32(dead[:20]))
+        with self.assertRaises(ota.ElfError):
+            ota.decode_metadata(bytes(dead))
 
     def test_decode_rejects_corruption(self):
         for index in (0, 8, 20, 24, 30):

@@ -21,7 +21,6 @@ SCAN_TOOL = Path(__file__).resolve().parent.parent / "examples" / \
 SLOT_BASES = {"a": ota_image.SLOT_A_BASE, "b": ota_image.SLOT_B_BASE}
 METADATA_BASE = 0x70000  # DataFlash region base (not an image-header constant)
 METADATA_DUMP_LEN = 0x200  # both metadata pages
-FLAG_ROLLBACK = 1
 BOOT_MAGIC = 0x544F4F42  # "BOOT", matches `stats::BOOT_MAGIC`
 BOOT_VERSION = 1
 ELAPSED_WORD = 11  # `ELAPSED_US` in `stats.rs`
@@ -90,6 +89,11 @@ def assert_monotonic(downloads, failed):
 
 # ---------------------------------------------------------------- metadata
 
+def _newer(a, b):
+    """Wrap-safe `a` is newer than `b` (same rule as `select`)."""
+    return a != b and (a - b) & 0xFFFF_FFFF < 0x8000_0000
+
+
 def decode_pages(blob):
     """Return the newest valid metadata record in a 512 B two-page dump."""
     best = None
@@ -102,7 +106,7 @@ def decode_pages(blob):
         except ota_image.ElfError:
             continue
         record["page"] = index
-        if best is None or record["store_seq"] > best["store_seq"]:
+        if best is None or _newer(record["store_seq"], best["store_seq"]):
             best = record
     return best
 
@@ -184,9 +188,6 @@ class Probe:
         return {"name": name, "seen": result.returncode == 0,
                 "output": result.stdout.strip()}
 
-    def sweep(self, seconds=6):
-        return self.scan("wch585", seconds)
-
 
 # ---------------------------------------------------------------- rounds
 
@@ -251,6 +252,8 @@ def meta_gate(key, expected):
     return ("meta", key, expected)
 
 
+# R6 (both metadata copies corrupt) stays offline; the old streaming-CRC
+# rounds R0/R9 were dropped with the boot-time read-back approach.
 ROUNDS = {
     "R1": Round([
         Dl("boot"), Blank(SLOT_BASES["b"]), Dl("wipe"), Reset(), Wait(4.0),
@@ -349,7 +352,6 @@ def run_round(round_id, manifest, work_dir, probe):
     evidence = {"round": round_id, "started": time.time(), "steps": [],
                 "scans": [], "downloads": [], "stats": {}, "metadata": None,
                 "sha256": {}}
-    downloads = []
 
     def resolve(name):
         entry = manifest["boot"] if name == "boot" else manifest["images"][name]
@@ -379,8 +381,6 @@ def run_round(round_id, manifest, work_dir, probe):
             output = probe.download(image["path"], no_run=True)
             evidence["downloads"].append(name)
             evidence["sha256"][name] = image["sha256"]
-            if image.get("slot"):
-                downloads.append((name, image))
         elif step.kind == "blank":
             address = step.args[0]
             path = work_dir / f"blank-{address:x}.bin"

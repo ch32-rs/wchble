@@ -2,6 +2,7 @@
 """Offline tests for ota_boot_run.py; no probe, no Swift scan."""
 import importlib.util
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,19 @@ class MetadataTest(unittest.TestCase):
         bad[30] ^= 0xFF
         blob = bytes(bad) + page(store_seq=2)
         self.assertEqual(run.decode_pages(blob)["store_seq"], 2)
+
+    def test_ignores_tombstone_page(self):
+        dead = bytearray(page(store_seq=5))
+        struct.pack_into("<H", dead, 12, 0)
+        struct.pack_into("<I", dead, 16, 0)
+        struct.pack_into("<I", dead, 20, ota.crc32(dead[:20]))
+        blob = bytes(dead) + page(store_seq=2)
+        self.assertEqual(run.decode_pages(blob)["store_seq"], 2)
+
+    def test_newer_handles_sequence_wrap(self):
+        self.assertTrue(run._newer(5, 0xFFFF_FFF0))
+        self.assertFalse(run._newer(0xFFFF_FFF0, 5))
+        self.assertFalse(run._newer(3, 3))
 
     def test_none_when_both_invalid(self):
         self.assertIsNone(run.decode_pages(b"\xff" * 512))

@@ -43,9 +43,13 @@ static mut OTA_SLOT: [u32; 16] = [0; 16];
 const SLOT_MAGIC: u32 = 0x4f54_4102;
 
 fn slot_put(slot: usize, value: u32) {
-    // SAFETY: single-threaded example; only this task writes the array.
+    assert!(slot < 16);
+    // SAFETY: the assertion bounds the index; only this task writes the array.
     unsafe {
-        addr_of_mut!(OTA_SLOT).cast::<u32>().add(slot).write(value);
+        addr_of_mut!(OTA_SLOT)
+            .cast::<u32>()
+            .add(slot)
+            .write_volatile(value);
     }
 }
 
@@ -66,19 +70,28 @@ impl UsClock {
     }
 }
 
+impl UsClock {
+    fn now_ticks(&self) -> u32 {
+        hal::pac::SYSTICK.cntl().read().cntl()
+    }
+}
+
 impl InstantUs for UsClock {
     fn now_us(&self) -> u32 {
-        hal::pac::SYSTICK.cntl().read().cntl() / self.ticks_per_us
+        self.now_ticks() / self.ticks_per_us
     }
 
     fn delay_us(&self, us: u32) {
-        let start = self.now_us();
-        while self.now_us().wrapping_sub(start) < us {}
+        // Subtract raw ticks first: the divided value does not wrap with the counter.
+        let start = self.now_ticks();
+        let ticks = us.saturating_mul(self.ticks_per_us);
+        while self.now_ticks().wrapping_sub(start) < ticks {}
     }
 }
 
 /// Legacy ADV_NONCONN_IND: header + AdvA + flags + complete local name.
 fn build_adv(out: &mut [u8; 32]) -> usize {
+    const _: () = assert!(6 + 3 + 2 + NAME.len() <= 30);
     // Static random address C1:FF:EE:00:00:03, least-significant byte first.
     let adv_a = [0x03, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
     let mut payload = [0u8; 30];
@@ -197,7 +210,7 @@ fn main() -> ! {
         }
         unsafe {
             let count = addr_of_mut!(OTA_SLOT).cast::<u32>().add(11);
-            count.write(count.read().wrapping_add(1));
+            count.write_volatile(count.read_volatile().wrapping_add(1));
         }
         clock.delay_us(20_000);
     }

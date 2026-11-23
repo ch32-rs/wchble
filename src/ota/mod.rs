@@ -65,7 +65,7 @@ impl ImageHeader {
 
     /// In-memory form of a flat image with a stamped header.
     pub fn stamp(image: &mut [u8], sequence: u32, flags: u32) -> Result<(), HeaderError> {
-        let len = image.len() as u32;
+        let len = u32::try_from(image.len()).map_err(|_| HeaderError::BadLength)?;
         if len <= IMAGE_HEADER_LEN as u32 || len > MAX_IMAGE_LEN {
             return Err(HeaderError::BadLength);
         }
@@ -112,6 +112,10 @@ impl ImageHeader {
         let header_crc = u32::from_le_bytes(raw[24..28].try_into().unwrap());
         if header_crc != crc32(&raw[..24]) {
             return Err(HeaderError::BadHeaderCrc);
+        }
+        // The tail is outside the header CRC; both codecs require it zero.
+        if raw[28..32] != [0; 4] {
+            return Err(HeaderError::BadFormat);
         }
         Ok(header)
     }

@@ -23,12 +23,12 @@ pages.
 ## Boot flow
 
 1. `hal::init(HSE_PLL_78MHZ)` (flash engine clock), SysTick µs clock
-2. Load metadata (`DualCopyStore`); a bad record counts as none
-3. Read + validate both slot headers (magic/format/length/header CRC)
+2. Read + validate both slot headers (magic/format/length/header CRC)
+3. Load metadata (`DualCopyStore`); a bad record counts as none
 4. `ota::select()` → persist `attempts_done` **before** jumping
-6. Fill `BOOT_STATS`, then `csrci mstatus,8; fence.i; jr slot_base+0x20`
+5. Fill `BOOT_STATS`, then `csrci mstatus,8; fence.i; jr slot_base+0x20`
 
-`BOOT_STATS` (`extern "C"`, magic `0x544F_4F42`): slot states, sequences,
+`BOOT_STATS` (`#[no_mangle] static mut`, magic `0x544F_4F42`): slot states, sequences,
 selected slot, attempts, action, metadata load/save status, elapsed µs,
 rollback flag. Actions: `0` boot, `1` no valid slot, `2` all failed,
 `3` metadata write failed. Park states feed the watchdog and never reset.

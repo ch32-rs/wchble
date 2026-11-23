@@ -45,7 +45,8 @@ pub fn complete() {
 }
 
 pub fn put(slot: usize, value: u32) {
-    // SAFETY: single-threaded boot manager; only this core writes the array.
+    assert!(slot < 32);
+    // SAFETY: the assertion bounds the index; only this core writes the array.
     unsafe {
         let stats = core::ptr::addr_of_mut!(BOOT_STATS).cast::<u32>();
         stats.add(slot).write_volatile(value);

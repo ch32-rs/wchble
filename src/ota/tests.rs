@@ -71,6 +71,13 @@ fn header_rejects_bad_fields() {
 }
 
 #[test]
+fn header_rejects_a_nonzero_reserved_tail() {
+    let mut raw = HEADER_GOLDEN;
+    raw[30] = 1;
+    assert_eq!(ImageHeader::parse(&raw), Err(HeaderError::BadFormat));
+}
+
+#[test]
 fn header_crc_ignores_the_crc_fields() {
     // Re-stamping the same image must produce identical bytes twice.
     let mut image = image();

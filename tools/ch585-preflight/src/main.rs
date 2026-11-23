@@ -237,7 +237,11 @@ fn run() -> Result<(), (u8, String)> {
         let raw = algorithm_for(&target, *address)
             .ok_or((4, format!("no flash algorithm covers {address:#x}")))?
             .clone();
-        let sector_size = raw.flash_properties.page_size as u64;
+        // Sector, not page: probe-rs erases a whole sector per staged range.
+        let sector_size = raw
+            .flash_properties
+            .sector_info(*address)
+            .map_or(raw.flash_properties.page_size as u64, |sector| sector.size);
         let first = *address / sector_size * sector_size;
         let end = address + bytes.len() as u64;
         let mut patched = Vec::new();

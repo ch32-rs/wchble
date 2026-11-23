@@ -63,7 +63,7 @@ def parse_elf(path):
     for i in range(e_phnum):
         offset = e_phoff + i * e_phentsize
         (p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz,
-         _align) = struct.unpack_from("<IIIIIII", data, offset)[:7]
+         _p_flags, _align) = struct.unpack_from("<IIIIIIII", data, offset)
         if p_type == PT_LOAD and p_filesz:
             if p_offset + p_filesz > len(data):
                 raise ElfError("segment runs past the file")
@@ -109,12 +109,6 @@ def parse_elf(path):
         "symbols": symbols,
         "data": data,
     }
-
-
-def elf_section_addr(elf, name_hint):
-    # Section names need the shstrtab; the carrier uses fixed layouts, so
-    # callers pass name hints and we match by address range instead.
-    return [s for s in elf["sections"] if s["addr"] >= 0x20000000]
 
 
 def flatten(elf, base, role):
@@ -175,6 +169,8 @@ def check_header(raw, expect_sequence=None):
         raise ElfError("image truncated")
     if header_crc != crc32(raw[:24]):
         raise ElfError("header CRC mismatch")
+    if raw[28:32] != b"\x00" * 4:
+        raise ElfError("reserved header tail is not zero")
     body = bytearray(raw[:image_len])
     struct.pack_into("<I", body, 12, 0)
     struct.pack_into("<I", body, 24, 0)
@@ -264,6 +260,8 @@ def encode_metadata(args):
 
 
 def decode_metadata(page):
+    if len(page) < STORE_HEADER_LEN:
+        raise ElfError("store header truncated")
     magic, version, _flags, store_seq, payload_len, _pad, payload_crc = \
         struct.unpack_from("<IHHIHHI", page, 0)
     header_crc = struct.unpack_from("<I", page, 20)[0]
@@ -271,7 +269,11 @@ def decode_metadata(page):
         raise ElfError("not a BND3 record")
     if header_crc != crc32(page[:20]):
         raise ElfError("store header CRC mismatch")
+    if payload_len != METADATA_LEN:
+        raise ElfError(f"payload length {payload_len} != {METADATA_LEN}")
     payload = page[STORE_HEADER_LEN:STORE_HEADER_LEN + payload_len]
+    if len(payload) != payload_len:
+        raise ElfError("store payload truncated")
     if crc32(payload) != payload_crc:
         raise ElfError("store payload CRC mismatch")
     (meta_magic, meta_version, candidate, attempts, flags, active) = \
@@ -351,8 +353,9 @@ def main(argv=None):
     stamp_parser.add_argument("--hex", default=None)
 
     verify_parser = sub.add_parser("verify")
-    verify_parser.add_argument("--bin", dest="image", default=None)
-    verify_parser.add_argument("--hex", dest="hex_image", default=None)
+    inputs = verify_parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--bin", dest="image")
+    inputs.add_argument("--hex", dest="hex_image")
     verify_parser.add_argument("--slot", choices=("a", "b"), required=True)
     verify_parser.add_argument("--expect-sequence", type=int, default=None)
 

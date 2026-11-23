@@ -15,7 +15,7 @@ by this crate. `qingke-rt` needs `.init` (`j handle_reset`) at
 ## What it does
 
 1. `hal::init(rcc)` (HSE 60 MHz) and SysTick µs clock
-2. Radio init (`Ch585Radio::new` → `init`)
+2. Radio init (`new_radio_with_dma` → `init`)
 3. Load the boot metadata (`DualCopyStore` over DataFlash), apply
    `ota::on_good()`, save only when the record changes
 4. Record `OTA_SLOT` for a probe read, advertise
@@ -53,6 +53,9 @@ OTA_SEQUENCE=3 cargo build --release --no-default-features --features slot-b \
 
 `wipe-meta` is the round reset: the probe cannot write DataFlash on a running
 target, so metadata test states are reached through device code.
+
+The carrier marks the slot good right after radio init, before advertising.
+A production BLE app should mark good only once its stack and event loop run.
 
 ## Stamp and flash
 

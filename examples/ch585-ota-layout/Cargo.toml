@@ -14,7 +14,7 @@ slot-b = []
 no-good = []
 # Truncate the good-mark write (needs wchble's fault injection).
 ota-fault-mark-good = ["wchble/storage-fault"]
-# Erase both metadata pages, then reset (round reset between boot runs).
+# Erase both metadata pages, then park (round reset between boot runs).
 wipe-meta = []
 
 [dependencies]

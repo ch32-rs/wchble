@@ -18,43 +18,20 @@ mod stats;
 use dataflash::HalDataFlash;
 use slots::{SlotState, SLOT_BASES};
 
-fn now_us(ticks_per_us: u32) -> u32 {
-    hal::pac::SYSTICK.cntl().read().cntl() / ticks_per_us
+fn now_ticks() -> u32 {
+    hal::pac::SYSTICK.cntl().read().cntl()
 }
 
 #[entry]
 fn main() -> ! {
     let p = hal::init(hal::rcc::Config::HSE_PLL_78MHZ.into());
     let ticks_per_us = (hal::rcc::clocks().sysclk.0 / 1_000_000).max(1);
-    let started = now_us(ticks_per_us);
+    let started = now_ticks();
     stats::init();
 
     let mut flash = Flash::new(p.FLASHROM);
 
-    // Metadata first, in its own DataFlash borrow. A bad record is "none":
-    // the slots still define what can boot.
-    let mut load_state = 0u32;
-    let mut meta = None;
-    {
-        let mut store =
-            DualCopyStore::new(HalDataFlash::new(flash.data_flash()), ota::METADATA_SLOTS);
-        let mut payload = [0u8; ota::METADATA_LEN];
-        match store.load(&mut payload) {
-            Ok(Some(len)) if len == ota::METADATA_LEN => {
-                match Metadata::decode(payload[..ota::METADATA_LEN].try_into().unwrap()) {
-                    Some(record) => {
-                        meta = Some(record);
-                        load_state = 1;
-                    }
-                    None => load_state = 2,
-                }
-            }
-            Ok(Some(_)) | Err(_) => load_state = 2,
-            Ok(None) => {}
-        }
-    }
-
-    // Header pass.
+    // Header pass first: it borrows only CodeFlash.
     let mut states = [SlotState::Read; 2];
     let mut seq = [0u32; 2];
     {
@@ -68,6 +45,26 @@ fn main() -> ! {
         }
     }
 
+    // One DataFlash borrow covers load and save; a bad record is "none".
+    let mut load_state = 0u32;
+    let mut save_state = 0u32;
+    let mut store = DualCopyStore::new(HalDataFlash::new(flash.data_flash()), ota::METADATA_SLOTS);
+    let mut payload = [0u8; ota::METADATA_LEN];
+    let mut meta = None;
+    match store.load(&mut payload) {
+        Ok(Some(len)) if len == ota::METADATA_LEN => {
+            match Metadata::decode(payload[..ota::METADATA_LEN].try_into().unwrap()) {
+                Some(record) => {
+                    meta = Some(record);
+                    load_state = 1;
+                }
+                None => load_state = 2,
+            }
+        }
+        Ok(Some(_)) | Err(_) => load_state = 2,
+        Ok(None) => {}
+    }
+
     // Header validation only: the engine read path is not reliable enough
     // for a full-image CRC at boot (see ch585-ota-spec §3.3). Image integrity
     // is established by the writer and carried by the metadata good mark.
@@ -75,10 +72,7 @@ fn main() -> ! {
     let decision = ota::select(meta, valid, seq);
 
     // Persist the decision; a failed save fails closed (no jump).
-    let mut save_state = 0u32;
     if let Some(next) = decision.persist {
-        let mut store =
-            DualCopyStore::new(HalDataFlash::new(flash.data_flash()), ota::METADATA_SLOTS);
         match store.save(&next.encode()) {
             Ok(()) => save_state = 1,
             Err(_) => save_state = 2,
@@ -93,7 +87,7 @@ fn main() -> ! {
     stats::put(stats::META_SAVE, save_state);
     stats::put(
         stats::ELAPSED_US,
-        now_us(ticks_per_us).wrapping_sub(started),
+        now_ticks().wrapping_sub(started) / ticks_per_us,
     );
 
     match decision.action {
