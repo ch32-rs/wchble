@@ -6,6 +6,19 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["slot-a"]
+slot-a = []
+slot-b = []
+# Skip the good-mark write so the boot manager rolls the slot back.
+no-good = []
+# Truncate the good-mark write (needs wchble's fault injection).
+ota-fault-mark-good = ["wchble/storage-fault"]
+# Erase both metadata pages, then park (round reset between boot runs).
+wipe-meta = []
+# Write non-blank garbage over both metadata pages, then park.
+poison-meta = []
+
 [dependencies]
 # No `memory-x`: metapac would emit a competing 0x0 script, and a missing
 # local `memory.x` would then link a normal image instead of failing.
@@ -14,7 +27,8 @@ ch5xx-hal = { path = "../../../ch5xx-hal", features = [
     "rt",
 ], default-features = false }
 wchble = { path = "../..", features = ["ch585", "controller"] }
-qingke-rt = "0.8.4"
+# DataFlash writes must run from RAM.
+qingke-rt = { version = "0.8.4", features = ["highcode"] }
 panic-halt = "1.0"
 static_cell = "2.1"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
@@ -22,4 +36,3 @@ portable-atomic = { version = "1.11", features = ["critical-section"] }
 [profile.release]
 strip = false
 lto = true
-opt-level = "z"

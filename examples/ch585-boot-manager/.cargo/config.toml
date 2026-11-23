@@ -1,0 +1,8 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = []
+
+[unstable]
+build-std = ["core"]

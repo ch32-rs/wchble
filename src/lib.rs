@@ -34,6 +34,7 @@ compile_error!(
     "enable at most one chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, `ch592`, or `ch595`)"
 );
 
+pub mod ota;
 pub mod rf;
 pub mod storage;
 pub mod time;
