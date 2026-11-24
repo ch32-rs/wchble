@@ -22,7 +22,7 @@
 use core::cell::Cell;
 use critical_section::Mutex;
 
-use crate::rf::analog::AnalogInit;
+use crate::rf::analog::{AnalogInit, CAL_TIMEOUT_US};
 use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::regs::{self, autocfg, bb, lle, rssi};
@@ -155,7 +155,7 @@ unsafe fn set_mode(mode: u16) {
 }
 
 /// Synthesise one channel and return `(nGA << 24) | nCO`.
-unsafe fn txctune(clock: &impl InstantUs, channel: u8) -> u32 {
+unsafe fn txctune(clock: &impl InstantUs, channel: u8) -> Result<u32> {
     rf_w(RF1, rf_r(RF1) & !1);
     let map = CHANNEL_MAP[channel as usize] as u32;
     rf_w(
@@ -168,17 +168,20 @@ unsafe fn txctune(clock: &impl InstantUs, channel: u8) -> u32 {
     let started = clock.now_us();
     while (rf_r(RF_TXCTUNE_CO_CTRL) & (1 << 25)) == 0 || (rf_r(RF_TXCTUNE_GA_CTRL) & (1 << 26)) == 0
     {
-        if regs::read(LLE_BASE, lle::WINDOW) == 0 || clock.now_us().wrapping_sub(started) >= 4_000 {
+        if regs::read(LLE_BASE, lle::WINDOW) == 0 {
             break;
+        }
+        if clock.now_us().wrapping_sub(started) >= CAL_TIMEOUT_US {
+            return Err(Error::Timeout);
         }
     }
 
     let n_co = rf_r(RF_TXCTUNE_CO_CTRL) & 0x3f;
     let n_ga = (rf_r(RF_TXCTUNE_GA_CTRL) >> 10) & 0x7f;
-    (n_ga << 24) | n_co
+    Ok((n_ga << 24) | n_co)
 }
 
-unsafe fn tx_tune(clock: &impl InstantUs) {
+unsafe fn tx_tune(clock: &impl InstantUs) -> Result<()> {
     rf_w(RF1, rf_r(RF1) & 0xffff_feff);
     rf_w(RF10, rf_r(RF10) & 0xffff_efff);
     rf_w(RF11, rf_r(RF11) & 0xffff_ffef);
@@ -186,9 +189,9 @@ unsafe fn tx_tune(clock: &impl InstantUs) {
     rf_w(RF1, rf_r(RF1) | 0x10);
 
     // Calibrate at both band edges and near the middle, then interpolate.
-    let low = txctune(clock, 37);
-    let high = txctune(clock, 39);
-    let middle = txctune(clock, 18);
+    let low = txctune(clock, 37)?;
+    let high = txctune(clock, 39)?;
+    let middle = txctune(clock, 18)?;
 
     let n_co = |t: u32| t & 0x3f;
     let n_ga = |t: u32| (t >> 24) & 0x7f;
@@ -255,9 +258,10 @@ unsafe fn tx_tune(clock: &impl InstantUs) {
         (rf_r(RF_TXTUNE_CTRL) & 0x80ff_ffff) | (middle & 0x7f00_0000),
     );
     rf_w(RF1, rf_r(RF1) | 0x100);
+    Ok(())
 }
 
-unsafe fn rx_tune(clock: &impl InstantUs) {
+unsafe fn rx_tune(clock: &impl InstantUs) -> Result<()> {
     rf_w(RF20, rf_r(RF20) & 0xfffe_ffff);
     rf_w(RF2, rf_r(RF2) | 0x0020_0000);
     rf_w(RF3, (rf_r(RF3) & !0x10) | 0x10);
@@ -266,8 +270,8 @@ unsafe fn rx_tune(clock: &impl InstantUs) {
     regs::write(LLE_BASE, lle::WINDOW, 100);
     let started = clock.now_us();
     while regs::read(LLE_BASE, lle::WINDOW) != 0 && rf_r(RF_RXTUNE) & 0x100 != 0 {
-        if clock.now_us().wrapping_sub(started) >= 50 {
-            break;
+        if clock.now_us().wrapping_sub(started) >= CAL_TIMEOUT_US {
+            return Err(Error::Timeout);
         }
     }
 
@@ -280,13 +284,14 @@ unsafe fn rx_tune(clock: &impl InstantUs) {
     rf_w(RF2, rf_r(RF2) | 0x0001_0000);
     rf_w(RF3, (rf_r(RF3) & !0x100) | 0x100);
     rf_w(RF1, (rf_r(RF1) & !0x0001_0000) | 0x0010_0000);
+    Ok(())
 }
 
-unsafe fn tune(clock: &impl InstantUs) {
+unsafe fn tune(clock: &impl InstantUs) -> Result<()> {
     set_mode(DEVMODE_TUNE);
-    tx_tune(clock);
-    rx_tune(clock);
+    let result = tx_tune(clock).and_then(|()| rx_tune(clock));
     set_mode(0);
+    result
 }
 
 /// CH582/CH583 LLE command bits and timer offset.
@@ -413,8 +418,12 @@ impl Ch583Radio {
         if !self.initialized {
             return true;
         }
-        self.shut();
-        self.wait_idle(clock)
+        self.request_idle();
+        if !self.wait_idle(clock) {
+            return false;
+        }
+        self.rx_destination = None;
+        true
     }
 
     /// Process one latched RX completion or timeout, and return the event.
@@ -478,8 +487,7 @@ impl AnalogInit for Ch583Radio {
         if !self.stop(clock) {
             return Err(Error::Busy);
         }
-        unsafe { tune(clock) };
-        Ok(())
+        unsafe { tune(clock) }
     }
 }
 

@@ -112,12 +112,16 @@ fn run(radio: &mut Backend, clock: &Clock, serial: &mut UartTx<'_, UART1, Blocki
     }
 
     let mut rx = [0u8; RX_DMA_MIN];
-    // SAFETY: rx stays live while the receive window is armed.
-    unsafe { radio.rx_basic(clock, &mut rx, 20_000) }?;
+    let mut first_rx = [0u8; RX_DMA_MIN];
+    // SAFETY: first_rx stays live through the re-arm, and rx through stop.
+    unsafe {
+        radio.rx_basic(clock, &mut first_rx, 20_000)?;
+        radio.rx_basic(clock, &mut rx, 20_000)?;
+    }
     if !radio.stop(clock) || radio.poll(clock).is_some() {
         return Err(Error::InvalidState);
     }
-    writeln!(serial, "late TX and RX cancellation ok\r").unwrap();
+    writeln!(serial, "late TX, RX re-arm and cancellation ok\r").unwrap();
     serial.blocking_flush().unwrap();
 
     let mut sent = [0u32; 3];

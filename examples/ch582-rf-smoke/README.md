@@ -3,8 +3,8 @@
 This example exercises the CH582 polling radio with a non-connectable,
 non-scannable advertisement on channels 37, 38, and 39. It opens a receive
 window on each channel and reports TX completions, CRC-valid RX packets,
-recognized peer advertisements, and window expirations. It also checks that
-an already missed TX deadline returns `Error::Late`.
+recognized peer advertisements, and window expirations. It also checks RX
+re-arm and cancellation, and that a missed TX deadline returns `Error::Late`.
 
 The board needs 32 MHz and 32.768 kHz crystals. The example selects the
 external 32 kHz clock and leaves BLE interrupts masked. It uses UART1 TX on
@@ -53,5 +53,5 @@ scope.
 ## RF sequence provenance
 
 The active register sequence and three-point calibration are based on the
-public [ch32fun iSLER implementation](https://github.com/cnlohr/ch32fun/blob/master/extralibs/iSLER.h).
+public [ch32fun iSLER implementation](https://github.com/cnlohr/ch32fun/blob/486c5dd7ceed18ec65abe3064bac6a568c8a673c/extralibs/iSLER.h).
 See the included [MIT notice](../../LICENSE-ch32fun).
