@@ -661,7 +661,8 @@ opt-z+ICF is retired project-wide and every example builds plain release
   boot 22–23 ms. Boot validates headers only: CH585's flash-algorithm crate
   exposes no CodeFlash read for this chip and long engine reads are
   nondeterministic, so image integrity moves to the writer (X6c), matching
-  WCH's `BackupUpgrade_*` verify-on-write model. Evidence
+  WCH's `BackupUpgrade_*` verify-on-write model. Merged as PR #31
+  (`748b6e98`, 2026-11-23). Evidence
   `local-docs/results/x6b-boot-manager-20261122.md`.
 - [x] **Coex branch shared-path changes — resolved by review.** Of the three
   un-cfg'd pp_loop edits, two are one reservation-pattern redesign kept as
