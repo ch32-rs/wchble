@@ -114,19 +114,27 @@ engineering-grade real-device bring-up, not a certification claim.
 
 - **A1 — HCI policy matrix.** Every scan/initiator policy value is either
   applied exactly as specified or rejected with `0x12`; no value is accepted
-  silently. Required rows: policy 0 with Filter_Duplicates (duplicates
-  suppressed, new reports delivered), directed-ADV target filtering, and
-  initiator policy 1 honouring Peer_Address. PASS = 100% of matrix rows.
-- **A2 — ACL credit conservation.** Over a bidirectional transfer of at least
-  10,000 fragments with a central and a peripheral link active concurrently,
-  for each handle
-  `Number of Completed Packets` equals the fragments the controller consumed,
-  the host never exceeds the advertised buffers, and no credit leaks or
-  overflows appear. PASS = zero mismatches for both handles.
-- **A3 — Host silence budget.** In every pairing/security window of the
-  acceptance runs, the longest Host poll is at most 100 ms and at most
-  one-fifth of that link's supervision timeout, whichever is smaller.
-  PASS = the bound holds and no supervision expiry occurs.
+  silently. Required rows: scan policy 0 with Filter_Duplicates (an exact
+  duplicate address+payload is suppressed, a changed payload or a second
+  device is still reported, and the cache resets when scanning is disabled);
+  initiator policy 1 connects to a device from the accept list and ignores
+  Peer_Address; scan policies 1–3 and initiator policies 2–3 are rejected with
+  `0x12`. Directed advertising under policy 0 is delivered with event type
+  `0x01`; target filtering exists only in the rejected policies. PASS = 100%
+  of matrix rows, with the applied rows also observed on hardware.
+- **A2 — ACL credit conservation.** With a central and a peripheral link
+  active concurrently, move at least 10,000 LL fragments both ways (Host ACL
+  packets fragmented to the negotiated air length). For each handle, the sum
+  of `Number of Completed Packets` equals the Host ACL packets the controller
+  consumed, the Host never has more advertised buffers outstanding across both
+  links than the controller reports, and no credit leaks or overflows appear.
+  PASS = zero mismatches for both handles.
+- **A3 — Host silence budget.** Outside pairing, every Host poll is at most
+  100 ms. In each pairing window the link uses a 4 s supervision timeout, and
+  the single LESC P-256 poll must stay below 2 s (supervision/2). Core bounds
+  supervision and the 30 s ATT transaction, not the Host poll, so the gate is
+  the measured poll against those bounds. PASS = both bounds hold and no
+  supervision expiry occurs.
 - **B1 — Central encryption.** Against a controlled LESC peripheral,
   central-initiated security reaches `Encryption Change` status 0 for both a
   first pairing and a reconnect from the stored bond, 10/10 rounds each;
