@@ -89,6 +89,11 @@ Common evidence rule for every gate: same release image with recorded
 gate names one; runner `errors=[]`; `TX_LATE=0`; supervision never expires;
 smoke image restored and exact-name discovery confirmed afterwards.
 
+End state: someone who never worked on the tree can flash the recorded image
+and run the scripts to reproduce a real bonded HID mouse working end-to-end
+and a central+peripheral dual-link round, with the evidence archived. This is
+engineering-grade real-device bring-up, not a certification claim.
+
 - **A. Compliance and flow control.** Issue #9 B6 (the policy matrix below),
   X3.3 total ACL credit and `Number of Completed Packets` accounting plus
   outbound fragmentation and the real Session/scheduler wiring, and the Host
