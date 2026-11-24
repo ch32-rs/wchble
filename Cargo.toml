@@ -6,6 +6,7 @@ exclude = [
     "examples/ch32v208-rf-smoke",
     "examples/ch32v208-trouble-adv",
     "examples/ch573-rf-smoke",
+    "examples/ch582-rf-smoke",
     "examples/ch592-rf-smoke",
     "examples/ch585-rf-smoke",
 ]
@@ -58,7 +59,7 @@ default = []
 ch32v208 = []
 ch572 = []
 ch573 = []
-ch583 = []
+ch583 = ["dep:critical-section"]
 ch585 = []
 ch592 = []
 ch595 = []

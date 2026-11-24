@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "ch582-rf-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", default-features = false, features = ["ch582", "rt", "memory-x"] }
+wchble = { path = "../..", features = ["ch583"] }
+critical-section = "1"
+qingke-rt = { version = "0.8.4", features = ["highcode"] }
+panic-halt = "1"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+
+[profile.release]
+lto = true
+opt-level = 3
