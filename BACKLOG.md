@@ -1,6 +1,6 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-19. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-24. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
 failures or retroactively change archived results.
@@ -661,7 +661,8 @@ opt-z+ICF is retired project-wide and every example builds plain release
   boot 22–23 ms. Boot validates headers only: CH585's flash-algorithm crate
   exposes no CodeFlash read for this chip and long engine reads are
   nondeterministic, so image integrity moves to the writer (X6c), matching
-  WCH's `BackupUpgrade_*` verify-on-write model. Evidence
+  WCH's `BackupUpgrade_*` verify-on-write model. Merged as PR #31
+  (`748b6e98`, 2026-11-23). Evidence
   `local-docs/results/x6b-boot-manager-20261122.md`.
 - [x] **Coex branch shared-path changes — resolved by review.** Of the three
   un-cfg'd pp_loop edits, two are one reservation-pattern redesign kept as
@@ -684,6 +685,33 @@ opt-z+ICF is retired project-wide and every example builds plain release
   answer by design; scanner retry behavior was not separately captured.
 - [ ] **Periodic advertising, SYNC_ADV/SYNC_SCAN and PAwR** are untouched X2
   scope.
+
+## X6c deferred: the secure DFU carrier does not fit a slot (2026-11-24)
+
+- [ ] **X6c BLE DFU is deferred until a size scheme exists.** Spec §6 requires
+  DFU to be open only to bonded-and-encrypted links; that pulls in
+  `trouble-host/security` and makes the carrier 345,384 B plain release
+  against a 221,184 B slot (over by 124,200 B). Non-secure builds are
+  175,868–182,540 B and fit with 37–44 KiB headroom, so the transport is not
+  the size problem. The retired opt-z recipe only reaches 216,632 B
+  (4.5 KiB headroom) before any DFU code, so a build-flag tweak cannot close
+  the gap. Trimming app features has not been shown to recover ~120 KiB.
+- [ ] **Decision (user, 2026-11-24): abandon the lab-only / CRC-only DFU
+  path.** A CRC-only service without the bond/encryption gate is not a
+  product capability and must not be built as one; X6c and X6d stay
+  unstarted.
+- [ ] **Unblock conditions, none adopted.** (a) Vendor fixed-LIB +
+  swappable-APP layout (the `BackupUpgrade_*` model) so the security stack is
+  not duplicated; (b) a single-slot, no-rollback trade-off; (c) another size
+  reduction that lets the secure image fit with DFU code. Revisit when one is
+  chosen.
+- [ ] **Park cannot advertise DFU.** The 16 KiB boot manager has no
+  radio/HCI, so `NoValidSlot`/`AllFailed` park stays terminal (BOOT_STATS +
+  watchdog) and recovery is probe-based. Spec §3.3/§5 still say park enters
+  "DFU advertising mode"; that promise must be rewritten with X6c, not left
+  standing.
+- X6b is unaffected: the boot manager and A/B slots are size-valid for
+  non-secure images, and R1–R8 pass.
 
 ## Explicitly outside this milestone
 
