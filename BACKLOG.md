@@ -75,6 +75,35 @@ independent phone acceptance and reliable sniffer evidence (sections below).
 Multi-connection is not a compliance requirement; a single-link peripheral is
 complete. X3's value is the central/HOGP use case, not conformance.
 
+## Phase 1 milestone: central HOGP closed loop (confirmed 2026-11-24)
+
+The first stage covers tiers 1–2 as one milestone: a central that can host a
+real HID device, after the claimed behavior is compliant. All four blocks are
+required; each needs offline tests plus at least one archived hardware round
+on the same image (smoke restored, `TX_LATE=0`, no supervision loss).
+
+- **A. Compliance and flow control.** Issue #9 B6 under policy 0
+  (Filter_Duplicates, directed-ADV targeting) and initiator policy 1 /
+  Peer_Address; X3.3 total ACL credits and `Number of Completed Packets`
+  accounting, outbound fragmentation and the real Session/scheduler wiring,
+  accepted on a two-link round; Host poll budget inside security windows
+  measured and bounded.
+- **B. Central security (#27).** Outbound LESC initiation, key distribution,
+  bond save/load, encrypted reconnect from an existing bond, and the failure
+  and deletion paths. Hard prerequisite for HOGP: real devices hide reports
+  until the link is encrypted.
+- **C. Central interoperability (#30 and X3 CP gaps).** L2CAP Connection
+  Parameter Update response and an explicit LL_CONNECTION_PARAM_REQ decision;
+  bonded-device reconnect with identity/RPA handling; CP reverse connect order
+  and Create Connection Cancel with a live link.
+- **D. Acceptance vehicle (#29).** HOGP host example: 0x1812 discovery,
+  Report Map read, Report Reference parsing, notification subscription and
+  report decoding. Real-device round: encrypted link, report counts, the
+  peripheral's parameter request handled, wake/reconnect without user action.
+
+Out of phase 1: 2M corroboration and DTM, Service Changed, L0 extraction, OTA,
+periodic/PAwR/ISO and the other optional features.
+
 ## Issue #9 audit follow-ups (2026-11-14)
 
 - [x] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
