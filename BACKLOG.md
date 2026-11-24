@@ -27,6 +27,54 @@ See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
+## Protocol-priority work queue (2026-11-24)
+
+The Core spec makes a feature mandatory only when its role, command or
+feature bit is claimed (ICS); the tree stays compliant by leaving 2M/Coded
+and other unimplemented features unadvertised. This queue orders the open
+work by compliance risk first, then interoperability value, then optional
+features by product demand. Details and evidence stay in the sections below;
+this is the entry point.
+
+1. **Must fix — accepted behavior is incomplete or wrong.**
+   - Issue #9 B6: under policy 0, Filter_Duplicates and directed-ADV target
+     filtering are accepted but not applied, and initiator policy 1 still
+     ignores Peer_Address; non-zero policies now return `0x12`. (A2 and B1
+     are fixed in PR #10.)
+   - X3.3 acceptance gap: per-link credits are implemented, but the total
+     ACL credit and `Number of Completed Packets` accounting is not accepted
+     end-to-end across the limited HCI subset. Outbound fragmentation and
+     the real Session/scheduler wiring sit in the same subsection; this is
+     an acceptance gap, not a known single-link defect.
+   - Host poll budget inside security windows: one HID run recorded
+     `max_host_poll_us=562,467` with `host_poll_overrun=1`. The refusal gate
+     passed, but that budget inside a pairing window stays unverified.
+2. **Central interoperability** (unlocks #26–#30).
+   - L2CAP Connection Parameter Update response and an explicit
+     LL_CONNECTION_PARAM_REQ decision (#30).
+   - Bonded-device reconnect (#30); CP reverse connect order and Create
+     Connection Cancel with a live link.
+   - HOGP host example (#29) once #27/#30 land.
+3. **Standard test evidence.**
+   - 2M corroboration (X1b); mainstream peers request it.
+   - DTM and `ch585-rf-basic` (X5), the entry point for any air-interface
+     claim in X8.
+4. **Service evolution.**
+   - Service Changed (0x2A05) before a firmware update changes services under
+     a retained bond; the current workaround changes the advertised identity.
+   - OTA: X6c is deferred on the secure-carrier size boundary; no protocol
+     work unblocks it.
+5. **Structural / optional.**
+   - L0 library extraction: prerequisite for X8 and a second chip.
+   - Coded PHY (BLOCKED on instruments), periodic advertising /
+     `SYNC_ADV`/`SYNC_SCAN`, PAwR, ISO/LE Audio, direction finding, LE Power
+     Control and connection subrating: optional, add on product demand.
+
+Two evidence tracks stay first-class and are not demoted by this queue:
+independent phone acceptance and reliable sniffer evidence (sections below).
+Multi-connection is not a compliance requirement; a single-link peripheral is
+complete. X3's value is the central/HOGP use case, not conformance.
+
 ## Issue #9 audit follow-ups (2026-11-14)
 
 - [x] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
@@ -585,9 +633,12 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 The PP/CP subsets are closed in `local-docs/results/x3-6-closeout.md`. These
 remain open and must not be read as verified:
-- [ ] **`pp+secure` (two encrypted links).** The feature combination builds
-  (flash 310,126 B, RAM 44,308 B) but has no hardware round; PP acceptance is
-  plaintext only.
+- [x] **`pp+secure` (two encrypted links) — closed 2026-11-22.** PR #25
+  (`ad729ae`): dual encrypted reconnect on hardware (`dual#6`), 38 cross-link
+  notifications, one link dropped and one preserved, `TX_LATE=0`; the 3a
+  refusal subset also passed. Residues (peer-visible 0x05 rejection,
+  ECDH-entry blocking, pairing-burst coexistence) stay with the
+  concurrent-pairing item below, not with the dual-link transport.
 - [ ] **CP reverse connect order (peripheral first, then central).** Starting
   the phone after the Mac link failed: the fixture advertises about 11 s after
   boot while the app's scan budget is about 10 s and a live link leaves roughly
@@ -607,7 +658,8 @@ remain open and must not be read as verified:
   privileged-GATT limitation above is unchanged.
 - [ ] **Concurrent new pairing.** Pairing while two links are live is rejected
   at SMP with Pairing Failed 0x05 by design; a multi-link pairing path has no
-  acceptance evidence.
+  acceptance evidence. Unverified 3b residues: peer-visible 0x05 rejection,
+  ECDH-entry blocking and pairing-burst coexistence.
 - [ ] **Host poll budget in security windows.** The HID 60 s refusal-gate run
   recorded `max_host_poll_us=562,467` with `host_poll_overrun=1`; the gate
   passed, but the Host poll budget inside pairing/security windows is not
