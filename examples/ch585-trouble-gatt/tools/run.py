@@ -26,15 +26,17 @@ SMOKE = p3.SMOKE
 NAME = 'wch585-p4'
 SERVICE = '00001000-b0cd-11ec-871f-d45ddf138840'
 CHARACTERISTIC = '00001001-b0cd-11ec-871f-d45ddf138840'
-STAT_NAMES = p3.STAT_NAMES[:61] + ['max_host_poll_us', 'host_poll_overrun', 'bridge_error']
+STAT_NAMES = p3.STAT_NAMES[:60] + ['pairing_max_poll_us', 'max_host_poll_us',
+                                     'host_poll_overrun', 'bridge_error']
 STAT_NAMES[31] = 'backpressure'
 HOST_NAMES = '''phase connections disconnects reads writes notifications value errors last_error
     gatt_other subscribed advertise_attempts uart_writes uart_notifications uart_len
-    reserved_15'''.split()
+    reserved_15 update_accepted'''.split()
+HOST_STATS_WORDS = len(HOST_NAMES)
 FAILURES = (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt)
 
 
-def observation_symbols(text, image):
+def observation_symbols(text, image, extra=()):
     symbols = symbols_from(text)
     matches = [parts for line in text.splitlines()
                if len(parts := line.split()) == 3 and parts[2] == 'HOST_STATS']
@@ -56,9 +58,17 @@ def observation_symbols(text, image):
         raise ValueError('ambiguous DIAG2 symbol')
     if matches:
         symbols['DIAG2'] = int(matches[0][0], 16)
+    # Image-specific observation buffers (e.g. HOGP_STATS) must be present
+    # exactly once and are validated like the shared ones.
+    for name, count in extra:
+        matches = [parts for line in text.splitlines()
+                   if len(parts := line.split()) == 3 and parts[2] == name]
+        if len(matches) != 1:
+            raise ValueError(f'missing or ambiguous {name} symbol')
+        symbols[name] = int(matches[0][0], 16)
     sections = p3.elf_sections(image)
     ranges = []
-    buffers = [('STATS', 64), ('HOST_STATS', 16), ('TRACE', 128 * 8)]
+    buffers = [('STATS', 64), ('HOST_STATS', HOST_STATS_WORDS), ('TRACE', 128 * 8), *extra]
     if 'SEC_DIAG' in symbols:
         buffers.append(('SEC_DIAG', 64))
     if 'DIAG2' in symbols:
@@ -174,7 +184,7 @@ def evaluate_stats(obs, host, cycles, run_seconds):
     for index in (62, 63):
         if obs[index]:
             errors.append(f'firmware {STAT_NAMES[index]}={obs[index]}')
-    if len(host) != 16:
+    if len(host) != HOST_STATS_WORDS:
         return errors + ['invalid HOST_STATS size']
     if host[1] != cycles or host[2] != cycles or host[1] != obs[14] or host[2] != obs[28]:
         errors.append('host connection/disconnect counters do not match client and LL cycles')
@@ -260,7 +270,8 @@ def execute(args):
             if symbols is not None and safe_read_at:
                 # Independent reads preserve HOST_STATS and trace evidence even
                 # when one observation command or its validation fails.
-                for name, count, names in (('STATS', 64, STAT_NAMES), ('HOST_STATS', 16, HOST_NAMES)):
+                for name, count, names in (('STATS', 64, STAT_NAMES),
+                                           ('HOST_STATS', HOST_STATS_WORDS, HOST_NAMES)):
                     try:
                         words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
                         observations[name] = words

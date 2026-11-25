@@ -236,7 +236,7 @@ def validate_observation_buffers(image, symbols, extra=()):
     """
     sections = p4.p3.elf_sections(image)
     ranges = []
-    buffers = (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
+    buffers = (('STATS', 64), ('HOST_STATS', len(HOST_NAMES)), ('SECURE_STATS', 16),
                ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('HOST_ERROR', 32),
                ('BOND_STATS', 32), ('BOND_ECHO', 16), ('CATT_STATS', 16),
                ('PERIPHERAL_ADDRESS', 2),
@@ -267,14 +267,8 @@ def adb(serial, *args, timeout=30, check=True):
                           timeout=timeout, check=check).stdout
 
 
-def confirm_pairing_dialog(serial):
-    """Confirm the system Just Works dialog on behalf of the user.
-
-    This ROM rejects `BluetoothDevice.setPairingConfirmation` from an
-    unprivileged app (BLUETOOTH_PRIVILEGED), so the only path is the system
-    dialog. Tap it only when that dialog owns the focus; returns a record of
-    the tap, or None when there is nothing to confirm.
-    """
+def pairing_dialog_button(serial, resource_id, action):
+    """Tap one button of the system Just Works dialog while it owns focus."""
     try:
         focus = adb(serial, 'shell', 'dumpsys', 'window', timeout=20)
     except (OSError, subprocess.SubprocessError):
@@ -288,7 +282,7 @@ def confirm_pairing_dialog(serial):
     except (OSError, subprocess.SubprocessError, ElementTree.ParseError):
         return None
     for node in root.iter('node'):
-        if node.get('resource-id') != 'android:id/button1' or not node.get('bounds'):
+        if node.get('resource-id') != resource_id or not node.get('bounds'):
             continue
         x1, y1, x2, y2 = (int(value) for value in re.findall(r'\d+', node.get('bounds')))
         tap = [x // 2 for x in (x1 + x2, y1 + y2)]
@@ -296,8 +290,24 @@ def confirm_pairing_dialog(serial):
             adb(serial, 'shell', 'input', 'tap', str(tap[0]), str(tap[1]), timeout=20)
         except (OSError, subprocess.SubprocessError):
             return None
-        return {'action': 'confirm', 'button': node.get('text', ''), 'tap': tap}
+        return {'action': action, 'button': node.get('text', ''), 'tap': tap}
     return None
+
+
+def confirm_pairing_dialog(serial):
+    """Confirm the system Just Works dialog on behalf of the user.
+
+    This ROM rejects `BluetoothDevice.setPairingConfirmation` from an
+    unprivileged app (BLUETOOTH_PRIVILEGED), so the only path is the system
+    dialog. Tap it only when that dialog owns the focus; returns a record of
+    the tap, or None when there is nothing to confirm.
+    """
+    return pairing_dialog_button(serial, 'android:id/button1', 'confirm')
+
+
+def deny_pairing_dialog(serial):
+    """Cancel the system Just Works dialog; B2 rejected pairing."""
+    return pairing_dialog_button(serial, 'android:id/button2', 'cancel')
 
 
 def read_log(lines):
@@ -596,7 +606,7 @@ def evaluate_rejected_link(sec, host):
         errors.append(f'expected LL_REJECT_IND 0x06, last_error={sec[SEC_NAMES.index("last_error")]}')
     if sec[active] != 0:
         errors.append('the run reports an active encrypted link')
-    if len(host) == 16 and host[15] == SECURITY_ENCRYPTED:
+    if len(host) == len(HOST_NAMES) and host[15] == SECURITY_ENCRYPTED:
         errors.append('the Host still reports an encrypted link')
     return errors
 
@@ -649,7 +659,7 @@ def evaluate_security(sec, host, stats, run_seconds, encryptions=1):
         errors.append(f'encryption errors: {sec[12]} (last 0x{sec[15]:02x})')
     if sec[14]:
         errors.append(f'plaintext START_ENC_REQ retransmissions: {sec[14]}')
-    if len(host) != 16:
+    if len(host) != len(HOST_NAMES):
         errors.append('invalid HOST_STATS size')
     elif host[15] != SECURITY_ENCRYPTED:
         errors.append(f'Host security state={host[15]}, expected encrypted ({SECURITY_ENCRYPTED})')
@@ -1018,7 +1028,7 @@ def execute(args):
         p4.wait_until(safe_read_at)
         observations = {}
         for name, count, names in (('STATS', 64, STAT_NAMES),
-                                   ('HOST_STATS', 16, HOST_NAMES),
+                                   ('HOST_STATS', len(HOST_NAMES), HOST_NAMES),
                                    ('SECURE_STATS', 16, SEC_NAMES)):
             words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
             observations[name] = words

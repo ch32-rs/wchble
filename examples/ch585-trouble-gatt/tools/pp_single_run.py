@@ -51,7 +51,7 @@ TRACE_COUNT = 39
 
 def evaluate_stats(obs, host, cycles):
     errors = []
-    if len(obs) != 64 or len(host) != 16:
+    if len(obs) != 64 or len(host) != len(HOST_NAMES):
         return [f'short STATS read: {len(obs)}/{len(host)}']
     if obs[:3] != [0x50343538, 1, 9]:
         errors.append(f'image did not finish: magic/version/stage={obs[:3]}')
@@ -171,7 +171,7 @@ def execute(args):
         wait_until(safe_read_at)
         observations = {}
         for name, count, names in (('STATS', 64, STAT_NAMES),
-                                   ('HOST_STATS', 16, HOST_NAMES)):
+                                   ('HOST_STATS', len(HOST_NAMES), HOST_NAMES)):
             words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
             observations[name] = words
             metadata[name.lower()] = dict(zip(names, words))

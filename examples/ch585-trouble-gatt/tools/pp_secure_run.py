@@ -60,7 +60,7 @@ PP_MODE_DUAL_LINK = 1
 
 # Observation buffers the pp+secure image carries. HOST_ERROR and the X1/X4/
 # PHY fixtures are single-link host paths and stay absent here.
-PP_BUFFERS = (('STATS', 64), ('HOST_STATS', 16), ('SECURE_STATS', 16),
+PP_BUFFERS = (('STATS', 64), ('HOST_STATS', len(gatt.HOST_NAMES)), ('SECURE_STATS', 16),
               ('SEC_DIAG', 64), ('SEC_OPCODES', 96), ('BOND_STATS', 32),
               ('BOND_ECHO', 16), ('CATT_STATS', 16), ('PERIPHERAL_ADDRESS', 2),
               ('TRACE', 128 * 8), ('PP_STATS', 16))
@@ -277,7 +277,7 @@ def evaluate_secure(words, encryptions, minimum=False):
 
 def evaluate_host(host, phase):
     errors = []
-    if len(host) != 16:
+    if len(host) != len(gatt.HOST_NAMES):
         return ['invalid HOST_STATS size'], {}
     named = dict(zip(gatt.HOST_NAMES, host))
     # bond-mac counts the MacPair pairing link plus the scripted central.
@@ -739,7 +739,7 @@ def execute(args):
                 gatt.wait_until(safe_read_at)
                 observations = {}
                 for name, count, names in (('STATS', 64, gatt.STAT_NAMES),
-                                            ('HOST_STATS', 16, gatt.HOST_NAMES),
+                                            ('HOST_STATS', len(gatt.HOST_NAMES), gatt.HOST_NAMES),
                                             ('SECURE_STATS', 16, secure.SEC_NAMES),
                                             ('PP_STATS', 16, PP_NAMES),
                                             ('BOND_STATS', 32, secure.BOND_NAMES)):

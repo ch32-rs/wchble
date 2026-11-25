@@ -153,6 +153,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
     fn new_aes(&mut self, key: &[u8; 16]) -> X::Aes {
         X::Aes::from_key(key)
     }
+    fn fill_random(&mut self, out: &mut [u8]) {
+        self.soft.fill_random(out);
+    }
 
     fn stat_inc(&mut self, slot: usize) {
         self.extras.stat_inc(slot);
@@ -296,6 +299,18 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         }
         let key = self.key;
         self.soft.take_ltk_reply_for(key)
+    }
+    fn take_encryption_request(&mut self) -> Option<crate::hci::runner::EnableEncryption> {
+        if !self.live() {
+            return None;
+        }
+        self.soft.take_encryption_request_on(self.slot)
+    }
+    fn take_connection_update(&mut self) -> Option<(u16, u16, u16, u16)> {
+        if !self.live() {
+            return None;
+        }
+        self.bridge_mut().take_connection_update()
     }
     fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool {
         if !self.live() {

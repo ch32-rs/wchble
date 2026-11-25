@@ -199,13 +199,12 @@ impl Default for Privacy {
     }
 }
 
-/// FAL entries are public or static-random identity addresses.
-fn validate_fal_identity(kind: u8, address: [u8; 6]) -> Result<(), PrivacyError> {
+/// Filter Accept List entries are device addresses: §7.8.16 allows only public
+/// and random device addresses. A resolving peer is matched after resolution,
+/// so an RPA is legal here even though it is not a static random address.
+fn validate_fal_identity(kind: u8, _address: [u8; 6]) -> Result<(), PrivacyError> {
     if kind > 1 {
         return Err(PrivacyError::InvalidKind);
-    }
-    if kind == 1 && address[5] & 0xc0 != 0xc0 {
-        return Err(PrivacyError::InvalidIdentity);
     }
     Ok(())
 }
@@ -658,6 +657,12 @@ impl Privacy {
             .any(|&(k, a)| k == kind && a == address)
     }
 
+    /// Indexed access so the RF owner can snapshot the list for initiator
+    /// policy 1 without allocating.
+    pub fn fal_entry(&self, index: usize) -> Option<(u8, [u8; 6])> {
+        self.fal.get(index).copied().flatten()
+    }
+
     /// Returns true when the member was newly added.
     pub fn fal_add(&mut self, kind: u8, address: [u8; 6]) -> Result<bool, PrivacyError> {
         validate_fal_identity(kind, address)?;
@@ -1080,15 +1085,10 @@ mod tests {
     fn fal_identity_validation_applies_to_add_and_remove() {
         let mut p = Privacy::new();
         assert_eq!(p.fal_add(2, [1; 6]), Err(PrivacyError::InvalidKind));
-        assert_eq!(
-            p.fal_add(1, [1, 2, 3, 4, 5, 0x40]),
-            Err(PrivacyError::InvalidIdentity)
-        );
+        // Device addresses: an RPA is a legal random device address.
+        assert_eq!(p.fal_add(1, [1, 2, 3, 4, 5, 0x40]), Ok(true));
+        assert_eq!(p.fal_remove(1, [1, 2, 3, 4, 5, 0x40]), Ok(true));
         assert_eq!(p.fal_add(1, [1, 2, 3, 4, 5, 0xc0]), Ok(true));
-        assert_eq!(
-            p.fal_remove(1, [1, 2, 3, 4, 5, 0x40]),
-            Err(PrivacyError::InvalidIdentity)
-        );
         assert_eq!(p.fal_remove(1, [1, 2, 3, 4, 5, 0xc0]), Ok(true));
         assert_eq!(
             p.fal_remove(1, [1, 2, 3, 4, 5, 0xc0]),

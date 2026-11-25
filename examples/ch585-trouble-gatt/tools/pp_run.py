@@ -236,7 +236,7 @@ def evaluate_stats(stats, host, run_seconds):
             errors.append(f'firmware counter {index}={stats[index]}')
     if not stats[PP_FRAGMENTS]:
         errors.append('no advertising fragment was served')
-    if len(host) != 16:
+    if len(host) != len(HOST_NAMES):
         return errors + ['invalid HOST_STATS size'], {}
     names = dict(zip(HOST_NAMES, host))
     if host[0] != 2:
@@ -413,7 +413,7 @@ def execute(args):
             observations = {}
             if symbols is not None and safe_read_at:
                 for name, count, names in (('STATS', 64, gatt.STAT_NAMES),
-                                           ('HOST_STATS', 16, HOST_NAMES)):
+                                           ('HOST_STATS', len(HOST_NAMES), HOST_NAMES)):
                     try:
                         words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
                         observations[name] = words

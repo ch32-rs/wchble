@@ -33,8 +33,6 @@ use {panic_halt as _, portable_atomic as _};
 
 #[cfg(all(feature = "pp", feature = "cp"))]
 compile_error!("`pp` and `cp` are separate acceptance images; enable one");
-#[cfg(all(feature = "cp", feature = "secure"))]
-compile_error!("`cp` is a plaintext acceptance image; it cannot advertise LE encryption");
 #[cfg(all(feature = "x1b-2m", any(feature = "pp", feature = "cp")))]
 compile_error!("`x1b-2m` opens the Peripheral-only PHY procedure; Central links cannot claim 2M");
 #[cfg(all(feature = "x2-ext-adv", feature = "cp"))]
@@ -48,6 +46,8 @@ mod bond;
 mod client_att;
 #[cfg(feature = "cp")]
 mod cp;
+#[cfg(feature = "hogp")]
+mod hogp;
 mod host;
 #[cfg(feature = "pp")]
 mod pp;
@@ -94,7 +94,7 @@ const RPA_TIMEOUT_SECS: u32 = if cfg!(feature = "rpa-fast") { 5 } else { 900 };
 #[no_mangle]
 static mut STATS: [u32; 64] = [0; 64];
 #[no_mangle]
-static mut HOST_STATS: [u32; 16] = [0; 16];
+static mut HOST_STATS: [u32; host::HOST_STATS_WORDS] = [0; host::HOST_STATS_WORDS];
 #[no_mangle]
 static mut TRACE: [u32; 128 * 8] = [0; 128 * 8];
 /// S2 encryption evidence, kept separate so the P4 STATS invariants and the
@@ -684,7 +684,16 @@ impl<'a, F: Future> wchble::hci::link::LinkExtras for Extra<'a, F> {
         if info.peer_address_type != 0 && wchble::ll::privacy::is_resolvable(info.peer_address) {
             info.peer_rpa = Some(info.peer_address);
             let started = self.clock.now_us();
-            info.peer_identity = soft.resolve_pending_peer();
+            // Only an incoming CONNECT_IND records a pending address; a
+            // Central must resolve the advertiser's RPA here, or the Host
+            // would pair with the identity address and fail the DHKey check.
+            info.peer_identity = soft
+                .resolve_pending_peer()
+                .or_else(|| soft.resolve_peer(info.peer_address, true))
+                // The Host may have refused to enable controller resolution
+                // (static local address): resolve with the stored IRK instead,
+                // or SMP would fall back to the identity address.
+                .or_else(|| bond::resolve_identity(info.peer_address));
             privacy::note_resolve(self.clock.now_us().wrapping_sub(started));
         }
         #[cfg(not(feature = "privacy"))]
@@ -783,7 +792,7 @@ fn publish_x1(x: &X1Snapshot) {
 }
 
 fn host_snapshot(stats: &host::HostStats) {
-    for i in 0..16 {
+    for i in 0..host::HOST_STATS_WORDS {
         unsafe {
             core::ptr::addr_of_mut!(HOST_STATS)
                 .cast::<u32>()
@@ -1066,9 +1075,28 @@ fn idle<F: Future>(
             inc(63);
         }
         let took = clock.now_us().wrapping_sub(before);
-        if took > get(61) {
-            put(61, took);
+        // A3 separates the pairing window: one LESC P-256 poll is ~1 s, while
+        // steady-state polls must stay under 100 ms. Slot 61 = steady max,
+        // slot 60 = pairing-window max. Polls with no live link cannot starve
+        // a connection, so the boot keypair poll is not measured.
+        #[cfg(all(feature = "secure", feature = "cp"))]
+        let pairing = crate::cp::pairing_window();
+        #[cfg(all(feature = "secure", not(feature = "cp")))]
+        let pairing = matches!(
+            stats.word(host::STAT_SECURITY),
+            host::SECURITY_REQUESTED | host::SECURITY_PAIRED
+        );
+        #[cfg(not(feature = "secure"))]
+        let pairing = false;
+        #[cfg(feature = "secure")]
+        if soft.any_link_connected() {
+            let slot = if pairing { 60 } else { 61 };
+            if took > get(slot) {
+                put(slot, took);
+            }
         }
+        #[cfg(not(feature = "secure"))]
+        let _ = pairing;
         if took > 100_000 {
             diag_put(DIAG_SLOW_POLLS, diag_get(DIAG_SLOW_POLLS).wrapping_add(1));
         }
@@ -1705,6 +1733,13 @@ struct CpInitiator {
     params: ConnectParams,
     ind_len: usize,
     deadline_us: u32,
+    /// Policy 1 snapshot: the CONNECT_IND is built before the AdvA is known.
+    accept_list: bool,
+    fal: [(u8, [u8; 6]); CP_FAL_MAX],
+    fal_len: usize,
+    /// Last RPA resolved for this accept list. Resolving inside the T_IFS
+    /// budget is too slow, so the first advertisement is only a cache fill.
+    resolved: Option<([u8; 6], u8, [u8; 6])>,
 }
 
 #[cfg(feature = "cp")]
@@ -1719,17 +1754,53 @@ struct CpScanPacket {
     len: usize,
     crc_ok: bool,
     peer_chsel: bool,
+    peer_addr: [u8; 6],
+    peer_random: bool,
     connect_done: Option<u32>,
 }
 
 #[cfg(feature = "cp")]
 const CP_SCAN_WINDOW_US: u32 = 6_000;
+/// A1 evidence: policy-1 initiator activity.
+///
+/// 0 magic, 1 prepares, 2 accept-list length, 3 connectable advertisements
+/// seen while armed, 4 address matches, 5 CONNECT_INDs queued, 6 queue
+/// failures, 7 last header, 8/9 last advertiser address and type, 10/11 first
+/// accept-list member address and type.
+#[cfg(feature = "cp")]
+#[no_mangle]
+static mut INIT_DIAG: [u32; 12] = [0; 12];
+
+#[cfg(feature = "cp")]
+fn init_put(index: usize, value: u32) {
+    // SAFETY: single-threaded; the RF loop and the Host poll never overlap.
+    unsafe {
+        core::ptr::addr_of_mut!(INIT_DIAG)
+            .cast::<u32>()
+            .add(index)
+            .write_volatile(value)
+    }
+}
+
+#[cfg(feature = "cp")]
+fn init_inc(index: usize) {
+    // SAFETY: see `init_put`.
+    let current = unsafe {
+        core::ptr::addr_of!(INIT_DIAG)
+            .cast::<u32>()
+            .add(index)
+            .read_volatile()
+    };
+    init_put(index, current.wrapping_add(1));
+}
 #[cfg(feature = "cp")]
 const CP_SCAN_CAPTURE_US: u32 = 700;
 #[cfg(feature = "cp")]
 const CP_INITIATOR_TIMEOUT_US: u32 = 6_000_000;
 #[cfg(feature = "cp")]
 const CP_CONN_IND_CSEL_OFFSET: usize = 64;
+#[cfg(feature = "cp")]
+const CP_FAL_MAX: usize = wchble::ll::privacy::MAX_FILTER_ACCEPT_LIST;
 #[cfg(feature = "cp")]
 const CP_WIN_SIZE: u8 = 8;
 #[cfg(feature = "cp")]
@@ -1744,6 +1815,35 @@ const CP_CONNECT_SCA: u8 = 0;
 /// keeps the outbound link from colliding with a live inbound one.
 #[cfg(feature = "cp")]
 const CP_AAS: [(u32, u32); 2] = [(0x1234_5678, 0x0055_5555), (0x1a2b_3c4d, 0x0065_4321)];
+
+/// A1: a cached RPA matches when its resolved identity is in the accept list.
+#[cfg(feature = "cp")]
+fn cp_accept_identity(
+    accept: &[(u8, [u8; 6])],
+    cached: Option<([u8; 6], u8, [u8; 6])>,
+    address: [u8; 6],
+) -> bool {
+    match cached {
+        Some((rpa, kind, identity)) if rpa == address => accept
+            .iter()
+            .any(|&(k, a)| a == identity && k & 1 == kind & 1),
+        _ => false,
+    }
+}
+
+/// Resolve an on-air RPA through the peer IRKs the controller loaded.
+#[cfg(feature = "cp")]
+fn resolve_accept_identity(address: [u8; 6]) -> Option<(u8, [u8; 6])> {
+    #[cfg(feature = "secure")]
+    {
+        return crate::bond::resolve_identity(address);
+    }
+    #[cfg(not(feature = "secure"))]
+    {
+        let _ = address;
+        None
+    }
+}
 
 /// Build both CONNECT_IND variants once per pending request, with an AA that
 /// no live link is using.
@@ -1776,7 +1876,7 @@ fn cp_prepare_initiator(
     };
     let (own_addr, own_random) = soft.initiator_addr(&request);
     let Some(ind_len) = params.build_connect_ind(&mut conn_buf.0 .0, own_addr, own_random) else {
-        let _ = soft.bridge.connection_failed(0x12);
+        let _ = soft.connection_failed(0x12);
         soft.clear_pending_connect();
         return None;
     };
@@ -1787,16 +1887,41 @@ fn cp_prepare_initiator(
         own_random,
     ) != Some(ind_len)
     {
-        let _ = soft.bridge.connection_failed(0x12);
+        let _ = soft.connection_failed(0x12);
         soft.clear_pending_connect();
         return None;
     }
     params.chsel = false;
+    let mut fal = [(0u8, [0u8; 6]); CP_FAL_MAX];
+    let mut fal_len = 0;
+    if request.use_accept_list {
+        for index in 0..CP_FAL_MAX {
+            if let Some(entry) = soft.filter_accept_entry(index) {
+                fal[fal_len] = entry;
+                fal_len += 1;
+            }
+        }
+    }
+    init_put(0, 0x3149_4e49);
+    init_inc(1);
+    init_put(2, fal_len as u32);
+    if let Some(&(kind, address)) = fal[..fal_len].first() {
+        init_put(10, u32::from(address[0]) | u32::from(address[1]) << 8
+            | u32::from(address[2]) << 16 | u32::from(address[3]) << 24);
+        init_put(
+            11,
+            u32::from(address[4]) | u32::from(address[5]) << 8 | u32::from(kind) << 16,
+        );
+    }
     Some(CpInitiator {
         request,
         params,
         ind_len,
         deadline_us: 0,
+        accept_list: request.use_accept_list,
+        fal,
+        fal_len,
+        resolved: None,
     })
 }
 
@@ -1812,7 +1937,7 @@ fn cp_receive_scan(
     conn_buf: &mut CpConnInd,
     until: u32,
     expires: u32,
-    initiator: Option<&CpInitiator>,
+    mut initiator: Option<&mut CpInitiator>,
 ) -> Option<CpScanPacket> {
     radio.clear_rx_status();
     let now = clock.now_us();
@@ -1856,30 +1981,101 @@ fn cp_receive_scan(
         len: if crc_ok && len <= 40 { len } else { 0 },
         crc_ok,
         peer_chsel: false,
+        peer_addr: [0; 6],
+        peer_random: false,
         connect_done: None,
     };
+    let mut late_resolve = None;
     if crc_ok && len <= 40 {
-        if let Some(init) = initiator {
+        if let Some(init) = initiator.as_deref_mut() {
             let header = rx.0[0];
             let adv_random = header & 0x40 != 0;
-            if header & 0x0f == 0
-                && adv_random == init.request.peer_random
-                && rx.0[2..8] == init.request.peer_addr
-            {
+            let mut adv_addr = [0u8; 6];
+            adv_addr.copy_from_slice(&rx.0[2..8]);
+            init_put(7, u32::from(header));
+            init_put(
+                8,
+                u32::from(adv_addr[0])
+                    | u32::from(adv_addr[1]) << 8
+                    | u32::from(adv_addr[2]) << 16
+                    | u32::from(adv_addr[3]) << 24,
+            );
+            init_put(
+                9,
+                u32::from(adv_addr[4])
+                    | u32::from(adv_addr[5]) << 8
+                    | u32::from(adv_random) << 16,
+            );
+            if header & 0x0f == 0 {
+                init_inc(3);
+            }
+            let matched = if init.accept_list {
+                // Policy 1 ignores Peer_Address and matches the snapshot;
+                // random vs public is part of the member identity.
+                let kind = u8::from(adv_random);
+                let accept = &init.fal[..init.fal_len];
+                if accept.iter().any(|&(k, a)| k & 1 == kind && a == adv_addr) {
+                    true
+                } else if adv_random {
+                    // The Host writes bonded peers under their identity, so an
+                    // RPA matches only through the resolving list. The lookup
+                    // uses the cached resolution; a miss fills it after the
+                    // window and the next advertisement connects.
+                    if cp_accept_identity(accept, init.resolved, adv_addr) {
+                        true
+                    } else {
+                        late_resolve = Some(adv_addr);
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                adv_random == init.request.peer_random && adv_addr == init.request.peer_addr
+            };
+            if header & 0x0f == 0 && matched {
                 packet.peer_chsel = header & 0x20 != 0;
+                packet.peer_addr = adv_addr;
+                packet.peer_random = adv_random;
+                // Policy 1: both ChSel variants were built before the AdvA was
+                // known, so patch RxAdd and AdvA in place.
+                if init.accept_list {
+                    for ind in [0, CP_CONN_IND_CSEL_OFFSET] {
+                        conn_buf.0 .0[ind + 8..ind + 14].copy_from_slice(&adv_addr);
+                        if adv_random {
+                            conn_buf.0 .0[ind] |= 0x80;
+                        } else {
+                            conn_buf.0 .0[ind] &= !0x80;
+                        }
+                    }
+                }
                 let ind = if packet.peer_chsel {
                     CP_CONN_IND_CSEL_OFFSET
                 } else {
                     0
                 };
+                init_inc(4);
                 match radio.initiate_tx(clock, &conn_buf.0 .0[ind..ind + init.ind_len]) {
-                    Ok(done) => packet.connect_done = Some(done),
-                    Err(_) => inc(45),
+                    Ok(done) => {
+                        init_inc(5);
+                        packet.connect_done = Some(done);
+                    }
+                    Err(_) => {
+                        init_inc(6);
+                        inc(45);
+                    }
                 }
             }
         }
     }
     let _ = radio.stop(clock);
+    if let (Some(init), Some(address)) = (initiator, late_resolve) {
+        // Outside the RX window: one AES block per peer IRK is far more than
+        // the 150 us T_IFS budget allows.
+        if let Some((kind, identity)) = resolve_accept_identity(address) {
+            init.resolved = Some((address, kind, identity));
+        }
+    }
     Some(packet)
 }
 
@@ -1929,7 +2125,7 @@ fn cp_scan_fragment<F: Future>(
     if let Some(init) = initiator.as_ref() {
         if reached(clock.now_us(), init.deadline_us) {
             inc(45);
-            let _ = soft.bridge.connection_failed(0x3e);
+            let _ = soft.connection_failed(0x3e);
             soft.clear_pending_connect();
             *initiator = None;
         }
@@ -1946,7 +2142,7 @@ fn cp_scan_fragment<F: Future>(
         conn_buf,
         until,
         expires,
-        initiator.as_ref(),
+        initiator.as_mut(),
     ) {
         if packet.crc_ok && packet.len >= 8 && soft.scan_state().enabled {
             if let Some(pdu) = wchble::ll::scan::Pdu::parse(&rx.0[..packet.len], true) {
@@ -1958,6 +2154,10 @@ fn cp_scan_fragment<F: Future>(
         if let (Some(init), Some(connect_done)) = (initiator.as_ref(), packet.connect_done) {
             let mut params = init.params;
             params.chsel = packet.peer_chsel;
+            // Policy 1: the peer is whoever the accept list matched, not the
+            // ignored Peer_Address field.
+            params.peer_addr = packet.peer_addr;
+            params.peer_random = packet.peer_random;
             out = CpScan::Connect(params, connect_done);
         }
     }
@@ -2223,7 +2423,7 @@ fn cp_loop<F: Future>(
                             }
                             Err(_) => {
                                 inc(33);
-                                let _ = soft.bridge.connection_failed(0x3e);
+                                let _ = soft.connection_failed(0x3e);
                                 put(2, 2);
                             }
                         }
@@ -2377,9 +2577,9 @@ fn main() -> ! {
     stop(&mut radio, &clock);
     let controller = wchble::hci::new();
     let mut soft = SoftRunner::new();
-    // X3 decision A: two-link pp builds advertise half the physical credit
-    // pool so two Host connections cannot overcommit the TX slots.
-    #[cfg(feature = "pp")]
+    // X3 decision A: two-link builds (pp or cp) advertise half the physical
+    // credit pool so the Host cannot overcommit the TX slots.
+    #[cfg(any(feature = "pp", feature = "cp"))]
     soft.set_acl_credits_report(2);
     // The pp table is a different database; give it its own on-air identity so
     // a peer's cached GATT handles cannot cross the two layouts.
@@ -2558,6 +2758,8 @@ fn main() -> ! {
         bond::set_local_irk(&local_irk);
     }
     let app_stats = host::HostStats::new();
+    #[cfg(feature = "hogp")]
+    hogp::init();
     set_peripheral_address(&peripheral_address);
     #[cfg(feature = "pp")]
     let mut app = core::pin::pin!(pp::run(controller, &app_stats));

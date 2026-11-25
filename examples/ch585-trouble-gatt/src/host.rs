@@ -264,7 +264,7 @@ pub fn x1_word(index: usize) -> u32 {
     x1_get(index)
 }
 
-pub const HOST_STATS_WORDS: usize = 16;
+pub const HOST_STATS_WORDS: usize = 17;
 pub const STAT_PHASE: usize = 0;
 pub const STAT_CONNECTIONS: usize = 1;
 pub const STAT_DISCONNECTS: usize = 2;
@@ -283,6 +283,10 @@ pub const STAT_UART_LEN: usize = 14;
 // 0 = not requested, 1 = L2CAP request sent, 2 = send failed (test feature).
 #[allow(dead_code)]
 pub const STAT_CONN_PARAMS: usize = 15;
+
+/// CP central: L2CAP Connection Parameter Updates accepted (HCI 0x2013).
+#[cfg(feature = "cp")]
+pub const STAT_UPDATE_ACCEPTED: usize = 16;
 
 #[cfg(feature = "secure")]
 pub const STAT_SECURITY: usize = 15;
@@ -720,7 +724,12 @@ pub async fn run(
             // procedure until the LL can carry it. The peer-initiated image
             // leaves the request to the phone so the two cannot collide.
             #[cfg(all(feature = "x1b-2m", not(feature = "x1b-2m-peer")))]
-            if connection.raw().set_phy(&stack, PhyKind::Le2M).await.is_err() {
+            if connection
+                .raw()
+                .set_phy(&stack, PhyKind::Le2M)
+                .await
+                .is_err()
+            {
                 stats.error(17);
             }
             // S2: a peripheral Security Request is what makes a macOS central

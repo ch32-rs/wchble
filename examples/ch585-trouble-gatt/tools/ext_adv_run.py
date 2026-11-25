@@ -91,7 +91,7 @@ def validate_ram_layout(image, symbols):
     """Aligned, writable, non-overlapping buffers inside mapped RAM."""
     sections = gatt.p3.elf_sections(image)
     ranges = []
-    for name, count in (('STATS', 64), ('HOST_STATS', 16), ('EXT_ADV_STATS', 16),
+    for name, count in (('STATS', 64), ('HOST_STATS', gatt.HOST_STATS_WORDS), ('EXT_ADV_STATS', 16),
                         ('TRACE', 128 * 8)):
         address, size = symbols[name], count * 4
         if (address % 4 or not 0x20000000 <= address < address + size <= 0x30000000

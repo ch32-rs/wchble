@@ -57,6 +57,44 @@ public final class MainActivity extends Activity {
     private static final UUID CCCD_UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
+    // Phase 1 D1: HOGP mode. The service replaces the vendor one so that one
+    // fixture run exercises either the C1 cycle or the HID client.
+    private static final UUID HID_SERVICE_UUID =
+            UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
+    private static final UUID HID_INFORMATION_UUID =
+            UUID.fromString("00002a4a-0000-1000-8000-00805f9b34fb");
+    private static final UUID REPORT_MAP_UUID =
+            UUID.fromString("00002a4b-0000-1000-8000-00805f9b34fb");
+    private static final UUID REPORT_UUID =
+            UUID.fromString("00002a4d-0000-1000-8000-00805f9b34fb");
+    private static final UUID PROTOCOL_MODE_UUID =
+            UUID.fromString("00002a4e-0000-1000-8000-00805f9b34fb");
+    private static final UUID REPORT_REFERENCE_UUID =
+            UUID.fromString("00002908-0000-1000-8000-00805f9b34fb");
+    private static final int HID_REPORT_ID = 1;
+    private static final long REPORT_INTERVAL_MS = 50;
+    // Stop after the client's gate count: a send racing the client's
+    // disconnect would otherwise count as a fixture failure.
+    private static final int REPORT_LIMIT = 100;
+    // 3 buttons + 5-bit padding, 16-bit X/Y, 8-bit wheel. The frame length is
+    // REPORT_ID + buttons + 2 + 2 + 1 bytes.
+    private static final byte[] MOUSE_REPORT_MAP = {
+            0x05, 0x01, 0x09, 0x02, (byte) 0xA1, 0x01,
+            (byte) 0x85, 0x01,
+            0x09, 0x01, (byte) 0xA1, 0x00,
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+            0x15, 0x00, 0x25, 0x01,
+            (byte) 0x95, 0x03, 0x75, 0x01, (byte) 0x81, 0x02,
+            (byte) 0x95, 0x01, 0x75, 0x05, (byte) 0x81, 0x01,
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+            0x16, 0x01, (byte) 0x80, 0x26, (byte) 0xFF, 0x7F,
+            0x75, 0x10, (byte) 0x95, 0x02, (byte) 0x81, 0x06,
+            0x09, 0x38,
+            0x15, (byte) 0x81, 0x25, 0x7F,
+            0x75, 0x08, (byte) 0x95, 0x01, (byte) 0x81, 0x06,
+            (byte) 0xC0, (byte) 0xC0,
+    };
+
     private static final int INITIAL_VALUE = 0x0000002A;
     private static final int LEGACY_ADV_MAX_BYTES = 31;
     private static final long NAME_POLL_MS = 250;
@@ -84,6 +122,12 @@ public final class MainActivity extends Activity {
 
     private String name = "wch585-c1";
     private boolean noService;
+    private boolean hid;
+    private BluetoothGattCharacteristic hidReport;
+    private String reportPeerAddress;
+    private Runnable reportRunnable;
+    private int reportsSent;
+    private int reportFailures;
     private int timeoutSeconds = 90;
     // Test-only: delay ATT read responses so the runner can take the adapter
     // down while a request is outstanding.
@@ -164,6 +208,9 @@ public final class MainActivity extends Activity {
                         + ",\"connections\":" + connections);
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 subscribers.remove(address);
+                if (hid) {
+                    stopReports();
+                }
                 disconnections++;
                 logEvent("\"event\":\"disconnected\",\"address\":" + quote(address)
                         + ",\"status\":" + status
@@ -197,6 +244,10 @@ public final class MainActivity extends Activity {
                 return;
             }
             String address = addressOf(device);
+            if (hid && isHidValue(requested.getUuid())) {
+                hidRead(device, requestId, offset, requested, address);
+                return;
+            }
             if (!CHARACTERISTIC_UUID.equals(requested.getUuid())) {
                 respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null);
                 logEvent("\"event\":\"read\",\"address\":" + quote(address)
@@ -259,6 +310,21 @@ public final class MainActivity extends Activity {
                 return;
             }
             String address = addressOf(device);
+            if (hid && PROTOCOL_MODE_UUID.equals(requested.getUuid())) {
+                byte mode = requestValue != null && requestValue.length == 1
+                        ? requestValue[0] : 0;
+                if (requestValue != null && requestValue.length == 1
+                        && (mode == 0 || mode == 1)) {
+                    requested.setValue(new byte[] { mode });
+                }
+                if (responseNeeded) {
+                    respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null);
+                }
+                writes++;
+                logEvent("\"event\":\"protocol_mode\",\"address\":" + quote(address)
+                        + ",\"mode\":" + mode + ",\"writes\":" + writes);
+                return;
+            }
             if (!CHARACTERISTIC_UUID.equals(requested.getUuid())) {
                 if (responseNeeded) {
                     respond(device, requestId,
@@ -320,6 +386,14 @@ public final class MainActivity extends Activity {
                 return;
             }
             String address = addressOf(device);
+            if (REPORT_REFERENCE_UUID.equals(descriptor.getUuid()) && offset == 0) {
+                byte[] value = descriptor.getValue();
+                respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset,
+                        value == null ? new byte[] { HID_REPORT_ID, 0x01 } : value);
+                logEvent("\"event\":\"report_reference_read\",\"address\":"
+                        + quote(address));
+                return;
+            }
             if (CCCD_UUID.equals(descriptor.getUuid()) && offset == 0) {
                 respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset,
                         cccdBytes(subscribers.contains(address)));
@@ -364,6 +438,13 @@ public final class MainActivity extends Activity {
                     + ",\"value\":" + cccd
                     + ",\"subscribed\":" + subscribers.contains(address)
                     + ",\"subscribers\":" + subscribers.size());
+            if (hid) {
+                if (subscribers.contains(address)) {
+                    startReports(device, address);
+                } else {
+                    stopReports();
+                }
+            }
         }
     };
 
@@ -379,6 +460,7 @@ public final class MainActivity extends Activity {
             name = requestedName;
         }
         noService = intent != null && intent.getBooleanExtra("no_service", false);
+        hid = intent != null && intent.getBooleanExtra("hid", false);
         int requestedTimeout = intent == null ? 90 : intent.getIntExtra("timeout", 90);
         if (requestedTimeout > 0) {
             timeoutSeconds = requestedTimeout;
@@ -541,6 +623,11 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        if (hid) {
+            openHidServer();
+            return;
+        }
+
         characteristic = new BluetoothGattCharacteristic(
                 CHARACTERISTIC_UUID,
                 BluetoothGattCharacteristic.PROPERTY_READ
@@ -573,6 +660,146 @@ public final class MainActivity extends Activity {
             return;
         }
         // onServiceAdded() starts advertising once the database is registered.
+    }
+
+    /// Publish 0x1812 with encrypted access: the DUT must bond before the
+    /// Report Map or CCCD is reachable.
+    private void openHidServer() {
+        int readEnc = BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED;
+        int writeEnc = BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED;
+
+        BluetoothGattCharacteristic info = new BluetoothGattCharacteristic(
+                HID_INFORMATION_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ, readEnc);
+        // bcdHID 1.11, country 0, flags: normally connectable.
+        info.setValue(new byte[] { 0x11, 0x01, 0x00, 0x02 });
+
+        BluetoothGattCharacteristic reportMap = new BluetoothGattCharacteristic(
+                REPORT_MAP_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ, readEnc);
+        reportMap.setValue(MOUSE_REPORT_MAP);
+
+        BluetoothGattCharacteristic protocol = new BluetoothGattCharacteristic(
+                PROTOCOL_MODE_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ
+                        | BluetoothGattCharacteristic.PROPERTY_WRITE,
+                readEnc | writeEnc);
+        protocol.setValue(new byte[] { 0x01 });
+
+        hidReport = new BluetoothGattCharacteristic(
+                REPORT_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ
+                        | BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                readEnc);
+        hidReport.setValue(mouseReport(0, 0, 0));
+        BluetoothGattDescriptor reference = new BluetoothGattDescriptor(
+                REPORT_REFERENCE_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED);
+        reference.setValue(new byte[] { HID_REPORT_ID, 0x01 });
+        BluetoothGattDescriptor cccd = new BluetoothGattDescriptor(
+                CCCD_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED
+                        | BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED);
+        cccd.setValue(new byte[] { 0, 0 });
+        if (!hidReport.addDescriptor(reference) || !hidReport.addDescriptor(cccd)) {
+            logEvent("\"event\":\"error\",\"stage\":\"add_hid_descriptor\"");
+            finishWithSummary("add_hid_descriptor_failed");
+            return;
+        }
+
+        BluetoothGattService service = new BluetoothGattService(
+                HID_SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+        service.addCharacteristic(info);
+        service.addCharacteristic(reportMap);
+        service.addCharacteristic(protocol);
+        service.addCharacteristic(hidReport);
+        if (!gattServer.addService(service)) {
+            logEvent("\"event\":\"error\",\"stage\":\"add_service\""
+                    + ",\"service\":\"" + HID_SERVICE_UUID + "\"");
+            finishWithSummary("add_service_failed");
+            return;
+        }
+        logEvent("\"event\":\"hid_ready\",\"report_map_bytes\":"
+                + MOUSE_REPORT_MAP.length
+                + ",\"report_id\":" + HID_REPORT_ID
+                + ",\"interval_ms\":" + REPORT_INTERVAL_MS);
+        // onServiceAdded() starts advertising once the database is registered.
+    }
+
+    private static byte[] mouseReport(int buttons, int dx, int dy) {
+        // Report protocol prefixes the report ID; X/Y are 16-bit little-endian.
+        return new byte[] {
+                (byte) HID_REPORT_ID,
+                (byte) buttons,
+                (byte) (dx & 0xFF), (byte) ((dx >> 8) & 0xFF),
+                (byte) (dy & 0xFF), (byte) ((dy >> 8) & 0xFF),
+                0,
+        };
+    }
+
+    /// Start the deterministic motion stream for one subscribed peer.
+    private void startReports(BluetoothDevice device, String address) {
+        if (reportRunnable != null || gattServer == null || hidReport == null) {
+            return;
+        }
+        reportPeerAddress = address;
+        reportRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (finished || stopping || gattServer == null) {
+                    return;
+                }
+                int phase = reportsSent % 4;
+                int dx = (phase & 1) == 0 ? 3 : 5;
+                int dy = (phase & 2) == 0 ? -2 : -4;
+                int buttons = (reportsSent % 50) < 10 ? 1 : 0;
+                byte[] value = mouseReport(buttons, dx, dy);
+                hidReport.setValue(value);
+                boolean sent;
+                try {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        sent = gattServer.notifyCharacteristicChanged(
+                                device, hidReport, false, value) == BluetoothStatusCodes.SUCCESS;
+                    } else {
+                        sent = gattServer.notifyCharacteristicChanged(device, hidReport, false);
+                    }
+                } catch (RuntimeException error) {
+                    sent = false;
+                }
+                if (sent) {
+                    reportsSent++;
+                    notifications++;
+                } else {
+                    reportFailures++;
+                }
+                // One line per report is 20 lines/s; the runner counts them.
+                logEvent("\"event\":\"report\",\"address\":" + quote(address)
+                        + ",\"id\":" + HID_REPORT_ID
+                        + ",\"buttons\":" + buttons
+                        + ",\"dx\":" + dx
+                        + ",\"dy\":" + dy
+                        + ",\"sent\":" + sent
+                        + ",\"reports\":" + reportsSent
+                        + ",\"failures\":" + reportFailures);
+                if (reportsSent >= REPORT_LIMIT) {
+                    stopReports();
+                } else {
+                    handler.postDelayed(this, REPORT_INTERVAL_MS);
+                }
+            }
+        };
+        logEvent("\"event\":\"reports_start\",\"address\":" + quote(address));
+        handler.postDelayed(reportRunnable, REPORT_INTERVAL_MS);
+    }
+
+    private void stopReports() {
+        if (reportRunnable != null) {
+            handler.removeCallbacks(reportRunnable);
+            reportRunnable = null;
+            logEvent("\"event\":\"reports_stop\",\"reports\":" + reportsSent
+                    + ",\"failures\":" + reportFailures);
+        }
+        reportPeerAddress = null;
     }
 
     private void startAdvertising(boolean restart) {
@@ -679,6 +906,38 @@ public final class MainActivity extends Activity {
         handler.postDelayed(delayedRestartRunnable, RESTART_SETTLE_MS);
     }
 
+    private static boolean isHidValue(UUID uuid) {
+        return HID_INFORMATION_UUID.equals(uuid) || REPORT_MAP_UUID.equals(uuid)
+                || PROTOCOL_MODE_UUID.equals(uuid) || REPORT_UUID.equals(uuid);
+    }
+
+    /// HID reads slice the stored value: the Report Map needs a long read.
+    private void hidRead(BluetoothDevice device, int requestId, int offset,
+            BluetoothGattCharacteristic requested, String address) {
+        byte[] bytes = requested.getValue();
+        if (bytes == null) {
+            bytes = new byte[0];
+        }
+        if (offset < 0 || offset > bytes.length) {
+            respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null);
+            logEvent("\"event\":\"hid_read\",\"address\":" + quote(address)
+                    + ",\"uuid\":" + quote(requested.getUuid().toString())
+                    + ",\"offset\":" + offset
+                    + ",\"status\":" + BluetoothGatt.GATT_INVALID_OFFSET);
+            return;
+        }
+        byte[] slice = Arrays.copyOfRange(bytes, offset, bytes.length);
+        boolean sent = respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice);
+        reads++;
+        logEvent("\"event\":\"hid_read\",\"address\":" + quote(address)
+                + ",\"uuid\":" + quote(requested.getUuid().toString())
+                + ",\"offset\":" + offset
+                + ",\"length\":" + slice.length
+                + ",\"status\":" + BluetoothGatt.GATT_SUCCESS
+                + ",\"sent\":" + sent
+                + ",\"reads\":" + reads);
+    }
+
     private boolean respond(BluetoothDevice device, int requestId, int status,
             int offset, byte[] response) {
         if (gattServer == null) {
@@ -698,6 +957,7 @@ public final class MainActivity extends Activity {
         finished = true;
         stopping = true;
 
+        stopReports();
         if (timeoutRunnable != null) {
             handler.removeCallbacks(timeoutRunnable);
             timeoutRunnable = null;
@@ -716,8 +976,11 @@ public final class MainActivity extends Activity {
 
         logEvent("\"event\":\"summary\",\"name\":" + quote(name)
                 + ",\"no_service\":" + noService
+                + ",\"hid\":" + hid
                 + ",\"reads\":" + reads
                 + ",\"writes\":" + writes
+                + ",\"reports\":" + reportsSent
+                + ",\"report_failures\":" + reportFailures
                 + ",\"notifications\":" + notifications
                 + ",\"connections\":" + connections
                 + ",\"disconnections\":" + disconnections
@@ -753,6 +1016,7 @@ public final class MainActivity extends Activity {
         }
         gattServer = null;
         characteristic = null;
+        hidReport = null;
     }
 
     @Override

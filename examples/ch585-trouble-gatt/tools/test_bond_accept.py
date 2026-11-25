@@ -88,7 +88,7 @@ def secure_stats(**overrides):
 
 
 def host_stats(security=secure.SECURITY_ENCRYPTED):
-    host = [0] * 16
+    host = [0] * len(secure.HOST_NAMES)
     host[bond.HOST_SECURITY] = security
     return host
 

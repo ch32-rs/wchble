@@ -232,7 +232,7 @@ def collect(out, symbols, seconds, prefix=''):
     """Read every observation buffer and judge the firmware completion first."""
     named, raw = {}, {}
     for name, count, names in (('STATS', 64, secure.STAT_NAMES),
-                               ('HOST_STATS', 16, secure.HOST_NAMES),
+                               ('HOST_STATS', len(secure.HOST_NAMES), secure.HOST_NAMES),
                                ('SECURE_STATS', 16, secure.SEC_NAMES),
                                ('BOND_STATS', 32, secure.BOND_NAMES),
                                ('CATT_STATS', 16, secure.CATT_NAMES)):

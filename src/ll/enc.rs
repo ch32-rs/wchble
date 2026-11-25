@@ -25,8 +25,9 @@
 //! `LL_START_ENC_RSP`, TX counter 0) and the Peripheral answers with its own
 //! encrypted `LL_START_ENC_RSP` (TX counter 0). The Peripheral enables TX
 //! before precomputing its RSP and RX when it sends `LL_START_ENC_REQ`; the
-//! Central enables RX after `LL_ENC_RSP` and TX before its RSP. Counters reset
-//! on every start or pause/resume procedure.
+//! Central enables TX before its RSP and RX only once that RSP is queued,
+//! because the Peripheral's plaintext `LL_START_ENC_REQ` arrives first.
+//! Counters reset on every start or pause/resume procedure.
 
 use crate::crypto::ccm::{decrypt as ccm_decrypt, encrypt as ccm_encrypt, CcmError, BLE_MIC_LEN};
 use crate::crypto::{Aes128, AesEngine};
@@ -501,6 +502,183 @@ impl PeripheralStart {
     }
 }
 
+/// Where the Central is in the start-encryption exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CentralStage {
+    /// No procedure running; PDUs are plaintext.
+    Idle,
+    /// `LL_ENC_REQ` sent; waiting for the Peripheral's `LL_ENC_RSP`.
+    AwaitingRsp,
+    /// `LL_ENC_RSP` seen; waiting for the Host's LTK answer.
+    AwaitingKey,
+    /// Encrypted `LL_START_ENC_RSP` precomputed; waiting for the Peripheral's
+    /// plaintext `LL_START_ENC_REQ`.
+    Prepared,
+    /// Encrypted response queued and RX decryption on; waiting for the
+    /// Peripheral's encrypted `LL_START_ENC_RSP`.
+    WaitingRsp,
+    /// Both sides encrypted.
+    Active,
+}
+
+/// Central-side start-encryption sequencing (Core 5.4 Vol 6 Part B §5.1.3.1):
+/// LL_ENC_REQ, LTK, precomputed encrypted LL_START_ENC_RSP, then `Active`.
+pub struct CentralStart {
+    stage: CentralStage,
+    rand: [u8; 8],
+    ediv: u16,
+    skdm: [u8; 8],
+    ivm: [u8; 4],
+    skds: [u8; 8],
+    ivs: [u8; 4],
+    prepared: [u8; MAX_ENCRYPTED],
+    prepared_len: u8,
+}
+
+impl Default for CentralStart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CentralStart {
+    pub const fn new() -> Self {
+        Self {
+            stage: CentralStage::Idle,
+            rand: [0; 8],
+            ediv: 0,
+            skdm: [0; 8],
+            ivm: [0; 4],
+            skds: [0; 8],
+            ivs: [0; 4],
+            prepared: [0; MAX_ENCRYPTED],
+            prepared_len: 0,
+        }
+    }
+
+    pub fn stage(&self) -> CentralStage {
+        self.stage
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.stage == CentralStage::Active
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.stage == CentralStage::Idle
+    }
+
+    /// True while the procedure owns the link's TX: no ACL or other control
+    /// PDU may share an event until it ends.
+    pub fn owns_link(&self) -> bool {
+        self.stage != CentralStage::Idle && self.stage != CentralStage::Active
+    }
+
+    /// Abandon the procedure (Host refused, reject PDU, disconnect).
+    pub fn abort(&mut self) {
+        self.stage = CentralStage::Idle;
+        self.prepared_len = 0;
+    }
+
+    /// Queue the plaintext `LL_ENC_REQ`. `skdm`/`ivm` come from the
+    /// controller's random source; `rand`/`ediv` are the Host's.
+    pub fn begin(
+        &mut self,
+        rand: [u8; 8],
+        ediv: u16,
+        skdm: [u8; 8],
+        ivm: [u8; 4],
+    ) -> Result<ControlPdu, StartError> {
+        if self.stage != CentralStage::Idle {
+            return Err(StartError::NotIdle);
+        }
+        self.rand = rand;
+        self.ediv = ediv;
+        self.skdm = skdm;
+        self.ivm = ivm;
+        self.stage = CentralStage::AwaitingRsp;
+        Ok(ControlPdu::enc_req(&EncReq {
+            rand,
+            ediv,
+            skdm,
+            ivm,
+        }))
+    }
+
+    /// Consume the Peripheral's `LL_ENC_RSP` and store its contributions.
+    pub fn on_enc_rsp(&mut self, payload: &[u8]) -> Result<(), StartError> {
+        if self.stage != CentralStage::AwaitingRsp {
+            return Err(StartError::NotReady);
+        }
+        let rsp = EncRsp::parse(payload).map_err(|error| match error {
+            super::conn::ConnError::Length => StartError::Length,
+            _ => StartError::Opcode,
+        })?;
+        self.skds = rsp.skds;
+        self.ivs = rsp.ivs;
+        self.stage = CentralStage::AwaitingKey;
+        Ok(())
+    }
+
+    /// `(rand, ediv)` for the Host's `LE Long Term Key Request` event.
+    pub fn rand_ediv(&self) -> ([u8; 8], u16) {
+        (self.rand, self.ediv)
+    }
+
+    /// Derive the session key from the Host's LTK.
+    pub fn session(&self, ltk: &[u8; 16]) -> Result<SessionKey, StartError> {
+        if !matches!(
+            self.stage,
+            CentralStage::AwaitingKey | CentralStage::Prepared
+        ) {
+            return Err(StartError::NotReady);
+        }
+        Ok(SessionKey::from_parts(
+            ltk, &self.skdm, &self.skds, &self.ivm, &self.ivs,
+        ))
+    }
+
+    /// Precompute the encrypted `LL_START_ENC_RSP` (TX counter 0). The link
+    /// still transmits nothing but empty PDUs until the Peripheral's
+    /// `LL_START_ENC_REQ` releases it.
+    pub fn prepare_start_rsp<E: AesEngine>(
+        &mut self,
+        enc: &mut Encryption<E>,
+    ) -> Result<(), StartError> {
+        if self.stage != CentralStage::AwaitingKey {
+            return Err(StartError::NotReady);
+        }
+        enc.enable_tx();
+        let mut out = [0; MAX_ENCRYPTED];
+        // AAD is the masked PDU header first octet: LLID=3 for a control PDU.
+        let len = enc.encrypt(3, ControlPdu::start_enc_rsp().as_bytes(), &mut out)?;
+        self.prepared[..len].copy_from_slice(&out[..len]);
+        self.prepared_len = len as u8;
+        self.stage = CentralStage::Prepared;
+        Ok(())
+    }
+
+    /// The Peripheral's plaintext `LL_START_ENC_REQ` arrived: hand back the
+    /// precomputed response. The caller queues it and only then enables RX.
+    pub fn on_start_enc_req(&mut self) -> Result<&[u8], StartError> {
+        if self.stage != CentralStage::Prepared {
+            return Err(StartError::NotReady);
+        }
+        self.stage = CentralStage::WaitingRsp;
+        Ok(&self.prepared[..usize::from(self.prepared_len)])
+    }
+
+    /// The Peripheral's encrypted `LL_START_ENC_RSP` decrypted.
+    pub fn on_peer_rsp(&mut self) -> Result<(), StartError> {
+        if self.stage != CentralStage::WaitingRsp {
+            return Err(StartError::NotReady);
+        }
+        self.stage = CentralStage::Active;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,6 +1070,104 @@ mod tests {
         assert_eq!(c_enc.rx_counter(), 2); // Peripheral RSP + data
         assert_eq!(p_enc.tx_counter(), 2);
         assert_eq!(p_enc.rx_counter(), 2);
+    }
+
+    /// The Central driver runs the same exchange from its own side: RX stays
+    /// off until the Peripheral's plaintext START_ENC_REQ releases the
+    /// precomputed response.
+    #[test]
+    fn central_start_drives_the_exchange_to_active() {
+        let mut central_start = CentralStart::new();
+        let mut peripheral_start = PeripheralStart::new();
+
+        let req = central_start.begin([0; 8], 0, SKDM, IVM).unwrap();
+        assert_eq!(central_start.stage(), CentralStage::AwaitingRsp);
+        assert!(central_start.owns_link());
+        let rsp = peripheral_start
+            .on_enc_req(req.as_bytes(), SKDS, IVS)
+            .unwrap();
+        assert_eq!(central_start.on_enc_rsp(rsp.as_bytes()), Ok(()));
+        assert_eq!(central_start.stage(), CentralStage::AwaitingKey);
+        assert_eq!(central_start.rand_ediv(), ([0; 8], 0));
+
+        // Both sides answer the Host with the same LTK and derive one session.
+        let c_key = central_start.session(&LTK).unwrap();
+        let p_key = peripheral_start.session(&LTK).unwrap();
+        assert_eq!(c_key.key(), p_key.key());
+        let mut c_enc = Encryption::new(c_key.clone(), EncRole::Central, Aes128::new(c_key.key()));
+        let mut p_enc =
+            Encryption::new(p_key.clone(), EncRole::Peripheral, Aes128::new(p_key.key()));
+
+        central_start.prepare_start_rsp(&mut c_enc).unwrap();
+        peripheral_start.prepare_start_rsp(&mut p_enc).unwrap();
+        assert_eq!(central_start.stage(), CentralStage::Prepared);
+        // The Central has not enabled RX: the next PDU is still plaintext.
+        assert!(!c_enc.rx_enabled());
+
+        let start_req = peripheral_start.start_enc_req(&mut p_enc).unwrap();
+        assert_eq!(start_req.as_bytes(), &[0x05]);
+        let mut rsp = [0; MAX_ENCRYPTED];
+        let rsp_len = {
+            let bytes = central_start.on_start_enc_req().unwrap();
+            rsp[..bytes.len()].copy_from_slice(bytes);
+            bytes.len()
+        };
+        assert_eq!(central_start.stage(), CentralStage::WaitingRsp);
+        // Queueing the response is what arms RX.
+        c_enc.enable_rx();
+        assert!(c_enc.rx_enabled());
+
+        let mut plain = [0; MAX_PLAINTEXT];
+        let n = p_enc.decrypt(0x03, &rsp[..rsp_len], &mut plain).unwrap();
+        assert_eq!(&plain[..n], &[0x06]);
+        let peer = peripheral_start.on_start_enc_rsp().unwrap();
+        let mut peer_bytes = [0; MAX_ENCRYPTED];
+        peer_bytes[..peer.len()].copy_from_slice(peer);
+        let n = c_enc
+            .decrypt(0x03, &peer_bytes[..peer.len()], &mut plain)
+            .unwrap();
+        assert_eq!(&plain[..n], &[0x06]);
+        assert_eq!(central_start.on_peer_rsp(), Ok(()));
+        assert!(central_start.is_active());
+        assert!(!central_start.owns_link());
+        assert_eq!(c_enc.tx_counter(), 1);
+        assert_eq!(c_enc.rx_counter(), 1);
+
+        // A fresh begin is refused until the running procedure is aborted.
+        assert_eq!(
+            central_start.begin([0; 8], 0, SKDM, IVM).unwrap_err(),
+            StartError::NotIdle
+        );
+        central_start.abort();
+        assert!(central_start.is_idle());
+        assert!(central_start.begin([0; 8], 0, SKDM, IVM).is_ok());
+    }
+
+    #[test]
+    fn central_start_enforces_the_step_order() {
+        let mut start = CentralStart::new();
+        assert_eq!(
+            start.on_enc_rsp(&[0x04; 13]).unwrap_err(),
+            StartError::NotReady
+        );
+        assert_eq!(start.session(&LTK).unwrap_err(), StartError::NotReady);
+        start.begin([0; 8], 0, SKDM, IVM).unwrap();
+        assert_eq!(start.session(&LTK).unwrap_err(), StartError::NotReady);
+        // A malformed response stays in AwaitingRsp and reports the shape.
+        assert_eq!(
+            start.on_enc_rsp(&[0x04; 5]).unwrap_err(),
+            StartError::Length
+        );
+        assert_eq!(start.stage(), CentralStage::AwaitingRsp);
+        start.on_enc_rsp(&[0x04; 13]).unwrap();
+        let c_key = start.session(&LTK).unwrap();
+        let mut enc = Encryption::new(c_key.clone(), EncRole::Central, Aes128::new(c_key.key()));
+        // The response is not released before the key arrives.
+        assert_eq!(start.on_start_enc_req().unwrap_err(), StartError::NotReady);
+        start.prepare_start_rsp(&mut enc).unwrap();
+        assert_eq!(start.on_peer_rsp().unwrap_err(), StartError::NotReady);
+        start.on_start_enc_req().unwrap();
+        assert_eq!(start.on_peer_rsp(), Ok(()));
     }
 
     /// The pause procedure is three encrypted PDUs on the old session; a

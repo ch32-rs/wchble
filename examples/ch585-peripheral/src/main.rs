@@ -252,6 +252,16 @@ impl LinkHost for P3Host<'_> {
     fn new_aes(&mut self, _key: &[u8; 16]) -> NoEncryption {
         NoEncryption
     }
+    fn fill_random(&mut self, out: &mut [u8]) {
+        // This host is Peripheral-only and never starts encryption.
+        out.fill(0);
+    }
+    fn take_encryption_request(&mut self) -> Option<wchble::hci::runner::EnableEncryption> {
+        None
+    }
+    fn take_connection_update(&mut self) -> Option<(u16, u16, u16, u16)> {
+        None
+    }
 
     fn stat_inc(&mut self, slot: usize) {
         inc(slot);

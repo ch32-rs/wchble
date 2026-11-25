@@ -72,12 +72,85 @@ pub struct ScanState {
     pub filter_duplicates: bool,
 }
 
+/// `LE Set Scan Enable` Filter_Duplicates cache: an advertising report is a
+/// duplicate only when address and payload both match (Core 5.4 Vol 6 Part B
+/// §4.4.3). Cleared whenever scanning is re-enabled or disabled.
+const DEDUP_SLOTS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DedupEntry {
+    used: bool,
+    random: bool,
+    addr: [u8; 6],
+    len: u8,
+    data: [u8; 31],
+}
+
+impl DedupEntry {
+    const EMPTY: Self = Self {
+        used: false,
+        random: false,
+        addr: [0; 6],
+        len: 0,
+        data: [0; 31],
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DedupCache {
+    entries: [DedupEntry; DEDUP_SLOTS],
+    next: u8,
+}
+
+impl DedupCache {
+    const fn new() -> Self {
+        Self {
+            entries: [DedupEntry::EMPTY; DEDUP_SLOTS],
+            next: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries = [DedupEntry::EMPTY; DEDUP_SLOTS];
+        self.next = 0;
+    }
+
+    fn contains(&self, random: bool, addr: [u8; 6], data: &[u8]) -> bool {
+        let len = data.len().min(31);
+        self.entries.iter().any(|entry| {
+            entry.used
+                && entry.random == random
+                && entry.addr == addr
+                && usize::from(entry.len) == len
+                && entry.data[..len] == data[..len]
+        })
+    }
+
+    fn remember(&mut self, random: bool, addr: [u8; 6], data: &[u8]) {
+        let len = data.len().min(31);
+        let mut entry = DedupEntry {
+            used: true,
+            random,
+            addr,
+            len: len as u8,
+            data: [0; 31],
+        };
+        entry.data[..len].copy_from_slice(&data[..len]);
+        let slot = usize::from(self.next) % DEDUP_SLOTS;
+        self.entries[slot] = entry;
+        self.next = ((slot + 1) % DEDUP_SLOTS) as u8;
+    }
+}
+
 /// Pending `LE Create Connection` request, consumed by the RF owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateConnRequest {
     pub peer_addr: [u8; 6],
     pub peer_random: bool,
     pub own_random: bool,
+    /// Initiator filter policy 1: ignore `peer_addr` and match the Filter
+    /// Accept List at scan time.
+    pub use_accept_list: bool,
     /// HCI units of 0.625 ms.
     pub scan_interval_slots: u16,
     pub scan_window_slots: u16,
@@ -121,6 +194,8 @@ pub struct SoftRunner {
     /// Next slot to poll for output, so neither link starves the other.
     flush_slot: u8,
     scan: ScanState,
+    /// Filter_Duplicates window; cleared with every `LE Set Scan Enable`.
+    dedup: DedupCache,
     pending_connect: Option<CreateConnRequest>,
     adv_reports_dropped: u32,
     pending_reply: Option<Packet>,
@@ -195,6 +270,7 @@ impl SoftRunner {
             slot1: ConnectionBridge::for_slot(1),
             flush_slot: 0,
             scan: ScanState::default(),
+            dedup: DedupCache::new(),
             pending_connect: None,
             adv_reports_dropped: 0,
             pending_reply: None,
@@ -242,6 +318,15 @@ impl SoftRunner {
             1 => Some(&self.slot1),
             _ => None,
         }
+    }
+
+    /// True while any slot has an established link; the A3 poll budget only
+    /// covers polls that a live link is waiting on.
+    pub fn any_link_connected(&self) -> bool {
+        (0..2u8).any(|slot| {
+            self.link_bridge(slot)
+                .map_or(false, ConnectionBridge::is_connected)
+        })
     }
 
     pub fn link_bridge_mut(&mut self, slot: u8) -> Option<&mut ConnectionBridge> {
@@ -968,6 +1053,32 @@ impl SoftRunner {
         self.pending_connect = None;
     }
 
+    /// Is `(kind, addr)` a Filter Accept List member? Used by initiator
+    /// policy 1 after resolving the observed advertiser.
+    pub fn filter_accept_contains(&self, kind: u8, addr: [u8; 6]) -> bool {
+        self.privacy.fal_contains(kind, addr)
+    }
+
+    /// `(kind, addr)` at `index`, or None. Policy-1 initiators snapshot the
+    /// list so matching stays inside the RF owner's RAM-resident path.
+    pub fn filter_accept_entry(&self, index: usize) -> Option<(u8, [u8; 6])> {
+        self.privacy.fal_entry(index)
+    }
+
+    /// Report a failed or cancelled connection attempt on a slot that holds no
+    /// live link. Slot 0 alone is wrong when a peripheral link already owns it
+    /// (the bridge would refuse and the Host would hang).
+    pub fn connection_failed(&mut self, status: u8) -> bool {
+        for slot in 0..MAX_LINKS {
+            let bridge = self.bridge_slot_mut(slot as u8);
+            if bridge.is_connected() || bridge.is_disconnecting() || bridge.is_resetting() {
+                continue;
+            }
+            return bridge.connection_failed(status).is_ok();
+        }
+        false
+    }
+
     /// Currently selected own address and whether it is random (advertising).
     pub fn own_addr(&self) -> ([u8; 6], bool) {
         (self.ll.adv.own_addr, self.ll.adv.random_addr)
@@ -1017,6 +1128,10 @@ impl SoftRunner {
             | scan::PduType::ScanRsp => pdu.payload().get(6..).unwrap_or(&[]),
             _ => &[],
         };
+        let random = pdu.tx_add();
+        if self.scan.filter_duplicates && self.dedup.contains(random, adv_a, data) {
+            return false;
+        }
         let mut parameters = [0u8; 2 + 10 + scan::MAX_LEGACY_ADV_PAYLOAD];
         parameters[0] = 0x02; // LE Advertising Report
         parameters[1] = 1; // one report
@@ -1033,6 +1148,11 @@ impl SoftRunner {
         {
             self.adv_reports_dropped = self.adv_reports_dropped.wrapping_add(1);
             return false;
+        }
+        if self.scan.filter_duplicates {
+            // Only delivered reports open the duplicate window; a report lost
+            // to a full queue must still be reportable next time.
+            self.dedup.remember(random, adv_a, data);
         }
         true
     }
@@ -1152,6 +1272,11 @@ impl SoftRunner {
                     PacketScope::Connection { key, .. } => key.slot,
                     PacketScope::Global => 0,
                 };
+                // The Host owns one buffer pool; per-bridge pools of five
+                // would let two links overcommit the advertised count.
+                if self.acl_outstanding() >= usize::from(self.acl_credits_report) {
+                    return Err(host);
+                }
                 match self.bridge_slot_mut(slot).enqueue_tx(&host.packet) {
                     Ok(()) | Err(BridgeError::InvalidPacket | BridgeError::NotConnected) => Ok(()),
                     Err(BridgeError::Full) => Err(host),
@@ -1160,6 +1285,11 @@ impl SoftRunner {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Host ACL packets accepted across both links and not yet completed.
+    fn acl_outstanding(&self) -> usize {
+        self.bridge.tx_outstanding() + self.slot1.tx_outstanding()
     }
 
     /// True while `scope` still names the live connection. A global command
@@ -1241,6 +1371,7 @@ impl SoftRunner {
         self.ll = LinkLayer::new();
         self.ll.adv.chsel = adv_chsel;
         self.scan = ScanState::default();
+        self.dedup.clear();
         self.pending_connect = None;
         self.clear_encryption();
         self.suggested_tx_octets = LL_LEGACY_PAYLOAD;
@@ -1294,11 +1425,9 @@ impl SoftRunner {
                 return;
             }
             0x2013 => {
-                self.log_command(opcode, HCI_COMMAND_DISALLOWED);
-                self.pending_reply = Some(transport::command_status_packet(
-                    opcode,
-                    HCI_COMMAND_DISALLOWED,
-                ));
+                let status = self.connection_update_command(params);
+                self.log_command(opcode, status);
+                self.pending_reply = Some(transport::command_status_packet(opcode, status));
                 return;
             }
             0x2019 => {
@@ -1606,7 +1735,7 @@ impl SoftRunner {
                 self.pending_reply = Some(transport::command_complete_packet(
                     opcode,
                     HCI_SUCCESS,
-                    &[lo, hi, ACL_CREDITS, 0, 0, 0],
+                    &[lo, hi, self.acl_credits_report, 0, 0, 0],
                 ));
                 return;
             }
@@ -1682,6 +1811,9 @@ impl SoftRunner {
                     }
                     self.scan.enabled = enable;
                     self.scan.filter_duplicates = params[1] != 0;
+                    // Core 5.4 Vol 6 Part B §4.4.3: the duplicate window ends
+                    // whenever scanning is enabled or disabled.
+                    self.dedup.clear();
                     Ok(&[][..])
                 }
             }
@@ -1698,7 +1830,7 @@ impl SoftRunner {
                     ));
                     return;
                 }
-                let _ = self.bridge.connection_failed(0x02);
+                let _ = self.connection_failed(0x02);
                 Ok(&[][..])
             }
             // Filter Accept List: size / clear / add / remove. Only the
@@ -1870,8 +2002,9 @@ impl SoftRunner {
         let interval_max = le16(15);
         let latency = le16(17);
         let timeout = le16(19);
-        // Initiator filter policy 1 is not implemented.
-        if filter_policy != 0
+        // Policy 1 uses the Filter Accept List and ignores Peer_Address;
+        // policies 2–3 stay rejected rather than silently unfiltered.
+        if filter_policy > 1
             || peer_kind > 1
             || own_kind > 1
             || !(0x0004..=0x4000).contains(&scan_interval)
@@ -1898,6 +2031,7 @@ impl SoftRunner {
             peer_addr,
             peer_random: peer_kind == 1,
             own_random: own_kind == 1,
+            use_accept_list: filter_policy == 1,
             scan_interval_slots: scan_interval,
             scan_window_slots: scan_window,
             interval_min,
@@ -1910,6 +2044,40 @@ impl SoftRunner {
         // Initiating replaces scanning on the radio owner.
         self.scan.enabled = false;
         HCI_SUCCESS
+    }
+
+    /// Validate `LE Connection Update` and let the Central engine run it.
+    /// Only the Central starts the procedure; a Peripheral uses L2CAP.
+    fn connection_update_command(&mut self, params: &[u8]) -> u8 {
+        if params.len() != 14 {
+            return HCI_INVALID_PARAMETERS;
+        }
+        let le16 = |index: usize| u16::from_le_bytes([params[index], params[index + 1]]);
+        let handle = le16(0);
+        let (min, max) = (le16(2), le16(4));
+        let latency = le16(6);
+        let timeout = le16(8);
+        let (min_ce, max_ce) = (le16(10), le16(12));
+        let Some(key) = self.live_key(handle) else {
+            return HCI_UNKNOWN_CONNECTION;
+        };
+        if self.bridge_slot(key.slot).role() != Some(crate::ll::Role::Central) {
+            return HCI_COMMAND_DISALLOWED;
+        }
+        if !(0x0006..=0x0c80).contains(&min)
+            || max < min
+            || max > 0x0c80
+            || latency > 499
+            || !(0x000a..=0x0c80).contains(&timeout)
+            || u32::from(timeout) * 10_000 <= 2 * u32::from(latency + 1) * u32::from(max) * 1250
+            // §7.8.18 bounds both CE lengths and requires the order.
+            || max_ce > 0x0c80
+            || max_ce < min_ce
+        {
+            return HCI_INVALID_PARAMETERS;
+        }
+        self.bridge_slot_mut(key.slot)
+            .request_connection_update(handle, min, max, latency, timeout)
     }
 
     fn set_default_phy_command(&mut self, all_phys: u8, tx: u8, rx: u8) -> u8 {
@@ -3394,16 +3562,17 @@ mod tests {
                 expect_command_complete(opcode, HCI_INVALID_PARAMETERS, &[]);
             }
 
-            // Identity kinds 0 and 1 only; a random identity must be static.
+            // §7.8.16: device addresses only (kinds 0 and 1). A resolvable
+            // private address is accepted and matched raw until it rotates.
             inject_cmd(0x2011, &[2, 1, 2, 3, 4, 5, 6]);
             runner.serve_one().await;
             expect_command_complete(0x2011, HCI_INVALID_PARAMETERS, &[]);
             inject_cmd(0x2011, &[1, 1, 2, 3, 4, 5, 0x40]);
             runner.serve_one().await;
-            expect_command_complete(0x2011, HCI_INVALID_PARAMETERS, &[]);
+            expect_command_complete(0x2011, HCI_SUCCESS, &[]);
             inject_cmd(0x2012, &[1, 1, 2, 3, 4, 5, 0x40]);
             runner.serve_one().await;
-            expect_command_complete(0x2012, HCI_INVALID_PARAMETERS, &[]);
+            expect_command_complete(0x2012, HCI_SUCCESS, &[]);
 
             for n in 0..8u8 {
                 inject_cmd(0x2011, &[0, n, 0, 0, 0, 0, 0]);
@@ -4166,6 +4335,181 @@ mod tests {
     }
 
     #[test]
+    fn filter_duplicates_suppresses_only_identical_reports() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21]);
+
+        pollster::block_on(async {
+            inject_cmd(0x200b, &scan_params());
+            runner.serve_one().await;
+            expect_command_complete(0x200b, HCI_SUCCESS, &[]);
+            inject_cmd(0x200c, &[1, 1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_SUCCESS, &[]);
+        });
+
+        let mut dma = [0u8; 19];
+        dma[0] = 0x00;
+        dma[1] = 17;
+        dma[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        dma[8] = 10;
+        dma[9] = 0x09;
+        dma[10..19].copy_from_slice(b"wch585-c1");
+        assert!(runner.push_adv_report(&scan::Pdu::parse(&dma, true).unwrap(), -40));
+        assert!(!runner.push_adv_report(&scan::Pdu::parse(&dma, true).unwrap(), -40));
+
+        // Same address, changed payload: a new report.
+        dma[18] = b'2';
+        assert!(runner.push_adv_report(&scan::Pdu::parse(&dma, true).unwrap(), -40));
+
+        // Same payload, another advertiser: a new report.
+        dma[2..8].copy_from_slice(&[7, 8, 9, 10, 11, 12]);
+        dma[18] = b'1';
+        assert!(runner.push_adv_report(&scan::Pdu::parse(&dma, true).unwrap(), -40));
+
+        // Disabling resets the window, so the first report is deliverable.
+        drain_controller(&mut runner);
+        pollster::block_on(async {
+            inject_cmd(0x200c, &[0, 1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_SUCCESS, &[]);
+            inject_cmd(0x200c, &[1, 1]);
+            runner.serve_one().await;
+            expect_command_complete(0x200c, HCI_SUCCESS, &[]);
+        });
+        dma[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        assert!(runner.push_adv_report(&scan::Pdu::parse(&dma, true).unwrap(), -40));
+        assert!(runner.scan_state().filter_duplicates);
+    }
+
+    #[test]
+    fn initiator_policy_one_uses_the_accept_list() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21]);
+        let mut params = create_params([1, 2, 3, 4, 5, 6]);
+
+        params[4] = 1;
+        pollster::block_on(async {
+            inject_cmd(0x200d, &params);
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_SUCCESS);
+        });
+        let request = runner.pending_connect().unwrap();
+        assert!(request.use_accept_list);
+        runner.clear_pending_connect();
+
+        params[4] = 2;
+        pollster::block_on(async {
+            inject_cmd(0x200d, &params);
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_INVALID_PARAMETERS);
+        });
+        assert!(runner.pending_connect().is_none());
+    }
+
+    #[test]
+    fn cancel_with_a_live_link_reports_on_the_free_slot() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        assert!(runner.bridge.is_connected());
+        runner.set_random_addr([0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x21]);
+
+        pollster::block_on(async {
+            inject_cmd(0x200d, &create_params([1, 2, 3, 4, 5, 6]));
+            runner.serve_one().await;
+            expect_command_status(0x200d, HCI_SUCCESS);
+        });
+        assert!(runner.pending_connect().is_some());
+
+        pollster::block_on(async {
+            inject_cmd(0x200e, &[]);
+            runner.serve_one().await;
+            expect_command_complete(0x200e, HCI_SUCCESS, &[]);
+        });
+        assert!(runner.pending_connect().is_none());
+        let event = transport::try_receive_controller_packet().unwrap();
+        let payload = event.payload();
+        assert_eq!(payload[0], 0x3e);
+        assert_eq!(payload[2], 0x01); // LE Connection Complete
+        assert_eq!(payload[3], 0x02); // Unknown Connection Identifier
+        assert!(runner.bridge.is_connected());
+        assert!(runner.bridge_slot_mut(1).handle().is_none());
+    }
+
+    #[test]
+    fn acl_credit_ledger_spans_both_links_and_ncp_conserves() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        runner.set_acl_credits_report(2);
+        runner.bridge_slot_mut(0).connected(info_h(1)).unwrap();
+        runner.bridge_slot_mut(1).connected(info_h(2)).unwrap();
+        drain_controller(&mut runner);
+
+        const TOTAL: u32 = 10_000;
+        let mut ncp = [0u32; 2];
+        let mut accepted = [0u32; 2];
+        let mut sent = 0u32;
+        let mut next = 0u32;
+        let mut max_outstanding = 0usize;
+
+        loop {
+            while let Some(packet) = transport::try_receive_controller_packet() {
+                let p = packet.payload();
+                if p[0] == 0x13 {
+                    let handle = u16::from_le_bytes([p[3], p[4]]);
+                    let count = u32::from(u16::from_le_bytes([p[5], p[6]]));
+                    ncp[usize::from(handle - 1)] += count;
+                }
+            }
+            if sent == TOTAL && ncp[0] + ncp[1] == TOTAL && runner.acl_outstanding() == 0 {
+                break;
+            }
+            if sent < TOTAL {
+                let slot = (next % 2) as u8;
+                let handle = 1 + u16::from(slot);
+                if runner.acl_outstanding() >= 2 {
+                    let tag = runner.bridge_slot_mut(slot).take_tx_acl().unwrap().tag;
+                    assert!(runner.bridge_slot_mut(slot).ack_tx(tag));
+                }
+                let packet = acl(handle, 0, &[next as u8; 27]);
+                if transport::try_send_host_packet(packet).is_ok() {
+                    sent += 1;
+                    next += 1;
+                    accepted[usize::from(slot)] += 1;
+                }
+            } else {
+                for slot in 0..2u8 {
+                    if let Some(tx) = runner.bridge_slot_mut(slot).take_tx_acl() {
+                        assert!(runner.bridge_slot_mut(slot).ack_tx(tx.tag));
+                    }
+                }
+            }
+            runner.pump_once();
+            max_outstanding = max_outstanding.max(runner.acl_outstanding());
+        }
+        while let Some(packet) = transport::try_receive_controller_packet() {
+            let p = packet.payload();
+            if p[0] == 0x13 {
+                let handle = u16::from_le_bytes([p[3], p[4]]);
+                let count = u32::from(u16::from_le_bytes([p[5], p[6]]));
+                ncp[usize::from(handle - 1)] += count;
+            }
+        }
+
+        assert_eq!(sent, TOTAL);
+        assert!(max_outstanding <= 2, "ledger exceeded the advertised 2");
+        assert_eq!(ncp, accepted);
+        assert_eq!(ncp[0] + ncp[1], TOTAL);
+    }
+
+    #[test]
     fn cancel_without_pending_is_command_complete() {
         let _guard = test_lock();
         transport::drain_channels_for_test();
@@ -4528,6 +4872,93 @@ mod tests {
         assert_eq!(request.ediv, 0x1234);
         assert_eq!(request.ltk, [0x5a; 16]);
         assert!(runner.take_encryption_request().is_none());
+    }
+
+    #[test]
+    fn connection_update_is_validated_and_queued_for_the_central() {
+        let _guard = test_lock();
+        transport::drain_channels_for_test();
+        let mut runner = SoftRunner::new();
+        let mut info = connection_info();
+        info.role = crate::ll::Role::Central;
+        runner.bridge.connected(info).unwrap();
+        assert!(runner.pump_once());
+        transport::try_receive_controller_packet().unwrap();
+
+        let mut params = [0u8; 14];
+        params[0..2].copy_from_slice(&1u16.to_le_bytes());
+        params[2..4].copy_from_slice(&0x0018u16.to_le_bytes());
+        params[4..6].copy_from_slice(&0x0028u16.to_le_bytes());
+        params[6..8].copy_from_slice(&0u16.to_le_bytes());
+        params[8..10].copy_from_slice(&0x0190u16.to_le_bytes());
+
+        pollster::block_on(async {
+            inject_cmd(0x2013, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2013, HCI_SUCCESS);
+            // One procedure at a time until the RF owner takes it.
+            inject_cmd(0x2013, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2013, HCI_COMMAND_DISALLOWED);
+        });
+        assert_eq!(
+            runner.bridge.take_connection_update(),
+            Some((0x0018, 0x0028, 0, 0x0190))
+        );
+
+        let reject = |runner: &mut SoftRunner, params: &[u8]| {
+            pollster::block_on(async {
+                inject_cmd(0x2013, params);
+                runner.serve_one().await;
+                expect_command_status(0x2013, HCI_INVALID_PARAMETERS);
+            });
+        };
+        // Interval range reversed, below the 7.5 ms floor, latency over 499,
+        // a supervision timeout under 100 ms, and one too short for the
+        // latency: all invalid parameters.
+        let mut bad = params;
+        bad[2..4].copy_from_slice(&0x0030u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        let mut bad = params;
+        bad[2..4].copy_from_slice(&0x0005u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        let mut bad = params;
+        bad[6..8].copy_from_slice(&500u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        let mut bad = params;
+        bad[8..10].copy_from_slice(&9u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        let mut bad = params;
+        bad[6..8].copy_from_slice(&4u16.to_le_bytes());
+        bad[8..10].copy_from_slice(&0x000au16.to_le_bytes());
+        reject(&mut runner, &bad);
+        // CE lengths: reversed and past the §7.8.18 ceiling.
+        let mut bad = params;
+        bad[10..12].copy_from_slice(&0x000cu16.to_le_bytes());
+        bad[12..14].copy_from_slice(&0x0008u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        let mut bad = params;
+        bad[12..14].copy_from_slice(&0x0c81u16.to_le_bytes());
+        reject(&mut runner, &bad);
+        reject(&mut runner, &params[..13]);
+
+        // Unknown handle, then the Peripheral role.
+        let mut bad = params;
+        bad[0..2].copy_from_slice(&9u16.to_le_bytes());
+        pollster::block_on(async {
+            inject_cmd(0x2013, &bad);
+            runner.serve_one().await;
+            expect_command_status(0x2013, HCI_UNKNOWN_CONNECTION);
+        });
+        assert!(runner.bridge.take_connection_update().is_none());
+
+        let mut runner = SoftRunner::new();
+        open(&mut runner);
+        pollster::block_on(async {
+            inject_cmd(0x2013, &params);
+            runner.serve_one().await;
+            expect_command_status(0x2013, HCI_COMMAND_DISALLOWED);
+        });
     }
 
     #[test]

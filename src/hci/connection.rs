@@ -185,6 +185,8 @@ pub struct ConnectionBridge {
     phy_request: Option<(u8, u8)>,
     /// True from `take_phy_request` until the LL procedure completes.
     phy_pending: bool,
+    /// Pending Host `LE Connection Update` range for the RF owner.
+    update_request: Option<(u16, u16, u16, u16)>,
     /// Current TX/RX PHY codes (1 = 1M, 2 = 2M), reported by the LL owner.
     phy_tx: u8,
     phy_rx: u8,
@@ -223,6 +225,7 @@ impl ConnectionBridge {
             data_length_request: None,
             phy_request: None,
             phy_pending: false,
+            update_request: None,
             phy_tx: 1,
             phy_rx: 1,
         }
@@ -262,6 +265,34 @@ impl ConnectionBridge {
         }
         self.phy_request = Some((tx_phys, rx_phys));
         0
+    }
+
+    /// Queue a Host `LE Connection Update` range for the RF owner. Returns an
+    /// HCI status: 0x00 accepted, 0x02 unknown connection, 0x0c disallowed.
+    pub(crate) fn request_connection_update(
+        &mut self,
+        handle: u16,
+        min: u16,
+        max: u16,
+        latency: u16,
+        timeout: u16,
+    ) -> u8 {
+        if self.handle() != Some(handle) {
+            return 0x02;
+        }
+        if self.disconnecting || self.resetting || self.info.is_none() {
+            return 0x0c;
+        }
+        if self.update_request.is_some() {
+            return 0x0c;
+        }
+        self.update_request = Some((min, max, latency, timeout));
+        0
+    }
+
+    /// Take the pending update range; the LL procedure owns it from here.
+    pub fn take_connection_update(&mut self) -> Option<(u16, u16, u16, u16)> {
+        self.update_request.take()
     }
 
     /// Take the pending PHY request; from here the LL procedure owns it.
@@ -444,6 +475,7 @@ impl ConnectionBridge {
         self.retire(Some(info.handle), key);
         transport::set_link(self.slot, None);
         self.radio_request = None;
+        self.update_request = None;
         self.disconnecting = false;
         if !self.resetting && self.event_enabled(0x05) {
             let [lo, hi] = info.handle.to_le_bytes();
@@ -614,6 +646,13 @@ impl ConnectionBridge {
         Ok(())
     }
 
+    /// Host ACL packets accepted but not yet completed. The controller-wide
+    /// ledger sums this over both links; it is derived, so ack/retire cannot
+    /// desynchronize a counter.
+    pub fn tx_outstanding(&self) -> usize {
+        self.tx.iter().filter(|slot| slot.is_some()).count()
+    }
+
     /// Moving a packet to LL does not release its HCI credit. The caller owns
     /// retransmission and must retain this tag until the LL acknowledges it.
     pub fn take_tx_acl(&mut self) -> Option<TxAcl> {
@@ -662,6 +701,7 @@ impl ConnectionBridge {
         transport::set_link(self.slot, None);
         self.events = [None; EVENT_CAPACITY];
         self.radio_request = None;
+        self.update_request = None;
         self.disconnecting = false;
         self.resetting = false;
         self.reset_done = true;
@@ -794,6 +834,7 @@ impl ConnectionBridge {
         self.completed = 0;
         self.data_length_request = None;
         self.phy_request = None;
+        self.update_request = None;
         self.phy_pending = false;
         self.phy_tx = 1;
         self.phy_rx = 1;

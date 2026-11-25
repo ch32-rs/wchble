@@ -64,6 +64,8 @@ ch595 = []
 controller = ["dep:bt-hci", "dep:critical-section", "dep:embassy-sync", "dep:embedded-io"]
 # PHY scheduler helpers (can be used without full controller).
 phy = []
+# Host-side HID-over-GATT report-map parsing (chip independent).
+hogp = []
 # Test-only: let the storage layer inject a truncated program.
 storage-fault = []
 defmt = ["dep:defmt", "bt-hci?/defmt"]

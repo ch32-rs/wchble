@@ -311,6 +311,18 @@ pub fn to_bond(record: &PersistedBond) -> BondInformation {
     )
 }
 
+/// Resolve an on-air RPA through the live resolving-list IRKs.
+#[cfg(feature = "secure")]
+pub fn resolve_identity(address: [u8; 6]) -> Option<(u8, [u8; 6])> {
+    // Live list, not the boot snapshot: a bond the Host dropped after the
+    // peer rejected its LTK must stop resolving that peer.
+    let target = BdAddr::new(address);
+    rl_expected().iter().find_map(|&(kind, on_air, irk)| {
+        let key = IdentityResolvingKey::from_le_bytes(irk)?;
+        key.resolve_address(&target).then_some((kind, on_air))
+    })
+}
+
 /// Record the key material of the bond the Host just added, for dump checks.
 pub fn echo(bond: &BondInformation) {
     let record = from_bond(bond);
