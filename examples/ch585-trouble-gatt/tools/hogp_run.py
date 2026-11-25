@@ -363,7 +363,7 @@ def execute(args):
         symbols = gatt.observation_symbols(
             nm_text, image,
             extra=(('HOGP_STATS', 18), ('BOND_STATS', 32), ('SECURE_STATS', 16),
-                   ('PEER_DIAG', 10), ('INIT_DIAG', 12)))
+                   ('PEER_DIAG', 10), ('INIT_DIAG', 18)))
         metadata['symbols'] = symbols
         metadata['ram_layout'] = gatt.validate_ram_layout(image, symbols)
         embedded = gatt.embedded_u32(image, symbols['RUN_SECONDS'])
@@ -425,11 +425,13 @@ def execute(args):
             metadata['sec_diag'] = diag
         peer_words = io.read32(symbols['PEER_DIAG'], 10, args.out / 'peer_diag.txt')
         metadata['peer_diag'] = decode_peer_diag(peer_words)
-        init_words = io.read32(symbols['INIT_DIAG'], 12, args.out / 'init_diag.txt')
+        init_words = io.read32(symbols['INIT_DIAG'], 18, args.out / 'init_diag.txt')
         metadata['init_diag'] = dict(zip(
             ('magic', 'prepares', 'accept_len', 'advs', 'matches', 'tx_ok', 'tx_err',
              'last_header', 'last_addr_lo', 'last_addr_hi', 'fal_addr_lo',
-             'fal_addr_hi'), init_words))
+             'fal_addr_hi', 'first_target_lo', 'first_target_hi',
+             'expire_target_lo', 'expire_target_hi',
+             'expire_seen_lo', 'expire_seen_hi'), init_words))
         # Last link-layer PDUs; the ring is diagnostic only, never gated.
         trace_count = min(observations.get('STATS', [0] * 40)[39], 128)
         trace_words = io.read32(symbols['TRACE'], trace_count * 8,

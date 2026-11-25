@@ -506,7 +506,17 @@ async fn connect_target<'d>(
     })
     .await;
     session.stop().await;
-    let target = found.map_err(|_| 3u32)?.ok_or(3u32)?;
+    let mut target = found.map_err(|_| 3u32)?.ok_or(3u32)?;
+    // BondLost dropped the bonded rewrite; without the identity here, a
+    // mid-scan RPA rotation strands the initiator on a stale target.
+    #[cfg(feature = "secure")]
+    if target.kind.as_raw() & 1 == 1 {
+        if let Some((kind, identity)) =
+            crate::bond::resolve_identity_boot(target.addr.into_inner())
+        {
+            target = Address::new(AddrKind::new(kind & 1), BdAddr::new(identity));
+        }
+    }
     // A1: the Host only uses initiator policy 1 when the accept list holds
     // more than one member. The second member never advertises, so the connect
     // still targets `target` and proves the list (not Peer_Address) matched.

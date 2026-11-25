@@ -1769,7 +1769,13 @@ const CP_SCAN_WINDOW_US: u32 = 6_000;
 /// accept-list member address and type.
 #[cfg(feature = "cp")]
 #[no_mangle]
-static mut INIT_DIAG: [u32; 12] = [0; 12];
+static mut INIT_DIAG: [u32; 18] = [0; 18];
+
+#[cfg(feature = "cp")]
+fn init_get(index: usize) -> u32 {
+    // SAFETY: see `init_put`.
+    unsafe { core::ptr::addr_of!(INIT_DIAG).cast::<u32>().add(index).read_volatile() }
+}
 
 #[cfg(feature = "cp")]
 fn init_put(index: usize, value: u32) {
@@ -1831,12 +1837,14 @@ fn cp_accept_identity(
     }
 }
 
-/// Resolve an on-air RPA through the peer IRKs the controller loaded.
+/// Resolve an on-air RPA through the peer IRKs the controller loaded. The
+/// boot snapshot backs the reconnect after BondLost pruned the live list.
 #[cfg(feature = "cp")]
 fn resolve_accept_identity(address: [u8; 6]) -> Option<(u8, [u8; 6])> {
     #[cfg(feature = "secure")]
     {
-        return crate::bond::resolve_identity(address);
+        return crate::bond::resolve_identity(address)
+            .or_else(|| crate::bond::resolve_identity_boot(address));
     }
     #[cfg(not(feature = "secure"))]
     {
@@ -1906,12 +1914,16 @@ fn cp_prepare_initiator(
     init_inc(1);
     init_put(2, fal_len as u32);
     if let Some(&(kind, address)) = fal[..fal_len].first() {
-        init_put(10, u32::from(address[0]) | u32::from(address[1]) << 8
-            | u32::from(address[2]) << 16 | u32::from(address[3]) << 24);
-        init_put(
-            11,
-            u32::from(address[4]) | u32::from(address[5]) << 8 | u32::from(kind) << 16,
-        );
+        let lo = u32::from(address[0]) | u32::from(address[1]) << 8
+            | u32::from(address[2]) << 16 | u32::from(address[3]) << 24;
+        let hi = u32::from(address[4]) | u32::from(address[5]) << 8 | u32::from(kind) << 16;
+        init_put(10, lo);
+        init_put(11, hi);
+        // First prepare of the run: the address its CONNECT_IND targeted.
+        if init_get(12) == 0 && init_get(13) == 0 {
+            init_put(12, lo);
+            init_put(13, hi);
+        }
     }
     Some(CpInitiator {
         request,
@@ -2125,6 +2137,13 @@ fn cp_scan_fragment<F: Future>(
     if let Some(init) = initiator.as_ref() {
         if reached(clock.now_us(), init.deadline_us) {
             inc(45);
+            // Expired attempt diagnosis: target (10/11) vs the last address
+            // on air (8/9). Equal words mean a match-logic defect; different
+            // words mean the target went stale.
+            init_put(14, init_get(10));
+            init_put(15, init_get(11));
+            init_put(16, init_get(8));
+            init_put(17, init_get(9));
             let _ = soft.connection_failed(0x3e);
             soft.clear_pending_connect();
             *initiator = None;
