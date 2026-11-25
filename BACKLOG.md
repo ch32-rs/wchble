@@ -1,9 +1,27 @@
 # CH585 BLE bring-up backlog
 
-Updated 2026-11-24. These are open defects, evidence gaps and acceptance work,
+Updated 2026-11-25. These are open defects, evidence gaps and acceptance work,
 not features implicitly promised by the current example. Keep functional,
 capture, recovery, platform and compliance results separate. Do not retry away
-failures or retroactively change archived results.
+failures or retroactively change archived results. Stage status follows merged
+PRs; a PR that lands code is not the same as a milestone gate closing.
+
+## How to read these docs
+
+| Need | Read |
+| --- | --- |
+| Capability stages / delivery order (P/O/C/X/S/L) | Local `local-docs/ch585-ble-role-roadmap.md` |
+| Acceptance gates / binary DoD | This file, §Phase N |
+| What to work next | §Protocol-priority work queue below |
+| Whether a gate passed | Dated `local-docs/results/*` (not in git); cite path/SHA only |
+| User-facing “what works” | Root `README.md` and example READMEs |
+
+Letter namespaces collide — always qualify them:
+
+- **Phase 1** A1/A2/B1/B2/C1 ≠ **Issue #9** A1/A2/B1/B2 (PR #10/#12) ≠
+  roadmap/baseline **C1** central (`examples/ch585-central`, PR #2).
+- BACKLOG **Phase 1** (central HOGP closed loop) ≠ roadmap **P1** Broadcaster.
+- Peripheral HOGP keyboard (PR #7 / X4b) ≠ central HOGP host (PR #35 / `hogp`).
 
 ## Current baseline
 
@@ -22,39 +40,49 @@ failures or retroactively change archived results.
   Android five-phase runner (positive, three negatives, bogus peer) and a
   `peer-vanish` phase. CONNECT_IND is hardware-timed by the LLE;
   `CONNECT_OFFSET` is 0. P3 and P4 one-cycle regressions passed afterwards.
+- Phase 1 controller/HOGP path (PR #35): `examples/ch585-trouble-gatt`
+  `--features hogp` can central-initiate LESC, recover from BondLost, and host
+  a scripted HID mouse. That is code + partial gate evidence, **not** Phase 1
+  milestone closure (OPEN gates below).
 
 See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README.md)
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
-## Protocol-priority work queue (2026-11-24)
+## Protocol-priority work queue (2026-11-25)
 
 The Core spec makes a feature mandatory only when its role, command or
 feature bit is claimed (ICS); the tree stays compliant by leaving 2M/Coded
 and other unimplemented features unadvertised. This queue orders the open
 work by compliance risk first, then interoperability value, then optional
 features by product demand. Details and evidence stay in the sections below;
-this is the entry point.
+this is the entry point. Items marked “code landed” still need gate evidence.
 
 1. **Must fix — accepted behavior is incomplete or wrong.**
-   - Issue #9 B6: under policy 0, Filter_Duplicates and directed-ADV target
-     filtering are accepted but not applied, and initiator policy 1 still
-     ignores Peer_Address; non-zero policies now return `0x12`. (A2 and B1
-     are fixed in PR #10.)
-   - X3.3 acceptance gap: per-link credits are implemented, but the total
-     ACL credit and `Number of Completed Packets` accounting is not accepted
-     end-to-end across the limited HCI subset. Outbound fragmentation and
-     the real Session/scheduler wiring sit in the same subsection; this is
-     an acceptance gap, not a known single-link defect.
-   - Host poll budget inside security windows: one HID run recorded
-     `max_host_poll_us=562,467` with `host_poll_overrun=1`. The refusal gate
-     passed, but that budget inside a pairing window stays unverified.
-2. **Central interoperability** (unlocks #26–#30).
-   - L2CAP Connection Parameter Update response and an explicit
-     LL_CONNECTION_PARAM_REQ decision (#30).
-   - Bonded-device reconnect (#30); CP reverse connect order and Create
-     Connection Cancel with a live link.
-   - HOGP host example (#29) once #27/#30 land.
+   - Issue #9 B6 residue: under policy 0, Filter_Duplicates and directed-ADV
+     target filtering are still accepted but not applied. Initiator **policy 1
+     already uses the accept list and ignores Peer_Address (PR #35)**; scan
+     policies 1–3 and initiator policies 2–3 still return `0x12`. Remaining
+     acceptance: Filter_Duplicates on hardware and directed ADV observed with
+     event type `0x01`. (**Issue #9** A2/B1 were fixed in PR #10 — not Phase 1
+     A2/B1.)
+   - X3.3 / Phase 1 A2 acceptance gap: the controller-level ACL credit ledger
+     landed in PR #35 and is covered offline; end-to-end hardware streaming
+     (≥10k fragments both ways across two handles) is still missing. Outbound
+     fragmentation and Session/scheduler wiring sit in the same subsection.
+   - Host poll budget: a historical HID run recorded `max_host_poll_us=562,467`
+     with `host_poll_overrun=1`. Phase 1 A3 on the hogp matrix already PASSed
+     the dual bound (steady ≤100 ms, pairing P-256 <2 s); do not treat that
+     historical HID figure as the current Phase 1 status.
+2. **Central interoperability — code landed (PR #35); gates still open.**
+   - L2CAP Connection Parameter Update / HCI 0x2013 path is in tree; Phase 1
+     C1 (and D1’s parameter clause) still need a peer that actually requests
+     parameters (#30 evidence).
+   - Bonded reconnect and BondLost recovery are in tree; keep watching C3
+     regressions. CP reverse connect order and Create Connection Cancel with a
+     live link still need hardware (Phase 1 C4; Mac bluetoothd state).
+   - Central HOGP host example (`hogp` / #29) is in tree; remaining D1 work is
+     peer-limited evidence, not a missing host.
 3. **Standard test evidence.**
    - 2M corroboration (X1b); mainstream peers request it.
    - DTM and `ch585-rf-basic` (X5), the entry point for any air-interface
@@ -77,6 +105,16 @@ complete. X3's value is the central/HOGP use case, not conformance.
 
 ## Phase 1 milestone: central HOGP closed loop (confirmed 2026-11-24)
 
+**Status (2026-11-25):** controller / central HOGP **code landed in PR #35**;
+milestone **open**. Merge ≠ gate closure.
+
+- **PASS** (archived evidence): B1, B2, C2, C3, A3; A1 initiator policy 1 on
+  hardware; A2 offline ledger fixture.
+- **OPEN:** C1; D1 parameter-request clause; C4 hardware; A1 Filter_Duplicates
+  hardware row and directed ADV observation; A2 hardware streaming.
+- Local scoreboard (not in git):
+  `local-docs/results/phase1-status-20261125.md`.
+
 The first stage covers tiers 1–2 as one milestone: a central that can host a
 real HID device, after the claimed behavior is compliant. All four blocks are
 required. **Acceptance is binary: every gate below passes on the recorded
@@ -94,21 +132,23 @@ and run the scripts to reproduce a real bonded HID mouse working end-to-end
 and a central+peripheral dual-link round, with the evidence archived. This is
 engineering-grade real-device bring-up, not a certification claim.
 
-- **A. Compliance and flow control.** Issue #9 B6 (the policy matrix below),
-  X3.3 total ACL credit and `Number of Completed Packets` accounting plus
-  outbound fragmentation and the real Session/scheduler wiring, and the Host
-  poll budget inside security windows.
+- **A. Compliance and flow control.** Issue #9 B6 residue (policy matrix
+  below), X3.3 total ACL credit and `Number of Completed Packets` accounting
+  plus outbound fragmentation and the real Session/scheduler wiring, and the
+  Host poll budget inside security windows.
 - **B. Central security (#27).** Outbound LESC initiation, key distribution,
   bond save/load, encrypted reconnect from an existing bond, and the failure
-  and deletion paths. Hard prerequisite for HOGP: real devices hide reports
-  until the link is encrypted.
+  and deletion paths — **code in PR #35**; hard prerequisite for HOGP because
+  real devices hide reports until the link is encrypted.
 - **C. Central interoperability (#30 and X3 CP gaps).** L2CAP Connection
   Parameter Update response, LL_CONNECTION_PARAM_REQ consistency,
   bonded-device reconnect with identity/RPA handling, CP reverse connect order
-  and Create Connection Cancel with a live link.
+  and Create Connection Cancel with a live link — **most code in PR #35**;
+  open items are gate evidence (especially C1/C4).
 - **D. Acceptance vehicle (#29).** HOGP host example: 0x1812 discovery,
   Report Map read, Report Reference parsing, notification subscription and
-  report decoding, exercised on a real HID device.
+  report decoding — **`hogp` in PR #35**; still needs a peer that exercises
+  every D1 clause.
 
 ### Phase 1 gates (each gate is PASS/FAIL on its own)
 
@@ -238,13 +278,15 @@ periodic/PAwR/ISO and the other optional features.
   Current-tree P3/C1/reconnect/fresh-pair rounds pass, but none exercised a
   connection-update instant across the old deadline; air fixed-point evidence
   for the instant boundary is still pending.
-- [ ] **B6 — scan/filter policy application.** Filter_Duplicates and
-  directed-ADV target filtering are still accepted but not applied, and
-  initiator policy 1 still ignores Peer_Address. Unimplemented accept-list
-  policies no longer silently pass: Set Scan Parameters with policy ≠ 0 and
-  LE Create Connection with initiator policy ≠ 0 now return `0x12` (S4b).
-  Tests: `scan_filter_policies_are_rejected`,
-  `create_connection_rejects_invalid_parameters`.
+- [ ] **B6 — scan/filter policy application.** Under policy 0, Filter_Duplicates
+  and directed-ADV target filtering are still accepted but not applied.
+  Initiator policy 1 already matches the accept list and ignores Peer_Address
+  (PR #35; Phase 1 A1 policy-1 hardware row). Scan policies 1–3 and initiator
+  policies 2–3 return `0x12` (S4b). Remaining: Filter_Duplicates observed on
+  hardware and directed ADV delivered with event type `0x01`. Tests:
+  `scan_filter_policies_are_rejected`,
+  `create_connection_rejects_invalid_parameters`,
+  `initiator_policy_one_uses_the_accept_list`.
 - [x] **B7 — HCI state restrictions.** Set Random Address now returns Command
   Disallowed while advertising, scanning or initiating (§7.8.4), and Set Scan
   Parameters while scanning (§7.8.10). Test:

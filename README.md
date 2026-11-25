@@ -178,9 +178,12 @@ keeps advertising while a slot is free; `--features cp` holds one outbound
 central link to an Android GATT server and one inbound peripheral link from a
 macOS client in the same round. Both pass finite macOS/Android rounds (host two
 connections/disconnects, clean rate and bridge error counters, smoke restored).
-These are verified plaintext subsets, not full multilink: `pp+secure`, the
-reverse CP connect order, encrypted outbound links, the total ACL-credit claim
-and the full X3.3 scope remain open (see `BACKLOG.md`).
+Plaintext PP/CP subsets landed first; `pp+secure` closed in PR #25 and central
+encrypted outbound / HOGP host paths landed in PR #35. Still open: reverse CP
+connect order and Create Connection Cancel on hardware (Phase 1 C4), the
+Phase 1 A2 total ACL-credit streaming claim, and the rest of the X3.3
+acceptance scope (see `BACKLOG.md`). Phase 1 central HOGP **code is merged**;
+the milestone stays open until every Phase 1 gate PASSes.
 
 **CH585 X2a extended advertising (advertiser subset)** (2026-11-20):
 [`examples/ch585-trouble-gatt`](examples/ch585-trouble-gatt) with

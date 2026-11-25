@@ -335,6 +335,17 @@ rate; the separate three-cycle regression above validates the functional change.
 It does not retroactively alter archived images, reclassify earlier failures, or
 validate calibrated clock/IFS compliance.
 
+## Phase 1 central HOGP host (feature `hogp`)
+
+`--features hogp` (implies `cp` + `privacy`/`secure`) is the Phase 1 acceptance
+vehicle from PR #35: the same example drives a central LESC link to a scripted
+HID mouse (`tools/hogp_run.py`, android-gatt `--ez hid true`), reads Report Map,
+subscribes, and decodes motion/button reports. This is the **central HOGP host**
+path — not the peripheral keyboard in `examples/ch585-hid-keyboard` (PR #7 /
+X4b). Code and partial gate evidence are on `main`; the Phase 1 milestone is
+still open until every gate in `BACKLOG.md` PASSes (peer-limited OPEN rows
+remain).
+
 ## S2: LE Secure Connections (feature `secure`)
 
 `--features secure` enables `trouble-host/security` (RustCrypto AES-128,
