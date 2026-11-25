@@ -413,10 +413,10 @@ async fn connection_events(
             }
             #[cfg(feature = "secure")]
             ConnectionEvent::BondLost => {
-                // The peer rejected the stored LTK (it deleted its bond).
-                // Drop the stale entry and end this link: Android cannot
-                // complete a re-pairing on a link whose bonded encryption
-                // already failed, so the recovery has to be a fresh connect.
+                // Peer rejected the stored LTK. Drop the live entry and tear
+                // the link so recovery can pair on a fresh connect. Do not
+                // flush an empty snapshot: that would erase flash before the
+                // replacement bond exists and skip the next 0x06.
                 let identity = connection.peer_identity();
                 let removed = stack.remove_bond_information(identity).is_ok();
                 #[cfg(feature = "hogp")]
@@ -430,7 +430,7 @@ async fn connection_events(
                         list
                     });
                     crate::bond::set_rl_expected_from_snapshot(&snapshot);
-                    crate::bond::signals().set_pending(snapshot);
+                    crate::bond::signals().discard_pending();
                 }
                 BOND_LOST.store(true, Ordering::Relaxed);
                 connection.disconnect();
@@ -681,8 +681,13 @@ async fn central_cycle(
         #[cfg(feature = "secure")]
         if BOND_LOST.load(Ordering::Relaxed) && round < RECOVERY_ROUNDS {
             // Reconnect so the fresh pairing starts without the stale key.
+            // The Host Connection must drop before Create Connection again,
+            // or Connection Complete lands while accept() is still unmatched.
             BOND_LOST.store(false, Ordering::Relaxed);
-            Timer::after(RETRY_DELAY).await;
+            let settle = Instant::now() + RETRY_DELAY;
+            while connection.is_connected() || Instant::now() < settle {
+                yield_now().await;
+            }
             continue;
         }
         if cycle.is_ok() {

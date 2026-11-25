@@ -690,10 +690,8 @@ impl<'a, F: Future> wchble::hci::link::LinkExtras for Extra<'a, F> {
             info.peer_identity = soft
                 .resolve_pending_peer()
                 .or_else(|| soft.resolve_peer(info.peer_address, true))
-                // The Host may have refused to enable controller resolution
-                // (static local address): resolve with the stored IRK instead,
-                // or SMP would fall back to the identity address.
-                .or_else(|| bond::resolve_identity(info.peer_address));
+                // Live IRKs, then the boot snapshot after BondLost cleared them.
+                .or_else(|| resolve_accept_identity(info.peer_address));
             privacy::note_resolve(self.clock.now_us().wrapping_sub(started));
         }
         #[cfg(not(feature = "privacy"))]
@@ -1837,20 +1835,18 @@ fn cp_accept_identity(
     }
 }
 
-/// Resolve an on-air RPA through the peer IRKs the controller loaded. The
-/// boot snapshot backs the reconnect after BondLost pruned the live list.
-#[cfg(feature = "cp")]
+/// Resolve an on-air RPA through live IRKs, then the boot snapshot after
+/// BondLost pruned the live list (Host accept([identity]) still needs it).
+#[cfg(feature = "secure")]
 fn resolve_accept_identity(address: [u8; 6]) -> Option<(u8, [u8; 6])> {
-    #[cfg(feature = "secure")]
-    {
-        return crate::bond::resolve_identity(address)
-            .or_else(|| crate::bond::resolve_identity_boot(address));
-    }
-    #[cfg(not(feature = "secure"))]
-    {
-        let _ = address;
-        None
-    }
+    crate::bond::resolve_identity(address)
+        .or_else(|| crate::bond::resolve_identity_boot(address))
+}
+
+#[cfg(not(feature = "secure"))]
+fn resolve_accept_identity(address: [u8; 6]) -> Option<(u8, [u8; 6])> {
+    let _ = address;
+    None
 }
 
 /// Build both CONNECT_IND variants once per pending request, with an AA that
