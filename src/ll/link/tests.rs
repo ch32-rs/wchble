@@ -15,7 +15,9 @@ use std::vec::Vec;
 use super::central::{CentralLink, PREPARE_LEAD_US};
 use super::cp::CpLink;
 use super::*;
+use crate::crypto::aes::Aes128;
 use crate::ll::conn::ConnectParams;
+use crate::ll::enc::{EncRole, Encryption, SessionKey};
 use crate::ll::sched::{Decision, EventOutcome, LinkTable};
 use crate::rf::{PhyMode, Radio, RfCallback, RxState};
 
@@ -277,7 +279,15 @@ struct RecHost {
     x1: Option<X1Snapshot>,
     published: Vec<ConnectionInfo>,
     phy_requests: VecDeque<(u8, u8)>,
+    length_requests: VecDeque<(u16, u16)>,
     phy_events: Vec<(u8, u8, u8)>,
+    enable_request: Option<crate::hci::runner::EnableEncryption>,
+    update_request: Option<(u16, u16, u16, u16)>,
+    updates: Vec<(u16, u16, u16)>,
+    ltk_reply: Option<crate::hci::runner::LtkReply>,
+    enc_changes: Vec<(u16, u8, u8)>,
+    ltk_requests: Vec<([u8; 8], u16)>,
+    accepts_ltk_request: bool,
 }
 
 impl RecHost {
@@ -320,7 +330,15 @@ impl RecHost {
             x1: None,
             published: Vec::new(),
             phy_requests: VecDeque::new(),
+            length_requests: VecDeque::new(),
             phy_events: Vec::new(),
+            enable_request: None,
+            update_request: None,
+            updates: Vec::new(),
+            ltk_reply: None,
+            enc_changes: Vec::new(),
+            ltk_requests: Vec::new(),
+            accepts_ltk_request: true,
         }
     }
 }
@@ -333,6 +351,18 @@ impl LinkHost for RecHost {
     }
     fn new_aes(&mut self, key: &[u8; 16]) -> Self::Aes {
         crate::crypto::aes::Aes128::new(key)
+    }
+    fn fill_random(&mut self, out: &mut [u8]) {
+        // Fixture: deterministic material the tests can reproduce.
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = 0xa0 | (i as u8 & 0x0f);
+        }
+    }
+    fn take_encryption_request(&mut self) -> Option<crate::hci::runner::EnableEncryption> {
+        self.enable_request.take()
+    }
+    fn take_connection_update(&mut self) -> Option<(u16, u16, u16, u16)> {
+        self.update_request.take()
     }
 
     fn stat_inc(&mut self, slot: usize) {
@@ -456,8 +486,14 @@ impl LinkHost for RecHost {
             self.log.push("disconnect");
         }
     }
-    fn encryption_change(&mut self, _handle: u16, _status: u8, _enabled: u8) {}
-    fn connection_updated(&mut self, _interval: u16, _latency: u16, _timeout: u16) -> bool {
+    fn encryption_change(&mut self, handle: u16, status: u8, enabled: u8) {
+        self.enc_changes.push((handle, status, enabled));
+    }
+    fn local_handle(&self) -> Option<u16> {
+        Some(1)
+    }
+    fn connection_updated(&mut self, interval: u16, latency: u16, timeout: u16) -> bool {
+        self.updates.push((interval, latency, timeout));
         true
     }
     fn data_length_change(&mut self, _a: u16, _b: u16, _c: u16, _d: u16) -> bool {
@@ -465,13 +501,17 @@ impl LinkHost for RecHost {
     }
 
     fn take_ltk_reply(&mut self) -> Option<LtkReply> {
-        None
+        self.ltk_reply.take()
     }
-    fn push_ltk_request(&mut self, _rand: [u8; 8], _ediv: u16) -> bool {
+    fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool {
+        if !self.accepts_ltk_request {
+            return false;
+        }
+        self.ltk_requests.push((rand, ediv));
         true
     }
     fn take_data_length_request(&mut self) -> Option<(u16, u16)> {
-        None
+        self.length_requests.pop_front()
     }
     fn take_phy_request(&mut self) -> Option<(u8, u8)> {
         self.phy_requests.pop_front()
@@ -1914,9 +1954,13 @@ struct CentralHarness {
     clock: FakeClock,
     radio: FakeRadio,
     host: RecHost,
-    link: CentralLink,
+    link: CentralLink<crate::crypto::aes::Aes128>,
     rx: DmaBuf<RX_DMA_MIN>,
     tx: DmaBuf<MAX_PDU>,
+    /// SN of our next TX; the peer's NESN acknowledges it.
+    tx_sn: bool,
+    /// SN the next peer PDU must carry.
+    peer_sn: bool,
 }
 
 impl CentralHarness {
@@ -1935,7 +1979,47 @@ impl CentralHarness {
             link,
             rx: DmaBuf::zeroed(),
             tx: DmaBuf::zeroed(),
+            tx_sn: false,
+            peer_sn: false,
         }
+    }
+
+    fn new_encrypted_at(start: u32) -> Self {
+        let clock = FakeClock::new(start);
+        let stops = Rc::new(Cell::new(0));
+        let radio = FakeRadio::new(&clock, stops.clone());
+        let mut host = RecHost::new(stops);
+        host.clock = Some(clock.now.clone());
+        host.features = crate::ll::ctrl::feature_bits(&[
+            crate::ll::ctrl::FEATURE_LE_ENCRYPTION,
+            crate::ll::ctrl::FEATURE_LE_DATA_LENGTH_EXTENSION,
+            crate::ll::ctrl::FEATURE_LE_CSA2,
+        ]);
+        let features = host.local_features();
+        let link = CentralLink::new(params(), start.wrapping_add(CONNECT_END), start, features);
+        Self {
+            clock,
+            radio,
+            host,
+            link,
+            rx: DmaBuf::zeroed(),
+            tx: DmaBuf::zeroed(),
+            tx_sn: false,
+            peer_sn: false,
+        }
+    }
+
+    /// Push one peer PDU with the tracked NESN/SN and step once. The peer
+    /// acknowledges our TX and its own SN advances.
+    fn exchange(&mut self, llid: u8, payload: &[u8]) -> Control {
+        let mut frame = std::vec![peer_header(llid, !self.tx_sn, self.peer_sn)];
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+        self.radio.push(FakeRadio::frame(frame));
+        let control = self.step();
+        self.tx_sn = !self.tx_sn;
+        self.peer_sn = !self.peer_sn;
+        control
     }
 
     /// Move the fake clock to an absolute time.
@@ -2202,6 +2286,398 @@ fn a_two_slot_table_dispatches_cp_links_by_their_windows() {
     let advanced = table.link(early).unwrap().window();
     assert_eq!(advanced.event, early_window.event.wrapping_add(1));
     assert_eq!(table.link(late).unwrap().window().event, late_window.event);
+}
+
+/// Frame header for a peer PDU: LLID, NESN and SN.
+fn peer_header(llid: u8, nesn: bool, sn: bool) -> u8 {
+    llid | if nesn { 0x04 } else { 0 } | if sn { 0x08 } else { 0 }
+}
+
+fn enable_request() -> crate::hci::runner::EnableEncryption {
+    crate::hci::runner::EnableEncryption {
+        handle: 1,
+        rand: [0; 8],
+        ediv: 0,
+        ltk: [0; 16],
+    }
+}
+
+#[test]
+fn central_start_procedure_encrypts_the_link_and_carries_data() {
+    const LTK: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    const SKDS: [u8; 8] = [0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+    const IVS: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+
+    let mut h = CentralHarness::new_encrypted_at(0);
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    assert_eq!(h.host.connections, 1);
+
+    // The Host asks for encryption. The step after it runs in the gap and
+    // queues the plaintext LL_ENC_REQ for the event after that.
+    h.host.enable_request = Some(enable_request());
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    let mut enc_rsp = std::vec![0x04];
+    enc_rsp.extend_from_slice(&SKDS);
+    enc_rsp.extend_from_slice(&IVS);
+    assert_eq!(h.exchange(3, &enc_rsp), Control::Continue);
+    let enc_req = h.radio.sent.last().unwrap().clone();
+    assert_eq!(enc_req[0] & 3, 3, "LL control PDU");
+    assert_eq!(enc_req[2], 0x03, "LL_ENC_REQ");
+    assert_eq!(&enc_req[3..11], &[0; 8], "LESC rand");
+    assert_eq!(&enc_req[11..13], &[0, 0], "LESC ediv");
+    let skdm: [u8; 8] = enc_req[13..21].try_into().unwrap();
+    let ivm: [u8; 4] = enc_req[21..25].try_into().unwrap();
+
+    assert_eq!(h.host.ltk_requests, std::vec![([0; 8], 0)]);
+    assert!(!h.link.encrypted());
+
+    // The Host's LTK answer; the response is precomputed, not sent yet.
+    h.host.ltk_reply = Some(crate::hci::runner::LtkReply::Key(LTK));
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    assert_eq!(h.radio.sent.last().unwrap()[0] & 3, 1, "empty PDU only");
+    assert!(!h.link.encrypted());
+
+    // The Peripheral's plaintext LL_START_ENC_REQ releases the response.
+    h.complete();
+    assert_eq!(h.exchange(3, &[0x05]), Control::Continue);
+    assert!(!h.link.encrypted());
+
+    // The next event sends the encrypted LL_START_ENC_RSP; the peer answers
+    // with its own encrypted response, which arms the session.
+    let session = SessionKey::from_parts(&LTK, &skdm, &SKDS, &ivm, &IVS);
+    let mut peer = Encryption::new(
+        session.clone(),
+        EncRole::Peripheral,
+        Aes128::new(session.key()),
+    );
+    peer.enable_tx();
+    peer.enable_rx();
+    let mut wire = [0u8; MAX_ENCRYPTED];
+    let mut plain = [0u8; MAX_PLAINTEXT];
+    let len = peer.encrypt(0x03, &[0x06], &mut wire).unwrap();
+    let start_rsp = wire[..len].to_vec();
+
+    // A Host ACL queued now is encrypted in the same gap that arms the link.
+    let tag = crate::hci::connection::test_tag(0, 1, 9);
+    h.host.acl_tx.push_back(queued_data_acl(tag));
+    h.complete();
+    assert_eq!(h.exchange(3, &start_rsp), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[0] & 3, 3, "encrypted control PDU");
+    assert_eq!(sent[1] as usize, len, "ciphertext plus MIC");
+    assert_eq!(peer.decrypt(0x03, &sent[2..], &mut plain).unwrap(), 1);
+    assert_eq!(plain[0], 0x06);
+    assert!(h.link.encrypted());
+    assert_eq!(h.host.enc_changes, std::vec![(1, 0, 1)]);
+    assert_eq!(h.host.sec[SEC_ENC_REQ], 1);
+    assert_eq!(h.host.sec[SEC_ENC_RSP], 1);
+    assert_eq!(h.host.sec[SEC_LTK_REQUEST], 1);
+    assert_eq!(h.host.sec[SEC_LTK_REPLY], 1);
+    assert_eq!(h.host.sec[SEC_PREPARED], 1);
+    assert_eq!(h.host.sec[SEC_START_REQ], 1);
+    assert_eq!(h.host.sec[SEC_START_RSP], 1);
+    assert_eq!(h.host.sec[SEC_ENCRYPTED_RX], 1);
+    assert_eq!(h.host.sec[SEC_ACTIVE], 1);
+
+    // Host data leaves encrypted and keeps its tag until the peer acks it.
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[0] & 3, 2, "LLID 2 data");
+    let n = peer.decrypt(0x02, &sent[2..], &mut plain).unwrap();
+    assert_eq!(&plain[..n], &[0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(h.host.acked, std::vec![tag]);
+}
+
+#[test]
+fn central_start_accepts_start_enc_req_before_the_ltk_reply() {
+    const LTK: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    const SKDS: [u8; 8] = [0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+    const IVS: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+
+    let mut h = CentralHarness::new_encrypted_at(0);
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+
+    h.host.enable_request = Some(enable_request());
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    let mut enc_rsp = std::vec![0x04];
+    enc_rsp.extend_from_slice(&SKDS);
+    enc_rsp.extend_from_slice(&IVS);
+    assert_eq!(h.exchange(3, &enc_rsp), Control::Continue);
+    let enc_req = h.radio.sent.last().unwrap().clone();
+    let skdm: [u8; 8] = enc_req[13..21].try_into().unwrap();
+    let ivm: [u8; 4] = enc_req[21..25].try_into().unwrap();
+
+    // The peer calculates its session key first and sends LL_START_ENC_REQ
+    // while the Host's LTK answer is still outstanding.
+    h.complete();
+    assert_eq!(h.exchange(3, &[0x05]), Control::Continue);
+    h.complete();
+    assert!(
+        h.radio
+            .sent
+            .iter()
+            .all(|pdu| pdu.len() < 3 || pdu[2] != 0x07),
+        "an early START_ENC_REQ is not answered as unknown"
+    );
+    assert!(!h.link.encrypted());
+
+    // The Host's answer now prepares and releases the response in one gap,
+    // so the encrypted response leaves in the next event.
+    h.host.ltk_reply = Some(crate::hci::runner::LtkReply::Key(LTK));
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let session = SessionKey::from_parts(&LTK, &skdm, &SKDS, &ivm, &IVS);
+    let mut peer = Encryption::new(
+        session.clone(),
+        EncRole::Peripheral,
+        Aes128::new(session.key()),
+    );
+    peer.enable_tx();
+    peer.enable_rx();
+    let mut wire = [0u8; MAX_ENCRYPTED];
+    let mut plain = [0u8; MAX_PLAINTEXT];
+    let len = peer.encrypt(0x03, &[0x06], &mut wire).unwrap();
+    let start_rsp = wire[..len].to_vec();
+
+    h.complete();
+    assert_eq!(h.exchange(3, &start_rsp), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[0] & 3, 3, "encrypted control PDU");
+    assert_eq!(peer.decrypt(0x03, &sent[2..], &mut plain).unwrap(), 1);
+    assert_eq!(plain[0], 0x06);
+    assert!(h.link.encrypted());
+    assert_eq!(h.host.enc_changes, std::vec![(1, 0, 1)]);
+    assert_eq!(h.host.sec[SEC_START_REQ], 1);
+    assert_eq!(h.host.sec[SEC_START_RSP], 1);
+    assert_eq!(h.host.sec[SEC_ACTIVE], 1);
+}
+
+#[test]
+fn central_start_rejects_before_the_feature_bit() {
+    let mut h = CentralHarness::new_at(0);
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.host.enable_request = Some(enable_request());
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    assert_eq!(h.host.enc_changes, std::vec![(1, 0x11, 0)]);
+    assert_eq!(h.host.ltk_requests.len(), 0);
+}
+
+#[test]
+fn central_schedules_the_host_connection_update() {
+    let mut h = CentralHarness::new_at(0);
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+
+    h.host.update_request = Some((0x0018, 0x0028, 0, 0x0190));
+    h.complete();
+    // The request is taken in this event's gap; nothing is armed yet.
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    // The next event arms and sends it, so the instant counts from here.
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[2], 0x00, "LL_CONNECTION_UPDATE_IND");
+    assert_eq!(sent[3], 1, "win size");
+    assert_eq!(u16::from_le_bytes([sent[4], sent[5]]), 0, "win offset");
+    assert_eq!(u16::from_le_bytes([sent[6], sent[7]]), 0x0018, "interval");
+    assert_eq!(u16::from_le_bytes([sent[8], sent[9]]), 0, "latency");
+    assert_eq!(u16::from_le_bytes([sent[10], sent[11]]), 0x0190, "timeout");
+    assert_eq!(
+        u16::from_le_bytes([sent[12], sent[13]]),
+        h.link.conn.event_counter().wrapping_add(6),
+        "instant counts from the event that carries the PDU"
+    );
+
+    assert!(h.host.updates.is_empty());
+    for _ in 0..7 {
+        h.complete();
+        assert_eq!(h.exchange(1, &[]), Control::Continue);
+    }
+    assert_eq!(h.host.updates, std::vec![(0x0018, 0, 0x0190)]);
+    assert_eq!(h.link.conn.params.interval, 0x0018);
+}
+
+/// Run the scripted start procedure to `Encryption Change` and hand back the
+/// peer cipher for decoding what the link sends next.
+fn establish_encryption(h: &mut CentralHarness) -> Encryption<Aes128> {
+    const LTK: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    const SKDS: [u8; 8] = [0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+    const IVS: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
+
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.host.enable_request = Some(enable_request());
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    let mut enc_rsp = std::vec![0x04];
+    enc_rsp.extend_from_slice(&SKDS);
+    enc_rsp.extend_from_slice(&IVS);
+    assert_eq!(h.exchange(3, &enc_rsp), Control::Continue);
+    let enc_req = h.radio.sent.last().unwrap().clone();
+    let skdm: [u8; 8] = enc_req[13..21].try_into().unwrap();
+    let ivm: [u8; 4] = enc_req[21..25].try_into().unwrap();
+    h.host.ltk_reply = Some(crate::hci::runner::LtkReply::Key(LTK));
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    assert_eq!(h.exchange(3, &[0x05]), Control::Continue);
+
+    let session = SessionKey::from_parts(&LTK, &skdm, &SKDS, &ivm, &IVS);
+    let mut peer = Encryption::new(
+        session.clone(),
+        EncRole::Peripheral,
+        Aes128::new(session.key()),
+    );
+    peer.enable_tx();
+    peer.enable_rx();
+    let mut wire = [0u8; MAX_ENCRYPTED];
+    let len = peer.encrypt(0x03, &[0x06], &mut wire).unwrap();
+    let start_rsp = wire[..len].to_vec();
+    h.complete();
+    assert_eq!(h.exchange(3, &start_rsp), Control::Continue);
+    // The link's encrypted response burns peer RX counter 0.
+    let sent = h.radio.sent.last().unwrap().clone();
+    let mut plain = [0u8; MAX_PLAINTEXT];
+    assert_eq!(peer.decrypt(sent[0], &sent[2..], &mut plain).unwrap(), 1);
+    assert_eq!(plain[0], 0x06);
+    assert!(h.link.encrypted());
+    peer
+}
+
+/// Advance to the gap before the next event: services run there, and the
+/// event itself follows in the same pass.
+fn arm_before_event(h: &mut CentralHarness) {
+    h.link.advance_one().unwrap();
+    h.advance_to(h.prepare().wrapping_sub(5_000));
+}
+
+/// Step one encrypted event and decode the PDU the link sent with it. Empty
+/// PDUs carry no MIC and do not consume the RX counter.
+fn exchange_plain(h: &mut CentralHarness, peer: &mut Encryption<Aes128>) -> std::vec::Vec<u8> {
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    if sent[1] == 0 {
+        return std::vec::Vec::new();
+    }
+    let mut plain = [0u8; MAX_PLAINTEXT];
+    let n = peer.decrypt(sent[0], &sent[2..], &mut plain).unwrap();
+    plain[..n].to_vec()
+}
+
+#[test]
+fn central_encrypted_update_keeps_six_events_from_the_pre_event_pass() {
+    let mut h = CentralHarness::new_encrypted_at(0);
+    let mut peer = establish_encryption(&mut h);
+    h.host.update_request = Some((0x0018, 0x0028, 0, 0x0190));
+
+    // Take the request in a gap, where the staging pass already ran.
+    h.complete();
+    assert!(exchange_plain(&mut h, &mut peer).is_empty());
+
+    // Pre-event pass: the update is encrypted and staged for this event.
+    arm_before_event(&mut h);
+    assert_eq!(h.step(), Control::Continue);
+
+    h.advance_to(h.prepare());
+    let plain = exchange_plain(&mut h, &mut peer);
+    assert_eq!(plain[0], 0x00, "LL_CONNECTION_UPDATE_IND");
+    let instant = u16::from_le_bytes([plain[10], plain[11]]);
+    assert_eq!(
+        instant,
+        h.link.conn.event_counter().wrapping_add(6),
+        "six events from the sending event"
+    );
+}
+
+#[test]
+fn central_encrypted_update_staged_after_the_event_still_keeps_six() {
+    let mut h = CentralHarness::new_encrypted_at(0);
+    let mut peer = establish_encryption(&mut h);
+    h.host.update_request = Some((0x0018, 0x0028, 0, 0x0190));
+
+    // This event's body sends an empty PDU; the gap takes the request.
+    h.complete();
+    assert!(exchange_plain(&mut h, &mut peer).is_empty());
+    // The next gap stages it, knowing the PDU waits for the next event.
+    h.complete();
+    assert!(exchange_plain(&mut h, &mut peer).is_empty());
+    h.complete();
+    let plain = exchange_plain(&mut h, &mut peer);
+    assert_eq!(plain[0], 0x00, "LL_CONNECTION_UPDATE_IND");
+    let instant = u16::from_le_bytes([plain[10], plain[11]]);
+    assert_eq!(
+        instant,
+        h.link.conn.event_counter().wrapping_add(6),
+        "a PDU staged after the event is stamped for the next one"
+    );
+}
+
+#[test]
+fn central_update_and_dle_request_share_a_pass_without_loss() {
+    let mut h = CentralHarness::new_at(0);
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+
+    h.host.length_requests.push_back((27, 1_000));
+    h.host.update_request = Some((0x0018, 0x0028, 0, 0x0190));
+    h.complete();
+    // This event's body predates both requests; the gap takes them.
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.complete();
+    // The length request owns this event; the update waits, still armed for
+    // the event that carries it.
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[2], 0x14, "LL_LENGTH_REQ");
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    let sent = h.radio.sent.last().unwrap().clone();
+    assert_eq!(sent[2], 0x00, "LL_CONNECTION_UPDATE_IND");
+    assert_eq!(
+        u16::from_le_bytes([sent[12], sent[13]]),
+        h.link.conn.event_counter().wrapping_add(6)
+    );
+}
+
+#[test]
+fn central_peer_reject_reports_failure_without_encrypting() {
+    let mut h = CentralHarness::new_encrypted_at(0);
+    h.host.feature_request_allowed = false;
+    h.advance_to(h.prepare());
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+    h.host.enable_request = Some(enable_request());
+    h.complete();
+    assert_eq!(h.exchange(1, &[]), Control::Continue);
+
+    // LL_REJECT_IND with PIN or Key Missing.
+    h.complete();
+    assert_eq!(h.exchange(3, &[0x0d, 0x06]), Control::Continue);
+    assert_eq!(h.host.enc_changes, std::vec![(1, 0x06, 0)]);
+    assert!(!h.link.encrypted());
 }
 
 #[test]

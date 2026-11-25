@@ -151,7 +151,7 @@ def execute(args):
         wait_until(safe_read_at)
         observations = {}
         for name, count, names in (('STATS', 64, STAT_NAMES),
-                                   ('HOST_STATS', 16, HOST_NAMES)):
+                                   ('HOST_STATS', len(HOST_NAMES), HOST_NAMES)):
             words = io.read32(symbols[name], count, args.out / f'{name.lower()}.txt')
             observations[name] = words
             metadata[name.lower()] = dict(zip(names, words))
@@ -159,7 +159,7 @@ def execute(args):
                 json.dumps(metadata[name.lower()], indent=2) + '\n')
         host = observations.get('HOST_STATS', [])
         stats = observations.get('STATS', [])
-        if len(stats) != 64 or len(host) != 16:
+        if len(stats) != 64 or len(host) != len(HOST_NAMES):
             errors.append(f'short STATS read: {len(stats)}/{len(host)}')
         else:
             errors.extend(evaluate(host, stats))

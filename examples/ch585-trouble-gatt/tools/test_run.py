@@ -56,7 +56,7 @@ def good_stats(cycles=1, seconds=25):
 
 def good_host(cycles=1):
     return [2, cycles, cycles, 5 * cycles, 13 * cycles, 10 * cycles, 110,
-            0, 0, 0, 0, cycles + 1, 0, 0, 0, 0]
+            0, 0, 0, 0, cycles + 1, 0, 0, 0, 0, 0]
 
 
 def good_client(cycles=1, timeout=20, notification_first=False):
@@ -91,7 +91,8 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(runner.HOST_NAMES[:12], ['phase', 'connections', 'disconnects', 'reads',
                          'writes', 'notifications', 'value', 'errors', 'last_error', 'gatt_other',
                          'subscribed', 'advertise_attempts'])
-        self.assertEqual(len(runner.HOST_NAMES), 16)
+        self.assertEqual(len(runner.HOST_NAMES), 17)
+        self.assertEqual(runner.HOST_NAMES[-1], 'update_accepted')
         self.assertIn('F93', ' '.join(runner.PROBE))
 
     def test_symbols_and_ram_preflight(self):
@@ -268,7 +269,7 @@ class ExecutionTests(unittest.TestCase):
                     self.assertEqual(address, SYMBOLS['STATS'])
                     words = good_stats(seconds=seconds)
                     if mode == 'stats_fail': words[2] = 0xee
-                elif count == 16:
+                elif count == runner.HOST_STATS_WORDS:
                     self.assertEqual(address, SYMBOLS['HOST_STATS'])
                     words = good_host()
                     if mode == 'host_fail': words[7] = 1
@@ -339,7 +340,7 @@ class ExecutionTests(unittest.TestCase):
                                  'central.jsonl', 'stats.json', 'host_stats.json', 'trace.json',
                                  'result.json', 'central.command.json'}.issubset(files))
                 expected_time = 100 + seconds + 3
-                self.assertEqual([call[1] for call in calls if call[0] == 'read'], [64, 16, 8])
+                self.assertEqual([call[1] for call in calls if call[0] == 'read'], [64, runner.HOST_STATS_WORDS, 8])
                 # One combined helper flash gate replaces the former
                 # halt/idle/download sequence for both test and restore.
                 self.assertLess(calls.index(('flash', 'test', 100.0)), calls.index(('client', 'start', 100.0)))
@@ -399,7 +400,7 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(sum(call[:2] == ('flash', 'restore') for call in calls), 1)
                 self.assertTrue(all(call[2] >= 128 for call in calls if call[0] == 'read'))
                 self.assertTrue(all(call[2] >= 128 for call in calls if call[:2] == ('flash', 'restore')))
-                self.assertIn(16, [call[1] for call in calls if call[0] == 'read'])
+                self.assertIn(runner.HOST_STATS_WORDS, [call[1] for call in calls if call[0] == 'read'])
                 self.assertTrue(any(call[0] == 'read' and call[1] in (8, 1024) for call in calls))
                 if mode not in ('recovery_scan_fail', 'restore_flash_fail'):
                     self.assertIn('PASS', result['smoke_recovery'])
@@ -407,7 +408,7 @@ class ExecutionTests(unittest.TestCase):
     def test_failed_stats_read_still_reads_host_and_full_trace(self):
         code, result, calls, files = self.run_mocked('stats_read_fail')
         self.assertEqual(code, 1)
-        self.assertEqual([call[1] for call in calls if call[0] == 'read'], [64, 16, 1024])
+        self.assertEqual([call[1] for call in calls if call[0] == 'read'], [64, runner.HOST_STATS_WORDS, 1024])
         self.assertTrue({'host_stats.json', 'trace.json'}.issubset(files))
         self.assertIn('host_stats', result)
 

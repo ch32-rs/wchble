@@ -27,6 +27,149 @@ See [`examples/ch585-trouble-gatt/README.md`](examples/ch585-trouble-gatt/README
 for the GATT contract, test commands, counters and detailed validation boundaries.
 Raw captures and experiment records remain local; they are not required to build.
 
+## Protocol-priority work queue (2026-11-24)
+
+The Core spec makes a feature mandatory only when its role, command or
+feature bit is claimed (ICS); the tree stays compliant by leaving 2M/Coded
+and other unimplemented features unadvertised. This queue orders the open
+work by compliance risk first, then interoperability value, then optional
+features by product demand. Details and evidence stay in the sections below;
+this is the entry point.
+
+1. **Must fix — accepted behavior is incomplete or wrong.**
+   - Issue #9 B6: under policy 0, Filter_Duplicates and directed-ADV target
+     filtering are accepted but not applied, and initiator policy 1 still
+     ignores Peer_Address; non-zero policies now return `0x12`. (A2 and B1
+     are fixed in PR #10.)
+   - X3.3 acceptance gap: per-link credits are implemented, but the total
+     ACL credit and `Number of Completed Packets` accounting is not accepted
+     end-to-end across the limited HCI subset. Outbound fragmentation and
+     the real Session/scheduler wiring sit in the same subsection; this is
+     an acceptance gap, not a known single-link defect.
+   - Host poll budget inside security windows: one HID run recorded
+     `max_host_poll_us=562,467` with `host_poll_overrun=1`. The refusal gate
+     passed, but that budget inside a pairing window stays unverified.
+2. **Central interoperability** (unlocks #26–#30).
+   - L2CAP Connection Parameter Update response and an explicit
+     LL_CONNECTION_PARAM_REQ decision (#30).
+   - Bonded-device reconnect (#30); CP reverse connect order and Create
+     Connection Cancel with a live link.
+   - HOGP host example (#29) once #27/#30 land.
+3. **Standard test evidence.**
+   - 2M corroboration (X1b); mainstream peers request it.
+   - DTM and `ch585-rf-basic` (X5), the entry point for any air-interface
+     claim in X8.
+4. **Service evolution.**
+   - Service Changed (0x2A05) before a firmware update changes services under
+     a retained bond; the current workaround changes the advertised identity.
+   - OTA: X6c is deferred on the secure-carrier size boundary; no protocol
+     work unblocks it.
+5. **Structural / optional.**
+   - L0 library extraction: prerequisite for X8 and a second chip.
+   - Coded PHY (BLOCKED on instruments), periodic advertising /
+     `SYNC_ADV`/`SYNC_SCAN`, PAwR, ISO/LE Audio, direction finding, LE Power
+     Control and connection subrating: optional, add on product demand.
+
+Two evidence tracks stay first-class and are not demoted by this queue:
+independent phone acceptance and reliable sniffer evidence (sections below).
+Multi-connection is not a compliance requirement; a single-link peripheral is
+complete. X3's value is the central/HOGP use case, not conformance.
+
+## Phase 1 milestone: central HOGP closed loop (confirmed 2026-11-24)
+
+The first stage covers tiers 1–2 as one milestone: a central that can host a
+real HID device, after the claimed behavior is compliant. All four blocks are
+required. **Acceptance is binary: every gate below passes on the recorded
+image, or the milestone fails. There is no partial credit and no "known
+limitation" waiver — anything not in scope is excluded before work starts,
+not traded away afterwards.**
+
+Common evidence rule for every gate: same release image with recorded
+`elf_sha256`; scripted peer plus firmware counters, and a capture where the
+gate names one; runner `errors=[]`; `TX_LATE=0`; supervision never expires;
+smoke image restored and exact-name discovery confirmed afterwards.
+
+End state: someone who never worked on the tree can flash the recorded image
+and run the scripts to reproduce a real bonded HID mouse working end-to-end
+and a central+peripheral dual-link round, with the evidence archived. This is
+engineering-grade real-device bring-up, not a certification claim.
+
+- **A. Compliance and flow control.** Issue #9 B6 (the policy matrix below),
+  X3.3 total ACL credit and `Number of Completed Packets` accounting plus
+  outbound fragmentation and the real Session/scheduler wiring, and the Host
+  poll budget inside security windows.
+- **B. Central security (#27).** Outbound LESC initiation, key distribution,
+  bond save/load, encrypted reconnect from an existing bond, and the failure
+  and deletion paths. Hard prerequisite for HOGP: real devices hide reports
+  until the link is encrypted.
+- **C. Central interoperability (#30 and X3 CP gaps).** L2CAP Connection
+  Parameter Update response, LL_CONNECTION_PARAM_REQ consistency,
+  bonded-device reconnect with identity/RPA handling, CP reverse connect order
+  and Create Connection Cancel with a live link.
+- **D. Acceptance vehicle (#29).** HOGP host example: 0x1812 discovery,
+  Report Map read, Report Reference parsing, notification subscription and
+  report decoding, exercised on a real HID device.
+
+### Phase 1 gates (each gate is PASS/FAIL on its own)
+
+- **A1 — HCI policy matrix.** Every scan/initiator policy value is either
+  applied exactly as specified or rejected with `0x12`; no value is accepted
+  silently. Required rows: scan policy 0 with Filter_Duplicates (an exact
+  duplicate address+payload is suppressed, a changed payload or a second
+  device is still reported, and the cache resets when scanning is disabled);
+  initiator policy 1 connects to a device from the accept list and ignores
+  Peer_Address; scan policies 1–3 and initiator policies 2–3 are rejected with
+  `0x12`. Directed advertising under policy 0 is delivered with event type
+  `0x01`; target filtering exists only in the rejected policies. PASS = 100%
+  of matrix rows, with the applied rows also observed on hardware.
+- **A2 — ACL credit conservation.** With a central and a peripheral link
+  active concurrently, move at least 10,000 LL fragments both ways (Host ACL
+  packets fragmented to the negotiated air length). For each handle, the sum
+  of `Number of Completed Packets` equals the Host ACL packets the controller
+  consumed, the Host never has more advertised buffers outstanding across both
+  links than the controller reports, and no credit leaks or overflows appear.
+  PASS = zero mismatches for both handles.
+- **A3 — Host silence budget.** Outside pairing, every Host poll is at most
+  100 ms. In each pairing window the link uses a 4 s supervision timeout, and
+  the single LESC P-256 poll must stay below 2 s (supervision/2). Core bounds
+  supervision and the 30 s ATT transaction, not the Host poll, so the gate is
+  the measured poll against those bounds. PASS = both bounds hold and no
+  supervision expiry occurs.
+- **B1 — Central encryption.** Against a controlled LESC peripheral,
+  central-initiated security reaches `Encryption Change` status 0 for both a
+  first pairing and a reconnect from the stored bond, 10/10 rounds each;
+  reconnect shows no re-pairing; the bond survives reset; deleting it forces
+  pairing again. PASS = 10/10 in both scenarios, MIC failures 0, encryption
+  procedure errors 0.
+- **B2 — Security failure paths.** Missing key, rejected pairing and
+  deleted-bond reconnect each produce the spec-defined error or termination
+  and never hang. PASS = 3/3 rounds per case.
+- **C1 — Parameter update.** A peripheral-initiated L2CAP Connection Parameter
+  Update receives a response; when accepted the link adopts an interval in
+  the requested range, when refused it keeps the previous parameters, and
+  supervision holds. PASS = 10/10.
+- **C2 — Connection Parameter Request consistency.** Either
+  LL_CONNECTION_PARAM_REQ is not claimed and never used (the peer falls back
+  to L2CAP), or it is implemented and answered per spec. PASS = the feature
+  bit and the observed procedure agree, with no `LL_UNKNOWN_RSP` for anything
+  claimed.
+- **C3 — Bonded reconnect.** From off, a bonded peripheral's advertising is
+  recognised (RPA resolved where used) and connected within 10 s with no user
+  action and no re-pairing. PASS = 10/10.
+- **C4 — CP order and cancel.** Peripheral-first and central-first orders
+  each complete with both links healthy, and Create Connection Cancel with a
+  live link returns Command Complete while that link's error and supervision
+  counters stay unchanged. PASS = 10/10 each.
+- **D1 — HOGP on a real device.** The encrypted link exposes 0x1812; the
+  Report Map reads byte-exact; every input Report Reference is found and
+  subscribed; at least 100 input reports arrive with decoded motion (nonzero
+  dx/dy) and buttons; the device's parameter request ends with the link in
+  its requested range; wake → reconnect → reports works with no user action.
+  PASS = 10/10 rounds without re-pairing.
+
+Out of phase 1: 2M corroboration and DTM, Service Changed, L0 extraction, OTA,
+periodic/PAwR/ISO and the other optional features.
+
 ## Issue #9 audit follow-ups (2026-11-14)
 
 - [x] **A1 — async RX/TX DMA lifetime.** `rx_basic` (and the TX fast path) keep
@@ -585,9 +728,12 @@ capture checks, trim malformed PCAP tails, or blindly repeat until a pass.
 
 The PP/CP subsets are closed in `local-docs/results/x3-6-closeout.md`. These
 remain open and must not be read as verified:
-- [ ] **`pp+secure` (two encrypted links).** The feature combination builds
-  (flash 310,126 B, RAM 44,308 B) but has no hardware round; PP acceptance is
-  plaintext only.
+- [x] **`pp+secure` (two encrypted links) — closed 2026-11-22.** PR #25
+  (`ad729ae`): dual encrypted reconnect on hardware (`dual#6`), 38 cross-link
+  notifications, one link dropped and one preserved, `TX_LATE=0`; the 3a
+  refusal subset also passed. Residues (peer-visible 0x05 rejection,
+  ECDH-entry blocking, pairing-burst coexistence) stay with the
+  concurrent-pairing item below, not with the dual-link transport.
 - [ ] **CP reverse connect order (peripheral first, then central).** Starting
   the phone after the Mac link failed: the fixture advertises about 11 s after
   boot while the app's scan budget is about 10 s and a live link leaves roughly
@@ -607,7 +753,8 @@ remain open and must not be read as verified:
   privileged-GATT limitation above is unchanged.
 - [ ] **Concurrent new pairing.** Pairing while two links are live is rejected
   at SMP with Pairing Failed 0x05 by design; a multi-link pairing path has no
-  acceptance evidence.
+  acceptance evidence. Unverified 3b residues: peer-visible 0x05 rejection,
+  ECDH-entry blocking and pairing-burst coexistence.
 - [ ] **Host poll budget in security windows.** The HID 60 s refusal-gate run
   recorded `max_host_poll_us=562,467` with `host_poll_overrun=1`; the gate
   passed, but the Host poll budget inside pairing/security windows is not

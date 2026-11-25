@@ -101,7 +101,7 @@ class RejectionTests(unittest.TestCase):
                 self.assertTrue(secure.evaluate_rejection(bad))
 
     def test_firmware_side_rejection(self):
-        host = [0] * 16
+        host = [0] * len(secure.HOST_NAMES)
         host[15] = 1
         errors = secure.evaluate_rejected_link(
             sec(ltk_request=1, start_req=0, last_error=6, active=0), host)

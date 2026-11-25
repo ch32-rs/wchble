@@ -54,6 +54,9 @@ pub mod ll;
 #[cfg(feature = "controller")]
 pub mod hci;
 
+#[cfg(feature = "hogp")]
+pub mod hogp;
+
 /// Crate-level result alias used by radio bring-up helpers.
 pub type Result<T> = core::result::Result<T, Error>;
 

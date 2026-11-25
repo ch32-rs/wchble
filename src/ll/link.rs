@@ -145,6 +145,8 @@ pub trait LinkHost {
 
     fn local_features(&self) -> [u8; 8];
     fn new_aes(&mut self, key: &[u8; 16]) -> Self::Aes;
+    /// Controller randomness for LL_ENC_REQ SKDm/IVm (Central role).
+    fn fill_random(&mut self, out: &mut [u8]);
 
     fn stat_inc(&mut self, slot: usize);
     fn stat_put(&mut self, slot: usize, value: u32);
@@ -210,6 +212,10 @@ pub trait LinkHost {
 
     fn take_ltk_reply(&mut self) -> Option<LtkReply>;
     fn push_ltk_request(&mut self, rand: [u8; 8], ediv: u16) -> bool;
+    /// Host `LE Enable Encryption` waiting for the Central engine.
+    fn take_encryption_request(&mut self) -> Option<crate::hci::runner::EnableEncryption>;
+    /// Host `LE Connection Update` range waiting for the Central engine.
+    fn take_connection_update(&mut self) -> Option<(u16, u16, u16, u16)>;
     fn take_data_length_request(&mut self) -> Option<(u16, u16)>;
 
     /// Host `LE Set PHY` preference masks (1M bit0, 2M bit1).

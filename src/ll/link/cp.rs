@@ -18,7 +18,7 @@ use super::{step as peripheral_step, Control, LinkHost, Session, SessionLink};
 #[allow(clippy::large_enum_variant)]
 pub enum CpLink<E: AesEngine> {
     Peripheral(SessionLink<E>),
-    Central(CentralLink),
+    Central(CentralLink<E>),
 }
 
 impl<E: AesEngine> CpLink<E> {
@@ -26,18 +26,18 @@ impl<E: AesEngine> CpLink<E> {
         Self::Peripheral(SessionLink::new(session))
     }
 
-    pub fn central(link: CentralLink) -> Self {
+    pub fn central(link: CentralLink<E>) -> Self {
         Self::Central(link)
     }
 
-    pub fn as_central(&self) -> Option<&CentralLink> {
+    pub fn as_central(&self) -> Option<&CentralLink<E>> {
         match self {
             Self::Central(link) => Some(link),
             Self::Peripheral(_) => None,
         }
     }
 
-    pub fn as_central_mut(&mut self) -> Option<&mut CentralLink> {
+    pub fn as_central_mut(&mut self) -> Option<&mut CentralLink<E>> {
         match self {
             Self::Central(link) => Some(link),
             Self::Peripheral(_) => None,

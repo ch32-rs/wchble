@@ -38,7 +38,7 @@ def sec(**values):
 
 
 def host(**values):
-    words = [0] * 16
+    words = [0] * len(runner.gatt.HOST_NAMES)
     words[0] = 2  # back to advertising
     words[3] = words[4] = words[5] = 1
     for name, value in values.items():

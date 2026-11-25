@@ -198,11 +198,12 @@ class MacSource:
 
 
 class AndroidSource:
-    def __init__(self, out, name, no_service, hold_ms=0):
+    def __init__(self, out, name, no_service, hold_ms=0, hid=False):
         self.out = out
         self.name = name
         self.no_service = no_service
         self.hold_ms = hold_ms
+        self.hid = hid
         self.started = False
 
     def build(self):
@@ -233,6 +234,8 @@ class AndroidSource:
                 '--ei', 'timeout', str(timeout)]
         if self.hold_ms:
             args.extend(['--ei', 'hold_ms', str(self.hold_ms)])
+        if self.hid:
+            args.extend(['--ez', 'hid', 'true'])
         self.adb(*args, timeout=30)
         self.started = True
         time.sleep(0.8)

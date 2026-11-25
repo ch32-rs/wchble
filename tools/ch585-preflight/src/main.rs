@@ -81,6 +81,8 @@ enum Action {
     /// DataFlash is rejected: its contents are only reachable through the
     /// device's own code paths.
     WriteRaw { path: String, address: u64 },
+    /// Erase a DataFlash range (acceptance setup: a factory-fresh bond store).
+    EraseDataFlash { address: u64, length: usize },
 }
 
 /// Pick the flash algorithm that owns `address`.
@@ -92,6 +94,30 @@ fn algorithm_for(
         let range = &algorithm.flash_properties.address_range;
         address >= range.start && address < range.end
     })
+}
+
+/// Erase a DataFlash range through the data algorithm (sector erase).
+fn erase_dataflash_range(
+    session: &mut probe_rs::Session,
+    address: u64,
+    length: usize,
+) -> Result<(), (u8, String)> {
+    let target = session.target().clone();
+    algorithm_for(&target, address)
+        .ok_or((4, format!("no flash algorithm covers {address:#x}")))?;
+    let mut progress = FlashProgress::empty();
+    probe_rs::flashing::erase(
+        session,
+        &mut progress,
+        address,
+        address + length as u64,
+        // No restore: the caller stages and downloads its own data.
+        false,
+        false,
+    )
+    .map_err(|e| (4, format!("erase DataFlash: {e:?}")))?;
+    println!("preflight: erased {length} bytes at {address:#x}");
+    Ok(())
 }
 
 fn run() -> Result<(), (u8, String)> {
@@ -108,6 +134,7 @@ fn run() -> Result<(), (u8, String)> {
     let mut no_run = false;
     let mut dataflash_address = 0x0007_7E00u64;
     let mut dataflash_length = 0x200usize;
+    let mut erase_dataflash = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--probe" => selector = args.next(),
@@ -124,6 +151,7 @@ fn run() -> Result<(), (u8, String)> {
                         .map_err(|e| (2, format!("invalid --raw-addr: {e}")))?;
             }
             "--dump-dataflash" => dump = args.next(),
+            "--erase-dataflash" => erase_dataflash = true,
             "--dataflash-addr" => {
                 let raw = args.next().ok_or((2, "missing --dataflash-addr".into()))?;
                 dataflash_address =
@@ -158,10 +186,16 @@ fn run() -> Result<(), (u8, String)> {
                 address: raw_address,
             }
         }
+        (false, None, None, None) if erase_dataflash => Action::EraseDataFlash {
+            address: dataflash_address,
+            length: dataflash_length,
+        },
         _ => {
             return Err((
                 2,
-                "use exactly one of an image, --reset, --dump-dataflash or --write-raw".into(),
+                "use exactly one of an image, --reset, --dump-dataflash, --write-raw or \
+                 --erase-dataflash"
+                    .into(),
             ))
         }
     };
@@ -305,9 +339,18 @@ fn run() -> Result<(), (u8, String)> {
         return Ok(());
     }
 
+    if let Action::EraseDataFlash { address, length } = &action {
+        erase_dataflash_range(&mut session, *address, *length)?;
+        return Ok(());
+    }
+
     let Action::Download(image) = action else {
-        unreachable!("dump and reset returned above");
+        unreachable!("dump, reset and erase returned above");
     };
+    // Acceptance setup: a wiped bond store must boot exactly like a new part.
+    if erase_dataflash {
+        erase_dataflash_range(&mut session, dataflash_address, dataflash_length)?;
+    }
     let mut options = DownloadOptions::default();
     options.verify = verify;
     // A chip erase would wipe the other OTA slot; erase only the sectors
