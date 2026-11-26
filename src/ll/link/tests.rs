@@ -432,6 +432,9 @@ impl LinkHost for RecHost {
     fn take_tx_acl(&mut self) -> Option<TxAcl> {
         self.acl_tx.pop_front()
     }
+    fn has_tx_acl(&self) -> bool {
+        !self.acl_tx.is_empty()
+    }
     fn ack_tx(&mut self, tag: TxTag) -> bool {
         self.acked.push(tag);
         true
@@ -1321,6 +1324,38 @@ fn late_response_still_completes_the_acknowledged_host_packet() {
     h.radio.push(FakeRadio::missed());
     assert_eq!(h.event(FINISH), EventEnd::Continue);
     assert_eq!(h.host.acked, std::vec![tag]);
+}
+
+#[test]
+fn md_bit_keeps_queued_host_packets_in_the_same_event() {
+    let mut h = Harness::new();
+    let first = crate::hci::connection::test_tag(0, 1, 11);
+    let second = crate::hci::connection::test_tag(0, 1, 12);
+    h.host.acl_tx.push_back(queued_data_acl(first));
+    h.host.acl_tx.push_back(queued_data_acl(second));
+
+    // One event: the Central's anchor, then its ACK of our first PDU.
+    h.radio.push(FakeRadio::frame(empty_with(false, false)));
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+
+    assert_eq!(h.radio.sent.len(), 2, "both packets in one event");
+    assert_eq!(h.radio.sent[0][0] & 3, 2, "first data PDU");
+    assert_eq!(h.radio.sent[0][0] & 0x10, 0x10, "MD: a second packet waits");
+    assert_eq!(h.radio.sent[1][0] & 3, 2, "second data PDU");
+    assert_eq!(h.radio.sent[1][0] & 0x10, 0, "MD clear: nothing left");
+    assert_eq!(h.host.acked, std::vec![first]);
+
+    // Next event: the Central acknowledges our SN=1 (NESN=0) with its SN=0.
+    // The link is idle now: an Empty PDU with MD=0 lets it end the event.
+    h.radio.push(FakeRadio::frame(empty_with(false, false)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.acked, std::vec![first, second]);
+    let empty = h.radio.sent.last().unwrap();
+    assert_eq!(empty[0] & 3, 1, "Empty PDU");
+    assert_eq!(empty[0] & 0x10, 0);
 }
 
 #[test]

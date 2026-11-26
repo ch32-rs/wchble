@@ -188,6 +188,11 @@ pub trait LinkHost {
     /// Returns false when the bridge refuses the fragment.
     fn receive_acl(&mut self, llid: u8, payload: &[u8]) -> bool;
     fn take_tx_acl(&mut self) -> Option<TxAcl>;
+    /// Whether [`Self::take_tx_acl`] would return a packet. Sets the MD bit,
+    /// so the Central keeps the event open while Host data is queued.
+    fn has_tx_acl(&self) -> bool {
+        false
+    }
     fn ack_tx(&mut self, tag: TxTag) -> bool;
 
     fn is_connected(&self) -> bool;
@@ -1076,6 +1081,8 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             // §4.5.1: answer the first CRC-error packet with a retransmission
             // or an Empty PDU; the corrupt packet does not advance the SN.
             let retry = s.link.has_outstanding();
+            s.link
+                .set_more_data(s.pending_host.is_some() || host.has_tx_acl());
             let pdu = s.link.tx_pdu();
             let frame = pdu.as_bytes();
             tx.0[..frame.len()].copy_from_slice(frame);
@@ -1398,6 +1405,11 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
                 queue_next_host_fragment(host, s);
             }
         }
+        // MD: more data follows this PDU (the rest of the current Host
+        // packet, or another queued one), so the Central keeps the event
+        // open instead of closing it after a single exchange.
+        s.link
+            .set_more_data(s.pending_host.is_some() || host.has_tx_acl());
         let pdu = s.link.tx_pdu();
         let frame = pdu.as_bytes();
         tx.0[..frame.len()].copy_from_slice(frame);

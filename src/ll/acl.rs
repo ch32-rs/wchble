@@ -94,6 +94,7 @@ pub struct LinkSequence {
     transmitted: bool,
     tx_max_payload: u16,
     rx_max_payload: u16,
+    more_data: bool,
 }
 
 impl Default for LinkSequence {
@@ -111,7 +112,14 @@ impl LinkSequence {
             transmitted: false,
             tx_max_payload: LL_LEGACY_PAYLOAD,
             rx_max_payload: LL_DEFAULT_RX_PAYLOAD,
+            more_data: false,
         }
+    }
+
+    /// MD for the next transmissions: more data follows the PDU in this
+    /// event, so the Central keeps the event open (Vol 6 Part B §4.5.6).
+    pub fn set_more_data(&mut self, more: bool) {
+        self.more_data = more;
     }
 
     /// Apply the negotiated on-air limits (MIC included). Values are clamped
@@ -162,8 +170,10 @@ impl LinkSequence {
         if pdu.bytes[0] & 3 == 0 {
             pdu.bytes[0] = 1;
         }
-        pdu.bytes[0] =
-            (pdu.bytes[0] & 3) | (u8::from(self.expected_rx_sn) << 2) | (u8::from(self.tx_sn) << 3);
+        pdu.bytes[0] = (pdu.bytes[0] & 3)
+            | (u8::from(self.expected_rx_sn) << 2)
+            | (u8::from(self.tx_sn) << 3)
+            | (u8::from(self.more_data) << 4);
         self.transmitted = true;
         *pdu
     }
@@ -211,6 +221,32 @@ impl LinkSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md_bit_follows_the_more_data_flag() {
+        let mut link = LinkSequence::new();
+        assert_eq!(link.tx_pdu().header() & 0x10, 0, "MD clear by default");
+
+        let mut link = LinkSequence::new();
+        link.queue(2, &[1, 2, 3]).unwrap();
+        link.set_more_data(true);
+        let pdu = link.tx_pdu();
+        assert_eq!(
+            pdu.header() & 0x10,
+            0x10,
+            "MD set while more data is queued"
+        );
+        assert_eq!(pdu.llid(), 2, "LLID unchanged");
+        assert_eq!(pdu.payload(), &[1, 2, 3]);
+
+        // A retransmission of the same PDU reflects the current flag; SN and
+        // payload stay identical.
+        link.set_more_data(false);
+        let retry = link.tx_pdu();
+        assert_eq!(retry.header() & 0x10, 0);
+        assert_eq!(retry.header() & 0x0f, pdu.header() & 0x0f);
+        assert_eq!(retry.payload(), pdu.payload());
+    }
 
     #[test]
     fn pdu_bounds_and_llid() {

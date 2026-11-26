@@ -653,6 +653,13 @@ impl ConnectionBridge {
         self.tx.iter().filter(|slot| slot.is_some()).count()
     }
 
+    /// Whether [`Self::take_tx_acl`] would return a packet.
+    pub fn has_tx_acl(&self) -> bool {
+        !self.disconnecting
+            && !self.resetting
+            && self.tx.iter().flatten().any(|slot| !slot.in_flight)
+    }
+
     /// Moving a packet to LL does not release its HCI credit. The caller owns
     /// retransmission and must retain this tag until the LL acknowledges it.
     pub fn take_tx_acl(&mut self) -> Option<TxAcl> {
@@ -1199,6 +1206,32 @@ mod tests {
         );
         assert!(bridge.handle().is_none());
         assert!(transport::published_key(5).is_none());
+    }
+
+    #[test]
+    fn has_tx_acl_reports_only_packets_not_yet_in_flight() {
+        let _guard = serial();
+        let mut bridge = ConnectionBridge::for_slot(0);
+        bridge.connected(info_for(1)).unwrap();
+        assert!(!bridge.has_tx_acl());
+
+        bridge.enqueue_tx(&acl(1, &[1])).unwrap();
+        bridge.enqueue_tx(&acl(1, &[2])).unwrap();
+        assert!(bridge.has_tx_acl());
+        let first = bridge.take_tx_acl().unwrap().tag;
+        assert!(bridge.has_tx_acl(), "the second packet is still waiting");
+        let second = bridge.take_tx_acl().unwrap().tag;
+        assert!(!bridge.has_tx_acl(), "both are in flight");
+        assert!(bridge.ack_tx(first) && bridge.ack_tx(second));
+        assert!(!bridge.has_tx_acl());
+
+        bridge.enqueue_tx(&acl(1, &[3])).unwrap();
+        bridge.request_reset();
+        assert!(
+            !bridge.has_tx_acl(),
+            "nothing is handed out while resetting"
+        );
+        bridge.reset_finished();
     }
 
     #[test]
