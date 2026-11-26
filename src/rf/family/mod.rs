@@ -7,6 +7,7 @@
 //! that module's radio type.
 
 pub mod tables;
+pub mod caps;
 
 /// DIAGNOSTIC ONLY: scheduled-TX startup boundary samples (temporary).
 
