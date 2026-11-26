@@ -12,9 +12,14 @@ pub struct FamilyCaps {
     pub rfend_base: usize,
     pub irq_bb: u8,
     pub irq_lle: u8,
-    /// LLE TX DMA pointer register offset.
+    /// Base for [`Self::tx_bufptr_off`] / [`Self::rx_bufptr_off`].
+    ///
+    /// CH585/592/V208: same as `lle_base`. CH573: separate DMA block at
+    /// `0x4000_C000` (not LLE-relative).
+    pub bufptr_base: usize,
+    /// TX buffer pointer register offset from [`Self::bufptr_base`].
     pub tx_bufptr_off: usize,
-    /// LLE RX DMA pointer register offset.
+    /// RX buffer pointer register offset from [`Self::bufptr_base`].
     pub rx_bufptr_off: usize,
     /// Inclusive start of the SRAM window LLE DMA may use.
     pub sram_start: usize,
@@ -46,8 +51,9 @@ mod tests {
         rfend_base: 0,
         irq_bb: 0,
         irq_lle: 0,
-        tx_bufptr_off: 0x78,
-        rx_bufptr_off: 0x7c,
+        bufptr_base: 0x4000_c000,
+        tx_bufptr_off: 0x10,
+        rx_bufptr_off: 0x14,
         sram_start: 0x2000_3800,
         sram_end: 0x2000_8000,
         vco_mhz: &[],

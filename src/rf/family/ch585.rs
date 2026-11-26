@@ -203,6 +203,7 @@ pub const CAPS: FamilyCaps = FamilyCaps {
     rfend_base: RFEND_BASE,
     irq_bb: IRQ_BB,
     irq_lle: IRQ_LLE,
+    bufptr_base: LLE_BASE,
     tx_bufptr_off: 0x78,
     rx_bufptr_off: 0x7c,
     sram_start: 0x2000_0000,
