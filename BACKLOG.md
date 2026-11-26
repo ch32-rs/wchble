@@ -26,8 +26,11 @@ Letter namespaces collide — always qualify them:
 ## Current baseline
 
 - **In progress:** CH573 RF smoke + FamilyCaps (`ch573-rf-bringup`; probe
-  `1a86:8010:5CED8F06E1D2`, Chip ID `0x73000000`). DMA buffers must stay in
-  SRAM `@0x20003800..0x20008000`. Not Trouble/GATT; not Phase 1 closure.
+  `1a86:8010:5CED8F06E1D2`, Chip ID `0x73000000`). ADV_NONCONN_IND on
+  37/38/39 (AdvA `c1:ff:ee:00:00:73`, name `wch573`) **passes on air** with
+  both the nRF sniffer and a macOS scan. DMA buffers must stay in SRAM
+  `@0x20004000..0x20008000` (pointer registers keep the low 14 bits); the RX
+  hit path is still arm-only. Not Trouble/GATT; not Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle
