@@ -1448,6 +1448,16 @@ pub fn connection_event<E: AesEngine, H: LinkHost<Aes = E>, R: LinkRadio, C: Ins
             if let Some(reason) = report_connection(host, s) {
                 return EventEnd::Close(reason);
             }
+            // Likewise, the peer may have acknowledged our previous PDU in
+            // this packet. That Host packet is complete even though our
+            // response is late; dropping its tag here would leak its bridge
+            // slot and HCI credit for good.
+            if let Some(tag) = acknowledged_acl {
+                if !host.ack_tx(tag) {
+                    host.stat_inc(STAT_BRIDGE_FAIL);
+                    return EventEnd::Close(0x1f);
+                }
+            }
             if deliver_acl && !host.receive_acl(llid, payload) {
                 host.stat_inc(STAT_BRIDGE_FAIL);
                 return EventEnd::Close(0x1f);

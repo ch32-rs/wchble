@@ -1289,6 +1289,41 @@ fn late_response_retransmits_the_outstanding_pdu_and_acks_only_once() {
 }
 
 #[test]
+fn late_response_still_completes_the_acknowledged_host_packet() {
+    let mut h = Harness::new();
+    let tag = crate::hci::connection::test_tag(0, 1, 10);
+    h.host.acl_tx.push_back(queued_data_acl(tag));
+
+    h.radio.push(FakeRadio::frame(empty_with(false, false)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.radio.sent.len(), 1, "the data PDU went on air");
+    assert!(h.host.acked.is_empty());
+
+    // The peer acknowledges our data PDU (NESN=1), but our response to that
+    // packet is Late. The acknowledgement is already final in the LL sequence:
+    // the Host packet is complete and its buffer must be released now, or its
+    // HCI credit is lost for good.
+    h.radio.late = true;
+    h.radio.push(FakeRadio::frame(empty_with(true, true)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.radio.sent.len(), 1, "Late response never reached the air");
+    assert_eq!(
+        h.host.acked,
+        std::vec![tag],
+        "acknowledged despite the Late response"
+    );
+
+    // Later events cannot complete the same packet twice.
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    h.radio.push(FakeRadio::frame(empty_with(true, false)));
+    h.radio.push(FakeRadio::missed());
+    assert_eq!(h.event(FINISH), EventEnd::Continue);
+    assert_eq!(h.host.acked, std::vec![tag]);
+}
+
+#[test]
 fn feature_request_exchange_replies_after_the_empty_ack() {
     let mut h = Harness::new();
     // Central LL_FEATURE_REQ: LLID 3, NESN 0, SN 0.
