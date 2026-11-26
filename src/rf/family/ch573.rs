@@ -1,7 +1,9 @@
-//! CH573 BLE IP bases, DevInit tables from EVT, and stub radio backend.
+//! CH573 BLE IP bases, DevInit tables from EVT, and first MMIO bring-up.
 //!
 //! Tables recovered from `CH573EVT/EXAM/BLE/LIB/libCH57xBLE.a`
-//! (`lle.o` / `bb.o` / `rfend.o`). MMIO apply / `ch58x_common` wiring is next.
+//! (`lle.o` / `bb.o` / `rfend.o`). This backend applies the absolute stores and
+//! leaves TX/RX/`TXCtune` for a later commit once silicon readback confirms the
+//! runtime shape.
 //!
 //! Map (same CH5xx window as CH583/585/592):
 //! - BB    `0x4000_C100`
@@ -16,8 +18,10 @@
 
 use crate::rf::analog::AnalogInit;
 use crate::rf::family::caps::FamilyCaps;
-use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
+use crate::rf::family::tables::{self, BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
+use crate::rf::regs;
+use crate::rf::txrx::RX_DMA_MIN;
 use crate::rf::{Channel, PhyMode, Radio, RfCallback};
 use crate::time::InstantUs;
 use crate::{Error, Result};
@@ -66,9 +70,8 @@ pub const LLE_DEV_INIT: LleDevInit = LleDevInit {
 
 /// `BB_DevInit` highlights (`bb.o`).
 ///
-/// `BB+0x34 = 0x152` (not CH583/V208 `0x1D0`). `BB+0` packing mixes a
-/// config byte with `0x0100_8000`; not the V208 `bit23`/`bit28` immediates.
-/// SYS `0x40001040` SAFE_ACCESS poke stays outside this table.
+/// `BB+0x34 = 0x152` (not CH583/V208 `0x1D0`). Full `BB+0` packing and the
+/// SYS SAFE_ACCESS poke stay outside this first apply path.
 pub const BB_DEV_INIT: BbDevInit = BbDevInit {
     cfg34: RegInit::new(0x34, 0x152, Disasm),
     cfg20: None,
@@ -110,4 +113,169 @@ pub const CAPS: FamilyCaps = FamilyCaps {
     wait_tune_half_us: RFEND_INIT.wait_tune_half_us.value,
 };
 
-stub_radio!(Ch573Radio);
+/// CH573 radio — DevInit apply for silicon readback; TX/RX still TBD.
+#[derive(Debug)]
+pub struct Ch573Radio {
+    channel: Channel,
+    phy_tx: PhyMode,
+    phy_rx: PhyMode,
+    whiten_disabled: bool,
+    encrypt: bool,
+    access_address: u32,
+    crc_init: u32,
+    isr: IsrState,
+    rx_dma: *mut u8,
+    rx_dma_len: usize,
+}
+
+// Soft state only; MMIO runs through fixed bases.
+unsafe impl Send for Ch573Radio {}
+
+impl Ch573Radio {
+    /// Own a DMA-capable RX scratch; must sit inside [`CAPS`] SRAM.
+    pub fn new(rx_dma: &'static mut [u8]) -> Result<Self> {
+        let ptr = rx_dma.as_mut_ptr() as usize;
+        if rx_dma.len() < RX_DMA_MIN || ptr & 0x3 != 0 || !CAPS.contains_dma(ptr, rx_dma.len()) {
+            return Err(Error::InvalidState);
+        }
+        Ok(Self {
+            channel: 0xff,
+            phy_tx: PhyMode::Rate1m,
+            phy_rx: PhyMode::Rate1m,
+            whiten_disabled: false,
+            encrypt: false,
+            access_address: 0x8e89_bed6,
+            crc_init: 0x55_5555,
+            isr: IsrState::default(),
+            rx_dma: rx_dma.as_mut_ptr(),
+            rx_dma_len: rx_dma.len(),
+        })
+    }
+
+    fn lle_dev_init(&mut self) {
+        unsafe {
+            tables::apply_stores(LLE_BASE, LLE_DEV_INIT.stores);
+            // Smoke 2026-11-26: absolute stores matched, but writing
+            // `CAPS.rx_bufptr_off` (0x7c) did not stick (readback 0). Keep the
+            // attempt for later silicon probing of 0x70/0x74/0x78/0x7c.
+            regs::write(LLE_BASE, CAPS.rx_bufptr_off, self.rx_dma as u32);
+            let _ = self.rx_dma_len;
+        }
+    }
+
+    fn rfend_dev_init_abs(&mut self) {
+        unsafe {
+            regs::write(
+                RFEND_BASE,
+                RFEND_INIT.dev_init_0x28.offset as usize,
+                RFEND_INIT.dev_init_0x28.value,
+            );
+        }
+    }
+
+    fn bb_dev_init_abs(&mut self) {
+        unsafe {
+            regs::write(
+                BB_BASE,
+                BB_DEV_INIT.cfg34.offset as usize,
+                BB_DEV_INIT.cfg34.value,
+            );
+        }
+    }
+}
+
+impl AnalogInit for Ch573Radio {
+    fn rfend_dev_init<T: InstantUs>(&mut self, _clock: &T) -> Result<()> {
+        self.rfend_dev_init_abs();
+        Ok(())
+    }
+
+    fn calibrate<T: InstantUs>(&mut self, _clock: &T) -> Result<()> {
+        // TXCtune / RXFilter not ported yet; init still returns so smoke can
+        // dump the absolute DevInit stores.
+        Ok(())
+    }
+}
+
+impl Radio for Ch573Radio {
+    fn init<T: InstantUs>(&mut self, clock: &T) -> Result<()> {
+        // Order: LLE → RFEND → BB → cal. HAL owns BLE clock / NVIC.
+        self.lle_dev_init();
+        self.rfend_dev_init(clock)?;
+        self.bb_dev_init_abs();
+        self.calibrate(clock)
+    }
+
+    fn recalibrate<T: InstantUs>(&mut self, clock: &T) -> Result<()> {
+        self.calibrate(clock)
+    }
+
+    fn shut(&mut self) {}
+
+    fn set_channel(&mut self, channel: Channel) -> Result<()> {
+        if channel > 39 {
+            return Err(Error::InvalidState);
+        }
+        self.channel = channel;
+        Ok(())
+    }
+
+    fn channel(&self) -> Channel {
+        self.channel
+    }
+
+    fn set_aa_crc(&mut self, access_address: u32, crc_init: u32) {
+        self.access_address = access_address;
+        self.crc_init = crc_init;
+    }
+
+    fn set_phy(&mut self, tx: PhyMode, rx: PhyMode) {
+        self.phy_tx = tx;
+        self.phy_rx = rx;
+    }
+
+    fn set_whiten_disabled(&mut self, disabled: bool) {
+        self.whiten_disabled = disabled;
+    }
+
+    fn set_encrypt(&mut self, enabled: bool) {
+        self.encrypt = enabled;
+    }
+
+    fn set_callback(&mut self, cb: Option<RfCallback>) {
+        self.isr.callback = cb;
+    }
+
+    unsafe fn tx_basic<T: InstantUs>(
+        &mut self,
+        _clock: &T,
+        frame: &[u8],
+        _timeout_half_us: u32,
+        _start_cputime: Option<u32>,
+    ) -> Result<()> {
+        if frame.len() < 2 {
+            return Err(Error::InvalidState);
+        }
+        Err(Error::Unsupported)
+    }
+
+    unsafe fn rx_basic<T: InstantUs>(
+        &mut self,
+        _clock: &T,
+        rxbuf: &mut [u8],
+        _window_half_us: u32,
+    ) -> Result<()> {
+        if rxbuf.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        Err(Error::Unsupported)
+    }
+
+    fn rssi(&self) -> i8 {
+        0
+    }
+
+    fn crc_ok(&self) -> bool {
+        false
+    }
+}

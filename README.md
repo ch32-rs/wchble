@@ -30,7 +30,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | --- | --- |
 | `ch32v208` | DevInit/cal + channel/shut/tx_basic/rx_basic/ISR (open `wch_rf`); HAL smoke next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
-| `ch573` | WIP — same `0x4000Cxxx` window; **SRAM only `@0x20003800` (18 KiB)**; RF smoke + FamilyCaps in progress |
+| `ch573` | DevInit tables + absolute-store init; **SRAM only `@0x20003800` (18 KiB)**; smoke `examples/ch573-rf-smoke` (TX/RX TBD) |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | DevInit/cal + channel/shut/tx_basic/rx_basic (carved CH585EVT lib) — **verified on air** (`examples/ch585-rf-smoke`) |
 | `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
