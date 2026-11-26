@@ -305,9 +305,9 @@ mod lle583_irq {
     pub const TRANSFER: u32 = RX_EVENTS | TX_DONE;
 }
 
-// CH582M bring-up uses the CH584/585 DMA-footer convention: bit 4 of
-// the fourth byte after the PDU reports failure. iSLER leaves this flag
-// unimplemented for CH582/583. The peer smoke exercises normal reception.
+// The CH584/585 DMA-footer convention also matched the CH582M CRCInit
+// bench test: bit 4 of the fourth byte after the PDU reports failure.
+// iSLER leaves this flag unimplemented for CH582/583.
 const RX_CRC_ERROR: u8 = 1 << 4;
 const RX_FOOTER: usize = 4;
 
@@ -557,6 +557,8 @@ impl Radio for Ch583Radio {
         self.isr.callback = cb;
     }
 
+    /// For scheduled TX, the caller supplies a deadline with enough lead for
+    /// radio setup and settling. The CH582M RF smoke uses 180 µs of lead.
     unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -579,9 +581,6 @@ impl Radio for Ch583Radio {
         set_mode(DEVMODE_TX);
 
         if let Some(start) = start_cputime {
-            // The caller budgets mode settling in this absolute trigger time.
-            // The standalone RF smoke schedules 180 us ahead to account for
-            // both radio setup and the settle delay used by immediate TX.
             loop {
                 let elapsed = clock.now_us().wrapping_sub(start) as i32;
                 if elapsed >= 0 {
