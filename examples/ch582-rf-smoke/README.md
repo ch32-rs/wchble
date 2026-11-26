@@ -55,3 +55,16 @@ scope.
 The active register sequence and three-point calibration are based on the
 public [ch32fun iSLER implementation](https://github.com/cnlohr/ch32fun/blob/486c5dd7ceed18ec65abe3064bac6a568c8a673c/extralibs/iSLER.h).
 See the included [MIT notice](../../LICENSE-ch32fun).
+
+The CH582M bring-up uses the DMA-footer convention from iSLER's CH584/585
+path. A receive buffer starts with a two-byte header, followed by the payload.
+The driver reads bit 4 of the fourth byte after the PDU as the CRC error flag.
+iSLER leaves CRC status unimplemented for CH582/583. The peer exchange checks
+normal traffic on CH582M. Correlating this byte with known CRC failures on air
+requires a separate measurement.
+
+Immediate TX waits 100 µs after entering TX mode. For an absolute trigger the
+caller budgets setup and settling before the deadline. This example supplies
+180 µs of lead for scheduled TX. iSLER's timed PLL poll identifies its ready
+bit for CH570/572. Establishing the corresponding CH582/583 ready bit requires
+silicon measurements.

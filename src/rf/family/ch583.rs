@@ -22,7 +22,7 @@
 use core::cell::Cell;
 use critical_section::Mutex;
 
-use crate::rf::analog::{AnalogInit, CAL_TIMEOUT_US};
+use crate::rf::analog::{self, AnalogInit, CAL_TIMEOUT_US};
 use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::regs::{self, autocfg, bb, lle, rssi};
@@ -119,6 +119,7 @@ const DEVMODE_TUNE: u16 = 0xdd;
 const DEVMODE_TX: u16 = 0xda;
 const DEVMODE_RX: u16 = 0xd9;
 const TX_POWER_0_DBM: u32 = 0x12;
+const TX_SETTLE_US: u32 = 100;
 
 const CHANNEL_MAP: [u8; 40] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
@@ -164,17 +165,8 @@ unsafe fn txctune(clock: &impl InstantUs, channel: u8) -> Result<u32> {
     );
     rf_w(RF1, rf_r(RF1) | 1);
 
-    regs::write(LLE_BASE, lle::WINDOW, 8000);
-    let started = clock.now_us();
-    while (rf_r(RF_TXCTUNE_CO_CTRL) & (1 << 25)) == 0 || (rf_r(RF_TXCTUNE_GA_CTRL) & (1 << 26)) == 0
-    {
-        if regs::read(LLE_BASE, lle::WINDOW) == 0 {
-            break;
-        }
-        if clock.now_us().wrapping_sub(started) >= CAL_TIMEOUT_US {
-            return Err(Error::Timeout);
-        }
-    }
+    // iSLER's CH582/CH583 tune loop polls both ready bits in RF36.
+    analog::wait_tune(clock, LLE_BASE, RFEND_BASE, 8000)?;
 
     let n_co = rf_r(RF_TXCTUNE_CO_CTRL) & 0x3f;
     let n_ga = (rf_r(RF_TXCTUNE_GA_CTRL) >> 10) & 0x7f;
@@ -313,6 +305,9 @@ mod lle583_irq {
     pub const TRANSFER: u32 = RX_EVENTS | TX_DONE;
 }
 
+// CH582M bring-up uses the CH584/585 DMA-footer convention: bit 4 of
+// the fourth byte after the PDU reports failure. iSLER leaves this flag
+// unimplemented for CH582/583. The peer smoke exercises normal reception.
 const RX_CRC_ERROR: u8 = 1 << 4;
 const RX_FOOTER: usize = 4;
 
@@ -584,6 +579,9 @@ impl Radio for Ch583Radio {
         set_mode(DEVMODE_TX);
 
         if let Some(start) = start_cputime {
+            // The caller budgets mode settling in this absolute trigger time.
+            // The standalone RF smoke schedules 180 us ahead to account for
+            // both radio setup and the settle delay used by immediate TX.
             loop {
                 let elapsed = clock.now_us().wrapping_sub(start) as i32;
                 if elapsed >= 0 {
@@ -595,7 +593,7 @@ impl Radio for Ch583Radio {
                 }
             }
         } else {
-            clock.delay_us(100);
+            clock.delay_us(TX_SETTLE_US);
         }
 
         let started = clock.now_us();
