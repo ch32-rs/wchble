@@ -209,6 +209,9 @@ pub type Backend = family::ch32v208::Ch32v208Radio;
 #[cfg(feature = "ch572")]
 pub type Backend = family::ch572::Ch572Radio;
 
+#[cfg(feature = "ch573")]
+pub type Backend = family::ch573::Ch573Radio;
+
 #[cfg(feature = "ch583")]
 pub type Backend = family::ch583::Ch583Radio;
 
@@ -224,6 +227,7 @@ pub type Backend = family::ch595::Ch595Radio;
 #[cfg(not(any(
     feature = "ch32v208",
     feature = "ch572",
+    feature = "ch573",
     feature = "ch583",
     feature = "ch585",
     feature = "ch592",

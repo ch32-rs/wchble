@@ -56,6 +56,7 @@ default = []
 # Select at most one chip family backend for rf::family.
 ch32v208 = []
 ch572 = []
+ch573 = []
 ch583 = []
 ch585 = []
 ch592 = []

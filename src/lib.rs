@@ -15,14 +15,20 @@
 
 #[cfg(any(
     all(feature = "ch32v208", feature = "ch572"),
+    all(feature = "ch32v208", feature = "ch573"),
     all(feature = "ch32v208", feature = "ch583"),
     all(feature = "ch32v208", feature = "ch585"),
     all(feature = "ch32v208", feature = "ch592"),
     all(feature = "ch32v208", feature = "ch595"),
+    all(feature = "ch572", feature = "ch573"),
     all(feature = "ch572", feature = "ch583"),
     all(feature = "ch572", feature = "ch585"),
     all(feature = "ch572", feature = "ch592"),
     all(feature = "ch572", feature = "ch595"),
+    all(feature = "ch573", feature = "ch583"),
+    all(feature = "ch573", feature = "ch585"),
+    all(feature = "ch573", feature = "ch592"),
+    all(feature = "ch573", feature = "ch595"),
     all(feature = "ch583", feature = "ch585"),
     all(feature = "ch583", feature = "ch592"),
     all(feature = "ch583", feature = "ch595"),
@@ -31,7 +37,7 @@
     all(feature = "ch592", feature = "ch595"),
 ))]
 compile_error!(
-    "enable at most one chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`, `ch592`, or `ch595`)"
+    "enable at most one chip feature (`ch32v208`, `ch572`, `ch573`, `ch583`, `ch585`, `ch592`, or `ch595`)"
 );
 
 pub mod ota;

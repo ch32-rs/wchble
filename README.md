@@ -30,6 +30,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | --- | --- |
 | `ch32v208` | DevInit/cal + channel/shut/tx_basic/rx_basic/ISR (open `wch_rf`); HAL smoke next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
+| `ch573` | WIP — same `0x4000Cxxx` window; **SRAM only `@0x20003800` (18 KiB)**; RF smoke + FamilyCaps in progress |
 | `ch583` | Bases + closed-disasm “old tables” (≈V208); MMIO apply TBD |
 | `ch585` | DevInit/cal + channel/shut/tx_basic/rx_basic (carved CH585EVT lib) — **verified on air** (`examples/ch585-rf-smoke`) |
 | `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
@@ -70,8 +71,8 @@ cargo check --features ch32v208
 cargo check --features ch32v208,controller,phy
 ```
 
-Enable **at most one** chip feature (`ch32v208`, `ch572`, `ch583`, `ch585`,
-`ch592`, `ch595`).
+Enable **at most one** chip feature (`ch32v208`, `ch572`, `ch573`, `ch583`,
+`ch585`, `ch592`, `ch595`).
 
 ## HAL integration sketch
 
