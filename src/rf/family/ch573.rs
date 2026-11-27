@@ -158,6 +158,10 @@ pub struct Ch573Radio {
     rx_buf_len: usize,
     /// `BB_IRQLibHandler` reloads `LLE+0x60` once per window.
     rx_reloaded: bool,
+    /// `FILTMEAS[4:0]` that `RFEND_RXFilter` wrote into `CFG50`.
+    rx_filter_code: u8,
+    /// Whether `RFEND_RXFilter` saw the measurement-ready bit.
+    rx_filter_ok: bool,
 }
 
 /// Result of servicing an armed RX window with [`Ch573Radio::rx_poll`].
@@ -204,6 +208,8 @@ impl Ch573Radio {
             rx_buf: core::ptr::null_mut(),
             rx_buf_len: 0,
             rx_reloaded: false,
+            rx_filter_code: 0,
+            rx_filter_ok: false,
         })
     }
 
@@ -525,20 +531,36 @@ impl Ch573Radio {
             for _ in 0..4 {
                 core::hint::spin_loop();
             }
+            // Vendor sets CFG0C bit4 a second time after the settle and leaves
+            // it set; without it the measurement code is not stable.
+            regs::rmw(RFEND_BASE, rfend::CFG0C, 0, 0x10);
             // EVT sets TUNE bit12 and never clears it.
             regs::rmw(RFEND_BASE, rfend::TUNE, 0, 0x1000);
             let start = clock.now_us();
             while regs::read(RFEND_BASE, rfend::FILTMEAS) & rfend::FILTMEAS_RDY == 0 {
                 if clock.now_us().wrapping_sub(start) >= 200_000 {
+                    self.rx_filter_ok = false;
                     return Err(Error::Timeout);
                 }
             }
             regs::rmw(RFEND_BASE, rfend::CFG50, 0, rfend::CFG50_FILT_EN);
             let code = regs::read(RFEND_BASE, rfend::FILTMEAS);
             regs::rmw(RFEND_BASE, rfend::CFG50, 0x1f, code & rfend::FILTMEAS_MASK);
+            self.rx_filter_code = (code & rfend::FILTMEAS_MASK) as u8;
             regs::rmw(RFEND_BASE, rfend::FECTRL, rfend::FECTRL_RXFILT, 0);
         }
+        self.rx_filter_ok = true;
         Ok(())
+    }
+
+    /// `CFG50[4:0]` written by the last `RFEND_RXFilter`.
+    pub fn rx_filter_code(&self) -> u8 {
+        self.rx_filter_code
+    }
+
+    /// Whether the last `RFEND_RXFilter` reached the ready bit.
+    pub fn rx_filter_calibrated(&self) -> bool {
+        self.rx_filter_ok
     }
 
     /// `RFEND_RXAdc` (`rfend.o`, `gModeAdc == 0`): min ADC code into

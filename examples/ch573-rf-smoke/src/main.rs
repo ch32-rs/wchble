@@ -117,10 +117,12 @@ fn dump_regs() {
         mmio(DMA_BASE, 0x1c),
     );
     info!(
-        "RFEND 28={=u32:x} 0c={=u32:x} 90={=u32:x}",
+        "RFEND 28={=u32:x} 0c={=u32:x} 50={=u32:x} 90={=u32:x} 9c={=u32:x}",
         mmio(RFEND_BASE, 0x28),
         mmio(RFEND_BASE, 0x0c),
+        mmio(RFEND_BASE, 0x50),
         mmio(RFEND_BASE, 0x90),
+        mmio(RFEND_BASE, 0x9c),
     );
     info!(
         "BB 00={=u32:x} 34={=u32:x}",
@@ -288,6 +290,13 @@ fn main() -> ! {
             loop {}
         }
     }
+
+    // RFEND_RXFilter determinism: code from FILTMEAS, written to CFG50[4:0].
+    info!(
+        "rx filter ok={} code={=u8}",
+        radio.rx_filter_calibrated(),
+        radio.rx_filter_code()
+    );
 
     // SAFETY: PFIC VTF writes only; the entry lives in `.highcode`.
     unsafe { install_ble_irq() };

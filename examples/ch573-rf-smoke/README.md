@@ -75,8 +75,10 @@ with RMW and kicking on bit9 fixes it — same image, no RFEND replay hack:
 - macOS CoreBluetooth: `scan_ch573.swift wch573 25` → 37 observations,
   RSSI ≈ −40..−49 dBm (exit 0).
 
-Calibration note: full `RFEND_RXFilter`/`RFEND_RXAdc` runs in CAL mode after
-TXCtune; `RXFILT` can still time out and does **not** gate TX.
+Calibration note: `RFEND_RXFilter`/`RFEND_RXAdc` run in CAL mode after TXCtune.
+`RFEND_RXFilter` now replays the vendor order, including the second `CFG0C`
+bit4 set after the settle; the boot log reports `rx filter ok=… code=…`
+(`CFG50[4:0]`) and `RFEND 50=… 9c=…`. RX calibration does not gate TX.
 
 ## On-air (nRF sniffer)
 
@@ -86,7 +88,5 @@ scan raw traffic and search the capture for the AdvA bytes `c1 ff ee 00 00 73`
 
 ## Out of scope (follow-ups)
 
-- **RX hit path** (`rx_basic` is arm-only; no LLE RX-event handling yet).
-- `RFEND_RXFilter` occasionally times out; TX does not depend on it.
-- A real LLE IRQ handler instead of the tight poll kick.
+- RX hit path lives in `examples/ch573-rx-smoke` (`rx_basic` here is arm-only).
 - `.dma_buffer` placement (currently `RAM_END - 0x3400`).
