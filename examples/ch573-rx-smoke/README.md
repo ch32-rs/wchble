@@ -7,7 +7,8 @@ On-target RX path for the CH573 backend:
 2. Service the window from the **real LLE interrupt** (PFIC IRQ 21, routed
    through fast-interrupt slot 2); `rx_poll` remains as the `USE_ISR = false`
    fallback.
-3. Print `len`, `rssi` and the first 48 bytes of the DMA buffer over defmt.
+3. Print `len`, `rssi`, `crc` and `valid` (`crc && len <= 37`) plus the first
+   48 bytes of the DMA buffer over defmt.
 4. Answer each `Done` with one ADV and report the RX-done → TX-kick
    turnaround.
 
@@ -106,13 +107,35 @@ Continuity and similar). The same capture holds 60 of our own `wch573`
 advertisements. Two frames differed from the sniffer by one bit and 9 `Done`
 had impossible lengths (53/61/102/114/164/224…).
 
-Not yet:
+### CRC status (`crc=`, `valid=`)
 
-- **CRC status** — `BB+0x38` bit5 reads set even with no PDU in the polling
-  context, so `RxPoll::Done` omits it. The sniffer run above shows the cost:
-  bad frames (one-bit errors, garbage lengths) are reported as received.
-- RSSI is read from the status word (`(len+5)&0x1fc + 2`); cnlohr's iSLER
-  reads `BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
+`RxPoll::Done` now carries `crc_ok`, sampled from `BB+0x38` bit5 when
+`RX_DONE` is seen — the same bit the vendor's `ble_ll_chkcrc` tests. The
+handler then writes the event bits back (`bb & ~0x60`, as
+`BB_IRQLibHandler` does), and arming a window clears the previous window's
+software `Done`/`Timeout` flags.
+
+Ground truth: an nRF Sniffer capture in parallel (DLT 272 `flags` bit0 = CRC
+ok). 50 s run, ELF `a4421fea…`, all frames whose PDU matched byte-for-byte:
+
+| Item | Value |
+| --- | --- |
+| matched frames | 17 |
+| CRC verdict agrees | 12 |
+| false positive (ours ok, sniffer bad) | **0** |
+| false negative (ours bad, sniffer ok) | 5, RSSI −76…−97 dBm |
+
+Two earlier 50 s runs gave 30/23 and 26/19; the combined 73 frames have no
+false positives and 19 false negatives.
+
+So the gate is conservative: a bad frame never reaches the caller, at the
+cost of dropping ~27 % of good frames at weak signal. The vendor library
+makes the same early return in `ll_scan_rx`. The stale-flag fix also removed
+the old "Done with an all-`0xAA` buffer" artefacts (212 `Done` / 554 windows
+all carried data, vs 102 empty `Done` before).
+
+Still open: RSSI comes from the status word; cnlohr's iSLER reads
+`BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.

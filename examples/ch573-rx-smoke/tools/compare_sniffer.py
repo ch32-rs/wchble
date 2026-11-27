@@ -4,10 +4,12 @@
 Usage:
   compare_sniffer.py rx.log capture.pcap [--show N]
 
-rx.log is the defmt output: a `state=2 … len=N` line followed by a
+rx.log is the defmt output: a `state=2 … len=N … crc=…` line followed by a
 `buf [..]` line. The pcap is the Nordic DLT 272 format written by
 `nrfutil ble-sniffer sniff`; each record carries the on-air PDU after the
-advertising access address, so the PDU is located by searching for it.
+advertising access address, so the PDU is located by searching for it. The
+Nordic flag byte (offset 8) bit0 is the sniffer's CRC-ok verdict, so the
+script also reports how the board's `crc=` field agrees with it.
 """
 import argparse
 import re
@@ -18,17 +20,19 @@ MAX_LEGACY_LEN = 37
 
 
 def read_rx(path):
+    """Return [(pdu, crc_ok)] from `state=2 len=N … crc=…` + `buf [...]`."""
     frames, pending = [], None
     for line in open(path, errors="replace"):
-        m = re.search(r"state=2 .*?len=(\d+)", line)
+        m = re.search(r"state=2 .*?len=(\d+) .*?crc=(true|false)", line)
         if m:
-            pending = int(m.group(1))
+            pending = (int(m.group(1)), m.group(2) == "true")
             continue
         m = re.search(r"buf \[([0-9, ]+)\]", line)
         if m and pending is not None:
+            length, crc_ok = pending
             raw = [int(x) for x in m.group(1).split(",")]
-            if 0 < pending <= MAX_LEGACY_LEN and len(raw) >= 2 + pending:
-                frames.append(bytes(raw[:2 + pending]))
+            if 0 < length <= MAX_LEGACY_LEN and len(raw) >= 2 + length:
+                frames.append((bytes(raw[:2 + length]), crc_ok))
             pending = None
     return frames
 
@@ -55,7 +59,8 @@ def read_pcap(path):
         pdu = pkt[i + len(AA):]
         if len(pdu) < 2 + pdu[1]:
             continue
-        pdus.append(pdu[:2 + pdu[1]])
+        # Nordic DLT 272: byte 8 is the flag byte, bit0 = CRC ok.
+        pdus.append((pdu[:2 + pdu[1]], bool(pkt[8] & 1)))
     return pdus
 
 
@@ -68,13 +73,20 @@ def main():
 
     rx = read_rx(args.log)
     captured = read_pcap(args.pcap)
-    pdus = set(captured)
-    matched = [f for f in rx if f in pdus]
-    addrs = {f[2:8] for f in matched}
-    print(f"rx frames={len(rx)} sniffer records={len(captured)} unique={len(pdus)}")
+    by_pdu = {}
+    for pdu, crc_ok in captured:
+        by_pdu.setdefault(pdu, crc_ok)
+    matched = [(f, ours) for f, ours in rx if f in by_pdu]
+    addrs = {f[2:8] for f, _ in matched}
+    print(f"rx frames={len(rx)} sniffer records={len(captured)} unique={len(by_pdu)}")
     print(f"byte-exact={len(matched)}/{len(rx)} unique AdvA={len(addrs)}")
-    for f in matched[:args.show]:
-        print(f"match {f.hex(' ')}")
+    agree = sum(1 for f, ours in matched if ours == by_pdu[f])
+    print(f"crc agree={agree}/{len(matched)} (sniffer flags) ")
+    for f, ours in matched[:args.show]:
+        print(f"match {f.hex(' ')} ours={ours} sniffer={by_pdu[f]}")
+    for f, ours in matched:
+        if ours != by_pdu[f]:
+            print(f"MISMATCH {f.hex(' ')} ours={ours} sniffer={by_pdu[f]}")
 
 
 if __name__ == "__main__":

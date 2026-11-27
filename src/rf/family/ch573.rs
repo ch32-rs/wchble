@@ -173,16 +173,18 @@ pub enum RxPoll {
     Timeout,
     /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
     ///
-    /// CRC status is not reported: the vendor reads `BB+0x38` bit5 inside the
-    /// ISR, but in the polling context that bit already reads set when no PDU
-    /// has arrived (see `local-docs/ch573-rx-isr-spec.md`).
-    Done { len: u8, rssi: i8 },
+    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — the same
+    /// bit the vendor's `ble_ll_chkcrc` tests. The gate is conservative: it
+    /// can reject weak-signal frames whose CRC the sniffer accepts.
+    Done { len: u8, rssi: i8, crc_ok: bool },
 }
 
 /// `BB+0x38` events the vendor `BB_IRQLibHandler` serves.
 const BB_PAYLOAD_EVENT: u32 = 0x40;
 const BB_TIMER1_EVENT: u32 = 0x02;
 const BB_TIMER2_EVENT: u32 = 0x10;
+/// Sticky CRC-error flag; `ble_ll_chkcrc` tests `(BB+0x38 >> 5) & 1`.
+const BB_CRC_ERR: u32 = 0x20;
 
 // Soft state only; MMIO runs through fixed bases.
 unsafe impl Send for Ch573Radio {}
@@ -651,11 +653,25 @@ impl Ch573Radio {
                     };
                     (len, rssi)
                 };
+                // The CRC flag is final at RX_DONE; the payload event usually
+                // lands in the same entry and is still pending here.
+                let crc_ok = bb & BB_CRC_ERR == 0;
+                // Acknowledge the packet's BB events so they cannot leak into
+                // the next window.
+                regs::write(
+                    BB_BASE,
+                    bb::IRQSTAT,
+                    bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR | 0x1),
+                );
                 Self::clear_lle_irq(0xffff);
-                return RxPoll::Done { len, rssi };
+                return RxPoll::Done { len, rssi, crc_ok };
             }
             if bb & BB_PAYLOAD_EVENT != 0 {
-                regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | 0x1));
+                regs::write(
+                    BB_BASE,
+                    bb::IRQSTAT,
+                    bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR | 0x1),
+                );
                 if !*reloaded {
                     regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(buf_len));
                     *reloaded = true;
@@ -712,6 +728,8 @@ mod isr {
     pub static BUF: AtomicUsize = AtomicUsize::new(0);
     pub static BUF_LEN: AtomicUsize = AtomicUsize::new(0);
     pub static RELOADED: AtomicBool = AtomicBool::new(false);
+    /// CRC status sampled at RX_DONE.
+    pub static CRC_OK: AtomicBool = AtomicBool::new(false);
     pub static DONE: AtomicBool = AtomicBool::new(false);
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
@@ -851,10 +869,11 @@ pub fn ble_isr() {
             isr::armed_store(false);
             isr::TIMEOUT.store(true, Ordering::Release);
         }
-        RxPoll::Done { len, rssi } => {
+        RxPoll::Done { len, rssi, crc_ok } => {
             unsafe { mask_ble_lines() };
             isr::LEN.store(len, Ordering::Relaxed);
             isr::RSSI.store(rssi, Ordering::Relaxed);
+            isr::CRC_OK.store(crc_ok, Ordering::Relaxed);
             isr::RX_DONE_TICKS.store(now_ticks(), Ordering::Relaxed);
             isr::armed_store(false);
             isr::DONE.store(true, Ordering::Release);
@@ -968,6 +987,7 @@ pub fn rx_isr_take() -> Option<RxPoll> {
         Some(RxPoll::Done {
             len: isr::LEN.load(Ordering::Relaxed),
             rssi: isr::RSSI.load(Ordering::Relaxed),
+            crc_ok: isr::CRC_OK.load(Ordering::Relaxed),
         })
     } else if isr::TIMEOUT.swap(false, Ordering::AcqRel) {
         Some(RxPoll::Timeout)
@@ -1184,7 +1204,9 @@ impl Radio for Ch573Radio {
             isr::TX_DONE.store(false, Ordering::Release);
             isr::MODE.store(isr::TX, Ordering::Release);
             unsafe { unmask_ble_lines() };
-            let deadline = clock.now_us().wrapping_add((hw_window / 2).saturating_add(2_000));
+            let deadline = clock
+                .now_us()
+                .wrapping_add((hw_window / 2).saturating_add(2_000));
             let mut ok = false;
             loop {
                 if isr::TX_DONE.load(Ordering::Acquire) {
@@ -1328,6 +1350,10 @@ impl Radio for Ch573Radio {
             isr::BUF.store(rx_ptr as usize, core::sync::atomic::Ordering::Release);
             isr::BUF_LEN.store(rxbuf.len(), core::sync::atomic::Ordering::Release);
             isr::RELOADED.store(false, core::sync::atomic::Ordering::Release);
+            isr::CRC_OK.store(false, core::sync::atomic::Ordering::Release);
+            // A late Done from the previous window must not leak into this one.
+            isr::DONE.store(false, core::sync::atomic::Ordering::Release);
+            isr::TIMEOUT.store(false, core::sync::atomic::Ordering::Release);
             isr::armed_store(true);
             regs::write(DMA_BASE, dma_reg::RXBUFPTR, Self::dma_off(rx_ptr as usize));
             // EVT `ble_ll_hw_api_rx` order: CMD=1 then MODE=0x59.

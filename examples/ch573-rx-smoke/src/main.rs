@@ -225,11 +225,14 @@ fn main() -> ! {
             let bb30 = mmio(BB_BASE, 0x30);
             let bb38 = mmio(BB_BASE, 0x38);
             let lle08 = mmio(LLE_BASE, 0x08);
-            let (state, len, rssi) = match poll {
-                RxPoll::Armed => (0u8, 0u8, 0i8),
-                RxPoll::Timeout => (1, 0, 0),
-                RxPoll::Done { len, rssi } => (2, len, rssi),
+            let (state, len, rssi, crc_ok) = match poll {
+                RxPoll::Armed => (0u8, 0u8, 0i8, false),
+                RxPoll::Timeout => (1, 0, 0, false),
+                RxPoll::Done { len, rssi, crc_ok } => (2, len, rssi, crc_ok),
             };
+            // A legacy advertising PDU is at most 37 bytes; anything longer is
+            // a corrupted length byte even if the CRC flag says otherwise.
+            let valid = state == 2 && crc_ok && len <= 37;
             let isr_delta = irq_entries().wrapping_sub(isr_before);
             let mut dump = [0u8; 48];
             dump.copy_from_slice(&rx[..48]);
@@ -257,9 +260,9 @@ fn main() -> ! {
             }
 
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
-                ch, state, len, rssi, waited, count, isr_delta, tx_kick_count(), turn_us, dma18,
-                bb30, bb38, lle08
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} crc={=bool} valid={=bool} timeout={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, crc_ok, valid, waited, count, isr_delta, tx_kick_count(),
+                turn_us, dma18, bb30, bb38, lle08
             );
             if show_buf {
                 info!("buf {:?}", &dump[..]);
