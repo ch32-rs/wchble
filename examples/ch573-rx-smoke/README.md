@@ -8,6 +8,8 @@ On-target RX path for the CH573 backend:
    through fast-interrupt slot 2); `rx_poll` remains as the `USE_ISR = false`
    fallback.
 3. Print `len`, `rssi` and the first 48 bytes of the DMA buffer over defmt.
+4. Answer each `Done` with one ADV and report the RX-done → TX-kick
+   turnaround.
 
 `SDIPrint` is a no-op on CH573 in ch5xx-hal, so this example uses **defmt/RTT**.
 
@@ -56,12 +58,36 @@ probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram \
   target/riscv32imac-unknown-none-elf/release/ch573-rx-smoke
 ```
 
+## RX→TX turnaround (`turn=`)
+
+With `MEASURE_RX_TX`, every `Done` is answered with one `wch573` ADV on ch37;
+`turn=` is the SysTick delta from the RX-done ISR timestamp to the TX bit9
+kick in µs (`0` = TX failed before the kick, `0xffff` = no kick seen).
+The number includes this example's own register dump and `set_channel`, so it
+is an upper bound for the driver path.
+
+26 s run, ELF `6c29b94d…`:
+
+| RX window at `Done` | n | µs |
+| --- | --- | --- |
+| ended (`LLE+0x60 == 0`) | 41 | 378–380 (p50 379) |
+| still counting | 29 | 7180–7338 (p50 7203) |
+
+The LLE only raises the TX arm event after the RX window has expired;
+`engine_stop()` ahead of the TX arm does not cut the remaining count short.
+T_IFS is 150 µs, so a real SCAN_RSP/connected turnaround needs an RX abort
+at `Done` and a shorter arm path — this example only records the current
+number.
+
 ## Acceptance (2026-11-27, probe `5CED…`)
 
 Transmitter: `examples/ch585-rf-smoke` (ADV_NONCONN_IND, name `wch585`).
-30 s ISR run: **107 `Done`, 26 of them the exact `wch585` frame**, 503 window
-timeouts; `isr=` delta was 1–3 per window (no storm). ELF SHA256
-`898fcce0…fde038c3`. Earlier polling run for comparison: 13/13 exact.
+26 s ISR run: **70 `Done`, 13 of them the exact `wch585` frame**, 403 window
+timeouts and 41 waits that saw no event; `isr=` delta 0–4 per window (no
+storm). ELF SHA256 `6c29b94d…ad6f3ebc2`. All 70 `Done` also produced a TX
+kick; macOS CoreBluetooth saw the `wch573` ADV that answers them (9
+observations, RSSI −43…−47 dBm), so the RX and TX ISR paths run together.
+Earlier polling run for comparison: 13/13 exact.
 
 ```
 ch38 state=2 len=17 rssi=-99 cnt=0 isr=1 bb38=246f lle08=100000

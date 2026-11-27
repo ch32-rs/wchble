@@ -15,12 +15,11 @@
 use ch5xx_hal as hal;
 use defmt::info;
 use defmt_rtt as _;
-use hal::interrupt::{Interrupt, InterruptExt};
 use hal::rcc;
 use qingke_rt::entry;
 use wchble::rf::family::ch573::{
-    install_ble_irq, irq_entries, rx_isr_take, Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE,
-    LLE_BASE,
+    install_ble_irq, irq_entries, rx_done_ticks, rx_isr_take, tx_kick_count, tx_kick_ticks,
+    Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE,
 };
 use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
@@ -38,6 +37,30 @@ const USE_ISR: bool = true;
 
 /// PFIC fast-interrupt slots 2 (LLE, IRQ 21) and 3 (BB, IRQ 20).
 const PFIC_BASE: usize = 0xE000_E000;
+
+/// After a received frame, transmit one ADV and report the RX-done → TX-kick
+/// turnaround (SysTick counts / `ticks_per_us`).
+const MEASURE_RX_TX: bool = true;
+
+/// Minimal ADV_NONCONN_IND carrying the local name `wch573`.
+fn build_adv(out: &mut [u8]) -> usize {
+    let name = b"wch573";
+    let adv_a = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x73];
+    let mut payload_len = 0usize;
+    out[2..8].copy_from_slice(&adv_a);
+    payload_len += 6;
+    out[2 + payload_len] = 2;
+    out[2 + payload_len + 1] = 0x01;
+    out[2 + payload_len + 2] = 0x06;
+    payload_len += 3;
+    out[2 + payload_len] = (1 + name.len()) as u8;
+    out[2 + payload_len + 1] = 0x09;
+    out[2 + payload_len + 2..2 + payload_len + 2 + name.len()].copy_from_slice(name);
+    payload_len += 2 + name.len();
+    out[0] = 0x42; // ADV_NONCONN_IND | TxAdd=random
+    out[1] = payload_len as u8;
+    2 + payload_len
+}
 
 /// DMA-visible RX buffer placed by `build.rs`.
 #[repr(align(4))]
@@ -176,12 +199,9 @@ fn main() -> ! {
                 );
             }
 
-            // Unmask only while a window is armed: the lines are level-based.
-            // The ISR masks them again when the window ends.
+            // `rx_basic` unmasks the lines when `install_ble_irq` has run;
+            // the ISR masks them again when the window ends.
             let isr_before = irq_entries();
-            if USE_ISR {
-                unsafe { Interrupt::BLEL.enable() };
-            }
 
             // Wait for the window: the ISR (or `rx_poll` in poll mode) serves
             // the BB reload the engine needs and reports completion.
@@ -200,13 +220,6 @@ fn main() -> ! {
                 }
             };
 
-            if USE_ISR {
-                unsafe {
-                    Interrupt::BLEL.disable();
-                    Interrupt::BLEB.disable();
-                }
-            }
-
             let count = mmio(LLE_BASE, 0x60);
             let dma18 = mmio(DMA_BASE, 0x18);
             let bb30 = mmio(BB_BASE, 0x30);
@@ -218,12 +231,38 @@ fn main() -> ! {
                 RxPoll::Done { len, rssi } => (2, len, rssi),
             };
             let isr_delta = irq_entries().wrapping_sub(isr_before);
+            let mut dump = [0u8; 48];
+            dump.copy_from_slice(&rx[..48]);
+            let show_buf = poll != RxPoll::Timeout || dump[0] != 0xAA || dump[1] != 0xAA;
+
+            // RX done → TX kick, in SysTick counts (the V3A counter runs
+            // down). Includes the driver's engine stop and arm sequence; the
+            // TX itself runs to completion inside `tx_basic`. `turn=0xffff`
+            // means the kick never ran, so the delta is stale.
+            let mut turn_us = 0u32;
+            if MEASURE_RX_TX && matches!(poll, RxPoll::Done { .. }) {
+                let t_rx = rx_done_ticks();
+                let kicks = tx_kick_count();
+                let n = build_adv(&mut rx[..]);
+                if radio.set_channel(37).is_ok() {
+                    match unsafe { radio.tx_basic(&clock, &rx[..n], 0, None) } {
+                        Ok(()) if tx_kick_count() != kicks => {
+                            turn_us = t_rx.wrapping_sub(tx_kick_ticks())
+                                / clock.ticks_per_us.max(1);
+                        }
+                        Ok(()) => turn_us = 0xffff,
+                        Err(e) => info!("tx after rx err {:?}", e),
+                    }
+                }
+            }
+
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} isr={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
-                ch, state, len, rssi, waited, count, isr_delta, dma18, bb30, bb38, lle08
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, waited, count, isr_delta, tx_kick_count(), turn_us, dma18,
+                bb30, bb38, lle08
             );
-            if poll != RxPoll::Timeout || rx[0] != 0xAA || rx[1] != 0xAA {
-                info!("buf {:?}", &rx[..48]);
+            if show_buf {
+                info!("buf {:?}", &dump[..]);
             }
             radio.shut();
             clock.delay_us(5_000);
