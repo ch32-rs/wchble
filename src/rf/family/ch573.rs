@@ -21,7 +21,7 @@ use crate::rf::family::caps::FamilyCaps;
 use crate::rf::family::tables::{self, BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::regs::{self, autocfg, bb, lle, lle_cmd, lle_irq, lle_mode, rfctrl, rfend};
-use crate::rf::txrx::{tx_frame_valid, DmaBuf, MAX_PDU, RX_DMA_MIN};
+use crate::rf::txrx::{tx_frame_valid, RX_DMA_MIN};
 use crate::rf::{Channel, PhyMode, Radio, RfCallback};
 use crate::time::InstantUs;
 use crate::{Error, Result};
@@ -147,7 +147,6 @@ pub struct Ch573Radio {
     isr: IsrState,
     rx_dma: *mut u8,
     rx_dma_len: usize,
-    tx_bounce: DmaBuf<MAX_PDU>,
 }
 
 // Soft state only; MMIO runs through fixed bases.
@@ -171,7 +170,6 @@ impl Ch573Radio {
             isr: IsrState::default(),
             rx_dma: rx_dma.as_mut_ptr(),
             rx_dma_len: rx_dma.len(),
-            tx_bounce: DmaBuf::zeroed(),
         })
     }
 
@@ -591,8 +589,10 @@ impl Radio for Ch573Radio {
         self.rfend_dev_init(clock)?;
         self.bb_dev_init_abs();
         self.calibrate(clock)?;
+        // RMW clear only: `LLE+0x08` is plain R/W and its upper half carries
+        // the DMA state field, so a full `0xffff` store would clobber it.
+        Self::clear_lle_irq(0xffff);
         unsafe {
-            regs::write(LLE_BASE, lle::IRQSTAT, 0xffff);
             regs::write(
                 DMA_BASE,
                 dma_reg::RXBUFPTR,
@@ -651,6 +651,10 @@ impl Radio for Ch573Radio {
         self.isr.callback = cb;
     }
 
+    /// TX one PDU with a short busy-poll for the LLE TX-start event.
+    ///
+    /// The caller must not let an LLE ISR clear `LLE+0x08` bit9 during the
+    /// call (no IRQ handler is installed by this backend).
     unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -669,19 +673,21 @@ impl Radio for Ch573Radio {
             return Err(Error::Busy);
         }
 
-        // Prefer an already-aligned high-SRAM frame; else bounce.
-        let tx_ptr = if frame.as_ptr() as usize & 0x3 == 0
-            && CAPS.contains_dma(frame.as_ptr() as usize, frame.len())
-        {
-            frame.as_ptr()
-        } else {
-            self.tx_bounce.0[..frame.len()].copy_from_slice(frame);
-            let p = self.tx_bounce.0.as_ptr() as usize;
-            if !CAPS.contains_dma(p, frame.len()) {
+        // Prefer an aligned in-window frame; else bounce through the caller's
+        // RX scratch, which `new` already proved to be DMA-visible. A local
+        // bounce buffer would inherit `Ch573Radio`'s (possibly low) address.
+        let mut tx_ptr = frame.as_ptr();
+        if tx_ptr as usize & 0x3 != 0 || !CAPS.contains_dma(tx_ptr as usize, frame.len()) {
+            if frame.len() > self.rx_dma_len {
                 return Err(Error::InvalidState);
             }
-            self.tx_bounce.0.as_ptr()
-        };
+            // SAFETY: owned scratch, sized `RX_DMA_MIN`, word-aligned; TX
+            // stops the engine first, so RX is not writing it.
+            unsafe {
+                core::ptr::copy_nonoverlapping(frame.as_ptr(), self.rx_dma, frame.len());
+            }
+            tx_ptr = self.rx_dma;
+        }
 
         self.engine_stop();
         Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
@@ -737,6 +743,11 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::GUARD, 0x0000_8303);
             regs::write(LLE_BASE, LLE_COUNT, hw_window);
             regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
+        }
+        // Drop any stale flag (e.g. a bit9 left set by an earlier clear
+        // attempt) so the kick below can only come from this TX window.
+        Self::clear_lle_irq(0xffff);
+        unsafe {
             // EVT `ll_tx_set_wait_finish` pokes CMD=2 to start the TX.
             regs::write(LLE_BASE, lle::CMD, 0x2);
         }

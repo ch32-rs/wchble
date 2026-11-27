@@ -54,7 +54,7 @@ mod tests {
         bufptr_base: 0x4000_c000,
         tx_bufptr_off: 0x10,
         rx_bufptr_off: 0x14,
-        sram_start: 0x2000_3800,
+        sram_start: 0x2000_4000,
         sram_end: 0x2000_8000,
         vco_mhz: &[],
         wait_tune_half_us: 0,
@@ -62,8 +62,10 @@ mod tests {
 
     #[test]
     fn ch573_rejects_low_sram_window() {
+        // 14-bit pointers alias everything below 0x2000_4000.
         assert!(!CH573.contains_dma(0x2000_0000, 272));
-        assert!(CH573.contains_dma(0x2000_3800, 272));
+        assert!(!CH573.contains_dma(0x2000_3800, 272));
+        assert!(CH573.contains_dma(0x2000_4000, 272));
         assert!(!CH573.contains_dma(0x2000_7f00, 0x200));
     }
 }
