@@ -29,8 +29,12 @@ Letter namespaces collide — always qualify them:
   `1a86:8010:5CED8F06E1D2`, Chip ID `0x73000000`). ADV_NONCONN_IND on
   37/38/39 (AdvA `c1:ff:ee:00:00:73`, name `wch573`) **passes on air** with
   both the nRF sniffer and a macOS scan. DMA buffers must stay in SRAM
-  `@0x20004000..0x20008000` (pointer registers keep the low 14 bits); the RX
-  hit path is still arm-only. Not Trouble/GATT; not Phase 1 closure.
+  `@0x20004000..0x20008000` (pointer registers keep the low 14 bits).
+  `ch573-rx-isr`: single-window RX now delivers PDUs via `DMA+0x18` and
+  `rx_poll` (BB payload reload), verified byte-exact against the
+  `ch585-rf-smoke` transmitter plus reported RSSI (`examples/ch573-rx-smoke`).
+  Still open: CRC status, real LLE/BB IRQ. Not Trouble/GATT; not Phase 1
+  closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle

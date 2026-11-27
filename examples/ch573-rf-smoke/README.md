@@ -15,7 +15,8 @@ uses **defmt/RTT**.
 CH573 SRAM is only `@0x20003800..0x20008000` (18 KiB), and the DMA engine
 keeps just the low 14 bits of a pointer, so it only reaches
 `0x20004000..0x20008000`. Buffer pointers are programmed on the **DMA block**
-at `0x4000C000` (`+0x10` TX / `+0x14` RX) as **16-bit offsets from
+at `0x4000C000` (`+0x10` TX / `+0x18` RX; see `examples/ch573-rx-smoke`) as
+**16-bit offsets from
 `0x20000000`** (e.g. `0x20004c20` → `0x4c20`). This example pins its buffers
 in `.dma_buffer` at `0x20004c00`. LLE `+0x78/+0x7c` do **not** stick. Do
 **not** flash this image with the CH585 preflight probe (`F93D8F067E10`).

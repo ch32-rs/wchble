@@ -1,0 +1,189 @@
+//! CH573 RX smoke — arm a legacy-ADV RX window and dump what the DMA wrote.
+//!
+//! Flash with the pinned CH573 probe only:
+//! `probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram`
+//!
+//! Success markers (defmt/RTT):
+//! - `rf init ok`
+//! - `state=2` lines with a plausible `len`/`rssi`
+//! - `buf …` bytes matching an ADV seen by the nRF sniffer / a known
+//!   transmitter (`examples/ch585-rf-smoke` broadcasts the name `wch585`).
+
+#![no_std]
+#![no_main]
+
+use ch5xx_hal as hal;
+use defmt::info;
+use defmt_rtt as _;
+use hal::rcc;
+use qingke_rt::entry;
+use wchble::rf::family::ch573::{Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE};
+use wchble::rf::regs;
+use wchble::rf::txrx::RX_DMA_MIN;
+use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
+use wchble::time::InstantUs;
+use {panic_halt as _, portable_atomic as _};
+
+defmt::timestamp!("{=u32}", 0u32);
+
+const ADV_AA: u32 = 0x8e89_bed6;
+const ADV_CRC_INIT: u32 = 0x55_5555;
+
+/// DMA-visible RX buffer placed by `build.rs`.
+#[repr(align(4))]
+struct DmaCell<const N: usize>(core::cell::UnsafeCell<[u8; N]>);
+
+// SAFETY: single-threaded firmware; the buffer is only used by `main`.
+unsafe impl<const N: usize> Sync for DmaCell<N> {}
+
+impl<const N: usize> DmaCell<N> {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new([0; N]))
+    }
+}
+
+/// Scratch owned by the driver (DMA init seeds its pointers from it).
+#[link_section = ".dma_buffer"]
+static RX_SCRATCH: DmaCell<RX_DMA_MIN> = DmaCell::new();
+/// Buffer handed to `rx_basic` for each window.
+#[link_section = ".dma_buffer"]
+static RX_BUF: DmaCell<RX_DMA_MIN> = DmaCell::new();
+
+struct UsClock {
+    ticks_per_us: u32,
+}
+
+impl UsClock {
+    fn start() -> Self {
+        let hz = rcc::clocks().sysclk.0.max(1_000_000);
+        Self {
+            ticks_per_us: (hz / 1_000_000).max(1),
+        }
+    }
+
+    fn ticks(&self) -> u32 {
+        u32::MAX - hal::pac::SYSTICK.cntl().read().cntl()
+    }
+}
+
+impl InstantUs for UsClock {
+    fn now_us(&self) -> u32 {
+        self.ticks() / self.ticks_per_us
+    }
+
+    fn delay_us(&self, us: u32) {
+        let start = self.now_us();
+        while self.now_us().wrapping_sub(start) < us {}
+    }
+}
+
+fn mmio(base: usize, off: usize) -> u32 {
+    unsafe { regs::read(base, off) }
+}
+
+fn poke(base: usize, off: usize, value: u32) {
+    unsafe { regs::write(base, off, value) }
+}
+
+/// `LLE+0x08` is plain R/W: clear flags by writing the bits back as zero.
+fn clear_lle_irq(bits: u32) {
+    unsafe {
+        let v = mmio(LLE_BASE, 0x08);
+        regs::write(LLE_BASE, 0x08, v & !bits);
+    }
+}
+
+#[entry]
+fn main() -> ! {
+    let _p = hal::init(rcc::Config::PLL_60MHZ.into());
+    info!("boot");
+    info!("wchble ch573 rx-smoke sysclk={}", rcc::clocks().sysclk.0);
+
+    let clock = UsClock::start();
+    // SAFETY: single-threaded; the buffers are used only here.
+    let scratch: &mut [u8] = unsafe { &mut *RX_SCRATCH.0.get() };
+    let rx: &mut [u8; RX_DMA_MIN] = unsafe { &mut *RX_BUF.0.get() };
+    let dma_ptr = rx.as_ptr() as usize;
+    info!("dma {=usize:x}", dma_ptr);
+    if !CAPS.contains_dma(dma_ptr, rx.len()) || !CAPS.contains_dma(scratch.as_ptr() as usize, scratch.len()) {
+        info!("dma OUT OF WINDOW expect {=usize:x}..{=usize:x}", CAPS.sram_start, CAPS.sram_end);
+        loop {}
+    }
+
+    let mut radio: Ch573Radio = match new_radio_with_dma(scratch) {
+        Ok(r) => r,
+        Err(e) => {
+            info!("radio new err {:?}", e);
+            loop {}
+        }
+    };
+
+    match radio.init(&clock) {
+        Ok(()) => info!("rf init ok"),
+        Err(e) => {
+            info!("rf init err {:?}", e);
+            loop {}
+        }
+    }
+
+    radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+    radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
+
+    let mut round = 0u32;
+    loop {
+        for &ch in &[37u8, 38, 39] {
+            if radio.set_channel(ch).is_err() {
+                continue;
+            }
+            for b in rx.iter_mut() {
+                *b = 0xAA;
+            }
+            clear_lle_irq(0xffff);
+
+            // SAFETY: `rx` is DMA-visible and stops the engine before re-use.
+            if let Err(e) = unsafe { radio.rx_basic(&clock, &mut rx[..], 20_000) } {
+                info!("rx arm ch{=u8} err {:?}", ch, e);
+                continue;
+            }
+
+            // Poll the window; `rx_poll` serves the BB handler the engine
+            // needs (payload-window reload) and reports the completion.
+            let start = clock.now_us();
+            let mut poll = RxPoll::Armed;
+            let mut waited = false;
+            loop {
+                poll = unsafe { radio.rx_poll() };
+                if poll != RxPoll::Armed {
+                    break;
+                }
+                if clock.now_us().wrapping_sub(start) > 15_000 {
+                    waited = true;
+                    break;
+                }
+            }
+
+            let count = mmio(LLE_BASE, 0x60);
+            let dma18 = mmio(DMA_BASE, 0x18);
+            let bb30 = mmio(BB_BASE, 0x30);
+            let bb38 = mmio(BB_BASE, 0x38);
+            let (state, len, rssi) = match poll {
+                RxPoll::Armed => (0u8, 0u8, 0i8),
+                RxPoll::Timeout => (1, 0, 0),
+                RxPoll::Done { len, rssi } => (2, len, rssi),
+            };
+            info!(
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x}",
+                ch, state, len, rssi, waited, count, dma18, bb30, bb38
+            );
+            if poll != RxPoll::Timeout || rx[0] != 0xAA || rx[1] != 0xAA {
+                info!("buf {:?}", &rx[..48]);
+            }
+            radio.shut();
+            clock.delay_us(5_000);
+        }
+        round = round.wrapping_add(1);
+        if round % 5 == 0 {
+            info!("rx loop round={=u32}", round);
+        }
+    }
+}

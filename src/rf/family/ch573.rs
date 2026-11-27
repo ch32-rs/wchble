@@ -53,14 +53,20 @@ pub const SRAM_END: usize = 0x2000_8000;
 
 use Certainty::FromClosedDisasm as Disasm;
 
-/// DMA-block offsets (`dma.o` / `RF_Tx` / `RF_Rx`).
+/// DMA-block offsets (`dma.o` / `RF_Tx` / `RF_Rx` / `ll_scan`).
+///
+/// `DMA_DevInit` seeds `+0x10/+0x14` from `gBleIPPara[0x14]` and
+/// `+0x18/+0x1c` from `gBleIPPara[0x18]`; `llScanCreateCore` shows `[0x14]` is
+/// the TX buffer and `[0x18]` the RX buffer the stack parses.
 mod dma_reg {
     pub const CTRL: usize = 0x00;
     pub const CFG08: usize = 0x08;
     pub const CFG0C: usize = 0x0c;
     pub const TXBUFPTR: usize = 0x10;
-    pub const RXBUFPTR: usize = 0x14;
-    pub const AUX18: usize = 0x18;
+    /// BLE stack TX buffer (`ll_scan` SCAN_REQ / `ll_slave` data TX).
+    pub const TXBUFPTR_ALT: usize = 0x14;
+    /// BLE stack RX buffer — where received PDUs land.
+    pub const RXBUFPTR: usize = 0x18;
     pub const AUX1C: usize = 0x1c;
 }
 
@@ -147,7 +153,32 @@ pub struct Ch573Radio {
     isr: IsrState,
     rx_dma: *mut u8,
     rx_dma_len: usize,
+    /// Caller buffer armed by the current RX window.
+    rx_buf: *mut u8,
+    rx_buf_len: usize,
+    /// `BB_IRQLibHandler` reloads `LLE+0x60` once per window.
+    rx_reloaded: bool,
 }
+
+/// Result of servicing an armed RX window with [`Ch573Radio::rx_poll`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxPoll {
+    /// Still listening; poll again.
+    Armed,
+    /// The window drained without a PDU.
+    Timeout,
+    /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
+    ///
+    /// CRC status is not reported: the vendor reads `BB+0x38` bit5 inside the
+    /// ISR, but in the polling context that bit already reads set when no PDU
+    /// has arrived (see `local-docs/ch573-rx-isr-spec.md`).
+    Done { len: u8, rssi: i8 },
+}
+
+/// `BB+0x38` events the vendor `BB_IRQLibHandler` serves.
+const BB_PAYLOAD_EVENT: u32 = 0x40;
+const BB_TIMER1_EVENT: u32 = 0x02;
+const BB_TIMER2_EVENT: u32 = 0x10;
 
 // Soft state only; MMIO runs through fixed bases.
 unsafe impl Send for Ch573Radio {}
@@ -170,6 +201,9 @@ impl Ch573Radio {
             isr: IsrState::default(),
             rx_dma: rx_dma.as_mut_ptr(),
             rx_dma_len: rx_dma.len(),
+            rx_buf: core::ptr::null_mut(),
+            rx_buf_len: 0,
+            rx_reloaded: false,
         })
     }
 
@@ -186,14 +220,14 @@ impl Ch573Radio {
 
     /// `DMA_DevInit` enables + seed RX/TX ptrs (`dma.o`).
     ///
-    /// EVT seeds +0x10/+0x14 from `gBleIPPara` buffers; we point both at the
-    /// owned RX scratch until TX programs `+0x10` per packet.
+    /// EVT seeds +0x10/+0x14 and +0x18/+0x1c from `gBleIPPara` buffers; we
+    /// point all four at the owned RX scratch until per-transfer programming.
     fn dma_dev_init(&mut self) {
         let off = Self::dma_off(self.rx_dma as usize);
         unsafe {
             regs::write(DMA_BASE, dma_reg::TXBUFPTR, off);
+            regs::write(DMA_BASE, dma_reg::TXBUFPTR_ALT, off);
             regs::write(DMA_BASE, dma_reg::RXBUFPTR, off);
-            regs::write(DMA_BASE, dma_reg::AUX18, off);
             regs::write(DMA_BASE, dma_reg::AUX1C, off);
             // OR enables in EVT order: +0x08/+0x0c |= 0x2000, then |= 0x1000;
             // +0x00 |= 0x02 then |= 0x20.
@@ -317,12 +351,13 @@ impl Ch573Radio {
 
     fn engine_stop(&mut self) {
         unsafe {
+            // EVT `ble_ll_hw_api_shut`/`RF_Rx`: drop the mode direction bits,
+            // request a forced stop, then wait for the engine to report idle.
             regs::rmw(LLE_BASE, lle::MODE, lle_mode::DIR_MASK, 0);
             regs::rmw(LLE_BASE, lle::CMD, 0, lle_cmd::FORCE_STOP);
-            // EVT spins until the stop command self-clears; bail out bounded
-            // so an idle engine (already clear) costs nothing.
-            for _ in 0..1_000 {
-                if regs::read(LLE_BASE, lle::CMD) & lle_cmd::FORCE_STOP == 0 {
+            for _ in 0..10_000 {
+                let cmd = regs::read(LLE_BASE, lle::CMD);
+                if cmd & (lle_cmd::BUSY_MASK | lle_cmd::FORCE_STOP) == 0 {
                     break;
                 }
             }
@@ -554,6 +589,73 @@ impl Ch573Radio {
         }
         Ok(())
     }
+
+    /// `BB_IRQLibHandler` reload value: the payload window grows with the
+    /// buffer (`(maxlen + 7) << 4`, EVT `RF_Rx` / `ble_ll_hw_api_rx`).
+    fn rx_reload_count(buf_len: usize) -> u32 {
+        let max_payload = buf_len.saturating_sub(8).min(0xff) as u32;
+        ((max_payload.max(18) + 7) << 4).max(0x1b8)
+    }
+
+    /// Buffer offset of the RSSI byte: vendor `ble_ll_chkcrc` finds the status
+    /// word at `(len + 5) & 0x1fc` and the RSSI right after it.
+    fn rx_rssi_off(len: u8) -> usize {
+        ((len as usize + 5) & 0x1fc) + 2
+    }
+
+    /// Service BB/LLE flags for an armed window and report its state.
+    ///
+    /// Mirrors EVT `BB_IRQLibHandler` plus the LLE RX branch. The BB payload
+    /// event reloads `LLE+0x60`; without that reload the engine never DMAs the
+    /// PDU, so callers must keep polling while a window is open.
+    pub unsafe fn rx_poll(&mut self) -> RxPoll {
+        unsafe {
+            // Sample both status words before any writes: the BB service below
+            // clears flags, and RX_DONE may race with the timer branches.
+            let bb = regs::read(BB_BASE, bb::IRQSTAT);
+            let st = regs::read(LLE_BASE, lle::IRQSTAT);
+            if st & lle_irq::RX_DONE != 0 {
+                Self::clear_lle_irq(0xffff);
+                let (len, rssi) = if self.rx_buf.is_null() {
+                    (0, 0)
+                } else {
+                    let len = core::ptr::read_volatile(self.rx_buf.add(1));
+                    let off = Self::rx_rssi_off(len);
+                    let rssi = if off < self.rx_buf_len {
+                        core::ptr::read_volatile(self.rx_buf.add(off)) as i8
+                    } else {
+                        0
+                    };
+                    (len, rssi)
+                };
+                return RxPoll::Done { len, rssi };
+            }
+            if bb & BB_PAYLOAD_EVENT != 0 {
+                regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | 0x1));
+                if !self.rx_reloaded {
+                    regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(self.rx_buf_len));
+                    self.rx_reloaded = true;
+                }
+            }
+            if bb & BB_TIMER1_EVENT != 0 {
+                // EVT parks the engine in RX briefly (`0x45`) on this timer.
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_TIMER1_EVENT);
+                for _ in 0..24 {
+                    core::hint::spin_loop();
+                }
+                regs::write(LLE_BASE, lle::MODE, 0x45);
+            }
+            if bb & BB_TIMER2_EVENT != 0 {
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_TIMER2_EVENT);
+                regs::write(LLE_BASE, lle::MODE, 0);
+            }
+
+            if regs::read(LLE_BASE, LLE_COUNT) == 0 {
+                return RxPoll::Timeout;
+            }
+        }
+        RxPoll::Armed
+    }
 }
 
 impl AnalogInit for Ch573Radio {
@@ -615,6 +717,9 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::MODE, 0);
         }
         self.isr.clear_rx_flags();
+        self.rx_buf = core::ptr::null_mut();
+        self.rx_buf_len = 0;
+        self.rx_reloaded = false;
     }
 
     fn set_channel(&mut self, channel: Channel) -> Result<()> {
@@ -668,8 +773,9 @@ impl Radio for Ch573Radio {
         if self.channel > 39 {
             return Err(Error::InvalidState);
         }
-        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
-        if busy != 0 {
+        // The engine may still be finishing an RX window; stop it first.
+        self.engine_stop();
+        if unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
             return Err(Error::Busy);
         }
 
@@ -689,7 +795,6 @@ impl Radio for Ch573Radio {
             tx_ptr = self.rx_dma;
         }
 
-        self.engine_stop();
         Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
 
         self.program_channel(self.channel);
@@ -820,6 +925,12 @@ impl Radio for Ch573Radio {
         rc
     }
 
+    /// Arm a single RX window (MODE=0x59, CMD=1) and return.
+    ///
+    /// `Ok` means the engine is listening, **not** that a packet arrived.
+    /// Completion is serviced with [`Self::rx_poll`]; the hardware writes the
+    /// raw PDU into `DMA+0x18` as `[hdr][len][payload][pad]`, then a status
+    /// word plus RSSI byte at `(len + 5) & 0x1fc` (no RSSI prefix).
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -835,31 +946,49 @@ impl Radio for Ch573Radio {
         if self.channel > 39 {
             return Err(Error::InvalidState);
         }
-        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
-        if busy != 0 {
+        // EVT `ble_ll_hw_api_rx` stops a busy engine and waits for idle.
+        self.engine_stop();
+        if unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
             return Err(Error::Busy);
         }
 
-        self.engine_stop();
         Self::clear_lle_irq(0xffff);
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();
 
         unsafe {
+            // EVT `ble_ll_hw_api_rx` (libCH57xBLE.a `ip.o`): the BLE RX arm
+            // used by scanning. Not the 2.4G `RF_Rx`, which differs in AA/CRC
+            // cfg (0x1e vs 0x1f) and window handling.
             regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::PHY_MASK, rfctrl::PHY_1M);
             regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::DIR_RX);
-            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, rfend::FECTRL_RF_ON);
-            regs::write(
-                DMA_BASE,
-                dma_reg::RXBUFPTR,
-                Self::dma_off(rxbuf.as_mut_ptr() as usize),
-            );
-            regs::write(LLE_BASE, LLE_COUNT, window_half_us.max(1));
-            regs::write(LLE_BASE, lle::MODE, lle_mode::RX);
+            // CH573 RF-on is FECTRL bit17 only; the CH585 constant gates PA.
+            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, 0x2_0000);
+            regs::rmw(BB_BASE, bb::AUTOCFG, autocfg::ARM_MASK, 0x2);
+            regs::rmw(BB_BASE, bb::RFCTRL, 0, rfctrl::INIT_BIT28);
+            // RX PHY cfg: clear bits[26:25]/[23:16], keep bit24, set bit29.
+            regs::rmw(BB_BASE, bb::RXCFG18, 0xf900_0000, 0x2000_0000);
+            regs::rmw(BB_BASE, bb::RXCFG18, 0x7d, 0x18);
+            // BLE RX runs in channel-number mode.
+            regs::rmw(RFEND_BASE, rfend::FREQMODE, rfend::FREQMODE_EN, 0);
+            // Vendor BLE RX uses TX's 0x1f AA/CRC cfg, not `RF_Rx`'s 0x1e.
+            regs::write(LLE_BASE, lle::CRC_AA_CFG, 0x1f);
+            let rx_ptr = rxbuf.as_mut_ptr();
+            self.rx_buf = rx_ptr;
+            self.rx_buf_len = rxbuf.len();
+            self.rx_reloaded = false;
+            regs::write(DMA_BASE, dma_reg::RXBUFPTR, Self::dma_off(rx_ptr as usize));
+            // EVT `ble_ll_hw_api_rx` order: CMD=1 then MODE=0x59.
             regs::write(LLE_BASE, lle::CMD, lle_cmd::START_RX);
+            regs::write(LLE_BASE, lle::MODE, lle_mode::RX);
+            // EVT `ll_scan_process` arms the listen window as a guarded DMA
+            // block, exactly like TX. A bare COUNT store does not fire.
+            regs::write(LLE_BASE, lle::GUARD, 0x0000_8303);
+            regs::write(LLE_BASE, LLE_COUNT, window_half_us.max(1));
+            regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
         }
 
-        // Arm only; caller polls IRQSTAT. Keep a short settle so WINDOW sticks.
+        // Arm only; the caller polls LLE+0x08 bit0. Short settle so it sticks.
         clock.delay_us(2);
         let _ = self.phy_rx;
         Ok(())
