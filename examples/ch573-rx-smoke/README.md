@@ -96,13 +96,23 @@ buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, �
 
 = `42 11 02 00 00 EE FF C1 02 01 06 07 09 77 63 68 35 38 35` — the CH585 frame.
 
+### Independent receiver (nRF Sniffer)
+
+`tools/compare_sniffer.py` compares the log with a pcap written by
+`nrfutil ble-sniffer sniff` (Nordic DLT 272). 35 s run, ELF `a2d639bc…`:
+8215 records, CH573 `Done` 76 (67 with a legal length), **28 byte-exact**
+across 7 AdvAs — CH585 plus 6 surrounding third-party devices (Apple
+Continuity and similar). The same capture holds 60 of our own `wch573`
+advertisements. Two frames differed from the sniffer by one bit and 9 `Done`
+had impossible lengths (53/61/102/114/164/224…).
+
 Not yet:
 
 - **CRC status** — `BB+0x38` bit5 reads set even with no PDU in the polling
-  context, so `RxPoll::Done` omits it.
+  context, so `RxPoll::Done` omits it. The sniffer run above shows the cost:
+  bad frames (one-bit errors, garbage lengths) are reported as received.
 - RSSI is read from the status word (`(len+5)&0x1fc + 2`); cnlohr's iSLER
   reads `BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
-- RXFilter determinism (occasional spurious timeouts).
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.
