@@ -5,6 +5,7 @@ default-members = ["."]
 exclude = [
     "examples/ch32v208-rf-smoke",
     "examples/ch32v208-trouble-adv",
+    "examples/ch573-rf-smoke",
     "examples/ch592-rf-smoke",
     "examples/ch585-rf-smoke",
 ]
@@ -56,6 +57,7 @@ default = []
 # Select at most one chip family backend for rf::family.
 ch32v208 = []
 ch572 = []
+ch573 = []
 ch583 = []
 ch585 = []
 ch592 = []

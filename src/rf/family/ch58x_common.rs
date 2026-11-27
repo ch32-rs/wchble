@@ -15,12 +15,17 @@ macro_rules! ch58x_common {
         impl $ty {
             /// Build a radio that owns a DMA-capable RX scratch buffer.
             ///
-            /// `rx_dma` must be at least [`RX_DMA_MIN`] bytes and 4-byte aligned.
+            /// `rx_dma` must be at least [`RX_DMA_MIN`] bytes, 4-byte aligned, and
+            /// inside [`CAPS`] SRAM (CH573 rejects the low `0x2000_0000` window).
             pub fn new(rx_dma: &'static mut [u8]) -> Result<Self> {
-                let ptr = rx_dma.as_mut_ptr();
-                if rx_dma.len() < RX_DMA_MIN || (ptr as usize) & 0x3 != 0 {
+                let ptr = rx_dma.as_mut_ptr() as usize;
+                if rx_dma.len() < RX_DMA_MIN
+                    || ptr & 0x3 != 0
+                    || !CAPS.contains_dma(ptr, rx_dma.len())
+                {
                     return Err(Error::InvalidState);
                 }
+                let ptr = rx_dma.as_mut_ptr();
                 Ok(Self {
                     channel: 0xff,
                     phy_tx: PhyMode::Rate1m,

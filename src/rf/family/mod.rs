@@ -7,6 +7,7 @@
 //! that module's radio type.
 
 pub mod tables;
+pub mod caps;
 
 /// DIAGNOSTIC ONLY: scheduled-TX startup boundary samples (temporary).
 
@@ -156,6 +157,9 @@ pub mod ch32v208;
 
 #[cfg(feature = "ch572")]
 pub mod ch572;
+
+#[cfg(feature = "ch573")]
+pub mod ch573;
 
 #[cfg(feature = "ch583")]
 pub mod ch583;

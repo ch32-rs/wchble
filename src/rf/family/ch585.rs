@@ -29,6 +29,7 @@
 
 use super::ch58x_common::ch58x_common;
 use crate::rf::analog::{self, AnalogInit};
+use crate::rf::family::caps::FamilyCaps;
 use crate::rf::family::tables::{BbDevInit, Certainty, LleDevInit, RegInit, RfendInit};
 use crate::rf::isr::IsrState;
 use crate::rf::regs::{self, bb, bb_irq, lle, rfend};
@@ -192,6 +193,23 @@ pub const RFEND_INIT: RfendInit = RfendInit {
     wait_tune_half_us: RegInit::new(0x64, WAIT_TUNE_HALF_US, Disasm),
     vco_mhz: &[2401, 2440, 2480, 2522],
     certainty: Disasm,
+};
+
+/// L0 constants shared with other live CH5xx backends.
+pub const CAPS: FamilyCaps = FamilyCaps {
+    bb_base: BB_BASE,
+    lle_base: LLE_BASE,
+    aes_base: AES_BASE,
+    rfend_base: RFEND_BASE,
+    irq_bb: IRQ_BB,
+    irq_lle: IRQ_LLE,
+    bufptr_base: LLE_BASE,
+    tx_bufptr_off: 0x78,
+    rx_bufptr_off: 0x7c,
+    sram_start: 0x2000_0000,
+    sram_end: 0x2002_0000,
+    vco_mhz: RFEND_INIT.vco_mhz,
+    wait_tune_half_us: WAIT_TUNE_HALF_US,
 };
 
 /// TXCtune band codes written to `RFEND+0x38[15:8]`, in vendor order
