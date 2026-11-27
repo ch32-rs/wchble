@@ -615,7 +615,8 @@ impl Ch573Radio {
             let bb = regs::read(BB_BASE, bb::IRQSTAT);
             let st = regs::read(LLE_BASE, lle::IRQSTAT);
             if st & lle_irq::RX_DONE != 0 {
-                Self::clear_lle_irq(0xffff);
+                // Read the PDU before clearing: once RX_DONE drops the engine
+                // may start writing the next frame into the same buffer.
                 let (len, rssi) = if buf.is_null() {
                     (0, 0)
                 } else {
@@ -628,6 +629,7 @@ impl Ch573Radio {
                     };
                     (len, rssi)
                 };
+                Self::clear_lle_irq(0xffff);
                 return RxPoll::Done { len, rssi };
             }
             if bb & BB_PAYLOAD_EVENT != 0 {

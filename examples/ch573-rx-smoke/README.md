@@ -58,10 +58,13 @@ Not yet:
 - **CRC status** — `BB+0x38` bit5 reads set even with no PDU in the polling
   context, so `RxPoll::Done` omits it.
 - **Real LLE/BB PFIC IRQ** — `ble_isr`/`rx_isr_take` and the `BLEB`/`BLEL`
-  handlers are scaffolding only. Unmasking BLEL with a window armed starves
-  the main loop even with an empty handler (the line stays asserted while the
-  engine is armed); `USE_ISR` stays `false`. Details and next probes in
-  `local-docs/ch573-rx-isr-spec.md`.
+  handlers are scaffolding only; `USE_ISR` stays `false`. Measured with a
+  self-disabling counting handler: BLEL is entered **1000 times inside one
+  20 ms window** while the engine is armed, yet `LLE+0x08` low 16 bits are 0
+  on the first entry (only the non-writable bit 20 stays set) and `unpend()`
+  does not stop it. Enabling **only BLEB** keeps the main loop alive but then
+  every window times out with `cnt=0`, so RX completion still needs the LLE
+  side. Details and next probes in `local-docs/ch573-rx-isr-spec.md`.
 
 Register facts measured on silicon: `LLE+0x08` is plain R/W (write `~0`,
 read `~0`), bit 20 (`0x100000`) is not writable and must not be relied on for
