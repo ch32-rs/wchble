@@ -243,7 +243,7 @@ fn main() -> ! {
             // TX itself runs to completion inside `tx_basic`. `turn=0xffff`
             // means the kick never ran, so the delta is stale.
             let mut turn_us = 0u32;
-            if MEASURE_RX_TX && matches!(poll, RxPoll::Done { .. }) {
+            if MEASURE_RX_TX && valid {
                 let t_rx = rx_done_ticks();
                 let kicks = tx_kick_count();
                 let n = build_adv(&mut rx[..]);

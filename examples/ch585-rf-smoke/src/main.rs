@@ -185,7 +185,11 @@ fn dump_regs(out: &mut Log) {
 
 /// Minimal ADV_NONCONN_IND: header + AdvA + flags + complete local name "wch585".
 fn build_adv_nonconn_ind(out: &mut [u8; 32]) -> usize {
-    let name = b"wch585";
+    build_adv_name(out, b"wch585")
+}
+
+/// Same ADV_NONCONN_IND shape with a caller-chosen local name.
+fn build_adv_name(out: &mut [u8; 32], name: &[u8]) -> usize {
     // Static random address C1:FF:EE:00:00:02, least-significant byte first.
     let adv_a = [0x02, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
     let mut payload_len = 0usize;
@@ -206,6 +210,34 @@ fn build_adv_nonconn_ind(out: &mut [u8; 32]) -> usize {
     out[1] = payload_len as u8;
     out[2..2 + payload_len].copy_from_slice(&buf[..payload_len]);
     2 + payload_len
+}
+
+/// Known-answer CRC test (`--features crc-test`): transmit `crcgood` with the
+/// advertising CRC init and `crcbad!` with a one-bit-wrong init. Both payloads
+/// are intact, so a receiver must report crc=true only for the first and
+/// crc=false only for the second.
+#[cfg(feature = "crc-test")]
+fn crc_test_loop(radio: &mut Ch585Radio, clock: &UsClock) -> ! {
+    let mut good = [0u8; 32];
+    let mut bad = [0u8; 32];
+    let good_n = build_adv_name(&mut good, b"crcgood");
+    let bad_n = build_adv_name(&mut bad, b"crcbad!");
+    // One init for the whole run (`crc-test-bad` flips it): every frame of
+    // the named type has known ground truth, with no phase-boundary latch
+    // question.
+    let bad_run = cfg!(feature = "crc-test-bad");
+    let (frame, init) = if bad_run {
+        (&bad[..bad_n], ADV_CRC_INIT ^ 0x1)
+    } else {
+        (&good[..good_n], ADV_CRC_INIT)
+    };
+    let _ = radio.set_channel(37);
+    radio.set_aa_crc(ADV_AA, init);
+    clock.delay_us(1_000);
+    loop {
+        let _ = unsafe { radio.tx_basic(clock, frame, 0, None) };
+        clock.delay_us(1_000);
+    }
 }
 
 fn tx_burst(radio: &mut Ch585Radio, clock: &UsClock, out: &mut Log, frame: &[u8]) {
@@ -666,6 +698,9 @@ fn main() -> ! {
     radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
+    #[cfg(feature = "crc-test")]
+    crc_test_loop(&mut radio, &clock);
+
     let mut frame = [0u8; 32];
     let n = build_adv_nonconn_ind(&mut frame);
     let _ = writeln!(out, "adv len {}", n);
@@ -685,6 +720,7 @@ fn main() -> ! {
     // - the CH585 SDK `RF_PHY` reference frame on channel 39 (AA 0x71764129 /
     //   CRC 0x555555) which a V208/CH592 reference receiver decodes.
     let _ = writeln!(out, "adv loop");
+    let mut round = 0u32;
     loop {
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
@@ -702,15 +738,25 @@ fn main() -> ! {
             let _ = unsafe { radio.tx_basic(&clock, &rf_frame, 0, None) };
         }
 
-        // Listen on ch37 every round: this is the direction CH573 -> CH585,
-        // and dumping the frame is the whole point of the RX leg.
-        radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
-        if let Some((len, crc_ok)) =
-            rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 20_000)
-        {
-            let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
-            dump_frame(&mut out, &rx_listen_buf.0[..], len);
+        // `peer-rx` listens on ch37 every round (CH573 -> CH585 interop) and
+        // dumps hits; the default keeps the original periodic smoke listen.
+        if cfg!(feature = "peer-rx") {
+            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+            if let Some((len, crc_ok)) =
+                rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 20_000)
+            {
+                let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
+                dump_frame(&mut out, &rx_listen_buf.0[..], len);
+            }
+        } else if round % 20 == 0 {
+            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+            if let Some((len, crc_ok)) =
+                rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 10_000)
+            {
+                let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
+            }
         }
+        round = round.wrapping_add(1);
 
         clock.delay_us(100_000);
     }

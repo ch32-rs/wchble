@@ -17,8 +17,10 @@ Android phone. This smoke example does not support scanning responses or connect
 5. Multi-channel ADV_NONCONN_IND TX on **37 / 38 / 39**
 6. Two RX arming rounds on ch38 (arm-clear / timeout still proves the path)
 7. Loop: ADV_NONCONN_IND on 37/38/39 + the vendor `RF_PHY` reference frame on ch39,
-   then one 10 ms RX window on ch37; every hit is printed as
-   `rx loop hit len=N crc=…` plus `rx buf` hex.
+   then a 10 ms RX window on ch37 every 20 rounds; every hit is printed as
+   `rx loop hit len=N crc=…`. Build with `--features peer-rx` to listen every
+   round instead (20 ms window, hits dumped as `rx buf`) for the CH573 interop
+   and `crc-test` / `crc-test-bad` to transmit the CRC known-answer frames.
 
 Console markers: `rf init ok`, `LLE …` / `RFEND …` / `BB …`,
 `tx ch{37,38,39} ok`, `rx listen hit|arm-clear`, `adv loop`,
@@ -38,7 +40,8 @@ probe-rs read --chip CH585 b32 <PEER address> 8
 ```
 
 This is the CH573 → CH585 direction of the interop check in
-`examples/ch573-rx-smoke/README.md`.
+`examples/ch573-rx-smoke/README.md`; build with `--features peer-rx` for that
+run (the default keeps the periodic 10 ms listen).
 
 ## What the dump should show
 

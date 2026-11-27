@@ -634,10 +634,10 @@ impl Ch573Radio {
     /// PDU, so this must run repeatedly while a window is open.
     unsafe fn service_window(buf: *mut u8, buf_len: usize, reloaded: &mut bool) -> RxPoll {
         unsafe {
-            // Sample both status words before any writes: the BB service below
-            // clears flags, and RX_DONE may race with the timer branches.
-            let bb = regs::read(BB_BASE, bb::IRQSTAT);
+            // LLE first, then BB: if a frame completes between the two reads,
+            // the BB sample still carries that frame's final CRC bit.
             let st = regs::read(LLE_BASE, lle::IRQSTAT);
+            let bb = regs::read(BB_BASE, bb::IRQSTAT);
             if st & lle_irq::RX_DONE != 0 {
                 // Read the PDU before clearing: once RX_DONE drops the engine
                 // may start writing the next frame into the same buffer.
@@ -653,25 +653,21 @@ impl Ch573Radio {
                     };
                     (len, rssi)
                 };
-                // The CRC flag is final at RX_DONE; the payload event usually
-                // lands in the same entry and is still pending here.
+                // Sample a fresh word: the frame may have completed between
+                // the reads above, so the earlier `bb` could predate its CRC.
+                let bb = regs::read(BB_BASE, bb::IRQSTAT);
                 let crc_ok = bb & BB_CRC_ERR == 0;
-                // Acknowledge the packet's BB events so they cannot leak into
-                // the next window.
-                regs::write(
-                    BB_BASE,
-                    bb::IRQSTAT,
-                    bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR | 0x1),
-                );
+                // Vendor `BB_IRQLibHandler`: write the *current* word back with
+                // the payload/CRC bits cleared (it does not clear bit0).
+                regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
                 Self::clear_lle_irq(0xffff);
                 return RxPoll::Done { len, rssi, crc_ok };
             }
             if bb & BB_PAYLOAD_EVENT != 0 {
-                regs::write(
-                    BB_BASE,
-                    bb::IRQSTAT,
-                    bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR | 0x1),
-                );
+                // Leave the CRC bit: this driver samples it at RX_DONE, so
+                // clearing it here would turn a bad frame into a good report.
+                let bb = regs::read(BB_BASE, bb::IRQSTAT);
+                regs::write(BB_BASE, bb::IRQSTAT, bb & !BB_PAYLOAD_EVENT);
                 if !*reloaded {
                     regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(buf_len));
                     *reloaded = true;
@@ -757,6 +753,7 @@ mod isr {
 const PFIC_BASE: usize = 0xE000_E000;
 const PFIC_IRER: usize = 0x180;
 const PFIC_IENR: usize = 0x100;
+const PFIC_IPRR: usize = 0x280;
 /// V3A SysTick free-running down-counter (ticks at HCLK).
 const SYSTICK_CNTL: usize = 0xE000_F004;
 
@@ -1300,6 +1297,9 @@ impl Radio for Ch573Radio {
     /// Completion is serviced with [`Self::rx_poll`]; the hardware writes the
     /// raw PDU into `DMA+0x18` as `[hdr][len][payload][pad]`, then a status
     /// word plus RSSI byte at `(len + 5) & 0x1fc` (no RSSI prefix).
+    ///
+    /// Arming masks the BLE lines and drops any unconsumed result from the
+    /// previous window (software flags, pending PFIC entry, BB event bits).
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -1315,6 +1315,13 @@ impl Radio for Ch573Radio {
         if self.channel > 39 {
             return Err(Error::InvalidState);
         }
+        // Mask before touching state: an ISR from the previous window must not
+        // publish into this one. Masking also quiesces a line the engine holds
+        // high, so no entry can be running once we return.
+        unsafe {
+            mask_ble_lines();
+            regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20));
+        }
         // EVT `ble_ll_hw_api_rx` stops a busy engine and waits for idle.
         self.engine_stop();
         if unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
@@ -1322,6 +1329,10 @@ impl Radio for Ch573Radio {
         }
 
         Self::clear_lle_irq(0xffff);
+        // Drop per-frame BB bits too; a CRC error left by a window that ended
+        // without RX_DONE would otherwise mark the next frame bad.
+        let bb = unsafe { regs::read(BB_BASE, bb::IRQSTAT) };
+        unsafe { regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR)) };
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();
 

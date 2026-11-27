@@ -9,7 +9,7 @@ On-target RX path for the CH573 backend:
    fallback.
 3. Print `len`, `rssi`, `crc` and `valid` (`crc && len <= 37`) plus the first
    48 bytes of the DMA buffer over defmt.
-4. Answer each `Done` with one ADV and report the RX-done → TX-kick
+4. Answer each valid `Done` with one ADV and report the RX-done → TX-kick
    turnaround.
 
 `SDIPrint` is a no-op on CH573 in ch5xx-hal, so this example uses **defmt/RTT**.
@@ -61,7 +61,8 @@ probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram \
 
 ## RX→TX turnaround (`turn=`)
 
-With `MEASURE_RX_TX`, every `Done` is answered with one `wch573` ADV on ch37;
+With `MEASURE_RX_TX`, every `Done` that passes `valid` is answered with one
+`wch573` ADV on ch37;
 `turn=` is the SysTick delta from the RX-done ISR timestamp to the TX bit9
 kick in µs (`0` = TX failed before the kick, `0xffff` = no kick seen).
 The number includes this example's own register dump and `set_channel`, so it
@@ -100,7 +101,9 @@ buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, �
 ### Independent receiver (nRF Sniffer)
 
 `tools/compare_sniffer.py` compares the log with a pcap written by
-`nrfutil ble-sniffer sniff` (Nordic DLT 272). 35 s run, ELF `a2d639bc…`:
+`nrfutil ble-sniffer sniff` (Nordic DLT 272), byte for byte only — the pcap
+cannot attribute per-record CRC flags to a specific board reception, so CRC
+status is checked by the known-answer test below. 35 s run, ELF `a2d639bc…`:
 8215 records, CH573 `Done` 76 (67 with a legal length), **28 byte-exact**
 across 7 AdvAs — CH585 plus 6 surrounding third-party devices (Apple
 Continuity and similar). The same capture holds 60 of our own `wch573`
@@ -109,30 +112,34 @@ had impossible lengths (53/61/102/114/164/224…).
 
 ### CRC status (`crc=`, `valid=`)
 
-`RxPoll::Done` now carries `crc_ok`, sampled from `BB+0x38` bit5 when
-`RX_DONE` is seen — the same bit the vendor's `ble_ll_chkcrc` tests. The
-handler then writes the event bits back (`bb & ~0x60`, as
-`BB_IRQLibHandler` does), and arming a window clears the previous window's
-software `Done`/`Timeout` flags.
+`RxPoll::Done` carries `crc_ok`, sampled from `BB+0x38` bit5 after `RX_DONE`
+is seen — the bit the vendor's `ble_ll_chkcrc` tests. The handler writes the
+current word back with the payload/CRC bits cleared (`bb & ~0x60`, as
+`BB_IRQLibHandler` does; bit0 is not touched), re-reading the word first so a
+frame that completed between the LLE and BB reads cannot be reported with a
+stale CRC. Arming a window masks the lines, drops a pending PFIC entry and
+clears the software flags and the per-frame BB bits.
 
-Ground truth: an nRF Sniffer capture in parallel (DLT 272 `flags` bit0 = CRC
-ok). 50 s run, ELF `a4421fea…`, all frames whose PDU matched byte-for-byte:
+Ground truth is a controlled known-answer test, not the sniffer: the CH585
+with `--features crc-test` sends `crcgood` with the advertising CRC init and
+`--features crc-test-bad` sends `crcbad!` with a one-bit-wrong init,
+continuously on ch37. Every frame in a run therefore has a known verdict,
+which the sniffer confirms on air (752/752 `crcgood` flag set; 124/124
+`crcbad!` flag clear). ELF `f36260e9…`, 40 s per run:
 
-| Item | Value |
-| --- | --- |
-| matched frames | 17 |
-| CRC verdict agrees | 12 |
-| false positive (ours ok, sniffer bad) | **0** |
-| false negative (ours bad, sniffer ok) | 5, RSSI −76…−97 dBm |
+| Run | Frames received | RSSI | Reported `crc=true` |
+| --- | --- | --- | --- |
+| all `crcgood` (correct init) | 17 | −55…−98 dBm | 7 — the flag is live |
+| all `crcbad!` (wrong init) | 17 | −54…−98 dBm | **0** |
 
-Two earlier 50 s runs gave 30/23 and 26/19; the combined 73 frames have no
-false positives and 19 false negatives.
+No CRC-failed frame was reported as good, including three at −54…−56 dBm. The cost
+is sensitivity: many valid frames are rejected, the same trade-off the vendor
+makes by returning early in `ll_scan_rx`. The buffer holds no CRC bytes to
+re-check in software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
 
-So the gate is conservative: a bad frame never reaches the caller, at the
-cost of dropping ~27 % of good frames at weak signal. The vendor library
-makes the same early return in `ll_scan_rx`. The stale-flag fix also removed
-the old "Done with an all-`0xAA` buffer" artefacts (212 `Done` / 554 windows
-all carried data, vs 102 empty `Done` before).
+The stale-flag fix also removed the old "Done with an all-`0xAA` buffer"
+artefacts (212 `Done` / 554 windows all carried data, vs 102 empty `Done`
+before).
 
 Still open: RSSI comes from the status word; cnlohr's iSLER reads
 `BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
@@ -144,13 +151,17 @@ re-run the same ELF before suspecting a firmware hang.
 
 Run `ch585-rf-smoke` (probe `F93D…`) and this example (probe `5CED…`) at the
 same time: the CH585 advertises `wch585` on 37/38/39 and listens on ch37; this
-example receives and answers each `Done` with one `wch573` frame. 90 s run,
-2026-11-28:
+example receives and answers each valid `Done` with one `wch573` frame.
+Pre-CRC-gate 90 s run, 2026-11-28:
 
 | Direction | Result |
 | --- | --- |
 | CH585 → CH573 | 26 frames with the CH585 AdvA, **25 byte-exact** `wch585`; 1 differs in one bit |
 | CH573 → CH585 | CH585 `PEER` tally: **30/30 byte-exact** `wch573`, 0 CRC failures |
+
+Post-gate regression, 60 s, ELF `f36260e9…` / `172f5567…` (`--features peer-rx`):
+74 `Done`, **12 byte-exact** `wch585`; CH585 `PEER` **8/8 byte-exact**
+`wch573`, 0 CRC failures. `compare_peer.py` reports `PASS? True`.
 
 The CH585 side counts matching frames in a static `PEER` record (read it with
 `probe-rs read --chip CH585 b32 <PEER> 8`) because its RAM log wraps in
@@ -159,5 +170,6 @@ seconds. Cross-check both sides with
 `--ch585-log <ram.log>` when the matching hit is still in the log); details in
 `local-docs/results/ch573-ch585-bidir-20261128.md`.
 
-The 1 one-bit error and the 102 empty / 7 impossible-length `Done` lines are
-the same CRC-gating gap the nRF comparison exposed.
+The pre-gate one-bit error, 102 empty and 7 impossible-length `Done` lines
+are the CRC gap this stage closes; the post-gate run has none of the empty
+`Done` (the remaining mismatch traffic is CRC-gated or ambient).
