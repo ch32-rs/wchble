@@ -657,17 +657,21 @@ impl Ch573Radio {
                 // the reads above, so the earlier `bb` could predate its CRC.
                 let bb = regs::read(BB_BASE, bb::IRQSTAT);
                 let crc_ok = bb & BB_CRC_ERR == 0;
-                // Vendor `BB_IRQLibHandler`: write the *current* word back with
-                // the payload/CRC bits cleared (it does not clear bit0).
-                regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
+                // Write-zero-to-clear: ones leave the other bits alone, so a
+                // bit that asserts after the read is not cleared by this write.
+                regs::write(
+                    BB_BASE,
+                    bb::IRQSTAT,
+                    !(BB_PAYLOAD_EVENT | BB_CRC_ERR),
+                );
                 Self::clear_lle_irq(0xffff);
                 return RxPoll::Done { len, rssi, crc_ok };
             }
             if bb & BB_PAYLOAD_EVENT != 0 {
-                // Leave the CRC bit: this driver samples it at RX_DONE, so
-                // clearing it here would turn a bad frame into a good report.
-                let bb = regs::read(BB_BASE, bb::IRQSTAT);
-                regs::write(BB_BASE, bb::IRQSTAT, bb & !BB_PAYLOAD_EVENT);
+                // Clear only the payload event: this driver samples the CRC
+                // bit at RX_DONE, and a snapshot-based write could clear a
+                // CRC error that asserts before the write lands.
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_PAYLOAD_EVENT);
                 if !*reloaded {
                     regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(buf_len));
                     *reloaded = true;
@@ -694,6 +698,9 @@ impl Ch573Radio {
     }
 
     /// Poll variant of [`Self::service_window`] for the window armed last.
+    ///
+    /// Either poll or [`rx_isr_take`], never both: the ISR shares the same
+    /// window state. Do not call from an ISR of higher priority than BLE.
     pub unsafe fn rx_poll(&mut self) -> RxPoll {
         let state =
             unsafe { Self::service_window(self.rx_buf, self.rx_buf_len, &mut self.rx_reloaded) };
@@ -751,6 +758,7 @@ mod isr {
 
 /// PFIC base and interrupt-reset register (word 0 covers IRQs 0..31).
 const PFIC_BASE: usize = 0xE000_E000;
+const PFIC_ITHRESDR: usize = 0x004;
 const PFIC_IRER: usize = 0x180;
 const PFIC_IENR: usize = 0x100;
 const PFIC_IPRR: usize = 0x280;
@@ -764,8 +772,17 @@ fn now_ticks() -> u32 {
 /// Mask both BLE lines. Once the window is over the LLE line stays asserted
 /// by engine state (`LLE+0x08` bit14 / `TICK_CLR`) until the engine stops, so
 /// the ISR has to quiet it instead of spinning on it.
+///
+/// Same sequence as vendor `PFIC_DisableIRQ`: park the threshold, write
+/// `IRER`, restore it, then `fence.i` so the mask is visible.
 unsafe fn mask_ble_lines() {
-    unsafe { regs::write(PFIC_BASE, PFIC_IRER, (1 << 21) | (1 << 20)) };
+    unsafe {
+        let thr = regs::read(PFIC_BASE, PFIC_ITHRESDR);
+        regs::write(PFIC_BASE, PFIC_ITHRESDR, 0x10);
+        regs::write(PFIC_BASE, PFIC_IRER, (1 << 21) | (1 << 20));
+        regs::write(PFIC_BASE, PFIC_ITHRESDR, thr);
+        core::arch::asm!("fence.i", options(nostack, preserves_flags));
+    }
 }
 
 /// Unmask both BLE lines for the window just armed. Only called when
@@ -977,6 +994,9 @@ pub fn tx_kick_count() -> u32 {
 }
 
 /// Take a result produced by [`ble_isr`], clearing it.
+///
+/// The next `rx_basic` discards an unconsumed result; take before re-arming.
+/// Do not mix with [`Ch573Radio::rx_poll`] on the same window.
 pub fn rx_isr_take() -> Option<RxPoll> {
     use core::sync::atomic::Ordering;
 
@@ -1329,10 +1349,12 @@ impl Radio for Ch573Radio {
         }
 
         Self::clear_lle_irq(0xffff);
+        // The level line can re-pend while `engine_stop` runs; drop it again.
+        unsafe { regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20)) };
         // Drop per-frame BB bits too; a CRC error left by a window that ended
-        // without RX_DONE would otherwise mark the next frame bad.
-        let bb = unsafe { regs::read(BB_BASE, bb::IRQSTAT) };
-        unsafe { regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | BB_CRC_ERR)) };
+        // without RX_DONE would otherwise mark the next frame bad. Ones leave
+        // the other bits alone (write-zero-to-clear).
+        unsafe { regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR)) };
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();
 

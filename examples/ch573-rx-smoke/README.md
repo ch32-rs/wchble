@@ -113,29 +113,32 @@ had impossible lengths (53/61/102/114/164/224…).
 ### CRC status (`crc=`, `valid=`)
 
 `RxPoll::Done` carries `crc_ok`, sampled from `BB+0x38` bit5 after `RX_DONE`
-is seen — the bit the vendor's `ble_ll_chkcrc` tests. The handler writes the
-current word back with the payload/CRC bits cleared (`bb & ~0x60`, as
-`BB_IRQLibHandler` does; bit0 is not touched), re-reading the word first so a
-frame that completed between the LLE and BB reads cannot be reported with a
-stale CRC. Arming a window masks the lines, drops a pending PFIC entry and
-clears the software flags and the per-frame BB bits.
+is seen — the bit the vendor's `ble_ll_chkcrc` tests. `BB+0x38` is
+write-zero-to-clear (the vendor's timer write is `~mask`), so the handler only
+clears the bits it consumes (`!payload`, or `!payload & ~crc`) and never
+writes a stale snapshot over a bit that asserts later. Arming a window masks
+the lines with the vendor `PFIC_DisableIRQ` sequence (including `fence.i`),
+drops a re-pended PFIC entry and clears the software flags and per-frame BB
+bits.
 
-Ground truth is a controlled known-answer test, not the sniffer: the CH585
-with `--features crc-test` sends `crcgood` with the advertising CRC init and
-`--features crc-test-bad` sends `crcbad!` with a one-bit-wrong init,
-continuously on ch37. Every frame in a run therefore has a known verdict,
-which the sniffer confirms on air (752/752 `crcgood` flag set; 124/124
-`crcbad!` flag clear). ELF `f36260e9…`, 40 s per run:
+The CRC evidence is a controlled known-answer transmission; it bounds the gate
+but does not establish per-event truth, because air errors and collisions can
+still change any received frame. The CH585 with `--features crc-test` sends
+`crcgood` with the advertising CRC init; `--features crc-test-bad` sends
+`crcbad!` with the init flipped by one bit. ELF `dc13a3e3…`, 40 s per run,
+frames selected by the local-name bytes (frames whose name was corrupted are
+not counted):
 
-| Run | Frames received | RSSI | Reported `crc=true` |
+| Run | name-matched `Done` | RSSI | reported `crc=true` |
 | --- | --- | --- | --- |
-| all `crcgood` (correct init) | 17 | −55…−98 dBm | 7 — the flag is live |
-| all `crcbad!` (wrong init) | 17 | −54…−98 dBm | **0** |
+| all `crcgood` (correct init) | 13 | −58…−99 dBm | 2 — flag is live |
+| all `crcbad!` (wrong init) | 14 | −56…−99 dBm | **0** |
 
-No CRC-failed frame was reported as good, including three at −54…−56 dBm. The cost
-is sensitivity: many valid frames are rejected, the same trade-off the vendor
-makes by returning early in `ll_scan_rx`. The buffer holds no CRC bytes to
-re-check in software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
+None of the 14 wrong-init transmissions was reported good, including two at
+−56 dBm; good-init frames are reported good (2/13 — a lower bound, since a
+valid frame can also fail on air). The cost is sensitivity, the same trade-off
+the vendor takes in `ll_scan_rx`. The buffer holds no CRC bytes to re-check in
+software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
 
 The stale-flag fix also removed the old "Done with an all-`0xAA` buffer"
 artefacts (212 `Done` / 554 windows all carried data, vs 102 empty `Done`
@@ -159,8 +162,8 @@ Pre-CRC-gate 90 s run, 2026-11-28:
 | CH585 → CH573 | 26 frames with the CH585 AdvA, **25 byte-exact** `wch585`; 1 differs in one bit |
 | CH573 → CH585 | CH585 `PEER` tally: **30/30 byte-exact** `wch573`, 0 CRC failures |
 
-Post-gate regression, 60 s, ELF `f36260e9…` / `172f5567…` (`--features peer-rx`):
-74 `Done`, **12 byte-exact** `wch585`; CH585 `PEER` **8/8 byte-exact**
+Post-gate regression, 40 s, ELF `dc13a3e3…` / `172f5567…` (`--features peer-rx`):
+33 `Done`, **7 byte-exact** `wch585`; CH585 `PEER` **2/2 byte-exact**
 `wch573`, 0 CRC failures. `compare_peer.py` reports `PASS? True`.
 
 The CH585 side counts matching frames in a static `PEER` record (read it with

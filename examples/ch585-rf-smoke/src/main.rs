@@ -69,6 +69,7 @@ static RX_LISTEN: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 static mut LOG: [u8; 2048] = [0; 2048];
 
 /// CH573 peer advertisement (`wch573`, ADV_NONCONN_IND on random AdvA).
+#[cfg(feature = "peer-rx")]
 const PEER_ADV: [u8; 19] = [
     0x42, 0x11, 0xc1, 0xff, 0xee, 0x00, 0x00, 0x73, 0x02, 0x01, 0x06, 0x07, 0x09, b'w',
     b'c', b'h', b'5', b'7', b'3',
@@ -77,8 +78,10 @@ const PEER_ADV: [u8; 19] = [
 /// Peer RX tally kept outside the ring log so a probe read still sees it after
 /// the log wrapped: `u32` count, len, crc, crc failures, then the frame bytes.
 #[no_mangle]
+#[cfg(feature = "peer-rx")]
 static mut PEER: [u8; 32] = [0; 32];
 
+#[cfg(feature = "peer-rx")]
 fn peer_note(buf: &[u8], len: usize, crc_ok: bool) {
     let n = 2 + len;
     if n > buf.len() || buf[..n] != PEER_ADV {
@@ -301,6 +304,7 @@ fn rx_once(
         if st & RX_DONE != 0 {
             let crc_ok = mmio(BB_BASE, bb::IRQSTAT) & BB_CRC_ERR == 0;
             let len = usize::from(rxbuf[1]);
+            #[cfg(feature = "peer-rx")]
             peer_note(rxbuf, len, crc_ok);
             result = Some((len, crc_ok));
             unsafe { regs::write(LLE_BASE, lle::IRQSTAT, RX_DONE) };
@@ -340,6 +344,7 @@ fn rx_listen(
     match rx_once(radio, clock, rxbuf, 38, window_half_us) {
         Some((len, crc_ok)) => {
             let _ = writeln!(out, "rx listen hit len={} crc={}", len, crc_ok);
+            #[cfg(feature = "peer-rx")]
             dump_frame(out, rxbuf, len);
         }
         None => {

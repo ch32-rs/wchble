@@ -23,8 +23,10 @@ portable-atomic = { version = "1.11", features = ["critical-section"] }
 # One-shot AES known-answer test: init the radio, run the KAT, log to RAM and
 # park with RF off so the probe can read the result safely.
 aes-kat = []
+# Modes are one-at-a-time: `aes-kat` parks first, `crc-test` loops without
+# broadcasting/peer listening, `peer-rx` is the interop receive mode.
 # Listen on ch37 every round and dump hits (CH573 -> CH585 interop); default
-# keeps the original periodic 10 ms smoke listen.
+# keeps the original periodic 5 ms smoke listen.
 peer-rx = []
 # Transmit crcgood/crcbad! on ch37 with correct/wrong CRC init for a
 # receiver-side CRC known-answer test (`crc-test-bad` flips the init).

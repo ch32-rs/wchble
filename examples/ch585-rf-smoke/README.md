@@ -17,7 +17,7 @@ Android phone. This smoke example does not support scanning responses or connect
 5. Multi-channel ADV_NONCONN_IND TX on **37 / 38 / 39**
 6. Two RX arming rounds on ch38 (arm-clear / timeout still proves the path)
 7. Loop: ADV_NONCONN_IND on 37/38/39 + the vendor `RF_PHY` reference frame on ch39,
-   then a 10 ms RX window on ch37 every 20 rounds; every hit is printed as
+   then a 5 ms RX window (10,000 half-us) on ch37 every 20 rounds; every hit is printed as
    `rx loop hit len=N crc=…`. Build with `--features peer-rx` to listen every
    round instead (20 ms window, hits dumped as `rx buf`) for the CH573 interop
    and `crc-test` / `crc-test-bad` to transmit the CRC known-answer frames.
