@@ -996,7 +996,8 @@ pub fn tx_kick_count() -> u32 {
 /// Take a result produced by [`ble_isr`], clearing it.
 ///
 /// The next `rx_basic` discards an unconsumed result; take before re-arming.
-/// Do not mix with [`Ch573Radio::rx_poll`] on the same window.
+/// Do not mix with [`Ch573Radio::rx_poll`] on the same window. Thread context
+/// only; see `rx_basic` for the re-arm constraint.
 pub fn rx_isr_take() -> Option<RxPoll> {
     use core::sync::atomic::Ordering;
 
@@ -1320,6 +1321,11 @@ impl Radio for Ch573Radio {
     ///
     /// Arming masks the BLE lines and drops any unconsumed result from the
     /// previous window (software flags, pending PFIC entry, BB event bits).
+    ///
+    /// Call from thread context (or an ISR that cannot preempt BLE): masking
+    /// only stops new entries, so a preempted BLE ISR could resume after the
+    /// re-arm and publish into the new window. On `Err(Busy)` the BLE lines
+    /// stay masked; the next successful arm re-enables them.
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -1336,8 +1342,8 @@ impl Radio for Ch573Radio {
             return Err(Error::InvalidState);
         }
         // Mask before touching state: an ISR from the previous window must not
-        // publish into this one. Masking also quiesces a line the engine holds
-        // high, so no entry can be running once we return.
+        // publish into this one. In thread context no entry can be running
+        // while we execute; masking only keeps new ones out.
         unsafe {
             mask_ble_lines();
             regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20));

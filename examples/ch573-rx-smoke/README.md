@@ -113,13 +113,15 @@ had impossible lengths (53/61/102/114/164/224…).
 ### CRC status (`crc=`, `valid=`)
 
 `RxPoll::Done` carries `crc_ok`, sampled from `BB+0x38` bit5 after `RX_DONE`
-is seen — the bit the vendor's `ble_ll_chkcrc` tests. `BB+0x38` is
-write-zero-to-clear (the vendor's timer write is `~mask`), so the handler only
-clears the bits it consumes (`!payload`, or `!payload & ~crc`) and never
-writes a stale snapshot over a bit that asserts later. Arming a window masks
-the lines with the vendor `PFIC_DisableIRQ` sequence (including `fence.i`),
-drops a re-pended PFIC entry and clears the software flags and per-frame BB
-bits.
+is seen — the bit the vendor's `ble_ll_chkcrc` tests. Following the vendor's
+whole-word `~mask` writes on this register (the timer clear is `~0x2`), the
+handler only clears the bits it consumes (`!payload`, or `!payload & ~crc`)
+and never writes a stale snapshot over a bit that asserts later. Whole-register
+write-zero-to-clear is not documented; the clear style matches the EVT, and
+the known-answer test is the board-side check for the payload/CRC bits. Arming
+a window masks the lines with the vendor `PFIC_DisableIRQ` sequence (including
+`fence.i`), drops a re-pended PFIC entry and clears the software flags and
+per-frame BB bits.
 
 The CRC evidence is a controlled known-answer transmission; it bounds the gate
 but does not establish per-event truth, because air errors and collisions can
@@ -134,15 +136,26 @@ not counted):
 | all `crcgood` (correct init) | 13 | −58…−99 dBm | 2 — flag is live |
 | all `crcbad!` (wrong init) | 14 | −56…−99 dBm | **0** |
 
-None of the 14 wrong-init transmissions was reported good, including two at
-−56 dBm; good-init frames are reported good (2/13 — a lower bound, since a
-valid frame can also fail on air). The cost is sensitivity, the same trade-off
-the vendor takes in `ll_scan_rx`. The buffer holds no CRC bytes to re-check in
-software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
+None of the 14 name-matched `Done` selected during the wrong-init run was
+reported good, including two at −56 dBm. In the correct-init run 2 of the 13
+name-matched `Done` carry `crc=true`; that is an observed ratio, not an
+estimated pass rate for valid frames, because a valid frame can also fail on
+air and the two runs do not share a ground truth per event. Any sensitivity
+cost cannot be separated from air loss with this method. The buffer holds no
+CRC bytes to re-check in software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
 
 The stale-flag fix also removed the old "Done with an all-`0xAA` buffer"
 artefacts (212 `Done` / 554 windows all carried data, vs 102 empty `Done`
 before).
+
+Not exercised by the evidence above; needs targeted board tests before P3a:
+timer/timeout interleaving (`Done` does not abort the window, so a later
+frame can overwrite the buffer the ISR is about to publish), several frames
+inside one window, re-arming while an old window is still active, and
+priority nesting with other PFIC lines. Accepted for now because the gate only
+publishes a name-matched `Done` and no wrong-init frame was passed; the
+correct-init KAT run did exercise the timeout path (166 `timeout` / 30 `Armed`
+alongside 13 `Done`) without a false `Done`.
 
 Still open: RSSI comes from the status word; cnlohr's iSLER reads
 `BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
@@ -173,6 +186,8 @@ seconds. Cross-check both sides with
 `--ch585-log <ram.log>` when the matching hit is still in the log); details in
 `local-docs/results/ch573-ch585-bidir-20261128.md`.
 
-The pre-gate one-bit error, 102 empty and 7 impossible-length `Done` lines
-are the CRC gap this stage closes; the post-gate run has none of the empty
-`Done` (the remaining mismatch traffic is CRC-gated or ambient).
+The empty `Done` lines and the impossible lengths are the stale-flag and
+missing-gate defects this stage fixes; the post-gate run has no empty `Done`.
+The pre-gate one-bit error is not attributed to them — the remaining mismatch
+traffic is CRC-gated or ambient, and frame association under dense traffic is
+still open (see the interleaving list above).
