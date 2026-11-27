@@ -116,3 +116,25 @@ Not yet:
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.
+
+### CH573 ↔ CH585 interop (both directions)
+
+Run `ch585-rf-smoke` (probe `F93D…`) and this example (probe `5CED…`) at the
+same time: the CH585 advertises `wch585` on 37/38/39 and listens on ch37; this
+example receives and answers each `Done` with one `wch573` frame. 90 s run,
+2026-11-28:
+
+| Direction | Result |
+| --- | --- |
+| CH585 → CH573 | 26 frames with the CH585 AdvA, **25 byte-exact** `wch585`; 1 differs in one bit |
+| CH573 → CH585 | CH585 `PEER` tally: **30/30 byte-exact** `wch573`, 0 CRC failures |
+
+The CH585 side counts matching frames in a static `PEER` record (read it with
+`probe-rs read --chip CH585 b32 <PEER> 8`) because its RAM log wraps in
+seconds. Cross-check both sides with
+`tools/compare_peer.py --ch573-log <rtt.log> --ch585-peer <peer-dump>` (or
+`--ch585-log <ram.log>` when the matching hit is still in the log); details in
+`local-docs/results/ch573-ch585-bidir-20261128.md`.
+
+The 1 one-bit error and the 102 empty / 7 impossible-length `Done` lines are
+the same CRC-gating gap the nRF comparison exposed.

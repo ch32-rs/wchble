@@ -68,6 +68,33 @@ static RX_LISTEN: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 #[no_mangle]
 static mut LOG: [u8; 2048] = [0; 2048];
 
+/// CH573 peer advertisement (`wch573`, ADV_NONCONN_IND on random AdvA).
+const PEER_ADV: [u8; 19] = [
+    0x42, 0x11, 0xc1, 0xff, 0xee, 0x00, 0x00, 0x73, 0x02, 0x01, 0x06, 0x07, 0x09, b'w',
+    b'c', b'h', b'5', b'7', b'3',
+];
+
+/// Peer RX tally kept outside the ring log so a probe read still sees it after
+/// the log wrapped: `u32` count, len, crc, crc failures, then the frame bytes.
+#[no_mangle]
+static mut PEER: [u8; 32] = [0; 32];
+
+fn peer_note(buf: &[u8], len: usize, crc_ok: bool) {
+    let n = 2 + len;
+    if n > buf.len() || buf[..n] != PEER_ADV {
+        return;
+    }
+    let p = core::ptr::addr_of_mut!(PEER).cast::<u8>();
+    unsafe {
+        let count = core::ptr::read_unaligned(p.cast::<u32>()).wrapping_add(1);
+        core::ptr::write_unaligned(p.cast::<u32>(), count);
+        *p.add(4) = len as u8;
+        *p.add(5) = crc_ok as u8;
+        *p.add(6) = (*p.add(6)).wrapping_add((!crc_ok) as u8);
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(8), n);
+    }
+}
+
 const LOG_CAP: usize = 2048;
 const LOG_TEXT: usize = LOG_CAP - 4;
 
@@ -241,7 +268,9 @@ fn rx_once(
         let st = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
         if st & RX_DONE != 0 {
             let crc_ok = mmio(BB_BASE, bb::IRQSTAT) & BB_CRC_ERR == 0;
-            result = Some((usize::from(rxbuf[1]), crc_ok));
+            let len = usize::from(rxbuf[1]);
+            peer_note(rxbuf, len, crc_ok);
+            result = Some((len, crc_ok));
             unsafe { regs::write(LLE_BASE, lle::IRQSTAT, RX_DONE) };
             break;
         }
@@ -257,6 +286,17 @@ fn rx_once(
     result
 }
 
+/// Print the DMA RX frame as `[hdr][len][payload]` hex, same shape as the
+/// CH573 `rx-smoke` log so a byte comparison needs no extra parsing.
+fn dump_frame(out: &mut Log, buf: &[u8], len: usize) {
+    let n = (2 + len).min(buf.len());
+    let _ = write!(out, "rx buf");
+    for b in &buf[..n] {
+        let _ = write!(out, " {:02x}", b);
+    }
+    let _ = writeln!(out);
+}
+
 fn rx_listen(
     radio: &mut Ch585Radio,
     clock: &UsClock,
@@ -268,6 +308,7 @@ fn rx_listen(
     match rx_once(radio, clock, rxbuf, 38, window_half_us) {
         Some((len, crc_ok)) => {
             let _ = writeln!(out, "rx listen hit len={} crc={}", len, crc_ok);
+            dump_frame(out, rxbuf, len);
         }
         None => {
             let _ = writeln!(out, "rx listen arm-clear");
@@ -644,7 +685,6 @@ fn main() -> ! {
     // - the CH585 SDK `RF_PHY` reference frame on channel 39 (AA 0x71764129 /
     //   CRC 0x555555) which a V208/CH592 reference receiver decodes.
     let _ = writeln!(out, "adv loop");
-    let mut round = 0u32;
     loop {
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
@@ -662,17 +702,16 @@ fn main() -> ! {
             let _ = unsafe { radio.tx_basic(&clock, &rf_frame, 0, None) };
         }
 
-        // Periodically prove the RX path on silicon while the loop runs.
-        if round % 20 == 0 {
-            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
-            if let Some((len, crc_ok)) =
-                rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 10_000)
-            {
-                let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
-            }
+        // Listen on ch37 every round: this is the direction CH573 -> CH585,
+        // and dumping the frame is the whole point of the RX leg.
+        radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+        if let Some((len, crc_ok)) =
+            rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 20_000)
+        {
+            let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
+            dump_frame(&mut out, &rx_listen_buf.0[..], len);
         }
 
-        round = round.wrapping_add(1);
         clock.delay_us(100_000);
     }
 }

@@ -17,11 +17,28 @@ Android phone. This smoke example does not support scanning responses or connect
 5. Multi-channel ADV_NONCONN_IND TX on **37 / 38 / 39**
 6. Two RX arming rounds on ch38 (arm-clear / timeout still proves the path)
 7. Loop: ADV_NONCONN_IND on 37/38/39 + the vendor `RF_PHY` reference frame on ch39,
-   with a periodic RX check on ch37
+   then one 10 ms RX window on ch37; every hit is printed as
+   `rx loop hit len=N crc=…` plus `rx buf` hex.
 
 Console markers: `rf init ok`, `LLE …` / `RFEND …` / `BB …`,
 `tx ch{37,38,39} ok`, `rx listen hit|arm-clear`, `adv loop`,
 `rx loop hit len=N crc=true`.
+
+### Peer RX tally (`PEER`)
+
+The RAM log wraps within seconds once RX hits start, so the CH573 peer
+advertisement (`wch573`, `42 11 c1 ff ee 00 00 73 …`) is also counted in a
+separate `#[no_mangle]` static: `u32` byte-exact hit count, last len, last CRC
+result, CRC-failure count, then the last frame. Reading it after a run still
+shows the whole tally:
+
+```bash
+nm target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke | grep ' PEER'
+probe-rs read --chip CH585 b32 <PEER address> 8
+```
+
+This is the CH573 → CH585 direction of the interop check in
+`examples/ch573-rx-smoke/README.md`.
 
 ## What the dump should show
 
