@@ -86,6 +86,13 @@ bit4 set after the settle; the boot log reports `rx filter ok=… code=…`
 scan raw traffic and search the capture for the AdvA bytes `c1 ff ee 00 00 73`
 (or the payload string `wch573`).
 
+Byte-exact check (2026-11-27, nRF Sniffer via
+`~/.nrfutil/bin/nrfutil ble-sniffer sniff --port … --output-pcap-file …`):
+25 s run, 8162 PDUs captured, **79 of 79 `wch573` PDUs equal**
+`42 11 c1 ff ee 00 00 73 02 01 06 07 09 77 63 68 35 37 33`, and the board
+logged `tx ch37/38/39 ok` twice. The same image also passes the macOS scan
+(`scan_ch573.swift wch573`, 37 observations earlier).
+
 ## Out of scope (follow-ups)
 
 - RX hit path lives in `examples/ch573-rx-smoke` (`rx_basic` here is arm-only).
