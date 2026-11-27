@@ -42,15 +42,30 @@ probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram \
 ## Acceptance (2026-11-27, probe `5CED…`)
 
 Transmitter: `examples/ch585-rf-smoke` (ADV_NONCONN_IND, name `wch585`,
-ELF SHA256 `8b2ab81a…a7ac708`). CH573 received 5 byte-exact frames in 25 s:
+ELF SHA256 `8b2ab81a…a7ac708`). In a 20 s run CH573 completed 13 frames and
+all 13 were byte-exact:
 
 ```
-ch38 state=2 len=17 rssi=-92 … bb38=246f
+ch38 state=2 len=17 rssi=-91 … bb38=246f lle08=100000
 buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, …]
 ```
 
 = `42 11 02 00 00 EE FF C1 02 01 06 07 09 77 63 68 35 38 35` — matches the
-CH585 frame exactly. ELF SHA256 of this example: `f6d3ae60…5308f3`.
+CH585 frame exactly. ELF SHA256 of this example: `752801c8…1c3afb`.
 
-Not yet: CRC status (`BB+0x38` bit5 reads set even with no PDU in the polling
-context) and the real LLE/BB PFIC IRQ. See `local-docs/ch573-rx-isr-spec.md`.
+Not yet:
+
+- **CRC status** — `BB+0x38` bit5 reads set even with no PDU in the polling
+  context, so `RxPoll::Done` omits it.
+- **Real LLE/BB PFIC IRQ** — `ble_isr`/`rx_isr_take` and the `BLEB`/`BLEL`
+  handlers are scaffolding only. Unmasking BLEL with a window armed starves
+  the main loop even with an empty handler (the line stays asserted while the
+  engine is armed); `USE_ISR` stays `false`. Details and next probes in
+  `local-docs/ch573-rx-isr-spec.md`.
+
+Register facts measured on silicon: `LLE+0x08` is plain R/W (write `~0`,
+read `~0`), bit 20 (`0x100000`) is not writable and must not be relied on for
+the interrupt line; `BB+0x38` ignores software writes.
+
+`probe-rs run` occasionally attaches RTT late and shows only the boot lines —
+re-run the same ELF before suspecting a firmware hang.

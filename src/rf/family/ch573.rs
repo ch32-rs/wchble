@@ -603,12 +603,12 @@ impl Ch573Radio {
         ((len as usize + 5) & 0x1fc) + 2
     }
 
-    /// Service BB/LLE flags for an armed window and report its state.
+    /// Service BB/LLE flags for the window at `buf` and report its state.
     ///
     /// Mirrors EVT `BB_IRQLibHandler` plus the LLE RX branch. The BB payload
     /// event reloads `LLE+0x60`; without that reload the engine never DMAs the
-    /// PDU, so callers must keep polling while a window is open.
-    pub unsafe fn rx_poll(&mut self) -> RxPoll {
+    /// PDU, so this must run repeatedly while a window is open.
+    unsafe fn service_window(buf: *mut u8, buf_len: usize, reloaded: &mut bool) -> RxPoll {
         unsafe {
             // Sample both status words before any writes: the BB service below
             // clears flags, and RX_DONE may race with the timer branches.
@@ -616,13 +616,13 @@ impl Ch573Radio {
             let st = regs::read(LLE_BASE, lle::IRQSTAT);
             if st & lle_irq::RX_DONE != 0 {
                 Self::clear_lle_irq(0xffff);
-                let (len, rssi) = if self.rx_buf.is_null() {
+                let (len, rssi) = if buf.is_null() {
                     (0, 0)
                 } else {
-                    let len = core::ptr::read_volatile(self.rx_buf.add(1));
+                    let len = core::ptr::read_volatile(buf.add(1));
                     let off = Self::rx_rssi_off(len);
-                    let rssi = if off < self.rx_buf_len {
-                        core::ptr::read_volatile(self.rx_buf.add(off)) as i8
+                    let rssi = if off < buf_len {
+                        core::ptr::read_volatile(buf.add(off)) as i8
                     } else {
                         0
                     };
@@ -632,9 +632,9 @@ impl Ch573Radio {
             }
             if bb & BB_PAYLOAD_EVENT != 0 {
                 regs::write(BB_BASE, bb::IRQSTAT, bb & !(BB_PAYLOAD_EVENT | 0x1));
-                if !self.rx_reloaded {
-                    regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(self.rx_buf_len));
-                    self.rx_reloaded = true;
+                if !*reloaded {
+                    regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(buf_len));
+                    *reloaded = true;
                 }
             }
             if bb & BB_TIMER1_EVENT != 0 {
@@ -655,6 +655,101 @@ impl Ch573Radio {
             }
         }
         RxPoll::Armed
+    }
+
+    /// Poll variant of [`Self::service_window`] for the window armed last.
+    pub unsafe fn rx_poll(&mut self) -> RxPoll {
+        let state =
+            unsafe { Self::service_window(self.rx_buf, self.rx_buf_len, &mut self.rx_reloaded) };
+        if state != RxPoll::Armed {
+            isr::armed_store(false);
+        }
+        state
+    }
+}
+
+/// Interrupt-path state for [`ble_isr`].
+///
+/// Only the ISR touches the MMIO; `rx_basic` publishes the buffer and the
+/// main loop drains results with [`rx_isr_take`]. Do not mix with `rx_poll`
+/// on the same window.
+mod isr {
+    use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicUsize, Ordering};
+
+    pub static ARMED: AtomicBool = AtomicBool::new(false);
+    pub static BUSY: AtomicBool = AtomicBool::new(false);
+    pub static BUF: AtomicUsize = AtomicUsize::new(0);
+    pub static BUF_LEN: AtomicUsize = AtomicUsize::new(0);
+    pub static RELOADED: AtomicBool = AtomicBool::new(false);
+    pub static DONE: AtomicBool = AtomicBool::new(false);
+    pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
+    pub static LEN: AtomicU8 = AtomicU8::new(0);
+    pub static RSSI: AtomicI8 = AtomicI8::new(0);
+
+    pub fn armed_store(on: bool) {
+        ARMED.store(on, Ordering::Release);
+    }
+}
+
+/// Service the BLE IP from a `BLEB` (20) / `BLEL` (21) interrupt handler.
+///
+/// Cheap to call from both handlers: a second entry returns immediately and
+/// the still-asserted PFIC line re-fires once the first one finishes. Only
+/// windows armed by `rx_basic` are serviced.
+///
+/// **Unvalidated on silicon**: unmasking BLEL with a window armed livelocks
+/// the main loop even with an empty handler, so the line is held by engine
+/// state that software has not learned to clear. Use [`Ch573Radio::rx_poll`]
+/// until that is resolved.
+pub fn ble_isr() {
+    use core::sync::atomic::Ordering;
+
+    if !isr::ARMED.load(Ordering::Acquire) || isr::BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let buf = isr::BUF.load(Ordering::Relaxed) as *mut u8;
+    let buf_len = isr::BUF_LEN.load(Ordering::Relaxed);
+    let mut reloaded = isr::RELOADED.load(Ordering::Relaxed);
+    // SAFETY: `rx_basic` published this buffer and only one handler runs.
+    let state = unsafe {
+        let state = Ch573Radio::service_window(buf, buf_len, &mut reloaded);
+        if state == RxPoll::Armed {
+            // The LLE line is level-held by every low flag, and RX windows
+            // leave engine bits (e.g. 0x200) set; keep only RX_DONE pending.
+            Ch573Radio::clear_lle_irq(0xfffe);
+        }
+        state
+    };
+    isr::RELOADED.store(reloaded, Ordering::Relaxed);
+    match state {
+        RxPoll::Armed => {}
+        RxPoll::Timeout => {
+            isr::armed_store(false);
+            isr::TIMEOUT.store(true, Ordering::Release);
+        }
+        RxPoll::Done { len, rssi } => {
+            isr::LEN.store(len, Ordering::Relaxed);
+            isr::RSSI.store(rssi, Ordering::Relaxed);
+            isr::armed_store(false);
+            isr::DONE.store(true, Ordering::Release);
+        }
+    }
+    isr::BUSY.store(false, Ordering::Release);
+}
+
+/// Take a result produced by [`ble_isr`], clearing it.
+pub fn rx_isr_take() -> Option<RxPoll> {
+    use core::sync::atomic::Ordering;
+
+    if isr::DONE.swap(false, Ordering::AcqRel) {
+        Some(RxPoll::Done {
+            len: isr::LEN.load(Ordering::Relaxed),
+            rssi: isr::RSSI.load(Ordering::Relaxed),
+        })
+    } else if isr::TIMEOUT.swap(false, Ordering::AcqRel) {
+        Some(RxPoll::Timeout)
+    } else {
+        None
     }
 }
 
@@ -720,6 +815,7 @@ impl Radio for Ch573Radio {
         self.rx_buf = core::ptr::null_mut();
         self.rx_buf_len = 0;
         self.rx_reloaded = false;
+        isr::armed_store(false);
     }
 
     fn set_channel(&mut self, channel: Channel) -> Result<()> {
@@ -977,6 +1073,11 @@ impl Radio for Ch573Radio {
             self.rx_buf = rx_ptr;
             self.rx_buf_len = rxbuf.len();
             self.rx_reloaded = false;
+            // Publish for the interrupt path; harmless when polling instead.
+            isr::BUF.store(rx_ptr as usize, core::sync::atomic::Ordering::Release);
+            isr::BUF_LEN.store(rxbuf.len(), core::sync::atomic::Ordering::Release);
+            isr::RELOADED.store(false, core::sync::atomic::Ordering::Release);
+            isr::armed_store(true);
             regs::write(DMA_BASE, dma_reg::RXBUFPTR, Self::dma_off(rx_ptr as usize));
             // EVT `ble_ll_hw_api_rx` order: CMD=1 then MODE=0x59.
             regs::write(LLE_BASE, lle::CMD, lle_cmd::START_RX);
@@ -988,7 +1089,8 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
         }
 
-        // Arm only; the caller polls LLE+0x08 bit0. Short settle so it sticks.
+        // Arm only. Completion paths: `rx_poll`, or `ble_isr` from the BLEB/BLEL
+        // handlers. Short settle so the window latches.
         clock.delay_us(2);
         let _ = self.phy_rx;
         Ok(())

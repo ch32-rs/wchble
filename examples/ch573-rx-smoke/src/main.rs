@@ -15,9 +15,12 @@
 use ch5xx_hal as hal;
 use defmt::info;
 use defmt_rtt as _;
+use hal::interrupt::{Interrupt, InterruptExt};
 use hal::rcc;
 use qingke_rt::entry;
-use wchble::rf::family::ch573::{Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE};
+use wchble::rf::family::ch573::{
+    ble_isr, rx_isr_take, Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE,
+};
 use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
@@ -28,6 +31,33 @@ defmt::timestamp!("{=u32}", 0u32);
 
 const ADV_AA: u32 = 0x8e89_bed6;
 const ADV_CRC_INIT: u32 = 0x55_5555;
+
+/// Serve windows from the real PFIC handlers; `false` keeps the `rx_poll` kick.
+///
+/// The ISR path is **not yet working**: unmasking BLEL right after `rx_basic`
+/// starves the main loop even with an empty handler, i.e. the line stays
+/// asserted while the engine is armed. See `local-docs/ch573-rx-isr-spec.md`.
+const USE_ISR: bool = false;
+/// Which BLE lines to unmask: bit0 = BLEB, bit1 = BLEL.
+const ISR_LINES: u8 = 0b11;
+
+/// BB (IRQ 20) and LLE (IRQ 21) share one service entry; the driver handles
+/// the second entry as a no-op and the level line re-fires.
+#[hal::interrupt]
+fn BLEB() {
+    if USE_ISR {
+        ble_isr();
+    }
+    Interrupt::BLEB.unpend();
+}
+
+#[hal::interrupt]
+fn BLEL() {
+    if USE_ISR {
+        ble_isr();
+    }
+    Interrupt::BLEL.unpend();
+}
 
 /// DMA-visible RX buffer placed by `build.rs`.
 #[repr(align(4))]
@@ -81,10 +111,6 @@ fn mmio(base: usize, off: usize) -> u32 {
     unsafe { regs::read(base, off) }
 }
 
-fn poke(base: usize, off: usize, value: u32) {
-    unsafe { regs::write(base, off, value) }
-}
-
 /// `LLE+0x08` is plain R/W: clear flags by writing the bits back as zero.
 fn clear_lle_irq(bits: u32) {
     unsafe {
@@ -105,8 +131,13 @@ fn main() -> ! {
     let rx: &mut [u8; RX_DMA_MIN] = unsafe { &mut *RX_BUF.0.get() };
     let dma_ptr = rx.as_ptr() as usize;
     info!("dma {=usize:x}", dma_ptr);
-    if !CAPS.contains_dma(dma_ptr, rx.len()) || !CAPS.contains_dma(scratch.as_ptr() as usize, scratch.len()) {
-        info!("dma OUT OF WINDOW expect {=usize:x}..{=usize:x}", CAPS.sram_start, CAPS.sram_end);
+    if !CAPS.contains_dma(dma_ptr, rx.len())
+        || !CAPS.contains_dma(scratch.as_ptr() as usize, scratch.len())
+    {
+        info!(
+            "dma OUT OF WINDOW expect {=usize:x}..{=usize:x}",
+            CAPS.sram_start, CAPS.sram_end
+        );
         loop {}
     }
 
@@ -129,6 +160,8 @@ fn main() -> ! {
     radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
+    info!("rx mode={}", if USE_ISR { "isr" } else { "poll" });
+
     let mut round = 0u32;
     loop {
         for &ch in &[37u8, 38, 39] {
@@ -145,20 +178,47 @@ fn main() -> ! {
                 info!("rx arm ch{=u8} err {:?}", ch, e);
                 continue;
             }
+            if round == 0 && ch == 37 {
+                info!(
+                    "armed lle08={=u32:x} bb38={=u32:x}",
+                    mmio(LLE_BASE, 0x08),
+                    mmio(BB_BASE, 0x38)
+                );
+            }
 
-            // Poll the window; `rx_poll` serves the BB handler the engine
-            // needs (payload-window reload) and reports the completion.
+            // Unmask only while a window is armed: the lines are level-based.
+            if USE_ISR {
+                unsafe {
+                    if ISR_LINES & 0b01 != 0 {
+                        Interrupt::BLEB.enable();
+                    }
+                    if ISR_LINES & 0b10 != 0 {
+                        Interrupt::BLEL.enable();
+                    }
+                }
+            }
+
+            // Wait for the window: the ISR (or `rx_poll` in poll mode) serves
+            // the BB reload the engine needs and reports completion.
             let start = clock.now_us();
-            let mut poll = RxPoll::Armed;
-            let mut waited = false;
-            loop {
-                poll = unsafe { radio.rx_poll() };
-                if poll != RxPoll::Armed {
-                    break;
+            let (poll, waited) = loop {
+                let p = if USE_ISR {
+                    rx_isr_take().unwrap_or(RxPoll::Armed)
+                } else {
+                    unsafe { radio.rx_poll() }
+                };
+                if p != RxPoll::Armed {
+                    break (p, false);
                 }
                 if clock.now_us().wrapping_sub(start) > 15_000 {
-                    waited = true;
-                    break;
+                    break (RxPoll::Armed, true);
+                }
+            };
+
+            if USE_ISR {
+                unsafe {
+                    Interrupt::BLEL.disable();
+                    Interrupt::BLEB.disable();
                 }
             }
 
@@ -166,14 +226,15 @@ fn main() -> ! {
             let dma18 = mmio(DMA_BASE, 0x18);
             let bb30 = mmio(BB_BASE, 0x30);
             let bb38 = mmio(BB_BASE, 0x38);
+            let lle08 = mmio(LLE_BASE, 0x08);
             let (state, len, rssi) = match poll {
                 RxPoll::Armed => (0u8, 0u8, 0i8),
                 RxPoll::Timeout => (1, 0, 0),
                 RxPoll::Done { len, rssi } => (2, len, rssi),
             };
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x}",
-                ch, state, len, rssi, waited, count, dma18, bb30, bb38
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, waited, count, dma18, bb30, bb38, lle08
             );
             if poll != RxPoll::Timeout || rx[0] != 0xAA || rx[1] != 0xAA {
                 info!("buf {:?}", &rx[..48]);

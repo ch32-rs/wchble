@@ -33,8 +33,9 @@ Letter namespaces collide — always qualify them:
   `ch573-rx-isr`: single-window RX now delivers PDUs via `DMA+0x18` and
   `rx_poll` (BB payload reload), verified byte-exact against the
   `ch585-rf-smoke` transmitter plus reported RSSI (`examples/ch573-rx-smoke`).
-  Still open: CRC status, real LLE/BB IRQ. Not Trouble/GATT; not Phase 1
-  closure.
+  Still open: CRC status, real LLE/BB IRQ (scaffolding in place but not
+  enabled: the LLE line stays asserted while a window is armed). Not
+  Trouble/GATT; not Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle
