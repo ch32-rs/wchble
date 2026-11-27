@@ -676,7 +676,7 @@ impl Ch573Radio {
 /// main loop drains results with [`rx_isr_take`]. Do not mix with `rx_poll`
 /// on the same window.
 mod isr {
-    use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
     pub static ARMED: AtomicBool = AtomicBool::new(false);
     pub static BUSY: AtomicBool = AtomicBool::new(false);
@@ -687,25 +687,39 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
+    /// Every `ble_isr` entry, including ones that find no window armed.
+    pub static ENTRIES: AtomicU32 = AtomicU32::new(0);
+
+    pub fn entries_add() {
+        ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub fn armed_store(on: bool) {
         ARMED.store(on, Ordering::Release);
     }
 }
 
+/// PFIC base and interrupt-reset register (word 0 covers IRQs 0..31).
+const PFIC_BASE: usize = 0xE000_E000;
+const PFIC_IRER: usize = 0x180;
+
+/// Mask both BLE lines. Once the window is over the LLE line stays asserted
+/// by engine state (`LLE+0x08` bit14) until the main loop stops the engine,
+/// so the ISR has to quiet it instead of spinning on it.
+unsafe fn mask_ble_lines() {
+    unsafe { regs::write(PFIC_BASE, PFIC_IRER, (1 << 21) | (1 << 20)) };
+}
+
 /// Service the BLE IP from a `BLEB` (20) / `BLEL` (21) interrupt handler.
 ///
 /// Cheap to call from both handlers: a second entry returns immediately and
 /// the still-asserted PFIC line re-fires once the first one finishes. Only
-/// windows armed by `rx_basic` are serviced.
-///
-/// **Unvalidated on silicon**: unmasking BLEL with a window armed livelocks
-/// the main loop even with an empty handler, so the line is held by engine
-/// state that software has not learned to clear. Use [`Ch573Radio::rx_poll`]
-/// until that is resolved.
+/// windows armed by `rx_basic` are serviced. On `Done`/`Timeout` the handler
+/// masks both lines itself; the caller re-enables them before the next window.
 pub fn ble_isr() {
     use core::sync::atomic::Ordering;
 
+    isr::entries_add();
     if !isr::ARMED.load(Ordering::Acquire) || isr::BUSY.swap(true, Ordering::Acquire) {
         return;
     }
@@ -726,10 +740,12 @@ pub fn ble_isr() {
     match state {
         RxPoll::Armed => {}
         RxPoll::Timeout => {
+            unsafe { mask_ble_lines() };
             isr::armed_store(false);
             isr::TIMEOUT.store(true, Ordering::Release);
         }
         RxPoll::Done { len, rssi } => {
+            unsafe { mask_ble_lines() };
             isr::LEN.store(len, Ordering::Relaxed);
             isr::RSSI.store(rssi, Ordering::Relaxed);
             isr::armed_store(false);
@@ -737,6 +753,87 @@ pub fn ble_isr() {
         }
     }
     isr::BUSY.store(false, Ordering::Release);
+}
+
+// Fast-interrupt entry installed by `install_ble_irq`. The VTF path does no
+// hardware register stacking (see `LLE_IRQLibFunction` in `lle.o`), so this
+// saves every caller-saved register before calling `ble_isr` and `mret`s.
+core::arch::global_asm!(
+    r#"
+    .section .highcode, "ax"
+    .align 2
+    .global __wchble_ch573_ble_vtf
+    .type __wchble_ch573_ble_vtf, @function
+__wchble_ch573_ble_vtf:
+    addi sp, sp, -64
+    sw   ra, 60(sp)
+    sw   t0, 56(sp)
+    sw   t1, 52(sp)
+    sw   t2, 48(sp)
+    sw   a0, 44(sp)
+    sw   a1, 40(sp)
+    sw   a2, 36(sp)
+    sw   a3, 32(sp)
+    sw   a4, 28(sp)
+    sw   a5, 24(sp)
+    sw   a6, 20(sp)
+    sw   a7, 16(sp)
+    sw   t3, 12(sp)
+    sw   t4,  8(sp)
+    sw   t5,  4(sp)
+    sw   t6,  0(sp)
+    call __wchble_ch573_ble_vtf_body
+    lw   ra, 60(sp)
+    lw   t0, 56(sp)
+    lw   t1, 52(sp)
+    lw   t2, 48(sp)
+    lw   a0, 44(sp)
+    lw   a1, 40(sp)
+    lw   a2, 36(sp)
+    lw   a3, 32(sp)
+    lw   a4, 28(sp)
+    lw   a5, 24(sp)
+    lw   a6, 20(sp)
+    lw   a7, 16(sp)
+    lw   t3, 12(sp)
+    lw   t4,  8(sp)
+    lw   t5,  4(sp)
+    lw   t6,  0(sp)
+    addi sp, sp, 64
+    mret
+"#
+);
+
+#[unsafe(no_mangle)]
+extern "C" fn __wchble_ch573_ble_vtf_body() {
+    ble_isr();
+}
+
+extern "C" {
+    fn __wchble_ch573_ble_vtf();
+}
+
+/// Route BLE IRQ 20/21 through PFIC fast-interrupt slots 2/3.
+///
+/// Mirrors `PFIC_FastINT2CFG`/`PFIC_FastINT3CFG`, which the vendor library
+/// calls from `LLE_DevInit`/`BB_DevInit`. The entry must live in RAM, so the
+/// final binary needs the `highcode` feature. Without this the LLE line
+/// re-enters forever while `LLE+0x08` low bits read zero.
+///
+/// # Safety
+/// Call once per boot, before enabling the BLE interrupts.
+pub unsafe fn install_ble_irq() {
+    let addr = __wchble_ch573_ble_vtf as *const () as usize as u32;
+    unsafe {
+        regs::write(PFIC_BASE, 0x44, addr & 0xF000_0000);
+        regs::write(PFIC_BASE, 0x68, (21 << 24) | (addr & 0x000F_FFFF));
+        regs::write(PFIC_BASE, 0x6c, (20 << 24) | (addr & 0x000F_FFFF));
+    }
+}
+
+/// Number of [`ble_isr`] entries so far (diagnostics; wraps).
+pub fn irq_entries() -> u32 {
+    isr::ENTRIES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Take a result produced by [`ble_isr`], clearing it.

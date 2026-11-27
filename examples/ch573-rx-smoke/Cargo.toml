@@ -11,6 +11,7 @@ ch5xx-hal = { path = "../../../ch5xx-hal", features = [
     "ch573",
     "rt",
     "memory-x",
+    "highcode",
 ], default-features = false }
 wchble = { path = "../..", features = ["ch573", "defmt"] }
 qingke-rt = "0.8.4"

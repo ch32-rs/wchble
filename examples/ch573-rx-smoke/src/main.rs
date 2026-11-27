@@ -19,7 +19,8 @@ use hal::interrupt::{Interrupt, InterruptExt};
 use hal::rcc;
 use qingke_rt::entry;
 use wchble::rf::family::ch573::{
-    ble_isr, rx_isr_take, Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE,
+    install_ble_irq, irq_entries, rx_isr_take, Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE,
+    LLE_BASE,
 };
 use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
@@ -32,32 +33,11 @@ defmt::timestamp!("{=u32}", 0u32);
 const ADV_AA: u32 = 0x8e89_bed6;
 const ADV_CRC_INIT: u32 = 0x55_5555;
 
-/// Serve windows from the real PFIC handlers; `false` keeps the `rx_poll` kick.
-///
-/// The ISR path is **not yet working**: unmasking BLEL right after `rx_basic`
-/// starves the main loop even with an empty handler, i.e. the line stays
-/// asserted while the engine is armed. See `local-docs/ch573-rx-isr-spec.md`.
-const USE_ISR: bool = false;
-/// Which BLE lines to unmask: bit0 = BLEB, bit1 = BLEL.
-const ISR_LINES: u8 = 0b11;
+/// Serve windows from the real PFIC interrupt; `false` keeps the `rx_poll` kick.
+const USE_ISR: bool = true;
 
-/// BB (IRQ 20) and LLE (IRQ 21) share one service entry; the driver handles
-/// the second entry as a no-op and the level line re-fires.
-#[hal::interrupt]
-fn BLEB() {
-    if USE_ISR {
-        ble_isr();
-    }
-    Interrupt::BLEB.unpend();
-}
-
-#[hal::interrupt]
-fn BLEL() {
-    if USE_ISR {
-        ble_isr();
-    }
-    Interrupt::BLEL.unpend();
-}
+/// PFIC fast-interrupt slots 2 (LLE, IRQ 21) and 3 (BB, IRQ 20).
+const PFIC_BASE: usize = 0xE000_E000;
 
 /// DMA-visible RX buffer placed by `build.rs`.
 #[repr(align(4))]
@@ -161,6 +141,16 @@ fn main() -> ! {
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
     info!("rx mode={}", if USE_ISR { "isr" } else { "poll" });
+    if USE_ISR {
+        // SAFETY: PFIC writes only; runs with interrupts masked.
+        unsafe { install_ble_irq() };
+        info!(
+            "vtf fibaddr={=u32:x} slot2={=u32:x} slot3={=u32:x}",
+            mmio(PFIC_BASE, 0x44),
+            mmio(PFIC_BASE, 0x68),
+            mmio(PFIC_BASE, 0x6c)
+        );
+    }
 
     let mut round = 0u32;
     loop {
@@ -187,15 +177,10 @@ fn main() -> ! {
             }
 
             // Unmask only while a window is armed: the lines are level-based.
+            // The ISR masks them again when the window ends.
+            let isr_before = irq_entries();
             if USE_ISR {
-                unsafe {
-                    if ISR_LINES & 0b01 != 0 {
-                        Interrupt::BLEB.enable();
-                    }
-                    if ISR_LINES & 0b10 != 0 {
-                        Interrupt::BLEL.enable();
-                    }
-                }
+                unsafe { Interrupt::BLEL.enable() };
             }
 
             // Wait for the window: the ISR (or `rx_poll` in poll mode) serves
@@ -232,9 +217,10 @@ fn main() -> ! {
                 RxPoll::Timeout => (1, 0, 0),
                 RxPoll::Done { len, rssi } => (2, len, rssi),
             };
+            let isr_delta = irq_entries().wrapping_sub(isr_before);
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
-                ch, state, len, rssi, waited, count, dma18, bb30, bb38, lle08
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} timeout={=bool} cnt={=u32:x} isr={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, waited, count, isr_delta, dma18, bb30, bb38, lle08
             );
             if poll != RxPoll::Timeout || rx[0] != 0xAA || rx[1] != 0xAA {
                 info!("buf {:?}", &rx[..48]);
