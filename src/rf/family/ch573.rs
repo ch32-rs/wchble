@@ -678,6 +678,13 @@ impl Ch573Radio {
 mod isr {
     use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
+    pub const IDLE: u8 = 0;
+    pub const RX: u8 = 1;
+    pub const TX: u8 = 2;
+
+    /// Set by [`install_ble_irq`]; until then the polled paths are used.
+    pub static INSTALLED: AtomicBool = AtomicBool::new(false);
+    pub static MODE: AtomicU8 = AtomicU8::new(IDLE);
     pub static ARMED: AtomicBool = AtomicBool::new(false);
     pub static BUSY: AtomicBool = AtomicBool::new(false);
     pub static BUF: AtomicUsize = AtomicUsize::new(0);
@@ -687,6 +694,13 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
+    pub static TX_KICKED: AtomicBool = AtomicBool::new(false);
+    pub static TX_DONE: AtomicBool = AtomicBool::new(false);
+    /// Bit9 kicks serviced so far, so callers can tell a real kick apart.
+    pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
+    /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
+    pub static RX_DONE_TICKS: AtomicU32 = AtomicU32::new(0);
+    pub static TX_KICK_TICKS: AtomicU32 = AtomicU32::new(0);
     /// Every `ble_isr` entry, including ones that find no window armed.
     pub static ENTRIES: AtomicU32 = AtomicU32::new(0);
 
@@ -702,12 +716,68 @@ mod isr {
 /// PFIC base and interrupt-reset register (word 0 covers IRQs 0..31).
 const PFIC_BASE: usize = 0xE000_E000;
 const PFIC_IRER: usize = 0x180;
+const PFIC_IENR: usize = 0x100;
+/// V3A SysTick free-running down-counter (ticks at HCLK).
+const SYSTICK_CNTL: usize = 0xE000_F004;
+
+fn now_ticks() -> u32 {
+    unsafe { regs::read(SYSTICK_CNTL, 0) }
+}
 
 /// Mask both BLE lines. Once the window is over the LLE line stays asserted
-/// by engine state (`LLE+0x08` bit14) until the main loop stops the engine,
-/// so the ISR has to quiet it instead of spinning on it.
+/// by engine state (`LLE+0x08` bit14 / `TICK_CLR`) until the engine stops, so
+/// the ISR has to quiet it instead of spinning on it.
 unsafe fn mask_ble_lines() {
     unsafe { regs::write(PFIC_BASE, PFIC_IRER, (1 << 21) | (1 << 20)) };
+}
+
+/// Unmask both BLE lines for the window just armed. Only called when
+/// [`install_ble_irq`] has routed them through the VTF slots.
+unsafe fn unmask_ble_lines() {
+    unsafe { regs::write(PFIC_BASE, PFIC_IENR, (1 << 21) | (1 << 20)) };
+}
+
+/// `LLE_IRQLibHandler` kick: start the baseband when the LLE asks (bit9).
+const TX_ARM_EVENT: u32 = 0x200;
+
+unsafe fn tx_kick() {
+    unsafe {
+        regs::write(LLE_BASE, LLE_COUNT, 0x190);
+        regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0x2);
+        regs::rmw(BB_BASE, bb::RFCTRL, 0, 0x1000_0000);
+    }
+}
+
+/// Service an armed TX window (bit9 kick, then TX_DONE).
+///
+/// Runs under the same BUSY guard as the RX path; `tx_basic` is blocking, so
+/// only one direction is ever armed.
+fn tx_isr() {
+    use core::sync::atomic::Ordering;
+
+    if isr::BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        let st = regs::read(LLE_BASE, lle::IRQSTAT);
+        // Kick once per window: the LLE can leave bit9 asserted until the
+        // baseband reports done, and re-kicking from a level-triggered line
+        // just starves the caller.
+        if st & TX_ARM_EVENT != 0 && !isr::TX_KICKED.load(Ordering::Relaxed) {
+            tx_kick();
+            Ch573Radio::clear_lle_irq(TX_ARM_EVENT);
+            isr::TX_KICK_TICKS.store(now_ticks(), Ordering::Relaxed);
+            isr::TX_KICKS.fetch_add(1, Ordering::Relaxed);
+            isr::TX_KICKED.store(true, Ordering::Release);
+        }
+        let st = regs::read(LLE_BASE, lle::IRQSTAT);
+        if st & lle_irq::TX_DONE != 0 {
+            Ch573Radio::clear_lle_irq(lle_irq::TX_DONE);
+            mask_ble_lines();
+            isr::TX_DONE.store(true, Ordering::Release);
+        }
+    }
+    isr::BUSY.store(false, Ordering::Release);
 }
 
 /// Service the BLE IP from a `BLEB` (20) / `BLEL` (21) interrupt handler.
@@ -720,7 +790,22 @@ pub fn ble_isr() {
     use core::sync::atomic::Ordering;
 
     isr::entries_add();
-    if !isr::ARMED.load(Ordering::Acquire) || isr::BUSY.swap(true, Ordering::Acquire) {
+    match isr::MODE.load(Ordering::Acquire) {
+        isr::TX => {
+            tx_isr();
+            return;
+        }
+        isr::RX => {}
+        _ => {
+            unsafe { mask_ble_lines() };
+            return;
+        }
+    }
+    if !isr::ARMED.load(Ordering::Acquire) {
+        unsafe { mask_ble_lines() };
+        return;
+    }
+    if isr::BUSY.swap(true, Ordering::Acquire) {
         return;
     }
     let buf = isr::BUF.load(Ordering::Relaxed) as *mut u8;
@@ -748,6 +833,7 @@ pub fn ble_isr() {
             unsafe { mask_ble_lines() };
             isr::LEN.store(len, Ordering::Relaxed);
             isr::RSSI.store(rssi, Ordering::Relaxed);
+            isr::RX_DONE_TICKS.store(now_ticks(), Ordering::Relaxed);
             isr::armed_store(false);
             isr::DONE.store(true, Ordering::Release);
         }
@@ -829,11 +915,27 @@ pub unsafe fn install_ble_irq() {
         regs::write(PFIC_BASE, 0x68, (21 << 24) | (addr & 0x000F_FFFF));
         regs::write(PFIC_BASE, 0x6c, (20 << 24) | (addr & 0x000F_FFFF));
     }
+    isr::INSTALLED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Number of [`ble_isr`] entries so far (diagnostics; wraps).
 pub fn irq_entries() -> u32 {
     isr::ENTRIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// SysTick count captured when the ISR last reported RX `Done`.
+pub fn rx_done_ticks() -> u32 {
+    isr::RX_DONE_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// SysTick count captured at the last TX baseband kick (LLE bit9).
+pub fn tx_kick_ticks() -> u32 {
+    isr::TX_KICK_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of bit9 TX kicks serviced by the ISR so far (diagnostics; wraps).
+pub fn tx_kick_count() -> u32 {
+    isr::TX_KICKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Take a result produced by [`ble_isr`], clearing it.
@@ -1052,10 +1154,38 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::CMD, 0x2);
         }
 
-        // `LLE_IRQLibHandler` kicks the baseband on LLE IRQ bit9 (`0x200`)
-        // with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28. Mirror that from a
-        // tight poll; the window is short, so give up after 500 µs.
-        const TX_ARM_EVENT: u32 = 0x200;
+        if isr::INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
+            use core::sync::atomic::Ordering;
+            // The VTF handler does the bit9 kick and reports TX_DONE; this
+            // thread only waits, so there is no 500 µs poll on the hot path.
+            isr::TX_KICKED.store(false, Ordering::Release);
+            isr::TX_DONE.store(false, Ordering::Release);
+            isr::MODE.store(isr::TX, Ordering::Release);
+            unsafe { unmask_ble_lines() };
+            let deadline = clock.now_us().wrapping_add((hw_window / 2).saturating_add(2_000));
+            let mut ok = false;
+            loop {
+                if isr::TX_DONE.load(Ordering::Acquire) {
+                    ok = true;
+                    break;
+                }
+                if clock.now_us().wrapping_sub(deadline) as i32 >= 0 {
+                    break;
+                }
+            }
+            unsafe {
+                mask_ble_lines();
+                isr::MODE.store(isr::IDLE, Ordering::Release);
+            }
+            self.engine_stop();
+            Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
+            unsafe { regs::write(LLE_BASE, lle::MODE, 0) };
+            return if ok { Ok(()) } else { Err(Error::Timeout) };
+        }
+
+        // No ISR installed: `LLE_IRQLibHandler` kicks the baseband on LLE IRQ
+        // bit9 (`0x200`) with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28.
+        // Mirror that from a tight poll; give up after 500 µs.
         let kick_deadline = clock.now_us().wrapping_add(500);
         let mut kicked = false;
         loop {
@@ -1188,9 +1318,15 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
         }
 
-        // Arm only. Completion paths: `rx_poll`, or `ble_isr` from the BLEB/BLEL
-        // handlers. Short settle so the window latches.
+        // Arm only. Completion paths: `rx_poll`, or `ble_isr` when
+        // `install_ble_irq` has routed the lines through the VTF slots.
         clock.delay_us(2);
+        if isr::INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
+            isr::MODE.store(isr::RX, core::sync::atomic::Ordering::Release);
+            // SAFETY: VTF slots were installed, so enabling the lines cannot
+            // dispatch into an unconfigured vector.
+            unsafe { unmask_ble_lines() };
+        }
         let _ = self.phy_rx;
         Ok(())
     }

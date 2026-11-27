@@ -17,7 +17,9 @@ use defmt::info;
 use defmt_rtt as _;
 use hal::rcc;
 use qingke_rt::entry;
-use wchble::rf::family::ch573::{Ch573Radio, BB_BASE, CAPS, DMA_BASE, LLE_BASE, RFEND_BASE};
+use wchble::rf::family::ch573::{
+    install_ble_irq, Ch573Radio, BB_BASE, CAPS, DMA_BASE, LLE_BASE, RFEND_BASE,
+};
 use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
@@ -286,6 +288,10 @@ fn main() -> ! {
             loop {}
         }
     }
+
+    // SAFETY: PFIC VTF writes only; the entry lives in `.highcode`.
+    unsafe { install_ble_irq() };
+    info!("ble irq installed");
 
     dump_regs();
 
