@@ -168,13 +168,16 @@ gate for arbitrary frames.
 
 RSSI is the DMA byte at `((len + 5) & 0x1fc) + 2`, read by vendor
 `ble_ll_chkcrc` and copied straight into the scan-report `rssi` as a signed
-byte by `ll_scan_rx` / `ll_scan_add_advertising_to_report`. Vendor
-`BLE_ReadRssi` maps the live register the same way:
-`(BB+0x30 >> 12) as u8 as i8` — field `bits[19:12]`, sign-extended, no
-calibration subtraction. (cnlohr's iSLER uses `>> 15`; that is a different
-field/shift and does not match the CH573 V2.20 library.) The example logs the
-`Radio::rssi()` / `Radio::crc_ok()` accessors as `trssi=` / `tcrc=`; both
-return the last completed packet and now track `state=2` lines exactly.
+byte by `ll_scan_rx` / `ll_scan_add_advertising_to_report`. The board pins the
+register field: across 768 logged `Done` lines (pre-existing runs, 2026-11-28)
+`rssi` equals `(BB+0x30 >> 15) as u8 as i8` in 759 cases; the 9 exceptions
+are stale `BB+0x30` samples (the log reads it after the ISR, and it can hold a
+later frame). So the field is `bits[22:15]`, sign-extended, with no calibration
+subtraction — the same `>> 15` cnlohr's iSLER uses. Vendor `BLE_ReadRssi` in
+`bb.o` shifts by 12 instead and does **not** reproduce the received byte; treat
+it as an unrelated/legacy helper, not the packet-RSSI formula. The example logs
+`Radio::rssi()` / `Radio::crc_ok()` as `trssi=` / `tcrc=`; both return the last
+completed packet and track `state=2` lines exactly.
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.

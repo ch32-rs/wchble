@@ -202,8 +202,10 @@ pub enum RxPoll {
     /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
     ///
     /// `rssi` is the hardware byte at `((len + 5) & 0x1fc) + 2` in the DMA
-    /// buffer — the byte vendor `ble_ll_chkcrc` hands to `ll_scan_rx` and the
-    /// same value as `(BB+0x30 >> 12) as i8` in vendor `BLE_ReadRssi`.
+    /// buffer — the byte vendor `ble_ll_chkcrc` hands to `ll_scan_rx`. On the
+    /// board it equals `(BB+0x30 >> 15) as i8` (field `bits[22:15]`, no
+    /// calibration), matching cnlohr's iSLER; the V2.20 `BLE_ReadRssi`
+    /// helper in `bb.o` shifts by 12 and does not reproduce it.
     ///
     /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — exactly the
     /// bit vendor `ble_ll_chkcrc` returns as its CRC status (`(BB+0x38 >> 5)
@@ -1441,9 +1443,10 @@ impl Radio for Ch573Radio {
 
     /// RSSI of the last packet reported by [`rx_poll`]/[`rx_isr_take`].
     ///
-    /// Vendor `BLE_ReadRssi` converts `BB+0x30` with `>> 12` and a signed-byte
-    /// cast (`bits[19:12]`, no calibration subtraction); the DMA RSSI byte
-    /// this returns is the same value `ble_ll_chkcrc` hands to `ll_scan_rx`.
+    /// This is the DMA RSSI byte, which the board shows to be
+    /// `(BB+0x30 >> 15) as i8` (`bits[22:15]`, no calibration subtraction).
+    /// Vendor `BLE_ReadRssi` in `bb.o` uses `>> 12` instead; that helper does
+    /// not match the received status byte on this part.
     fn rssi(&self) -> i8 {
         isr::RSSI.load(core::sync::atomic::Ordering::Relaxed)
     }
