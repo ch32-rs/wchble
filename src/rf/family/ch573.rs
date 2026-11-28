@@ -201,9 +201,13 @@ pub enum RxPoll {
     Timeout,
     /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
     ///
-    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — the same
-    /// bit the vendor's `ble_ll_chkcrc` tests. The gate is conservative: it
-    /// can reject weak-signal frames whose CRC the sniffer accepts.
+    /// `rssi` is the hardware byte at `((len + 5) & 0x1fc) + 2` in the DMA
+    /// buffer — the byte vendor `ble_ll_chkcrc` hands to `ll_scan_rx` and the
+    /// same value as `(BB+0x30 >> 12) as i8` in vendor `BLE_ReadRssi`.
+    ///
+    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — exactly the
+    /// bit vendor `ble_ll_chkcrc` returns as its CRC status (`(BB+0x38 >> 5)
+    /// & 1`), not a software threshold.
     Done { len: u8, rssi: i8, crc_ok: bool },
 }
 
@@ -716,7 +720,7 @@ impl Ch573Radio {
     }
 
     /// Buffer offset of the RSSI byte: vendor `ble_ll_chkcrc` finds the status
-    /// word at `(len + 5) & 0x1fc` and the RSSI right after it.
+    /// word at `(len + 5) & 0x1fc` and copies the byte right after it as RSSI.
     fn rx_rssi_off(len: u8) -> usize {
         ((len as usize + 5) & 0x1fc) + 2
     }
@@ -751,6 +755,10 @@ impl Ch573Radio {
                 // the reads above, so the earlier `bb` could predate its CRC.
                 let bb = regs::read(BB_BASE, bb::IRQSTAT);
                 let crc_ok = bb & BB_CRC_ERR == 0;
+                // Publish for the `Radio::rssi`/`crc_ok` accessors on both the
+                // ISR and the poll path.
+                isr::RSSI.store(rssi, core::sync::atomic::Ordering::Relaxed);
+                isr::CRC_OK.store(crc_ok, core::sync::atomic::Ordering::Relaxed);
                 // Vendor-style whole-word `~mask` clear: ones leave the other
                 // bits alone, so a bit that asserts after the read survives.
                 regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
@@ -1430,11 +1438,17 @@ impl Radio for Ch573Radio {
         Ok(())
     }
 
+    /// RSSI of the last packet reported by [`rx_poll`]/[`rx_isr_take`].
+    ///
+    /// Vendor `BLE_ReadRssi` converts `BB+0x30` with `>> 12` and a signed-byte
+    /// cast (`bits[19:12]`, no calibration subtraction); the DMA RSSI byte
+    /// this returns is the same value `ble_ll_chkcrc` hands to `ll_scan_rx`.
     fn rssi(&self) -> i8 {
-        0
+        isr::RSSI.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CRC verdict of the last packet (vendor `ble_ll_chkcrc` bit5 test).
     fn crc_ok(&self) -> bool {
-        false
+        isr::CRC_OK.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
