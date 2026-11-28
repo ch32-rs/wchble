@@ -717,7 +717,6 @@ mod isr {
 
     pub const IDLE: u8 = 0;
     pub const RX: u8 = 1;
-    pub const TX: u8 = 2;
 
     /// Set by [`install_ble_irq`]; until then the polled paths are used.
     pub static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -733,8 +732,6 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
-    pub static TX_KICKED: AtomicBool = AtomicBool::new(false);
-    pub static TX_DONE: AtomicBool = AtomicBool::new(false);
     /// Bit9 kicks serviced so far, so callers can tell a real kick apart.
     pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
     /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
@@ -798,38 +795,6 @@ unsafe fn tx_kick() {
     }
 }
 
-/// Service an armed TX window (bit9 kick, then TX_DONE).
-///
-/// Runs under the same BUSY guard as the RX path; `tx_basic` is blocking, so
-/// only one direction is ever armed.
-fn tx_isr() {
-    use core::sync::atomic::Ordering;
-
-    if isr::BUSY.swap(true, Ordering::Acquire) {
-        return;
-    }
-    unsafe {
-        let st = regs::read(LLE_BASE, lle::IRQSTAT);
-        // Kick once per window: the LLE can leave bit9 asserted until the
-        // baseband reports done, and re-kicking from a level-triggered line
-        // just starves the caller.
-        if st & TX_ARM_EVENT != 0 && !isr::TX_KICKED.load(Ordering::Relaxed) {
-            tx_kick();
-            Ch573Radio::clear_lle_irq(TX_ARM_EVENT);
-            isr::TX_KICK_TICKS.store(now_ticks(), Ordering::Relaxed);
-            isr::TX_KICKS.fetch_add(1, Ordering::Relaxed);
-            isr::TX_KICKED.store(true, Ordering::Release);
-        }
-        let st = regs::read(LLE_BASE, lle::IRQSTAT);
-        if st & lle_irq::TX_DONE != 0 {
-            Ch573Radio::clear_lle_irq(lle_irq::TX_DONE);
-            mask_ble_lines();
-            isr::TX_DONE.store(true, Ordering::Release);
-        }
-    }
-    isr::BUSY.store(false, Ordering::Release);
-}
-
 /// Service the BLE IP from a `BLEB` (20) / `BLEL` (21) interrupt handler.
 ///
 /// Cheap to call from both handlers: a second entry returns immediately and
@@ -840,16 +805,9 @@ pub fn ble_isr() {
     use core::sync::atomic::Ordering;
 
     isr::entries_add();
-    match isr::MODE.load(Ordering::Acquire) {
-        isr::TX => {
-            tx_isr();
-            return;
-        }
-        isr::RX => {}
-        _ => {
-            unsafe { mask_ble_lines() };
-            return;
-        }
+    if isr::MODE.load(Ordering::Acquire) != isr::RX {
+        unsafe { mask_ble_lines() };
+        return;
     }
     if !isr::ARMED.load(Ordering::Acquire) {
         unsafe { mask_ble_lines() };
@@ -1111,8 +1069,9 @@ impl Radio for Ch573Radio {
 
     /// TX one PDU with a short busy-poll for the LLE TX-start event.
     ///
-    /// The caller must not let an LLE ISR clear `LLE+0x08` bit9 during the
-    /// call (no IRQ handler is installed by this backend).
+    /// Polling only: TX masks the BLE lines, so an installed BLE ISR cannot
+    /// race the bit9 kick or the completion flags. The RX ISR shares the
+    /// same engine, so call this from thread context.
     unsafe fn tx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -1148,7 +1107,10 @@ impl Radio for Ch573Radio {
             tx_ptr = self.rx_dma;
         }
 
-        Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
+        // Clear stale completion/arm flags *before* arming; the new window
+        // raises bit9 itself and clearing it after the GUARD writes would
+        // eat the kick request (intermittent 500 µs timeouts).
+        Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM | TX_ARM_EVENT);
 
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();
@@ -1202,58 +1164,26 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, LLE_COUNT, hw_window);
             regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
         }
-        // Drop any stale flag (e.g. a bit9 left set by an earlier clear
-        // attempt) so the kick below can only come from this TX window.
-        Self::clear_lle_irq(0xffff);
         unsafe {
             // EVT `ll_tx_set_wait_finish` pokes CMD=2 to start the TX.
             regs::write(LLE_BASE, lle::CMD, 0x2);
         }
 
-        if isr::INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
-            use core::sync::atomic::Ordering;
-            // The VTF handler does the bit9 kick and reports TX_DONE; this
-            // thread only waits, so there is no 500 µs poll on the hot path.
-            isr::TX_KICKED.store(false, Ordering::Release);
-            isr::TX_DONE.store(false, Ordering::Release);
-            isr::MODE.store(isr::TX, Ordering::Release);
-            unsafe { unmask_ble_lines() };
-            let deadline = clock
-                .now_us()
-                .wrapping_add((hw_window / 2).saturating_add(2_000));
-            let mut ok = false;
-            loop {
-                if isr::TX_DONE.load(Ordering::Acquire) {
-                    ok = true;
-                    break;
-                }
-                if clock.now_us().wrapping_sub(deadline) as i32 >= 0 {
-                    break;
-                }
-            }
-            unsafe {
-                mask_ble_lines();
-                isr::MODE.store(isr::IDLE, Ordering::Release);
-            }
-            self.engine_stop();
-            Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
-            unsafe { regs::write(LLE_BASE, lle::MODE, 0) };
-            return if ok { Ok(()) } else { Err(Error::Timeout) };
-        }
+        // TX is polling-only: a level-held BB/LLE event during the window
+        // would otherwise re-enter `ble_isr` and fight the poll loop.
+        unsafe { mask_ble_lines() };
 
-        // No ISR installed: `LLE_IRQLibHandler` kicks the baseband on LLE IRQ
-        // bit9 (`0x200`) with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28.
-        // Mirror that from a tight poll; give up after 500 µs.
+        // `LLE_IRQLibHandler` kicks the baseband on LLE IRQ bit9 (`0x200`)
+        // with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28. Mirror that from
+        // a tight poll; give up after 500 µs.
         let kick_deadline = clock.now_us().wrapping_add(500);
         let mut kicked = false;
         loop {
             if unsafe { regs::read(LLE_BASE, lle::IRQSTAT) } & TX_ARM_EVENT != 0 {
-                unsafe {
-                    regs::write(LLE_BASE, LLE_COUNT, 0x190);
-                    regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0x2);
-                    regs::rmw(BB_BASE, bb::RFCTRL, 0, 0x1000_0000);
-                }
+                unsafe { tx_kick() };
                 Self::clear_lle_irq(TX_ARM_EVENT);
+                isr::TX_KICK_TICKS.store(now_ticks(), core::sync::atomic::Ordering::Relaxed);
+                isr::TX_KICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 kicked = true;
                 break;
             }
