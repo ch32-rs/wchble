@@ -67,8 +67,8 @@ calibrated against a reference receiver.
   vendor `ll_scan_rx` reads it, so the level difference itself is the open
   question (antenna/placement vs RX gain). Tracked with the CH573 RSSI/CRC
   verification, not fixed here.
-- `early=` timeouts (window ended before 3/4 of its count) are ~15% of
-  windows; `late=` results (> 30 ms arm→result) are rare but exist.
+- `early=` and `to_dt_us` cover Timeout results only; `late=` (> 30 ms
+  arm→result) covers every result path. Early windows are ~15–20%.
 - The RX-arming path can hang before the first window (observed ~3/10 boot
   attempts with an unmodified `ch573-rx-smoke` during the RSSI/CRC
   verification, an ISR/arming race). If no `obs t=` line appears, re-run the
