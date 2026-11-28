@@ -783,6 +783,16 @@ fn main() -> ! {
             frame[seq_off + 1] = b[1];
             seq = seq.wrapping_add(1);
         }
+        #[cfg(feature = "adv-ch37")]
+        {
+            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+            if radio.set_channel(37).is_ok() {
+                let _ = unsafe { radio.tx_basic(&clock, &frame[..n], 0, None) };
+            }
+            clock.delay_us(20_000);
+            round = round.wrapping_add(1);
+            continue;
+        }
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
             if radio.set_channel(ch).is_ok() {

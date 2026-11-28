@@ -35,6 +35,9 @@ crc-test-bad = ["crc-test"]
 # Append a 16-bit air-event counter (manufacturer AD) to the advertising PDU
 # so a board receiver and a sniffer can be paired event by event.
 adv-seq = []
+# adv-seq plus a single-channel 20 ms broadcast on ch37, for dense paired
+# captures (implies adv-seq).
+adv-ch37 = ["adv-seq"]
 
 [profile.release]
 strip = false
