@@ -211,6 +211,21 @@ The counter sits at PDU offset 23; the CH585 random AdvA is
 metadata byte 9 before the AA (byte 8 is the channel, byte 10 the RSSI
 magnitude); this was cross-checked against `crcgood`/`crcbad!` captures.
 
+### Board RX level vs the sniffer (2026-11-28)
+
+Same CH585 frames at 0 dBm: sniffer −39 dBm, board −91…−99 (median −95, n=16);
+at −20 dBm: sniffer −58, board −87…−93 (median −93, n=3). The board caught 16
+of the ~440 frames that fell inside its ch37 windows (≈3.6%), so this is a
+real receive-path loss, not an arithmetic offset: `rssi` equals
+`(BB+0x30 >> 15) as i8` in 100% of sampled `Done`s, and vendor `ll_scan_rx`
+sign-extends the same DMA byte into `gapScanRec_t.rssi`. RFEND/BB init now
+matches the EVT disassembly (CFG54 bit16, RXADC TUNE bit16, CFG38 mask
+`0x00f8_0000`, RXCFG18 mask `0x7c`), with no measured RSSI change. Open:
+`RFEND_SetSensitivity` is exported but never called by `libCH57xBLE.a`, and
+the vendor scan path does not touch `FECTRL` while `shut()` clears bits
+17/20/21. Next check is the WCH EVT Observer on the same board and position.
+
+
 ### CH573 ↔ CH585 interop (both directions)
 
 Run `ch585-rf-smoke` (probe `F93D…`) and this example (probe `5CED…`) at the
