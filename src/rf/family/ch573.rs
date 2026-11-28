@@ -249,9 +249,9 @@ unsafe fn unmask_irq(_saved: usize) {}
 
 /// Run `body` inside one SAFE_ACCESS window with interrupts masked.
 ///
-/// A taken interrupt between the key write and the protected access ends the
-/// window, and the access that follows faults. `ch585` wraps every window the
-/// same way (`unlocked()`).
+/// An interrupt between the key writes and the protected access ends the
+/// window: the write is dropped, and the access that follows may fault.
+/// `ch585` wraps every window the same way (`unlocked()`).
 #[inline(always)]
 unsafe fn safe_access<R>(body: impl FnOnce() -> R) -> R {
     const SAFE_ACCESS: usize = 0x4000_1040;

@@ -73,21 +73,25 @@ calibrated against a reference receiver.
 - `early=` and `to_dt_us` cover Timeout results only; `late=` (> 30 ms
   arm→result) covers every result path. Early windows are ~15–20%.
 - A **stalled `probe-rs run` session** is a probe failure, not a firmware hang.
-  About one session in three the flash completes (`Finished in …`) yet no RTT
-  output appears at all — not even `boot` — or output stops mid-run (seen
-  right after `sysclk`); the process ends with `disable_debug_module: could
-  not clear sw-breakpoint state: DtmOperationFailed`. The same ELF then boots
-  and finishes its full run on the next attempt (measured 2/3 and 2/4 across
-  sessions, plus the 600 s run below). Follow-up debug sessions in that state
-  report the core halted on a software breakpoint at a bogus PC, return
-  `mcause=2` at a legal instruction, and read CodeFlash back scrambled — the
-  CH5xx flash algorithm documents that a halted debug read of CodeFlash
-  returns a scrambled placeholder. None of that is firmware evidence, and an
-  earlier revision of this file that called it an "ISR/arming race" was
-  wrong. Workaround: re-run the same ELF; if repeated re-runs stay silent,
-  `probe-rs reset` or re-plug the WCH-LinkE. Firmware side was hardened
-  anyway: `ble_clock_on` and `apply_tx_power` now run their SAFE_ACCESS
-  windows with `mstatus.MIE` masked, matching `ch585`.
+  In some sessions the flash completes (`Finished in …`) yet no RTT output
+  appears at all — not even `boot`. The same ELF then boots and finishes its
+  full run on a later attempt: in this session's batches one image both
+  succeeded (2/3, 2/4, and 20/20 for the pre-instrumentation build) and stayed
+  silent (0/20 in a batch whose sessions were torn down with SIGKILL). An
+  earlier run also stopped right after `sysclk`; that half-log was not
+  reproduced in the later batches and is kept as an observation only.
+  `disable_debug_module: could not clear sw-breakpoint state:
+  DtmOperationFailed` is common around a stalled session, but it also appears
+  when a session ends normally, so it is not a signature by itself. An earlier
+  revision of this file called the stall an "ISR/arming race"; that was wrong.
+  Follow-up debug sessions in that state report a bogus PC, `mcause=2` at a
+  legal instruction, and scrambled CodeFlash read-back — the CH5xx flash
+  algorithm documents that a halted debug read of CodeFlash returns a
+  scrambled placeholder — so none of that is firmware evidence. Workaround:
+  re-run the same ELF; if repeated re-runs stay silent, `probe-rs reset` or
+  re-plug the WCH-LinkE. Firmware side was hardened anyway: `ble_clock_on`
+  and `apply_tx_power` now run their SAFE_ACCESS windows with `mstatus.MIE`
+  masked, matching `ch585`.
 
 ## Acceptance (2026-11-28, probe `5CED…`)
 
@@ -120,9 +124,9 @@ deficit datum, because the channel and the transmitter are known.
 observer is usable for presence/counting at short range, but its counts are
 not a loss-rate or rate measurement.
 
-Post-fix check (same day, ELF `41b6af7d…eca`, after the SAFE_ACCESS masking
-change): `rf init ok`, 466 rounds / 1399 windows in 30 s, `arm_err=0`, counters
-in line with the numbers above.
+Post-fix check (same day, ELF `accb4e75…51`, after the SAFE_ACCESS masking
+change and the guarded panic handler): `rf init ok`, 470 rounds / 1410 windows
+in 30 s, `arm_err=0`, counters in line with the numbers above.
 
 `tools/compare_observer.py --board-log rtt.log --pcap capture.pcap` prints the
 per-AdvA table (board vs sniffer counts, channels, RSSI medians). Start the

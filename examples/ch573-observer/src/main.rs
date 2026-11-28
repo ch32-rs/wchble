@@ -20,14 +20,40 @@ use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::{ExtendingTicks, InstantUs};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use portable_atomic as _;
 
-/// Log where a panic happened instead of halting silently (`panic-halt`).
+/// Panic marker for a halted `probe-rs read`: `file hash << 16 | line`.
+/// `0xffff_ffff` means the panic carried no location.
+#[no_mangle]
+pub static PANIC_LOC: AtomicU32 = AtomicU32::new(0);
+
+/// defmt is only attempted once: a panic raised inside defmt's own lock would
+/// otherwise recurse (`defmt logger taken reentrantly`).
+static PANIC_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut h = 0x811c_9dc5u32;
+    for &b in bytes {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Record where a panic happened; log it once, then halt.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    match info.location() {
-        Some(l) => defmt::error!("panic {}:{}", l.file(), l.line()),
-        None => defmt::error!("panic"),
+    let loc = info.location();
+    let tag = match loc {
+        Some(l) => (u32::from(fnv1a(l.file().as_bytes()) as u16) << 16) | (l.line() & 0xffff),
+        None => 0xffff_ffff,
+    };
+    PANIC_LOC.store(tag, Ordering::Relaxed);
+    if !PANIC_LOGGED.swap(true, Ordering::AcqRel) {
+        match loc {
+            Some(l) => defmt::error!("panic {}:{}", l.file(), l.line()),
+            None => defmt::error!("panic"),
+        }
     }
     loop {
         core::hint::spin_loop();
