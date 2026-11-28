@@ -217,6 +217,55 @@ const BB_CRC_ERR: u32 = 0x20;
 // Soft state only; MMIO runs through fixed bases.
 unsafe impl Send for Ch573Radio {}
 
+/// Interrupt-enable bit in `mstatus`.
+#[cfg(target_arch = "riscv32")]
+const MSTATUS_MIE: usize = 1 << 3;
+
+#[cfg(target_arch = "riscv32")]
+#[inline(always)]
+unsafe fn mask_irq() -> usize {
+    let mstatus: usize;
+    unsafe { core::arch::asm!("csrrci {}, mstatus, 8", out(reg) mstatus) };
+    mstatus & MSTATUS_MIE
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+#[inline(always)]
+unsafe fn mask_irq() -> usize {
+    0
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline(always)]
+unsafe fn unmask_irq(saved: usize) {
+    if saved != 0 {
+        unsafe { core::arch::asm!("csrsi mstatus, 8") };
+    }
+}
+
+#[cfg(not(target_arch = "riscv32"))]
+#[inline(always)]
+unsafe fn unmask_irq(_saved: usize) {}
+
+/// Run `body` inside one SAFE_ACCESS window with interrupts masked.
+///
+/// An interrupt between the key writes and the protected access ends the
+/// window: the write is dropped, and the access that follows may fault.
+/// `ch585` wraps every window the same way (`unlocked()`).
+#[inline(always)]
+unsafe fn safe_access<R>(body: impl FnOnce() -> R) -> R {
+    const SAFE_ACCESS: usize = 0x4000_1040;
+    unsafe {
+        let saved = mask_irq();
+        core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0x57);
+        core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0xa8);
+        let out = body();
+        core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0);
+        unmask_irq(saved);
+        out
+    }
+}
+
 impl Ch573Radio {
     /// Own a DMA-capable RX scratch; must sit inside [`CAPS`] SRAM.
     pub fn new(rx_dma: &'static mut [u8]) -> Result<Self> {
@@ -256,7 +305,6 @@ impl Ch573Radio {
     /// Program `RFCTRL[13:8]` and the aux rail rule from `BB_DevInit` /
     /// `LL_SetTxPowerLevel`.
     fn apply_tx_power(&self) {
-        const SAFE_ACCESS: usize = 0x4000_1040;
         const AUX_POWER_ADJ: usize = 0x4000_1022;
         let code = u32::from(self.tx_power.code() & 0x3f);
         unsafe {
@@ -264,12 +312,11 @@ impl Ch573Radio {
             regs::write(BB_BASE, bb::RFCTRL, v);
 
             // SAFE_ACCESS window: aux rail boost only above 0 dBm.
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0x57);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0xa8);
-            let adj = core::ptr::read_volatile(AUX_POWER_ADJ as *const u16);
-            let adj = if code > 0x14 { adj | 0x10 } else { adj & !0x10 };
-            core::ptr::write_volatile(AUX_POWER_ADJ as *mut u16, adj);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0);
+            safe_access(|| {
+                let adj = core::ptr::read_volatile(AUX_POWER_ADJ as *const u16);
+                let adj = if code > 0x14 { adj | 0x10 } else { adj & !0x10 };
+                core::ptr::write_volatile(AUX_POWER_ADJ as *mut u16, adj);
+            });
 
             // Vendor mirrors the level into RFEND when CFG54 bit9 asks for it.
             if regs::read(RFEND_BASE, rfend::CFG54) & 0x200 != 0 {
@@ -460,14 +507,12 @@ impl Ch573Radio {
 
     /// Clear `RB_SLP_CLK_BLE` so the RF block is clocked (SAFE_ACCESS).
     fn ble_clock_on(&mut self) {
-        const SAFE_ACCESS: usize = 0x4000_1040;
         const SLP_CLK_OFF1: usize = 0x4000_100d;
         unsafe {
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0x57);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0xa8);
-            let v = core::ptr::read_volatile(SLP_CLK_OFF1 as *const u8);
-            core::ptr::write_volatile(SLP_CLK_OFF1 as *mut u8, v & !0x80);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0);
+            safe_access(|| {
+                let v = core::ptr::read_volatile(SLP_CLK_OFF1 as *const u8);
+                core::ptr::write_volatile(SLP_CLK_OFF1 as *mut u8, v & !0x80);
+            });
         }
     }
 
