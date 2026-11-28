@@ -29,10 +29,14 @@ MAX_LEGACY_LEN = 37
 
 
 def read_board(path, seq_off):
-    """Return {(seq, ch): record} from defmt `state=2` + `buf` pairs."""
+    """Return {(seq, ch): record} and trait-accessor mismatch counts."""
     out = {}
     pending = None
-    rx = re.compile(r"ch(\d+) state=2 .*?len=(\d+) rssi=(-?\d+) crc=(true|false)")
+    mismatches = {"rssi": 0, "crc": 0, "checked": 0}
+    rx = re.compile(
+        r"ch(\d+) state=2 .*?len=(\d+) rssi=(-?\d+) crc=(true|false)"
+        r"(?: .*?trssi=(-?\d+) tcrc=(true|false))?"
+    )
     for line in open(path, errors="replace"):
         m = rx.search(line)
         if m:
@@ -41,6 +45,8 @@ def read_board(path, seq_off):
                 "len": int(m.group(2)),
                 "rssi": int(m.group(3)),
                 "crc": m.group(4) == "true",
+                "trssi": int(m.group(5)) if m.group(5) is not None else None,
+                "tcrc": (m.group(6) == "true") if m.group(6) is not None else None,
             }
             continue
         m = re.search(r"buf \[([0-9, ]+)\]", line)
@@ -50,6 +56,10 @@ def read_board(path, seq_off):
             n = 2 + rec["len"]
             if not (0 < rec["len"] <= MAX_LEGACY_LEN and len(raw) >= n):
                 continue
+            if rec["trssi"] is not None:
+                mismatches["checked"] += 1
+                mismatches["rssi"] += rec["trssi"] != rec["rssi"]
+                mismatches["crc"] += rec["tcrc"] != rec["crc"]
             pdu = bytes(raw[:n])
             if seq_off is None:
                 key = pdu
@@ -58,7 +68,7 @@ def read_board(path, seq_off):
                     continue
                 key = (pdu[seq_off] | pdu[seq_off + 1] << 8, rec["ch"])
             out[key] = {"pdu": pdu, "rssi": rec["rssi"], "crc": rec["crc"]}
-    return out
+    return out, mismatches
 
 
 def read_pcap(path, seq_off, adv_a):
@@ -83,7 +93,7 @@ def read_pcap(path, seq_off, adv_a):
         if len(pdu) < 2 + pdu[1] or pdu[1] > MAX_LEGACY_LEN:
             continue
         pdu = pdu[:2 + pdu[1]]
-        if adv_a is not None and pdu[2:8] != adv_a:
+        if adv_a is not None and pdu[2:8] not in (adv_a, adv_a[::-1]):
             continue
         if seq_off is None:
             key = pdu
@@ -113,11 +123,14 @@ def main():
     args = ap.parse_args()
 
     adv_a = bytes(int(x, 16) for x in args.adv_a.split(":")) if args.adv_a else None
-    board = read_board(args.log, args.seq_off)
+    board, mism = read_board(args.log, args.seq_off)
     sniffer, dup = read_pcap(args.pcap, args.seq_off, adv_a)
 
     print(f"board receptions={len(board)} sniffer records={len(sniffer)} "
           f"(duplicates skipped={dup})")
+    if mism["checked"]:
+        print(f"Radio::rssi/crc_ok vs Done: checked={mism['checked']} "
+              f"rssi_mismatch={mism['rssi']} crc_mismatch={mism['crc']}")
     if args.seq_off is None:
         print("no --seq-off: key is the whole PDU, so repeated events collapse; "
               "per-event pairing is unavailable")
