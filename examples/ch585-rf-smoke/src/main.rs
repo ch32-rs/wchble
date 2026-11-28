@@ -215,6 +215,23 @@ fn build_adv_name(out: &mut [u8; 32], name: &[u8]) -> usize {
     2 + payload_len
 }
 
+/// `adv-seq`: append Manufacturer Specific Data `[05 ff ff ff seq_lo seq_hi]`
+/// and return the new length plus the sequence byte offset.
+///
+/// One counter per advertising event; the same PDU goes to 37/38/39, so
+/// `(seq, channel)` identifies a single air event.
+#[cfg(feature = "adv-seq")]
+fn append_seq_ad(out: &mut [u8; 32], n: usize) -> (usize, usize) {
+    let off = n;
+    out[off] = 5;
+    out[off + 1] = 0xFF;
+    out[off + 2] = 0xFF;
+    out[off + 3] = 0xFF;
+    out[off + 4] = 0;
+    out[off + 5] = 0;
+    (off + 6, off + 4)
+}
+
 /// Known-answer CRC test (`--features crc-test`): transmit `crcgood` with the
 /// advertising CRC init and `crcbad!` with a one-bit-wrong init. Both payloads
 /// are intact, so a receiver must report crc=true only for the first and
@@ -633,6 +650,28 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
     );
 }
 
+/// TX power code from `CH585_RF_SMOKE_TX_POWER` at build time (default 0 dBm).
+///
+/// Codes are `LL_TX_POWEER_*` from `CH58xBLE_LIB.h`; CH585 stops at +4 dBm.
+/// `Ch585Radio::set_tx_power` must be called before `init()`: the PA tune is
+/// bound to the level.
+fn tx_power_code() -> u8 {
+    match option_env!("CH585_RF_SMOKE_TX_POWER") {
+        Some("-20") => 0x01,
+        Some("-15") => 0x03,
+        Some("-10") => 0x05,
+        Some("-8") => 0x07,
+        Some("-5") => 0x0b,
+        Some("-3") => 0x0f,
+        Some("-1") => 0x13,
+        Some("1") => 0x1b,
+        Some("2") => 0x23,
+        Some("3") => 0x2b,
+        Some("4") => 0x3b,
+        _ => 0x15,
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
@@ -656,6 +695,8 @@ fn main() -> ! {
             loop {}
         }
     };
+    radio.set_tx_power(tx_power_code());
+    let _ = writeln!(out, "tx_power code={:x}", tx_power_code());
 
     match radio.init(&clock) {
         Ok(()) => {
@@ -708,6 +749,12 @@ fn main() -> ! {
 
     let mut frame = [0u8; 32];
     let n = build_adv_nonconn_ind(&mut frame);
+    #[cfg(feature = "adv-seq")]
+    let (n, seq_off) = {
+        let (nn, so) = append_seq_ad(&mut frame, n);
+        frame[1] = (nn - 2) as u8;
+        (nn, so)
+    };
     let _ = writeln!(out, "adv len {}", n);
     tx_burst(&mut radio, &clock, &mut out, &frame[..n]);
     for window_half_us in [2_000u32, 10_000] {
@@ -726,7 +773,26 @@ fn main() -> ! {
     //   CRC 0x555555) which a V208/CH592 reference receiver decodes.
     let _ = writeln!(out, "adv loop");
     let mut round = 0u32;
+    #[cfg(feature = "adv-seq")]
+    let mut seq = 1u16; // 0 is the uninitialised burst before the loop
     loop {
+        #[cfg(feature = "adv-seq")]
+        {
+            let b = seq.to_le_bytes();
+            frame[seq_off] = b[0];
+            frame[seq_off + 1] = b[1];
+            seq = seq.wrapping_add(1);
+        }
+        #[cfg(feature = "adv-ch37")]
+        {
+            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+            if radio.set_channel(37).is_ok() {
+                let _ = unsafe { radio.tx_basic(&clock, &frame[..n], 0, None) };
+            }
+            clock.delay_us(20_000);
+            round = round.wrapping_add(1);
+            continue;
+        }
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
             if radio.set_channel(ch).is_ok() {

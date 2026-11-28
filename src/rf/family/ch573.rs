@@ -201,9 +201,15 @@ pub enum RxPoll {
     Timeout,
     /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
     ///
-    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — the same
-    /// bit the vendor's `ble_ll_chkcrc` tests. The gate is conservative: it
-    /// can reject weak-signal frames whose CRC the sniffer accepts.
+    /// `rssi` is the hardware byte at `((len + 5) & 0x1fc) + 2` in the DMA
+    /// buffer — the byte vendor `ble_ll_chkcrc` hands to `ll_scan_rx`. On the
+    /// board it equals `(BB+0x30 >> 15) as i8` (field `bits[22:15]`, no
+    /// calibration), matching cnlohr's iSLER; the V2.20 `BLE_ReadRssi`
+    /// helper in `bb.o` shifts by 12 and does not reproduce it.
+    ///
+    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — exactly the
+    /// bit vendor `ble_ll_chkcrc` returns as its CRC status (`(BB+0x38 >> 5)
+    /// & 1`), not a software threshold.
     Done { len: u8, rssi: i8, crc_ok: bool },
 }
 
@@ -407,7 +413,7 @@ impl Ch573Radio {
             regs::rmw(RFEND_BASE, rfend::CFG50, 0x0000_f000, 0x0000_4000);
             regs::rmw(RFEND_BASE, rfend::CFG54, 0xf, 0xc);
             regs::rmw(RFEND_BASE, rfend::CFG54, 0, 0x80);
-            regs::rmw(RFEND_BASE, rfend::CFG54, 0x0000_1000, 0);
+            regs::rmw(RFEND_BASE, rfend::CFG54, 0x0001_0000, 0);
 
             // +0x3c
             regs::rmw(RFEND_BASE, 0x3c, 0x0000_f000, 0x0000_8000);
@@ -428,7 +434,7 @@ impl Ch573Radio {
             regs::rmw(RFEND_BASE, rfend::CFG30, 0x7000_0000, 0x5000_0000);
 
             // +0x38
-            regs::rmw(RFEND_BASE, rfend::CFG38, 0x0038_0000, 0x0018_0000);
+            regs::rmw(RFEND_BASE, rfend::CFG38, 0x00f8_0000, 0x0018_0000);
             regs::rmw(RFEND_BASE, rfend::CFG38, 0, 0x8000_0000);
 
             for _ in 0..100 {
@@ -680,7 +686,8 @@ impl Ch573Radio {
                     }
                 }
                 let code = regs::read(RFEND_BASE, MEAS) & 0xf;
-                regs::rmw(RFEND_BASE, rfend::TUNE, 0x1000, 0);
+                // Stop the ADC sample: vendor clears TUNE bit16, not bit12.
+                regs::rmw(RFEND_BASE, rfend::TUNE, rfend::TUNE_RXADC, 0);
                 if code != 0xf {
                     nonzero += 1;
                 }
@@ -703,7 +710,7 @@ impl Ch573Radio {
             } else {
                 min
             };
-            regs::rmw(RFEND_BASE, rfend::CFG58, 0x781, code << 7);
+            regs::rmw(RFEND_BASE, rfend::CFG58, 0x780, code << 7);
         }
         Ok(())
     }
@@ -716,7 +723,7 @@ impl Ch573Radio {
     }
 
     /// Buffer offset of the RSSI byte: vendor `ble_ll_chkcrc` finds the status
-    /// word at `(len + 5) & 0x1fc` and the RSSI right after it.
+    /// word at `(len + 5) & 0x1fc` and copies the byte right after it as RSSI.
     fn rx_rssi_off(len: u8) -> usize {
         ((len as usize + 5) & 0x1fc) + 2
     }
@@ -751,6 +758,13 @@ impl Ch573Radio {
                 // the reads above, so the earlier `bb` could predate its CRC.
                 let bb = regs::read(BB_BASE, bb::IRQSTAT);
                 let crc_ok = bb & BB_CRC_ERR == 0;
+                // Publish for the `Radio::rssi`/`crc_ok` accessors on both the
+                // ISR and the poll path.
+                let bb30 = regs::read(BB_BASE, bb::RSSICFO);
+                isr::RSSI.store(rssi, core::sync::atomic::Ordering::Relaxed);
+                isr::CRC_OK.store(crc_ok, core::sync::atomic::Ordering::Relaxed);
+                isr::BB_DONE.store(bb, core::sync::atomic::Ordering::Relaxed);
+                isr::BB30_DONE.store(bb30, core::sync::atomic::Ordering::Relaxed);
                 // Vendor-style whole-word `~mask` clear: ones leave the other
                 // bits alone, so a bit that asserts after the read survives.
                 regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
@@ -826,6 +840,9 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
+    /// Raw `BB+0x38` / `BB+0x30` sampled at the RX_DONE behind the result.
+    pub static BB_DONE: AtomicU32 = AtomicU32::new(0);
+    pub static BB30_DONE: AtomicU32 = AtomicU32::new(0);
     /// Bit9 kicks observed so far, so callers can tell a real kick apart.
     pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
     /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
@@ -1029,6 +1046,16 @@ pub fn irq_entries() -> u32 {
 /// SysTick count captured when the ISR last reported RX `Done`.
 pub fn rx_done_ticks() -> u32 {
     isr::RX_DONE_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raw `BB+0x38` sampled at the last RX `Done` (before the clear).
+pub fn rx_bb_stat() -> u32 {
+    isr::BB_DONE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raw `BB+0x30` sampled at the last RX `Done`; `rssi` is `>> 15 as i8`.
+pub fn rx_bb30() -> u32 {
+    isr::BB30_DONE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// SysTick count captured at the last TX baseband kick (LLE bit9).
@@ -1388,7 +1415,8 @@ impl Radio for Ch573Radio {
             regs::rmw(BB_BASE, bb::RFCTRL, 0, rfctrl::INIT_BIT28);
             // RX PHY cfg: clear bits[26:25]/[23:16], keep bit24, set bit29.
             regs::rmw(BB_BASE, bb::RXCFG18, 0xf900_0000, 0x2000_0000);
-            regs::rmw(BB_BASE, bb::RXCFG18, 0x7d, 0x18);
+            // Vendor `ble_ll_hw_api_rx` preserves RXCFG18 bit0 (mask 0x7c).
+            regs::rmw(BB_BASE, bb::RXCFG18, 0x7c, 0x18);
             // BLE RX runs in channel-number mode.
             regs::rmw(RFEND_BASE, rfend::FREQMODE, rfend::FREQMODE_EN, 0);
             // Vendor BLE RX uses TX's 0x1f AA/CRC cfg, not `RF_Rx`'s 0x1e.
@@ -1401,7 +1429,8 @@ impl Radio for Ch573Radio {
             isr::BUF.store(rx_ptr as usize, core::sync::atomic::Ordering::Release);
             isr::BUF_LEN.store(rxbuf.len(), core::sync::atomic::Ordering::Release);
             isr::RELOADED.store(false, core::sync::atomic::Ordering::Release);
-            isr::CRC_OK.store(false, core::sync::atomic::Ordering::Release);
+            // Keep RSSI/CRC_OK until the next `Done` so the trait accessors
+            // report the last completed packet; `DONE` alone gates results.
             // A late Done from the previous window must not leak into this one.
             isr::DONE.store(false, core::sync::atomic::Ordering::Release);
             isr::TIMEOUT.store(false, core::sync::atomic::Ordering::Release);
@@ -1430,11 +1459,18 @@ impl Radio for Ch573Radio {
         Ok(())
     }
 
+    /// RSSI of the last packet reported by [`rx_poll`]/[`rx_isr_take`].
+    ///
+    /// This is the DMA RSSI byte, which the board shows to be
+    /// `(BB+0x30 >> 15) as i8` (`bits[22:15]`, no calibration subtraction).
+    /// Vendor `BLE_ReadRssi` in `bb.o` uses `>> 12` instead; that helper does
+    /// not match the received status byte on this part.
     fn rssi(&self) -> i8 {
-        0
+        isr::RSSI.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CRC verdict of the last packet (vendor `ble_ll_chkcrc` bit5 test).
     fn crc_ok(&self) -> bool {
-        false
+        isr::CRC_OK.load(core::sync::atomic::Ordering::Relaxed)
     }
 }

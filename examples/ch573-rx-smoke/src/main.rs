@@ -18,8 +18,8 @@ use defmt_rtt as _;
 use hal::rcc;
 use qingke_rt::entry;
 use wchble::rf::family::ch573::{
-    install_ble_irq, irq_entries, rx_done_ticks, rx_isr_take, tx_kick_count, tx_kick_ticks,
-    Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE,
+    install_ble_irq, irq_entries, rx_bb30, rx_bb_stat, rx_done_ticks, rx_isr_take, tx_kick_count,
+    tx_kick_ticks, Ch573Radio, RxPoll, BB_BASE, CAPS, DMA_BASE, LLE_BASE,
 };
 use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
@@ -39,8 +39,9 @@ const USE_ISR: bool = true;
 const PFIC_BASE: usize = 0xE000_E000;
 
 /// After a received frame, transmit one ADV and report the RX-done → TX-kick
-/// turnaround (SysTick counts / `ticks_per_us`).
-const MEASURE_RX_TX: bool = true;
+/// turnaround (SysTick counts / `ticks_per_us`). Build with
+/// `CH573_RX_NO_TX=1` for passive captures (CRC/RSSI cross-checks).
+const MEASURE_RX_TX: bool = option_env!("CH573_RX_NO_TX").is_none();
 
 /// Minimal ADV_NONCONN_IND carrying the local name `wch573`.
 fn build_adv(out: &mut [u8]) -> usize {
@@ -260,8 +261,8 @@ fn main() -> ! {
             }
 
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} crc={=bool} valid={=bool} timeout={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
-                ch, state, len, rssi, crc_ok, valid, waited, count, isr_delta, tx_kick_count(),
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} crc={=bool} valid={=bool} timeout={=bool} trssi={=i8} tcrc={=bool} bbd={=u32:x} b30d={=u32:x} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, crc_ok, valid, waited, radio.rssi(), radio.crc_ok(), rx_bb_stat(), rx_bb30(), count, isr_delta, tx_kick_count(),
                 turn_us, dma18, bb30, bb38, lle08
             );
             if show_buf {

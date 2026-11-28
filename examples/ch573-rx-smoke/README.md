@@ -68,6 +68,9 @@ kick in µs (`0` = TX failed before the kick, `0xffff` = no kick seen).
 The number includes this example's own register dump and `set_channel`, so it
 is an upper bound for the driver path.
 
+Build with `CH573_RX_NO_TX=1` for a passive receiver (no answer ADV), e.g. for
+the RSSI/CRC comparison against a sniffer.
+
 26 s run, ELF `6c29b94d…`:
 
 | RX window at `Done` | n | µs |
@@ -92,7 +95,7 @@ observations, RSSI −43…−47 dBm), so the RX and TX ISR paths run together.
 Earlier polling run for comparison: 13/13 exact.
 
 ```
-ch38 state=2 len=17 rssi=-99 cnt=0 isr=1 bb38=246f lle08=100000
+ch38 state=2 len=17 rssi=-99 crc=false valid=false timeout=false trssi=-99 tcrc=false bbd=242e b30d=4e8abc cnt=0 isr=1 bb38=246f lle08=100000
 buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, …]
 ```
 
@@ -113,7 +116,10 @@ had impossible lengths (53/61/102/114/164/224…).
 ### CRC status (`crc=`, `valid=`)
 
 `RxPoll::Done` carries `crc_ok`, sampled from `BB+0x38` bit5 after `RX_DONE`
-is seen — the bit the vendor's `ble_ll_chkcrc` tests. Following the vendor's
+is seen. This is exactly the vendor predicate, not a software threshold:
+`ble_ll_chkcrc` (`ip.o`, `.highcode+0xd8`, LIB V2.20) loads `BB+0x38`,
+shifts right 5, masks bit0 and returns 1 when it is set (CRC error) before
+reading any payload byte. Following the vendor's
 whole-word `~mask` writes on this register (the timer clear is `~0x2`), the
 handler only clears the bits it consumes (`!payload`, or `!payload & ~crc`)
 and never writes a stale snapshot over a bit that asserts later. Whole-register
@@ -160,11 +166,69 @@ this example answers on `crc_ok && len <= 37`; the wrong-init run also had
 5 non-name ambient `valid=true` `Done`, so these runs do not establish the
 gate for arbitrary frames.
 
-Still open: RSSI comes from the status word; cnlohr's iSLER reads
-`BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
+RSSI is the DMA byte at `((len + 5) & 0x1fc) + 2`, read by vendor
+`ble_ll_chkcrc` and copied straight into the scan-report `rssi` as a signed
+byte by `ll_scan_rx` / `ll_scan_add_advertising_to_report`. The board pins the
+register field: across 768 logged `Done` lines (pre-existing runs, 2026-11-28)
+`rssi` equals `(BB+0x30 >> 15) as u8 as i8` in 759 cases; the 9 exceptions
+are stale `BB+0x30` samples (the log reads it after the ISR, and it can hold a
+later frame). So the field is `bits[22:15]`, sign-extended, with no calibration
+subtraction — the same `>> 15` cnlohr's iSLER uses. Vendor `BLE_ReadRssi` in
+`bb.o` shifts by 12 instead and does **not** reproduce the received byte; treat
+it as an unrelated/legacy helper, not the packet-RSSI formula. The example logs
+`Radio::rssi()` / `Radio::crc_ok()` as `trssi=` / `tcrc=`; both return the last
+completed packet and track `state=2` lines exactly.
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.
+
+### RSSI/CRC cross-check vs the nRF Sniffer
+
+Controlled source: `examples/ch585-rf-smoke --features adv-ch37` with
+`CH585_RF_SMOKE_TX_POWER=<dBm>` (CH585 stops at +4). `adv-seq` embeds a 16-bit
+counter in a manufacturer AD (`05 ff ff ff seq_lo seq_hi`) and `adv-ch37`
+broadcasts it on ch37 every 20 ms, so board and sniffer can be joined event by
+event. Build this example with `CH573_RX_NO_TX=1` as the passive receiver:
+
+```bash
+cd examples/ch585-rf-smoke
+CH585_RF_SMOKE_TX_POWER=0 cargo build --release --features adv-ch37
+probe-rs download --probe 1a86:8010:F93D8F067E10 --chip CH585 --protocol jtag \
+  --verify --start target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke
+
+cd ../ch573-rx-smoke
+CH573_RX_NO_TX=1 cargo build --release
+probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram \
+  target/riscv32imac-unknown-none-elf/release/ch573-rx-smoke > rtt.log 2>&1 &
+nrfutil ble-sniffer sniff --port /dev/cu.usbmodem21201 --only-advertising \
+  --output-pcap-file cap.pcap
+python3 tools/compare_rssi_crc.py rtt.log cap.pcap --seq-off 23 \
+  --adv-a C1:FF:EE:00:00:02
+```
+
+The counter sits at PDU offset 23; the CH585 random AdvA is
+`C1:FF:EE:00:00:02`. The sniffer's per-record CRC-OK flag is bit0 of the
+metadata byte 9 before the AA (byte 8 is the channel, byte 10 the RSSI
+magnitude); this was cross-checked against `crcgood`/`crcbad!` captures.
+
+### Board RX level vs the sniffer (2026-11-28)
+
+Same CH585 frames at 0 dBm: sniffer −39 dBm, board −91…−99 (median −95, n=16);
+at −20 dBm: sniffer −58, board −87…−93 (median −93, n=3). A round (three 10 ms
+windows) takes ~145 ms here (~7% ch37 duty), so ~60 of the sniffer's 874
+records should land in a window; the board caught 16 (~27%), which fits a true
+level near the sensitivity floor rather than a −39 dBm signal. The sniffer and
+board are not co-located, so this does not separate antenna/placement loss from
+receiver gain. The field itself is vendor-exact: `rssi` equals
+`(BB+0x30 >> 15) as i8` in 102 of 103 sampled `Done`s across these runs (the
+miss is a stale post-ISR register read), and vendor `ll_scan_rx`
+sign-extends the same DMA byte into `gapScanRec_t.rssi`. RFEND/BB init now
+matches the EVT disassembly (CFG54 bit16, RXADC TUNE bit16, CFG38 mask
+`0x00f8_0000`, RXCFG18 mask `0x7c`), with no measured RSSI change. Open:
+`RFEND_SetSensitivity` is exported but never called by `libCH57xBLE.a`, and
+the vendor scan path does not touch `FECTRL` while `shut()` clears bits
+17/20/21. Next check is the WCH EVT Observer on the same board and position.
+
 
 ### CH573 ↔ CH585 interop (both directions)
 

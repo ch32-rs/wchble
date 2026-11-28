@@ -34,8 +34,9 @@ Letter namespaces collide — always qualify them:
   byte-exact against the `ch585-rf-smoke` transmitter plus reported RSSI
   (`examples/ch573-rx-smoke`). The real LLE interrupt works: `install_ble_irq`
   routes IRQ 20/21 through PFIC fast-interrupt slots 2/3 (VTF, RAM entry) and
-  the ISR masks the line when the window ends. `Done` carries a conservative
-  CRC gate, and `RFEND_RXFilter` now replays the vendor `CFG0C` sequence.
+  the ISR masks the line when the window ends. `Done` carries the vendor
+  hardware CRC verdict (`BB+0x38` bit5, the `ble_ll_chkcrc` predicate), and
+  `RFEND_RXFilter` now replays the vendor `CFG0C` sequence.
   `ch573-adv`: legacy broadcaster (`ADV_IND` 37/38/39, 20 ms interval plus
   0–10 ms advDelay, name `wch573`), on air via nRF sniffer and macOS scan.
   TX is polling-only — after the GUARD/COUNT arm it mirrors the vendor bit9
