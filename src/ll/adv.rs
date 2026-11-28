@@ -56,6 +56,11 @@ impl AdvState {
         u32::from(self.interval_slots) * 625
     }
 
+    /// Interval plus the 0–10 ms advDelay, anchored at the event start.
+    pub fn event_interval_us(&self, rand: u16) -> u32 {
+        self.interval_us() + u32::from(rand % 10_001)
+    }
+
     /// Store HCI `LE Set Advertising Data` payload (`len` + bytes).
     pub fn set_adv_data(&mut self, len: u8, bytes: &[u8]) -> bool {
         let n = usize::from(len);
@@ -675,5 +680,22 @@ mod tests {
         assert_eq!(s.build_adv_ext_ind(&mut out, 0), None);
         assert_eq!(s.build_aux_adv_ind(&mut out), None);
         assert!(!s.round_done(0));
+    }
+
+    #[test]
+    fn event_interval_adds_a_bounded_adv_delay() {
+        let mut adv = AdvState::default();
+        adv.interval_slots = 0x20; // 20 ms
+        assert_eq!(adv.event_interval_us(0), 20_000);
+        assert_eq!(adv.event_interval_us(10_000), 30_000);
+        assert_eq!(
+            adv.event_interval_us(10_001),
+            20_000,
+            "delay wraps at 10 ms"
+        );
+        assert_eq!(
+            adv.event_interval_us(u16::MAX),
+            20_000 + u32::from(u16::MAX % 10_001)
+        );
     }
 }
