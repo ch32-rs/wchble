@@ -26,6 +26,7 @@ cargo run --release          # probe 1a86:8010:5CED8F06E1D2, RTT via probe-rs
 
 ```
 rf init ok
+tx_power=0 dBm code=20
 ADV_IND len=19 interval_us=20000 channels=3
 connection not implemented: CONNECT_IND is not answered
 adv round=0 event_us=1608 wait_us=23162 delay_us=21554
@@ -66,11 +67,15 @@ Silicon readback after init (`probe-rs read b32 0x4000c100 1`, RFCTRL
 | `0` | `0x14` | `0x10001427` |
 | `5` | `0x32` | `0x10003227` |
 
-On air, every level decodes with the same PDU/channel timing (nRF sniffer
-captures at 0 / +5 / -20 dBm: 2434 / 1922 / 1938 frames; macOS: 66 / 51 / 67
-sightings). RSSI cannot grade the levels on this bench — the board sits
-centimetres from the receivers, so both the sniffer (≈ −23 dBm) and macOS
-(≈ −40 dBm) saturate.
+On air, every level decodes with the same PDU structure and 3-channel
+rotation (nRF sniffer captures at 0 / +5 / -20 dBm: 2434 / 1922 / 1938 frames;
+macOS: 66 / 51 / 67 sightings). Same-channel medians stay in the P2-A band
+(≈ 21–29 ms) apart from capture gaps. The sniffer also emits duplicate
+records at sub-interval spacing; `adv_stats.py` drops the pairs below 5 ms,
+so treat the interval percentiles as approximate for these captures.
+
+RSSI cannot grade the levels on this bench — the board sits centimetres from
+the receivers, so both the sniffer (≈ −23 dBm) and macOS (≈ −40 dBm) saturate.
 
 ## On-air acceptance
 
