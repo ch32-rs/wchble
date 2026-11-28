@@ -28,7 +28,7 @@ META = 17
 MAX_LEGACY_LEN = 37
 
 
-def read_board(path, seq_off):
+def read_board(path, seq_off, adv_a):
     """Return {(seq, ch): record} and trait-accessor mismatch counts."""
     out = {}
     pending = None
@@ -61,6 +61,8 @@ def read_board(path, seq_off):
                 mismatches["rssi"] += rec["trssi"] != rec["rssi"]
                 mismatches["crc"] += rec["tcrc"] != rec["crc"]
             pdu = bytes(raw[:n])
+            if adv_a is not None and (len(pdu) < 8 or pdu[2:8] not in (adv_a, adv_a[::-1])):
+                continue
             if seq_off is None:
                 key = pdu
             else:
@@ -123,7 +125,7 @@ def main():
     args = ap.parse_args()
 
     adv_a = bytes(int(x, 16) for x in args.adv_a.split(":")) if args.adv_a else None
-    board, mism = read_board(args.log, args.seq_off)
+    board, mism = read_board(args.log, args.seq_off, adv_a)
     sniffer, dup = read_pcap(args.pcap, args.seq_off, adv_a)
 
     print(f"board receptions={len(board)} sniffer records={len(sniffer)} "
