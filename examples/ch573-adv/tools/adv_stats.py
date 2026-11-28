@@ -43,7 +43,7 @@ def read_pcap(path):
         pkt = data[off:off + incl]
         off += incl
         i = pkt.find(AA)
-        if i < 9 or i + 4 + 2 > len(pkt):
+        if i < 12 or i + 4 + 2 > len(pkt):
             continue
         pdu = pkt[i + 4:]
         if len(pdu) < 2 + pdu[1] or pdu[1] > MAX_LEGACY_LEN:
@@ -55,7 +55,8 @@ def read_pcap(path):
                 "txadd": bool(pdu[0] & 0x40),
                 "pdu": pdu[: 2 + pdu[1]],
                 "channel": pkt[i - 8],
-                "rssi": -pkt[i - 12],
+                # RSSI magnitude sits 7 bytes before the AA (protocol v3).
+                "rssi": -pkt[i - 7],
             }
         )
     return frames

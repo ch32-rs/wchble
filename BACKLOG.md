@@ -44,10 +44,19 @@ Letter namespaces collide — always qualify them:
   path was tried and removed: back-to-back channel TX kept the level-held
   BB/LLE lines asserted and stalled the caller for tens of ms. Scope is
   advertising only: no post-TX listen, `CONNECT_IND` unanswered.
-  Still open: RSSI cross-check (`BB+0x30`), per-event CRC truth, the RX
-  interleavings listed in the example README, TX power levels (P2-B), and the
-  rare (few per thousand) skipped PDU when the bit9 kick misses its 500 µs
-  window. Not Trouble/GATT; not Phase 1 closure.
+  `ch573-txpower`: `TxPower` enum plus `Ch573Radio::set_tx_power` mapping the
+  EVT codes (`0x01` -20 dBm … `0x32` +5 dBm) into `RFCTRL[13:8]` with the
+  vendor `AUX_POWER_ADJ` rule and the conditional `RFEND+0x10` mirror. The
+  level is applied by `init()`; changing it on a running radio is not
+  supported (the PA tune is bound to the init level — a post-init switch to
+  a lower level left the output inaudible at 20 cm). RFCTRL readback on
+  silicon: `0x1400`/`0x0100`/`0x3200` for 0/-20/+5 dBm. The PHY/DIR
+  read-modify-writes that shared bits 12–13 with the power field are gone.
+  Still open: quantitative RSSI-vs-level (both receivers saturate at bench
+  distance), RSSI cross-check (`BB+0x30`), per-event CRC truth, the RX
+  interleavings listed in the example README, and the rare (few per thousand)
+  skipped PDU when the bit9 kick misses its 500 µs window. Not Trouble/GATT;
+  not Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle
