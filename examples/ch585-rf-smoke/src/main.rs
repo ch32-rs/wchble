@@ -68,6 +68,36 @@ static RX_LISTEN: StaticCell<DmaBuf<RX_DMA_MIN>> = StaticCell::new();
 #[no_mangle]
 static mut LOG: [u8; 2048] = [0; 2048];
 
+/// CH573 peer advertisement (`wch573`, ADV_NONCONN_IND on random AdvA).
+#[cfg(feature = "peer-rx")]
+const PEER_ADV: [u8; 19] = [
+    0x42, 0x11, 0xc1, 0xff, 0xee, 0x00, 0x00, 0x73, 0x02, 0x01, 0x06, 0x07, 0x09, b'w',
+    b'c', b'h', b'5', b'7', b'3',
+];
+
+/// Peer RX tally kept outside the ring log so a probe read still sees it after
+/// the log wrapped: `u32` count, len, crc, crc failures, then the frame bytes.
+#[no_mangle]
+#[cfg(feature = "peer-rx")]
+static mut PEER: [u8; 32] = [0; 32];
+
+#[cfg(feature = "peer-rx")]
+fn peer_note(buf: &[u8], len: usize, crc_ok: bool) {
+    let n = 2 + len;
+    if n > buf.len() || buf[..n] != PEER_ADV {
+        return;
+    }
+    let p = core::ptr::addr_of_mut!(PEER).cast::<u8>();
+    unsafe {
+        let count = core::ptr::read_unaligned(p.cast::<u32>()).wrapping_add(1);
+        core::ptr::write_unaligned(p.cast::<u32>(), count);
+        *p.add(4) = len as u8;
+        *p.add(5) = crc_ok as u8;
+        *p.add(6) = (*p.add(6)).wrapping_add((!crc_ok) as u8);
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(8), n);
+    }
+}
+
 const LOG_CAP: usize = 2048;
 const LOG_TEXT: usize = LOG_CAP - 4;
 
@@ -158,7 +188,11 @@ fn dump_regs(out: &mut Log) {
 
 /// Minimal ADV_NONCONN_IND: header + AdvA + flags + complete local name "wch585".
 fn build_adv_nonconn_ind(out: &mut [u8; 32]) -> usize {
-    let name = b"wch585";
+    build_adv_name(out, b"wch585")
+}
+
+/// Same ADV_NONCONN_IND shape with a caller-chosen local name.
+fn build_adv_name(out: &mut [u8; 32], name: &[u8]) -> usize {
     // Static random address C1:FF:EE:00:00:02, least-significant byte first.
     let adv_a = [0x02, 0x00, 0x00, 0xEE, 0xFF, 0xC1];
     let mut payload_len = 0usize;
@@ -179,6 +213,34 @@ fn build_adv_nonconn_ind(out: &mut [u8; 32]) -> usize {
     out[1] = payload_len as u8;
     out[2..2 + payload_len].copy_from_slice(&buf[..payload_len]);
     2 + payload_len
+}
+
+/// Known-answer CRC test (`--features crc-test`): transmit `crcgood` with the
+/// advertising CRC init and `crcbad!` with a one-bit-wrong init. Both payloads
+/// are intact, so a receiver must report crc=true only for the first and
+/// crc=false only for the second.
+#[cfg(feature = "crc-test")]
+fn crc_test_loop(radio: &mut Ch585Radio, clock: &UsClock) -> ! {
+    let mut good = [0u8; 32];
+    let mut bad = [0u8; 32];
+    let good_n = build_adv_name(&mut good, b"crcgood");
+    let bad_n = build_adv_name(&mut bad, b"crcbad!");
+    // One init for the whole run (`crc-test-bad` flips it): every frame of
+    // the named type has known ground truth, with no phase-boundary latch
+    // question.
+    let bad_run = cfg!(feature = "crc-test-bad");
+    let (frame, init) = if bad_run {
+        (&bad[..bad_n], ADV_CRC_INIT ^ 0x1)
+    } else {
+        (&good[..good_n], ADV_CRC_INIT)
+    };
+    let _ = radio.set_channel(37);
+    radio.set_aa_crc(ADV_AA, init);
+    clock.delay_us(1_000);
+    loop {
+        let _ = unsafe { radio.tx_basic(clock, frame, 0, None) };
+        clock.delay_us(1_000);
+    }
 }
 
 fn tx_burst(radio: &mut Ch585Radio, clock: &UsClock, out: &mut Log, frame: &[u8]) {
@@ -241,7 +303,10 @@ fn rx_once(
         let st = unsafe { regs::read(LLE_BASE, lle::IRQSTAT) };
         if st & RX_DONE != 0 {
             let crc_ok = mmio(BB_BASE, bb::IRQSTAT) & BB_CRC_ERR == 0;
-            result = Some((usize::from(rxbuf[1]), crc_ok));
+            let len = usize::from(rxbuf[1]);
+            #[cfg(feature = "peer-rx")]
+            peer_note(rxbuf, len, crc_ok);
+            result = Some((len, crc_ok));
             unsafe { regs::write(LLE_BASE, lle::IRQSTAT, RX_DONE) };
             break;
         }
@@ -257,6 +322,17 @@ fn rx_once(
     result
 }
 
+/// Print the DMA RX frame as `[hdr][len][payload]` hex, same shape as the
+/// CH573 `rx-smoke` log so a byte comparison needs no extra parsing.
+fn dump_frame(out: &mut Log, buf: &[u8], len: usize) {
+    let n = (2 + len).min(buf.len());
+    let _ = write!(out, "rx buf");
+    for b in &buf[..n] {
+        let _ = write!(out, " {:02x}", b);
+    }
+    let _ = writeln!(out);
+}
+
 fn rx_listen(
     radio: &mut Ch585Radio,
     clock: &UsClock,
@@ -268,6 +344,8 @@ fn rx_listen(
     match rx_once(radio, clock, rxbuf, 38, window_half_us) {
         Some((len, crc_ok)) => {
             let _ = writeln!(out, "rx listen hit len={} crc={}", len, crc_ok);
+            #[cfg(feature = "peer-rx")]
+            dump_frame(out, rxbuf, len);
         }
         None => {
             let _ = writeln!(out, "rx listen arm-clear");
@@ -625,6 +703,9 @@ fn main() -> ! {
     radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
+    #[cfg(feature = "crc-test")]
+    crc_test_loop(&mut radio, &clock);
+
     let mut frame = [0u8; 32];
     let n = build_adv_nonconn_ind(&mut frame);
     let _ = writeln!(out, "adv len {}", n);
@@ -662,8 +743,17 @@ fn main() -> ! {
             let _ = unsafe { radio.tx_basic(&clock, &rf_frame, 0, None) };
         }
 
-        // Periodically prove the RX path on silicon while the loop runs.
-        if round % 20 == 0 {
+        // `peer-rx` listens on ch37 every round (CH573 -> CH585 interop) and
+        // dumps hits; the default keeps the original periodic smoke listen.
+        if cfg!(feature = "peer-rx") {
+            radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
+            if let Some((len, crc_ok)) =
+                rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 20_000)
+            {
+                let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
+                dump_frame(&mut out, &rx_listen_buf.0[..], len);
+            }
+        } else if round % 20 == 0 {
             radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
             if let Some((len, crc_ok)) =
                 rx_once(&mut radio, &clock, &mut rx_listen_buf.0[..], 37, 10_000)
@@ -671,8 +761,8 @@ fn main() -> ! {
                 let _ = writeln!(out, "rx loop hit len={} crc={}", len, crc_ok);
             }
         }
-
         round = round.wrapping_add(1);
+
         clock.delay_us(100_000);
     }
 }

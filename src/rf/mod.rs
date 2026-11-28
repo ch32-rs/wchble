@@ -105,6 +105,15 @@ pub trait Radio {
     /// the new buffer. If the engine does not idle within the bound it
     /// returns `Err(Busy)` without touching `RXBUFPTR`, so the old buffer's
     /// obligation is unchanged.
+    ///
+    /// Re-arm only from thread context, or from an ISR that cannot preempt the
+    /// BLE interrupt. Masking cannot terminate an ISR that is already running;
+    /// a higher-priority ISR that re-arms here can have the old BLE ISR resume
+    /// and publish into the new window.
+    ///
+    /// On `Err(Busy)` the old buffer's ownership obligation is unchanged.
+    /// Implementations that mask interrupt lines while arming (CH573) return
+    /// with them still masked — the next successful arm re-enables them.
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,

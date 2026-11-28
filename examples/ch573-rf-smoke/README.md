@@ -15,7 +15,8 @@ uses **defmt/RTT**.
 CH573 SRAM is only `@0x20003800..0x20008000` (18 KiB), and the DMA engine
 keeps just the low 14 bits of a pointer, so it only reaches
 `0x20004000..0x20008000`. Buffer pointers are programmed on the **DMA block**
-at `0x4000C000` (`+0x10` TX / `+0x14` RX) as **16-bit offsets from
+at `0x4000C000` (`+0x10` TX / `+0x18` RX; see `examples/ch573-rx-smoke`) as
+**16-bit offsets from
 `0x20000000`** (e.g. `0x20004c20` → `0x4c20`). This example pins its buffers
 in `.dma_buffer` at `0x20004c00`. LLE `+0x78/+0x7c` do **not** stick. Do
 **not** flash this image with the CH585 preflight probe (`F93D8F067E10`).
@@ -74,8 +75,10 @@ with RMW and kicking on bit9 fixes it — same image, no RFEND replay hack:
 - macOS CoreBluetooth: `scan_ch573.swift wch573 25` → 37 observations,
   RSSI ≈ −40..−49 dBm (exit 0).
 
-Calibration note: full `RFEND_RXFilter`/`RFEND_RXAdc` runs in CAL mode after
-TXCtune; `RXFILT` can still time out and does **not** gate TX.
+Calibration note: `RFEND_RXFilter`/`RFEND_RXAdc` run in CAL mode after TXCtune.
+`RFEND_RXFilter` now replays the vendor order, including the second `CFG0C`
+bit4 set after the settle; the boot log reports `rx filter ok=… code=…`
+(`CFG50[4:0]`) and `RFEND 50=… 9c=…`. RX calibration does not gate TX.
 
 ## On-air (nRF sniffer)
 
@@ -83,9 +86,14 @@ TXCtune; `RXFILT` can still time out and does **not** gate TX.
 scan raw traffic and search the capture for the AdvA bytes `c1 ff ee 00 00 73`
 (or the payload string `wch573`).
 
+Byte-exact check (2026-11-27, nRF Sniffer via
+`~/.nrfutil/bin/nrfutil ble-sniffer sniff --port … --output-pcap-file …`):
+25 s run, 8162 PDUs captured, **79 of 79 `wch573` PDUs equal**
+`42 11 c1 ff ee 00 00 73 02 01 06 07 09 77 63 68 35 37 33`, and the board
+logged `tx ch37/38/39 ok` twice. The same image also passes the macOS scan
+(`scan_ch573.swift wch573`, 37 observations earlier).
+
 ## Out of scope (follow-ups)
 
-- **RX hit path** (`rx_basic` is arm-only; no LLE RX-event handling yet).
-- `RFEND_RXFilter` occasionally times out; TX does not depend on it.
-- A real LLE IRQ handler instead of the tight poll kick.
+- RX hit path lives in `examples/ch573-rx-smoke` (`rx_basic` here is arm-only).
 - `.dma_buffer` placement (currently `RAM_END - 0x3400`).

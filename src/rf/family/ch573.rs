@@ -53,14 +53,20 @@ pub const SRAM_END: usize = 0x2000_8000;
 
 use Certainty::FromClosedDisasm as Disasm;
 
-/// DMA-block offsets (`dma.o` / `RF_Tx` / `RF_Rx`).
+/// DMA-block offsets (`dma.o` / `RF_Tx` / `RF_Rx` / `ll_scan`).
+///
+/// `DMA_DevInit` seeds `+0x10/+0x14` from `gBleIPPara[0x14]` and
+/// `+0x18/+0x1c` from `gBleIPPara[0x18]`; `llScanCreateCore` shows `[0x14]` is
+/// the TX buffer and `[0x18]` the RX buffer the stack parses.
 mod dma_reg {
     pub const CTRL: usize = 0x00;
     pub const CFG08: usize = 0x08;
     pub const CFG0C: usize = 0x0c;
     pub const TXBUFPTR: usize = 0x10;
-    pub const RXBUFPTR: usize = 0x14;
-    pub const AUX18: usize = 0x18;
+    /// BLE stack TX buffer (`ll_scan` SCAN_REQ / `ll_slave` data TX).
+    pub const TXBUFPTR_ALT: usize = 0x14;
+    /// BLE stack RX buffer — where received PDUs land.
+    pub const RXBUFPTR: usize = 0x18;
     pub const AUX1C: usize = 0x1c;
 }
 
@@ -147,7 +153,38 @@ pub struct Ch573Radio {
     isr: IsrState,
     rx_dma: *mut u8,
     rx_dma_len: usize,
+    /// Caller buffer armed by the current RX window.
+    rx_buf: *mut u8,
+    rx_buf_len: usize,
+    /// `BB_IRQLibHandler` reloads `LLE+0x60` once per window.
+    rx_reloaded: bool,
+    /// `FILTMEAS[4:0]` that `RFEND_RXFilter` wrote into `CFG50`.
+    rx_filter_code: u8,
+    /// Whether `RFEND_RXFilter` saw the measurement-ready bit.
+    rx_filter_ok: bool,
 }
+
+/// Result of servicing an armed RX window with [`Ch573Radio::rx_poll`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxPoll {
+    /// Still listening; poll again.
+    Armed,
+    /// The window drained without a PDU.
+    Timeout,
+    /// A PDU completed; `len` is the PDU length byte, `rssi` in dBm.
+    ///
+    /// `crc_ok` is `BB+0x38` bit5 sampled when `RX_DONE` is seen — the same
+    /// bit the vendor's `ble_ll_chkcrc` tests. The gate is conservative: it
+    /// can reject weak-signal frames whose CRC the sniffer accepts.
+    Done { len: u8, rssi: i8, crc_ok: bool },
+}
+
+/// `BB+0x38` events the vendor `BB_IRQLibHandler` serves.
+const BB_PAYLOAD_EVENT: u32 = 0x40;
+const BB_TIMER1_EVENT: u32 = 0x02;
+const BB_TIMER2_EVENT: u32 = 0x10;
+/// Sticky CRC-error flag; `ble_ll_chkcrc` tests `(BB+0x38 >> 5) & 1`.
+const BB_CRC_ERR: u32 = 0x20;
 
 // Soft state only; MMIO runs through fixed bases.
 unsafe impl Send for Ch573Radio {}
@@ -170,6 +207,11 @@ impl Ch573Radio {
             isr: IsrState::default(),
             rx_dma: rx_dma.as_mut_ptr(),
             rx_dma_len: rx_dma.len(),
+            rx_buf: core::ptr::null_mut(),
+            rx_buf_len: 0,
+            rx_reloaded: false,
+            rx_filter_code: 0,
+            rx_filter_ok: false,
         })
     }
 
@@ -186,14 +228,14 @@ impl Ch573Radio {
 
     /// `DMA_DevInit` enables + seed RX/TX ptrs (`dma.o`).
     ///
-    /// EVT seeds +0x10/+0x14 from `gBleIPPara` buffers; we point both at the
-    /// owned RX scratch until TX programs `+0x10` per packet.
+    /// EVT seeds +0x10/+0x14 and +0x18/+0x1c from `gBleIPPara` buffers; we
+    /// point all four at the owned RX scratch until per-transfer programming.
     fn dma_dev_init(&mut self) {
         let off = Self::dma_off(self.rx_dma as usize);
         unsafe {
             regs::write(DMA_BASE, dma_reg::TXBUFPTR, off);
+            regs::write(DMA_BASE, dma_reg::TXBUFPTR_ALT, off);
             regs::write(DMA_BASE, dma_reg::RXBUFPTR, off);
-            regs::write(DMA_BASE, dma_reg::AUX18, off);
             regs::write(DMA_BASE, dma_reg::AUX1C, off);
             // OR enables in EVT order: +0x08/+0x0c |= 0x2000, then |= 0x1000;
             // +0x00 |= 0x02 then |= 0x20.
@@ -317,12 +359,13 @@ impl Ch573Radio {
 
     fn engine_stop(&mut self) {
         unsafe {
+            // EVT `ble_ll_hw_api_shut`/`RF_Rx`: drop the mode direction bits,
+            // request a forced stop, then wait for the engine to report idle.
             regs::rmw(LLE_BASE, lle::MODE, lle_mode::DIR_MASK, 0);
             regs::rmw(LLE_BASE, lle::CMD, 0, lle_cmd::FORCE_STOP);
-            // EVT spins until the stop command self-clears; bail out bounded
-            // so an idle engine (already clear) costs nothing.
-            for _ in 0..1_000 {
-                if regs::read(LLE_BASE, lle::CMD) & lle_cmd::FORCE_STOP == 0 {
+            for _ in 0..10_000 {
+                let cmd = regs::read(LLE_BASE, lle::CMD);
+                if cmd & (lle_cmd::BUSY_MASK | lle_cmd::FORCE_STOP) == 0 {
                     break;
                 }
             }
@@ -490,20 +533,36 @@ impl Ch573Radio {
             for _ in 0..4 {
                 core::hint::spin_loop();
             }
+            // Vendor sets CFG0C bit4 a second time after the settle and leaves
+            // it set; without it the measurement code is not stable.
+            regs::rmw(RFEND_BASE, rfend::CFG0C, 0, 0x10);
             // EVT sets TUNE bit12 and never clears it.
             regs::rmw(RFEND_BASE, rfend::TUNE, 0, 0x1000);
             let start = clock.now_us();
             while regs::read(RFEND_BASE, rfend::FILTMEAS) & rfend::FILTMEAS_RDY == 0 {
                 if clock.now_us().wrapping_sub(start) >= 200_000 {
+                    self.rx_filter_ok = false;
                     return Err(Error::Timeout);
                 }
             }
             regs::rmw(RFEND_BASE, rfend::CFG50, 0, rfend::CFG50_FILT_EN);
             let code = regs::read(RFEND_BASE, rfend::FILTMEAS);
             regs::rmw(RFEND_BASE, rfend::CFG50, 0x1f, code & rfend::FILTMEAS_MASK);
+            self.rx_filter_code = (code & rfend::FILTMEAS_MASK) as u8;
             regs::rmw(RFEND_BASE, rfend::FECTRL, rfend::FECTRL_RXFILT, 0);
         }
+        self.rx_filter_ok = true;
         Ok(())
+    }
+
+    /// `CFG50[4:0]` written by the last `RFEND_RXFilter`.
+    pub fn rx_filter_code(&self) -> u8 {
+        self.rx_filter_code
+    }
+
+    /// Whether the last `RFEND_RXFilter` reached the ready bit.
+    pub fn rx_filter_calibrated(&self) -> bool {
+        self.rx_filter_ok
     }
 
     /// `RFEND_RXAdc` (`rfend.o`, `gModeAdc == 0`): min ADC code into
@@ -553,6 +612,401 @@ impl Ch573Radio {
             regs::rmw(RFEND_BASE, rfend::CFG58, 0x781, code << 7);
         }
         Ok(())
+    }
+
+    /// `BB_IRQLibHandler` reload value: the payload window grows with the
+    /// buffer (`(maxlen + 7) << 4`, EVT `RF_Rx` / `ble_ll_hw_api_rx`).
+    fn rx_reload_count(buf_len: usize) -> u32 {
+        let max_payload = buf_len.saturating_sub(8).min(0xff) as u32;
+        ((max_payload.max(18) + 7) << 4).max(0x1b8)
+    }
+
+    /// Buffer offset of the RSSI byte: vendor `ble_ll_chkcrc` finds the status
+    /// word at `(len + 5) & 0x1fc` and the RSSI right after it.
+    fn rx_rssi_off(len: u8) -> usize {
+        ((len as usize + 5) & 0x1fc) + 2
+    }
+
+    /// Service BB/LLE flags for the window at `buf` and report its state.
+    ///
+    /// Mirrors EVT `BB_IRQLibHandler` plus the LLE RX branch. The BB payload
+    /// event reloads `LLE+0x60`; without that reload the engine never DMAs the
+    /// PDU, so this must run repeatedly while a window is open.
+    unsafe fn service_window(buf: *mut u8, buf_len: usize, reloaded: &mut bool) -> RxPoll {
+        unsafe {
+            // LLE first, then BB: if a frame completes between the two reads,
+            // the BB sample still carries that frame's final CRC bit.
+            let st = regs::read(LLE_BASE, lle::IRQSTAT);
+            let bb = regs::read(BB_BASE, bb::IRQSTAT);
+            if st & lle_irq::RX_DONE != 0 {
+                // Read the PDU before clearing: once RX_DONE drops the engine
+                // may start writing the next frame into the same buffer.
+                let (len, rssi) = if buf.is_null() {
+                    (0, 0)
+                } else {
+                    let len = core::ptr::read_volatile(buf.add(1));
+                    let off = Self::rx_rssi_off(len);
+                    let rssi = if off < buf_len {
+                        core::ptr::read_volatile(buf.add(off)) as i8
+                    } else {
+                        0
+                    };
+                    (len, rssi)
+                };
+                // Sample a fresh word: the frame may have completed between
+                // the reads above, so the earlier `bb` could predate its CRC.
+                let bb = regs::read(BB_BASE, bb::IRQSTAT);
+                let crc_ok = bb & BB_CRC_ERR == 0;
+                // Vendor-style whole-word `~mask` clear: ones leave the other
+                // bits alone, so a bit that asserts after the read survives.
+                regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
+                Self::clear_lle_irq(0xffff);
+                return RxPoll::Done { len, rssi, crc_ok };
+            }
+            if bb & BB_PAYLOAD_EVENT != 0 {
+                // Clear only the payload event: this driver samples the CRC
+                // bit at RX_DONE, and a snapshot-based write could clear a
+                // CRC error that asserts before the write lands.
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_PAYLOAD_EVENT);
+                if !*reloaded {
+                    regs::write(LLE_BASE, LLE_COUNT, Self::rx_reload_count(buf_len));
+                    *reloaded = true;
+                }
+            }
+            if bb & BB_TIMER1_EVENT != 0 {
+                // EVT parks the engine in RX briefly (`0x45`) on this timer.
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_TIMER1_EVENT);
+                for _ in 0..24 {
+                    core::hint::spin_loop();
+                }
+                regs::write(LLE_BASE, lle::MODE, 0x45);
+            }
+            if bb & BB_TIMER2_EVENT != 0 {
+                regs::write(BB_BASE, bb::IRQSTAT, !BB_TIMER2_EVENT);
+                regs::write(LLE_BASE, lle::MODE, 0);
+            }
+
+            if regs::read(LLE_BASE, LLE_COUNT) == 0 {
+                return RxPoll::Timeout;
+            }
+        }
+        RxPoll::Armed
+    }
+
+    /// Poll variant of [`Self::service_window`] for the window armed last.
+    ///
+    /// Either poll or [`rx_isr_take`], never both: the ISR shares the same
+    /// window state. Do not call from an ISR of higher priority than BLE.
+    pub unsafe fn rx_poll(&mut self) -> RxPoll {
+        let state =
+            unsafe { Self::service_window(self.rx_buf, self.rx_buf_len, &mut self.rx_reloaded) };
+        if state != RxPoll::Armed {
+            isr::armed_store(false);
+        }
+        state
+    }
+}
+
+/// Interrupt-path state for [`ble_isr`].
+///
+/// Only the ISR touches the MMIO; `rx_basic` publishes the buffer and the
+/// main loop drains results with [`rx_isr_take`]. Do not mix with `rx_poll`
+/// on the same window.
+mod isr {
+    use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+
+    pub const IDLE: u8 = 0;
+    pub const RX: u8 = 1;
+    pub const TX: u8 = 2;
+
+    /// Set by [`install_ble_irq`]; until then the polled paths are used.
+    pub static INSTALLED: AtomicBool = AtomicBool::new(false);
+    pub static MODE: AtomicU8 = AtomicU8::new(IDLE);
+    pub static ARMED: AtomicBool = AtomicBool::new(false);
+    pub static BUSY: AtomicBool = AtomicBool::new(false);
+    pub static BUF: AtomicUsize = AtomicUsize::new(0);
+    pub static BUF_LEN: AtomicUsize = AtomicUsize::new(0);
+    pub static RELOADED: AtomicBool = AtomicBool::new(false);
+    /// CRC status sampled at RX_DONE.
+    pub static CRC_OK: AtomicBool = AtomicBool::new(false);
+    pub static DONE: AtomicBool = AtomicBool::new(false);
+    pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
+    pub static LEN: AtomicU8 = AtomicU8::new(0);
+    pub static RSSI: AtomicI8 = AtomicI8::new(0);
+    pub static TX_KICKED: AtomicBool = AtomicBool::new(false);
+    pub static TX_DONE: AtomicBool = AtomicBool::new(false);
+    /// Bit9 kicks serviced so far, so callers can tell a real kick apart.
+    pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
+    /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
+    pub static RX_DONE_TICKS: AtomicU32 = AtomicU32::new(0);
+    pub static TX_KICK_TICKS: AtomicU32 = AtomicU32::new(0);
+    /// Every `ble_isr` entry, including ones that find no window armed.
+    pub static ENTRIES: AtomicU32 = AtomicU32::new(0);
+
+    pub fn entries_add() {
+        ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn armed_store(on: bool) {
+        ARMED.store(on, Ordering::Release);
+    }
+}
+
+/// PFIC base and interrupt-reset register (word 0 covers IRQs 0..31).
+const PFIC_BASE: usize = 0xE000_E000;
+const PFIC_ITHRESDR: usize = 0x004;
+const PFIC_IRER: usize = 0x180;
+const PFIC_IENR: usize = 0x100;
+const PFIC_IPRR: usize = 0x280;
+/// V3A SysTick free-running down-counter (ticks at HCLK).
+const SYSTICK_CNTL: usize = 0xE000_F004;
+
+fn now_ticks() -> u32 {
+    unsafe { regs::read(SYSTICK_CNTL, 0) }
+}
+
+/// Mask both BLE lines. Once the window is over the LLE line stays asserted
+/// by engine state (`LLE+0x08` bit14 / `TICK_CLR`) until the engine stops, so
+/// the ISR has to quiet it instead of spinning on it.
+///
+/// Same sequence as vendor `PFIC_DisableIRQ`: park the threshold, write
+/// `IRER`, restore it, then `fence.i` so the mask is visible.
+unsafe fn mask_ble_lines() {
+    unsafe {
+        let thr = regs::read(PFIC_BASE, PFIC_ITHRESDR);
+        regs::write(PFIC_BASE, PFIC_ITHRESDR, 0x10);
+        regs::write(PFIC_BASE, PFIC_IRER, (1 << 21) | (1 << 20));
+        regs::write(PFIC_BASE, PFIC_ITHRESDR, thr);
+        core::arch::asm!("fence.i", options(nostack, preserves_flags));
+    }
+}
+
+/// Unmask both BLE lines for the window just armed. Only called when
+/// [`install_ble_irq`] has routed them through the VTF slots.
+unsafe fn unmask_ble_lines() {
+    unsafe { regs::write(PFIC_BASE, PFIC_IENR, (1 << 21) | (1 << 20)) };
+}
+
+/// `LLE_IRQLibHandler` kick: start the baseband when the LLE asks (bit9).
+const TX_ARM_EVENT: u32 = 0x200;
+
+unsafe fn tx_kick() {
+    unsafe {
+        regs::write(LLE_BASE, LLE_COUNT, 0x190);
+        regs::rmw(BB_BASE, bb::AUTOCFG, 0x3, 0x2);
+        regs::rmw(BB_BASE, bb::RFCTRL, 0, 0x1000_0000);
+    }
+}
+
+/// Service an armed TX window (bit9 kick, then TX_DONE).
+///
+/// Runs under the same BUSY guard as the RX path; `tx_basic` is blocking, so
+/// only one direction is ever armed.
+fn tx_isr() {
+    use core::sync::atomic::Ordering;
+
+    if isr::BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        let st = regs::read(LLE_BASE, lle::IRQSTAT);
+        // Kick once per window: the LLE can leave bit9 asserted until the
+        // baseband reports done, and re-kicking from a level-triggered line
+        // just starves the caller.
+        if st & TX_ARM_EVENT != 0 && !isr::TX_KICKED.load(Ordering::Relaxed) {
+            tx_kick();
+            Ch573Radio::clear_lle_irq(TX_ARM_EVENT);
+            isr::TX_KICK_TICKS.store(now_ticks(), Ordering::Relaxed);
+            isr::TX_KICKS.fetch_add(1, Ordering::Relaxed);
+            isr::TX_KICKED.store(true, Ordering::Release);
+        }
+        let st = regs::read(LLE_BASE, lle::IRQSTAT);
+        if st & lle_irq::TX_DONE != 0 {
+            Ch573Radio::clear_lle_irq(lle_irq::TX_DONE);
+            mask_ble_lines();
+            isr::TX_DONE.store(true, Ordering::Release);
+        }
+    }
+    isr::BUSY.store(false, Ordering::Release);
+}
+
+/// Service the BLE IP from a `BLEB` (20) / `BLEL` (21) interrupt handler.
+///
+/// Cheap to call from both handlers: a second entry returns immediately and
+/// the still-asserted PFIC line re-fires once the first one finishes. Only
+/// windows armed by `rx_basic` are serviced. On `Done`/`Timeout` the handler
+/// masks both lines itself; the caller re-enables them before the next window.
+pub fn ble_isr() {
+    use core::sync::atomic::Ordering;
+
+    isr::entries_add();
+    match isr::MODE.load(Ordering::Acquire) {
+        isr::TX => {
+            tx_isr();
+            return;
+        }
+        isr::RX => {}
+        _ => {
+            unsafe { mask_ble_lines() };
+            return;
+        }
+    }
+    if !isr::ARMED.load(Ordering::Acquire) {
+        unsafe { mask_ble_lines() };
+        return;
+    }
+    if isr::BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let buf = isr::BUF.load(Ordering::Relaxed) as *mut u8;
+    let buf_len = isr::BUF_LEN.load(Ordering::Relaxed);
+    let mut reloaded = isr::RELOADED.load(Ordering::Relaxed);
+    // SAFETY: `rx_basic` published this buffer and only one handler runs.
+    let state = unsafe {
+        let state = Ch573Radio::service_window(buf, buf_len, &mut reloaded);
+        if state == RxPoll::Armed {
+            // The LLE line is level-held by every low flag, and RX windows
+            // leave engine bits (e.g. 0x200) set; keep only RX_DONE pending.
+            Ch573Radio::clear_lle_irq(0xfffe);
+        }
+        state
+    };
+    isr::RELOADED.store(reloaded, Ordering::Relaxed);
+    match state {
+        RxPoll::Armed => {}
+        RxPoll::Timeout => {
+            unsafe { mask_ble_lines() };
+            isr::armed_store(false);
+            isr::TIMEOUT.store(true, Ordering::Release);
+        }
+        RxPoll::Done { len, rssi, crc_ok } => {
+            unsafe { mask_ble_lines() };
+            isr::LEN.store(len, Ordering::Relaxed);
+            isr::RSSI.store(rssi, Ordering::Relaxed);
+            isr::CRC_OK.store(crc_ok, Ordering::Relaxed);
+            isr::RX_DONE_TICKS.store(now_ticks(), Ordering::Relaxed);
+            isr::armed_store(false);
+            isr::DONE.store(true, Ordering::Release);
+        }
+    }
+    isr::BUSY.store(false, Ordering::Release);
+}
+
+// Fast-interrupt entry installed by `install_ble_irq`. The VTF path does no
+// hardware register stacking (see `LLE_IRQLibFunction` in `lle.o`), so this
+// saves every caller-saved register before calling `ble_isr` and `mret`s.
+core::arch::global_asm!(
+    r#"
+    .section .highcode, "ax"
+    .align 2
+    .global __wchble_ch573_ble_vtf
+    .type __wchble_ch573_ble_vtf, @function
+__wchble_ch573_ble_vtf:
+    addi sp, sp, -64
+    sw   ra, 60(sp)
+    sw   t0, 56(sp)
+    sw   t1, 52(sp)
+    sw   t2, 48(sp)
+    sw   a0, 44(sp)
+    sw   a1, 40(sp)
+    sw   a2, 36(sp)
+    sw   a3, 32(sp)
+    sw   a4, 28(sp)
+    sw   a5, 24(sp)
+    sw   a6, 20(sp)
+    sw   a7, 16(sp)
+    sw   t3, 12(sp)
+    sw   t4,  8(sp)
+    sw   t5,  4(sp)
+    sw   t6,  0(sp)
+    call __wchble_ch573_ble_vtf_body
+    lw   ra, 60(sp)
+    lw   t0, 56(sp)
+    lw   t1, 52(sp)
+    lw   t2, 48(sp)
+    lw   a0, 44(sp)
+    lw   a1, 40(sp)
+    lw   a2, 36(sp)
+    lw   a3, 32(sp)
+    lw   a4, 28(sp)
+    lw   a5, 24(sp)
+    lw   a6, 20(sp)
+    lw   a7, 16(sp)
+    lw   t3, 12(sp)
+    lw   t4,  8(sp)
+    lw   t5,  4(sp)
+    lw   t6,  0(sp)
+    addi sp, sp, 64
+    mret
+"#
+);
+
+#[unsafe(no_mangle)]
+extern "C" fn __wchble_ch573_ble_vtf_body() {
+    ble_isr();
+}
+
+extern "C" {
+    fn __wchble_ch573_ble_vtf();
+}
+
+/// Route BLE IRQ 20/21 through PFIC fast-interrupt slots 2/3.
+///
+/// Mirrors `PFIC_FastINT2CFG`/`PFIC_FastINT3CFG`, which the vendor library
+/// calls from `LLE_DevInit`/`BB_DevInit`. The entry must live in RAM, so the
+/// final binary needs the `highcode` feature. Without this the LLE line
+/// re-enters forever while `LLE+0x08` low bits read zero.
+///
+/// # Safety
+/// Call once per boot, before enabling the BLE interrupts.
+pub unsafe fn install_ble_irq() {
+    let addr = __wchble_ch573_ble_vtf as *const () as usize as u32;
+    unsafe {
+        regs::write(PFIC_BASE, 0x44, addr & 0xF000_0000);
+        regs::write(PFIC_BASE, 0x68, (21 << 24) | (addr & 0x000F_FFFF));
+        regs::write(PFIC_BASE, 0x6c, (20 << 24) | (addr & 0x000F_FFFF));
+    }
+    isr::INSTALLED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Number of [`ble_isr`] entries so far (diagnostics; wraps).
+pub fn irq_entries() -> u32 {
+    isr::ENTRIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// SysTick count captured when the ISR last reported RX `Done`.
+pub fn rx_done_ticks() -> u32 {
+    isr::RX_DONE_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// SysTick count captured at the last TX baseband kick (LLE bit9).
+pub fn tx_kick_ticks() -> u32 {
+    isr::TX_KICK_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of bit9 TX kicks serviced by the ISR so far (diagnostics; wraps).
+pub fn tx_kick_count() -> u32 {
+    isr::TX_KICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Take a result produced by [`ble_isr`], clearing it.
+///
+/// The next `rx_basic` discards an unconsumed result; take before re-arming.
+/// Do not mix with [`Ch573Radio::rx_poll`] on the same window. Thread context
+/// only; see `rx_basic` for the re-arm constraint.
+pub fn rx_isr_take() -> Option<RxPoll> {
+    use core::sync::atomic::Ordering;
+
+    if isr::DONE.swap(false, Ordering::AcqRel) {
+        Some(RxPoll::Done {
+            len: isr::LEN.load(Ordering::Relaxed),
+            rssi: isr::RSSI.load(Ordering::Relaxed),
+            crc_ok: isr::CRC_OK.load(Ordering::Relaxed),
+        })
+    } else if isr::TIMEOUT.swap(false, Ordering::AcqRel) {
+        Some(RxPoll::Timeout)
+    } else {
+        None
     }
 }
 
@@ -615,6 +1069,10 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::MODE, 0);
         }
         self.isr.clear_rx_flags();
+        self.rx_buf = core::ptr::null_mut();
+        self.rx_buf_len = 0;
+        self.rx_reloaded = false;
+        isr::armed_store(false);
     }
 
     fn set_channel(&mut self, channel: Channel) -> Result<()> {
@@ -668,8 +1126,9 @@ impl Radio for Ch573Radio {
         if self.channel > 39 {
             return Err(Error::InvalidState);
         }
-        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
-        if busy != 0 {
+        // The engine may still be finishing an RX window; stop it first.
+        self.engine_stop();
+        if unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
             return Err(Error::Busy);
         }
 
@@ -689,7 +1148,6 @@ impl Radio for Ch573Radio {
             tx_ptr = self.rx_dma;
         }
 
-        self.engine_stop();
         Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
 
         self.program_channel(self.channel);
@@ -752,10 +1210,40 @@ impl Radio for Ch573Radio {
             regs::write(LLE_BASE, lle::CMD, 0x2);
         }
 
-        // `LLE_IRQLibHandler` kicks the baseband on LLE IRQ bit9 (`0x200`)
-        // with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28. Mirror that from a
-        // tight poll; the window is short, so give up after 500 µs.
-        const TX_ARM_EVENT: u32 = 0x200;
+        if isr::INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
+            use core::sync::atomic::Ordering;
+            // The VTF handler does the bit9 kick and reports TX_DONE; this
+            // thread only waits, so there is no 500 µs poll on the hot path.
+            isr::TX_KICKED.store(false, Ordering::Release);
+            isr::TX_DONE.store(false, Ordering::Release);
+            isr::MODE.store(isr::TX, Ordering::Release);
+            unsafe { unmask_ble_lines() };
+            let deadline = clock
+                .now_us()
+                .wrapping_add((hw_window / 2).saturating_add(2_000));
+            let mut ok = false;
+            loop {
+                if isr::TX_DONE.load(Ordering::Acquire) {
+                    ok = true;
+                    break;
+                }
+                if clock.now_us().wrapping_sub(deadline) as i32 >= 0 {
+                    break;
+                }
+            }
+            unsafe {
+                mask_ble_lines();
+                isr::MODE.store(isr::IDLE, Ordering::Release);
+            }
+            self.engine_stop();
+            Self::clear_lle_irq(lle_irq::TX_DONE | lle_irq::CLEAR_ARM);
+            unsafe { regs::write(LLE_BASE, lle::MODE, 0) };
+            return if ok { Ok(()) } else { Err(Error::Timeout) };
+        }
+
+        // No ISR installed: `LLE_IRQLibHandler` kicks the baseband on LLE IRQ
+        // bit9 (`0x200`) with COUNT=0x190, AUTOCFG bit1 and RFCTRL bit28.
+        // Mirror that from a tight poll; give up after 500 µs.
         let kick_deadline = clock.now_us().wrapping_add(500);
         let mut kicked = false;
         loop {
@@ -820,6 +1308,20 @@ impl Radio for Ch573Radio {
         rc
     }
 
+    /// Arm a single RX window (MODE=0x59, CMD=1) and return.
+    ///
+    /// `Ok` means the engine is listening, **not** that a packet arrived.
+    /// Completion is serviced with [`Self::rx_poll`]; the hardware writes the
+    /// raw PDU into `DMA+0x18` as `[hdr][len][payload][pad]`, then a status
+    /// word plus RSSI byte at `(len + 5) & 0x1fc` (no RSSI prefix).
+    ///
+    /// Arming masks the BLE lines and drops any unconsumed result from the
+    /// previous window (software flags, pending PFIC entry, BB event bits).
+    ///
+    /// Call from thread context (or an ISR that cannot preempt BLE): masking
+    /// only stops new entries, so a preempted BLE ISR could resume after the
+    /// re-arm and publish into the new window. On `Err(Busy)` the BLE lines
+    /// stay masked; the next successful arm re-enables them.
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
@@ -835,32 +1337,79 @@ impl Radio for Ch573Radio {
         if self.channel > 39 {
             return Err(Error::InvalidState);
         }
-        let busy = unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK };
-        if busy != 0 {
+        // Mask before touching state: an ISR from the previous window must not
+        // publish into this one. In thread context no entry can be running
+        // while we execute; masking only keeps new ones out.
+        unsafe {
+            mask_ble_lines();
+            regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20));
+        }
+        // EVT `ble_ll_hw_api_rx` stops a busy engine and waits for idle.
+        self.engine_stop();
+        if unsafe { regs::read(LLE_BASE, lle::CMD) & lle_cmd::BUSY_MASK } != 0 {
             return Err(Error::Busy);
         }
 
-        self.engine_stop();
         Self::clear_lle_irq(0xffff);
+        // The level line can re-pend while `engine_stop` runs; drop it again.
+        unsafe { regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20)) };
+        // Drop per-frame BB bits too; a CRC error left by a window that ended
+        // without RX_DONE would otherwise mark the next frame bad. Ones leave
+        // the other bits alone (vendor `~mask` style).
+        unsafe { regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR)) };
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();
 
         unsafe {
+            // EVT `ble_ll_hw_api_rx` (libCH57xBLE.a `ip.o`): the BLE RX arm
+            // used by scanning. Not the 2.4G `RF_Rx`, which differs in AA/CRC
+            // cfg (0x1e vs 0x1f) and window handling.
             regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::PHY_MASK, rfctrl::PHY_1M);
             regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::DIR_RX);
-            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, rfend::FECTRL_RF_ON);
-            regs::write(
-                DMA_BASE,
-                dma_reg::RXBUFPTR,
-                Self::dma_off(rxbuf.as_mut_ptr() as usize),
-            );
-            regs::write(LLE_BASE, LLE_COUNT, window_half_us.max(1));
-            regs::write(LLE_BASE, lle::MODE, lle_mode::RX);
+            // CH573 RF-on is FECTRL bit17 only; the CH585 constant gates PA.
+            regs::rmw(RFEND_BASE, rfend::FECTRL, 0, 0x2_0000);
+            regs::rmw(BB_BASE, bb::AUTOCFG, autocfg::ARM_MASK, 0x2);
+            regs::rmw(BB_BASE, bb::RFCTRL, 0, rfctrl::INIT_BIT28);
+            // RX PHY cfg: clear bits[26:25]/[23:16], keep bit24, set bit29.
+            regs::rmw(BB_BASE, bb::RXCFG18, 0xf900_0000, 0x2000_0000);
+            regs::rmw(BB_BASE, bb::RXCFG18, 0x7d, 0x18);
+            // BLE RX runs in channel-number mode.
+            regs::rmw(RFEND_BASE, rfend::FREQMODE, rfend::FREQMODE_EN, 0);
+            // Vendor BLE RX uses TX's 0x1f AA/CRC cfg, not `RF_Rx`'s 0x1e.
+            regs::write(LLE_BASE, lle::CRC_AA_CFG, 0x1f);
+            let rx_ptr = rxbuf.as_mut_ptr();
+            self.rx_buf = rx_ptr;
+            self.rx_buf_len = rxbuf.len();
+            self.rx_reloaded = false;
+            // Publish for the interrupt path; harmless when polling instead.
+            isr::BUF.store(rx_ptr as usize, core::sync::atomic::Ordering::Release);
+            isr::BUF_LEN.store(rxbuf.len(), core::sync::atomic::Ordering::Release);
+            isr::RELOADED.store(false, core::sync::atomic::Ordering::Release);
+            isr::CRC_OK.store(false, core::sync::atomic::Ordering::Release);
+            // A late Done from the previous window must not leak into this one.
+            isr::DONE.store(false, core::sync::atomic::Ordering::Release);
+            isr::TIMEOUT.store(false, core::sync::atomic::Ordering::Release);
+            isr::armed_store(true);
+            regs::write(DMA_BASE, dma_reg::RXBUFPTR, Self::dma_off(rx_ptr as usize));
+            // EVT `ble_ll_hw_api_rx` order: CMD=1 then MODE=0x59.
             regs::write(LLE_BASE, lle::CMD, lle_cmd::START_RX);
+            regs::write(LLE_BASE, lle::MODE, lle_mode::RX);
+            // EVT `ll_scan_process` arms the listen window as a guarded DMA
+            // block, exactly like TX. A bare COUNT store does not fire.
+            regs::write(LLE_BASE, lle::GUARD, 0x0000_8303);
+            regs::write(LLE_BASE, LLE_COUNT, window_half_us.max(1));
+            regs::write(LLE_BASE, lle::GUARD, 0x0000_c303);
         }
 
-        // Arm only; caller polls IRQSTAT. Keep a short settle so WINDOW sticks.
+        // Arm only. Completion paths: `rx_poll`, or `ble_isr` when
+        // `install_ble_irq` has routed the lines through the VTF slots.
         clock.delay_us(2);
+        if isr::INSTALLED.load(core::sync::atomic::Ordering::Acquire) {
+            isr::MODE.store(isr::RX, core::sync::atomic::Ordering::Release);
+            // SAFETY: VTF slots were installed, so enabling the lines cannot
+            // dispatch into an unconfigured vector.
+            unsafe { unmask_ble_lines() };
+        }
         let _ = self.phy_rx;
         Ok(())
     }

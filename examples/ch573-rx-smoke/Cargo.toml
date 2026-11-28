@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "ch573-rx-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ch5xx-hal = { path = "../../../ch5xx-hal", features = [
+    "ch573",
+    "rt",
+    "memory-x",
+    "highcode",
+], default-features = false }
+wchble = { path = "../..", features = ["ch573", "defmt"] }
+qingke-rt = "0.8.4"
+qingke = "0.8.4"
+panic-halt = "1.0"
+static_cell = "2.1"
+portable-atomic = { version = "1.11", features = ["critical-section"] }
+defmt = "1.0"
+defmt-rtt = "1.3"
+
+[profile.release]
+strip = false
+debug = 2
+lto = true
+# Match ch5xx-hal CH573 smokes: "z" + LTO has been observed to drop
+# defmt-rtt's #[used] _SEGGER_RTT / BUFFER on this target, killing RTT.
+opt-level = "s"
