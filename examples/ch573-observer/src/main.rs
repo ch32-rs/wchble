@@ -48,7 +48,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         Some(l) => (u32::from(fnv1a(l.file().as_bytes()) as u16) << 16) | (l.line() & 0xffff),
         None => 0xffff_ffff,
     };
-    PANIC_LOC.store(tag, Ordering::Relaxed);
+    // First panic wins: a re-entrant panic must not overwrite the root site.
+    let _ = PANIC_LOC.compare_exchange(0, tag, Ordering::Relaxed, Ordering::Relaxed);
     if !PANIC_LOGGED.swap(true, Ordering::AcqRel) {
         match loc {
             Some(l) => defmt::error!("panic {}:{}", l.file(), l.line()),

@@ -124,8 +124,8 @@ deficit datum, because the channel and the transmitter are known.
 observer is usable for presence/counting at short range, but its counts are
 not a loss-rate or rate measurement.
 
-Post-fix check (same day, ELF `accb4e75…51`, after the SAFE_ACCESS masking
-change and the guarded panic handler): `rf init ok`, 470 rounds / 1410 windows
+Post-fix check (same day, ELF `619b7490…60`, after the SAFE_ACCESS masking
+change and the guarded panic handler): `rf init ok`, 472 rounds / 1416 windows
 in 30 s, `arm_err=0`, counters in line with the numbers above.
 
 `tools/compare_observer.py --board-log rtt.log --pcap capture.pcap` prints the
