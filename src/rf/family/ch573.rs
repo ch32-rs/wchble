@@ -759,8 +759,11 @@ impl Ch573Radio {
                 let crc_ok = bb & BB_CRC_ERR == 0;
                 // Publish for the `Radio::rssi`/`crc_ok` accessors on both the
                 // ISR and the poll path.
+                let bb30 = regs::read(BB_BASE, bb::RSSICFO);
                 isr::RSSI.store(rssi, core::sync::atomic::Ordering::Relaxed);
                 isr::CRC_OK.store(crc_ok, core::sync::atomic::Ordering::Relaxed);
+                isr::BB_DONE.store(bb, core::sync::atomic::Ordering::Relaxed);
+                isr::BB30_DONE.store(bb30, core::sync::atomic::Ordering::Relaxed);
                 // Vendor-style whole-word `~mask` clear: ones leave the other
                 // bits alone, so a bit that asserts after the read survives.
                 regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
@@ -836,6 +839,9 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
+    /// Raw `BB+0x38` / `BB+0x30` sampled at the RX_DONE behind the result.
+    pub static BB_DONE: AtomicU32 = AtomicU32::new(0);
+    pub static BB30_DONE: AtomicU32 = AtomicU32::new(0);
     /// Bit9 kicks observed so far, so callers can tell a real kick apart.
     pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
     /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
@@ -1039,6 +1045,16 @@ pub fn irq_entries() -> u32 {
 /// SysTick count captured when the ISR last reported RX `Done`.
 pub fn rx_done_ticks() -> u32 {
     isr::RX_DONE_TICKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raw `BB+0x38` sampled at the last RX `Done` (before the clear).
+pub fn rx_bb_stat() -> u32 {
+    isr::BB_DONE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raw `BB+0x30` sampled at the last RX `Done`; `rssi` is `>> 15 as i8`.
+pub fn rx_bb30() -> u32 {
+    isr::BB30_DONE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// SysTick count captured at the last TX baseband kick (LLE bit9).

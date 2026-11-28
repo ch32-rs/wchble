@@ -95,7 +95,7 @@ observations, RSSI −43…−47 dBm), so the RX and TX ISR paths run together.
 Earlier polling run for comparison: 13/13 exact.
 
 ```
-ch38 state=2 len=17 rssi=-99 crc=false valid=false timeout=false trssi=-99 tcrc=false cnt=0 isr=1 bb38=246f lle08=100000
+ch38 state=2 len=17 rssi=-99 crc=false valid=false timeout=false trssi=-99 tcrc=false bbd=242e b30d=4e8abc cnt=0 isr=1 bb38=246f lle08=100000
 buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, …]
 ```
 

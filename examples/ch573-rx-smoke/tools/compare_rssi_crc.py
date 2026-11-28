@@ -38,10 +38,12 @@ def read_board(path, seq_off, adv_a):
     """
     out = {}
     pending = None
-    mismatches = {"rssi": 0, "crc": 0, "checked": 0}
+    mismatches = {"rssi": 0, "crc": 0, "checked": 0,
+                  "shift15": 0, "shift15_n": 0, "bit5": 0, "bit5_n": 0}
     rx = re.compile(
         r"ch(\d+) state=2 .*?len=(\d+) rssi=(-?\d+) crc=(true|false)"
         r"(?: .*?trssi=(-?\d+) tcrc=(true|false))?"
+        r"(?: .*?bbd=([0-9a-f]+) b30d=([0-9a-f]+))?"
     )
     for line in open(path, errors="replace"):
         m = rx.search(line)
@@ -53,6 +55,8 @@ def read_board(path, seq_off, adv_a):
                 "crc": m.group(4) == "true",
                 "trssi": int(m.group(5)) if m.group(5) is not None else None,
                 "tcrc": (m.group(6) == "true") if m.group(6) is not None else None,
+                "bbd": int(m.group(7), 16) if m.group(7) is not None else None,
+                "b30d": int(m.group(8), 16) if m.group(8) is not None else None,
             }
             continue
         m = re.search(r"buf \[([0-9, ]+)\]", line)
@@ -66,6 +70,14 @@ def read_board(path, seq_off, adv_a):
                 mismatches["checked"] += 1
                 mismatches["rssi"] += rec["trssi"] != rec["rssi"]
                 mismatches["crc"] += rec["tcrc"] != rec["crc"]
+            if rec["b30d"] is not None:
+                s15 = (rec["b30d"] >> 15) & 0xFF
+                s15 = s15 - 256 if s15 >= 128 else s15
+                mismatches["shift15_n"] += 1
+                mismatches["shift15"] += s15 != rec["rssi"]
+            if rec["bbd"] is not None:
+                mismatches["bit5_n"] += 1
+                mismatches["bit5"] += ((rec["bbd"] & 0x20) == 0) != rec["crc"]
             pdu = bytes(raw[:n])
             if seq_off is None:
                 if adv_a is not None and (len(pdu) < 8 or pdu[2:8] not in (adv_a, adv_a[::-1])):
@@ -140,6 +152,12 @@ def main():
     if mism["checked"]:
         print(f"Radio::rssi/crc_ok vs Done: checked={mism['checked']} "
               f"rssi_mismatch={mism['rssi']} crc_mismatch={mism['crc']}")
+    if mism["shift15_n"]:
+        print(f"rssi == (BB+0x30 >> 15) as i8: {mism['shift15_n'] - mism['shift15']}"
+              f"/{mism['shift15_n']} (sampled in the completion path)")
+    if mism["bit5_n"]:
+        print(f"crc_ok == !(BB+0x38 bit5): {mism['bit5_n'] - mism['bit5']}"
+              f"/{mism['bit5_n']} (sampled in the completion path)")
     if args.seq_off is None:
         print("no --seq-off: key is the whole PDU, so repeated events collapse; "
               "per-event pairing is unavailable")
