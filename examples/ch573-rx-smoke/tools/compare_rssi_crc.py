@@ -2,7 +2,7 @@
 """Pair CH573 rx-smoke receptions with nRF Sniffer records, event by event.
 
 Usage:
-  compare_rssi_crc.py rx.log capture.pcap --seq-off 22 [--adv-a C1:FF:EE:00:00:02]
+  compare_rssi_crc.py rx.log capture.pcap --seq-off 23 [--adv-a C1:FF:EE:00:00:02]
 
 The source PDU must carry a per-event counter (`ch585-rf-smoke --features
 adv-seq`, manufacturer AD `05 ff ff ff seq_lo seq_hi`). The sniffer and the
@@ -92,7 +92,7 @@ def read_board(path, seq_off, adv_a):
 
 
 def read_pcap(path, seq_off, adv_a):
-    """Return {(seq, ch): record}, keeping the first duplicate per event."""
+    """Return {(seq, ch, len): record}, keeping the first duplicate per event."""
     data = open(path, "rb").read()
     endian = "<" if data[:4] == bytes.fromhex("d4c3b2a1") else ">"
     if data[:4] not in (bytes.fromhex("d4c3b2a1"), bytes.fromhex("a1b2c3d4")):
