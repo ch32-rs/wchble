@@ -6,8 +6,9 @@ Usage:
 
 The source PDU must carry a per-event counter (`ch585-rf-smoke --features
 adv-seq`, manufacturer AD `05 ff ff ff seq_lo seq_hi`). The sniffer and the
-board both see a subset of the same air events, so `(seq, channel)` is the
-pairing key.
+board both see a subset of the same air events, so `(seq, channel, length)` is
+the pairing key. Board frames are not filtered by AdvA: a CRC-rejected frame
+may have a corrupted address while its counter survives.
 
 Board side is the defmt log: a `state=2 ... len=N rssi=R crc=B ...` line
 followed by the `buf [...]` dump. Sniffer side is a Nordic DLT 272 pcap
@@ -29,7 +30,12 @@ MAX_LEGACY_LEN = 37
 
 
 def read_board(path, seq_off, adv_a):
-    """Return {(seq, ch): record} and trait-accessor mismatch counts."""
+    """Return {(seq, ch, len): record} and trait-accessor mismatch counts.
+
+    With a sequence offset the AdvA is *not* required: a CRC-rejected frame
+    may have a corrupted address, and it still pairs through the counter.
+    Ambient collisions are bounded by (16-bit seq, channel, length).
+    """
     out = {}
     pending = None
     mismatches = {"rssi": 0, "crc": 0, "checked": 0}
@@ -61,14 +67,14 @@ def read_board(path, seq_off, adv_a):
                 mismatches["rssi"] += rec["trssi"] != rec["rssi"]
                 mismatches["crc"] += rec["tcrc"] != rec["crc"]
             pdu = bytes(raw[:n])
-            if adv_a is not None and (len(pdu) < 8 or pdu[2:8] not in (adv_a, adv_a[::-1])):
-                continue
             if seq_off is None:
+                if adv_a is not None and (len(pdu) < 8 or pdu[2:8] not in (adv_a, adv_a[::-1])):
+                    continue
                 key = pdu
             else:
                 if seq_off + 2 > len(pdu):
                     continue
-                key = (pdu[seq_off] | pdu[seq_off + 1] << 8, rec["ch"])
+                key = (pdu[seq_off] | pdu[seq_off + 1] << 8, rec["ch"], rec["len"])
             out[key] = {"pdu": pdu, "rssi": rec["rssi"], "crc": rec["crc"]}
     return out, mismatches
 
@@ -102,7 +108,7 @@ def read_pcap(path, seq_off, adv_a):
         else:
             if seq_off + 2 > len(pdu):
                 continue
-            key = (pdu[seq_off] | pdu[seq_off + 1] << 8, pkt[i - 8])
+            key = (pdu[seq_off] | pdu[seq_off + 1] << 8, pkt[i - 8], pdu[1])
         rec = {
             "pdu": pdu,
             "rssi": -pkt[i - 7],
