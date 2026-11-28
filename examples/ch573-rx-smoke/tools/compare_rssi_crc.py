@@ -121,7 +121,8 @@ def main():
     ap.add_argument("pcap")
     ap.add_argument("--seq-off", type=int,
                     help="byte offset of the u16 event counter in the PDU")
-    ap.add_argument("--adv-a", help="only this six-byte AdvA, e.g. C1:FF:EE:00:00:02")
+    ap.add_argument("--adv-a",
+                    help="only this AdvA (air order or reversed), e.g. C1:FF:EE:00:00:02")
     args = ap.parse_args()
 
     adv_a = bytes(int(x, 16) for x in args.adv_a.split(":")) if args.adv_a else None
