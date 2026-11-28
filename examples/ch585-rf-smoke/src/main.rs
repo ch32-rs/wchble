@@ -650,6 +650,28 @@ fn aes_kat(out: &mut Log, clock: &UsClock) {
     );
 }
 
+/// TX power code from `CH585_RF_SMOKE_TX_POWER` at build time (default 0 dBm).
+///
+/// Codes are `LL_TX_POWEER_*` from `CH58xBLE_LIB.h`; CH585 stops at +4 dBm.
+/// `Ch585Radio::set_tx_power` must be called before `init()`: the PA tune is
+/// bound to the level.
+fn tx_power_code() -> u8 {
+    match option_env!("CH585_RF_SMOKE_TX_POWER") {
+        Some("-20") => 0x01,
+        Some("-15") => 0x03,
+        Some("-10") => 0x05,
+        Some("-8") => 0x07,
+        Some("-5") => 0x0b,
+        Some("-3") => 0x0f,
+        Some("-1") => 0x13,
+        Some("1") => 0x1b,
+        Some("2") => 0x23,
+        Some("3") => 0x2b,
+        Some("4") => 0x3b,
+        _ => 0x15,
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let _p = hal::init(rcc::Config::hse_nearest(Hertz(60_000_000)).into());
@@ -673,6 +695,8 @@ fn main() -> ! {
             loop {}
         }
     };
+    radio.set_tx_power(tx_power_code());
+    let _ = writeln!(out, "tx_power code={:x}", tx_power_code());
 
     match radio.init(&clock) {
         Ok(()) => {
@@ -750,7 +774,7 @@ fn main() -> ! {
     let _ = writeln!(out, "adv loop");
     let mut round = 0u32;
     #[cfg(feature = "adv-seq")]
-    let mut seq = 0u16;
+    let mut seq = 1u16; // 0 is the uninitialised burst before the loop
     loop {
         #[cfg(feature = "adv-seq")]
         {
