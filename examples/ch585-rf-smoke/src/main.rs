@@ -215,6 +215,23 @@ fn build_adv_name(out: &mut [u8; 32], name: &[u8]) -> usize {
     2 + payload_len
 }
 
+/// `adv-seq`: append Manufacturer Specific Data `[05 ff ff ff seq_lo seq_hi]`
+/// and return the new length plus the sequence byte offset.
+///
+/// One counter per advertising event; the same PDU goes to 37/38/39, so
+/// `(seq, channel)` identifies a single air event.
+#[cfg(feature = "adv-seq")]
+fn append_seq_ad(out: &mut [u8; 32], n: usize) -> (usize, usize) {
+    let off = n;
+    out[off] = 5;
+    out[off + 1] = 0xFF;
+    out[off + 2] = 0xFF;
+    out[off + 3] = 0xFF;
+    out[off + 4] = 0;
+    out[off + 5] = 0;
+    (off + 6, off + 4)
+}
+
 /// Known-answer CRC test (`--features crc-test`): transmit `crcgood` with the
 /// advertising CRC init and `crcbad!` with a one-bit-wrong init. Both payloads
 /// are intact, so a receiver must report crc=true only for the first and
@@ -708,6 +725,12 @@ fn main() -> ! {
 
     let mut frame = [0u8; 32];
     let n = build_adv_nonconn_ind(&mut frame);
+    #[cfg(feature = "adv-seq")]
+    let (n, seq_off) = {
+        let (nn, so) = append_seq_ad(&mut frame, n);
+        frame[1] = (nn - 2) as u8;
+        (nn, so)
+    };
     let _ = writeln!(out, "adv len {}", n);
     tx_burst(&mut radio, &clock, &mut out, &frame[..n]);
     for window_half_us in [2_000u32, 10_000] {
@@ -726,7 +749,16 @@ fn main() -> ! {
     //   CRC 0x555555) which a V208/CH592 reference receiver decodes.
     let _ = writeln!(out, "adv loop");
     let mut round = 0u32;
+    #[cfg(feature = "adv-seq")]
+    let mut seq = 0u16;
     loop {
+        #[cfg(feature = "adv-seq")]
+        {
+            let b = seq.to_le_bytes();
+            frame[seq_off] = b[0];
+            frame[seq_off + 1] = b[1];
+            seq = seq.wrapping_add(1);
+        }
         radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
         for &ch in &[37u8, 38, 39] {
             if radio.set_channel(ch).is_ok() {

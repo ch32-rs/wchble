@@ -32,6 +32,9 @@ peer-rx = []
 # receiver-side CRC known-answer test (`crc-test-bad` flips the init).
 crc-test = []
 crc-test-bad = ["crc-test"]
+# Append a 16-bit air-event counter (manufacturer AD) to the advertising PDU
+# so a board receiver and a sniffer can be paired event by event.
+adv-seq = []
 
 [profile.release]
 strip = false
