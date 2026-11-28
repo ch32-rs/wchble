@@ -128,9 +128,7 @@ def main():
             if dt <= 0 or dt > 5_000_000:
                 glitches += 1
                 continue
-            if cur["channel"] == prev["channel"]:
-                intra.append((prev["channel"], cur["channel"], dt)) if dt < 10_000 else None
-            elif dt < 10_000:
+            if cur["channel"] != prev["channel"] and dt < 10_000:
                 intra.append((prev["channel"], cur["channel"], dt))
         for f in group:
             prev = last_on_channel.get(f["channel"])

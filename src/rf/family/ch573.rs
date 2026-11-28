@@ -425,7 +425,8 @@ impl Ch573Radio {
 
     /// Rough 1M airtime window (half-µs), enough for ADV PDUs.
     fn tx_window_half_us(payload_len: u8) -> u32 {
-        // EVT RF_Tx: `(len << 4) + 0x1cc` style; keep a generous floor.
+        // EVT RF_Tx: `(len << 4) + 0x1cc`; ADV paths use `+0x118`, but this
+        // stays the wider RF_Tx window on purpose (extra completion margin).
         let air = (u32::from(payload_len) << 4).saturating_add(0x1cc);
         air.max(0x200)
     }
@@ -732,7 +733,7 @@ mod isr {
     pub static TIMEOUT: AtomicBool = AtomicBool::new(false);
     pub static LEN: AtomicU8 = AtomicU8::new(0);
     pub static RSSI: AtomicI8 = AtomicI8::new(0);
-    /// Bit9 kicks serviced so far, so callers can tell a real kick apart.
+    /// Bit9 kicks observed so far, so callers can tell a real kick apart.
     pub static TX_KICKS: AtomicU32 = AtomicU32::new(0);
     /// Raw SysTick counts: RX done observed, and the TX bit9 kick.
     pub static RX_DONE_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -942,7 +943,7 @@ pub fn tx_kick_ticks() -> u32 {
     isr::TX_KICK_TICKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Number of bit9 TX kicks serviced by the ISR so far (diagnostics; wraps).
+/// Number of bit9 TX kicks performed by `tx_basic` so far (diagnostics; wraps).
 pub fn tx_kick_count() -> u32 {
     isr::TX_KICKS.load(core::sync::atomic::Ordering::Relaxed)
 }

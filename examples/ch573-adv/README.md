@@ -50,7 +50,8 @@ board: a few per thousand PDUs.
    swift ../ch573-rf-smoke/tools/scan_ch573.swift wch573 10
    ```
 
-   Pass = repeated `seen name=wch573`.
+   Pass = repeated `seen name=wch573`. Bench run: 69 sightings in 10 s,
+   −41…−42 dBm.
 
 2. nRF Sniffer capture plus `tools/adv_stats.py`:
 
@@ -67,9 +68,10 @@ board: a few per thousand PDUs.
    maximum. The board's `wait_us` log is the primary interval evidence.
 
    Bench capture (`/tmp/ch573-adv.pcap`, 16 s): 1368 of our PDUs,
-   intra-event gaps median 0.54 ms, same-channel minimum 20.16 ms,
-   54–85 % of same-channel deltas inside 20–30 ms (the rest are multiples
-   caused by sniffer loss).
+   intra-event gaps median 0.54 ms, same-channel medians 25.7–29.6 ms, and
+   54–85 % of same-channel deltas inside 20–30 ms per channel. The rest are
+   mostly integer multiples from dropped events; one 10.3 ms sample looks like
+   a sniffer timestamp glitch rather than a short interval.
 
 A phone-side connect attempt is expected to time out (nothing answers the
 `CONNECT_IND`); it was not part of this round's evidence.
