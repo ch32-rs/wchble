@@ -1409,7 +1409,8 @@ impl Radio for Ch573Radio {
             isr::BUF.store(rx_ptr as usize, core::sync::atomic::Ordering::Release);
             isr::BUF_LEN.store(rxbuf.len(), core::sync::atomic::Ordering::Release);
             isr::RELOADED.store(false, core::sync::atomic::Ordering::Release);
-            isr::CRC_OK.store(false, core::sync::atomic::Ordering::Release);
+            // Keep RSSI/CRC_OK until the next `Done` so the trait accessors
+            // report the last completed packet; `DONE` alone gates results.
             // A late Done from the previous window must not leak into this one.
             isr::DONE.store(false, core::sync::atomic::Ordering::Release);
             isr::TIMEOUT.store(false, core::sync::atomic::Ordering::Release);
