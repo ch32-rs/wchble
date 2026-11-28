@@ -36,9 +36,18 @@ Letter namespaces collide — always qualify them:
   routes IRQ 20/21 through PFIC fast-interrupt slots 2/3 (VTF, RAM entry) and
   the ISR masks the line when the window ends. `Done` carries a conservative
   CRC gate, and `RFEND_RXFilter` now replays the vendor `CFG0C` sequence.
-  Still open: RSSI cross-check (`BB+0x30`), per-event CRC truth, and the RX
-  interleavings listed in the example README. Not Trouble/GATT; not
-  Phase 1 closure.
+  `ch573-adv`: legacy broadcaster (`ADV_IND` 37/38/39, 20 ms interval plus
+  0–10 ms advDelay, name `wch573`), on air via nRF sniffer and macOS scan.
+  TX is polling-only — after the GUARD/COUNT arm it mirrors the vendor bit9
+  kick and treats the window drain as completion; the arm flags are cleared
+  *before* the GUARD writes so the new bit9 is not eaten. An ISR-driven TX
+  path was tried and removed: back-to-back channel TX kept the level-held
+  BB/LLE lines asserted and stalled the caller for tens of ms. Scope is
+  advertising only: no post-TX listen, `CONNECT_IND` unanswered.
+  Still open: RSSI cross-check (`BB+0x30`), per-event CRC truth, the RX
+  interleavings listed in the example README, TX power levels (P2-B), and the
+  rare (few per thousand) skipped PDU when the bit9 kick misses its 500 µs
+  window. Not Trouble/GATT; not Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle

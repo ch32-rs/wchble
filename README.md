@@ -30,7 +30,7 @@ RF backends (cfg-per-family under `src/rf/family/`):
 | --- | --- |
 | `ch32v208` | DevInit/cal + channel/shut/tx_basic/rx_basic/ISR (open `wch_rf`); HAL smoke next |
 | `ch572` | CH5xx map + unique new-table constants (`0x64` / `0x16000F`); MMIO TBD |
-| `ch573` | DevInit/cal + DMA-block TX/RX; **DMA window `@0x20004000..0x20008000`**; **ADV TX verified on air** (`examples/ch573-rf-smoke`); **ADV RX verified byte-exact** against a known transmitter + RSSI, served by the real LLE IRQ (`install_ble_irq`, PFIC VTF slots 2/3), with a conservative CRC gate (`Done { crc_ok }`) (`examples/ch573-rx-smoke`) |
+| `ch573` | DevInit/cal + DMA-block TX/RX; **DMA window `@0x20004000..0x20008000`**; **ADV TX verified on air** (`examples/ch573-rf-smoke`); **legacy broadcaster** `ADV_IND` 37/38/39 with 20 ms + advDelay, verified by nRF sniffer and macOS scan (`examples/ch573-adv`); **ADV RX verified byte-exact** against a known transmitter + RSSI, served by the real LLE IRQ (`install_ble_irq`, PFIC VTF slots 2/3), with a conservative CRC gate (`Done { crc_ok }`) (`examples/ch573-rx-smoke`) |
 | `ch583` | iSLER-based polling RF init/cal + LE 1M TX/RX — **verified on CH582M** ([RF smoke](examples/ch582-rf-smoke)) |
 | `ch585` | DevInit/cal + channel/shut/tx_basic/rx_basic (carved CH585EVT lib) — **verified on air** (`examples/ch585-rf-smoke`) |
 | `ch592` | DevInit/cal + channel/shut/tx_basic/rx_basic — **verified on air** (`examples/ch592-rf-smoke`) |
