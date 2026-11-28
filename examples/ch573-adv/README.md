@@ -51,7 +51,7 @@ board: a few per thousand PDUs.
    ```
 
    Pass = repeated `seen name=wch573`. Bench run: 69 sightings in 10 s,
-   −41…−42 dBm.
+   mostly −41…−45 dBm.
 
 2. nRF Sniffer capture plus `tools/adv_stats.py`:
 
@@ -64,7 +64,7 @@ board: a few per thousand PDUs.
    Pass = type `0x00`, AdvA `C1:FF:EE:00:00:73`, AD `01 06` + `09 "wch573"`,
    channels split across 37/38/39, intra-event gaps ≪ 10 ms, and same-channel
    deltas clustering at 20–30 ms. The sniffer is lossy; a dropped event makes
-   one delta an integer multiple, so judge the cluster and the minimum, not the
+   one delta an integer multiple, so judge the cluster and the percentiles, not the
    maximum. The board's `wait_us` log is the primary interval evidence.
 
    Bench capture (`/tmp/ch573-adv.pcap`, 16 s): 1368 of our PDUs,
