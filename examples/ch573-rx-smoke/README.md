@@ -214,10 +214,14 @@ magnitude); this was cross-checked against `crcgood`/`crcbad!` captures.
 ### Board RX level vs the sniffer (2026-11-28)
 
 Same CH585 frames at 0 dBm: sniffer −39 dBm, board −91…−99 (median −95, n=16);
-at −20 dBm: sniffer −58, board −87…−93 (median −93, n=3). The board caught 16
-of the ~440 frames that fell inside its ch37 windows (≈3.6%), so this is a
-real receive-path loss, not an arithmetic offset: `rssi` equals
-`(BB+0x30 >> 15) as i8` in 100% of sampled `Done`s, and vendor `ll_scan_rx`
+at −20 dBm: sniffer −58, board −87…−93 (median −93, n=3). A round (three 10 ms
+windows) takes ~145 ms here (~7% ch37 duty), so ~60 of the sniffer's 874
+records should land in a window; the board caught 16 (~27%), which fits a true
+level near the sensitivity floor rather than a −39 dBm signal. The sniffer and
+board are not co-located, so this does not separate antenna/placement loss from
+receiver gain. The field itself is vendor-exact: `rssi` equals
+`(BB+0x30 >> 15) as i8` in 102 of 103 sampled `Done`s across these runs (the
+miss is a stale post-ISR register read), and vendor `ll_scan_rx`
 sign-extends the same DMA byte into `gapScanRec_t.rssi`. RFEND/BB init now
 matches the EVT disassembly (CFG54 bit16, RXADC TUNE bit16, CFG38 mask
 `0x00f8_0000`, RXCFG18 mask `0x7c`), with no measured RSSI change. Open:
