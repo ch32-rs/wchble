@@ -6,8 +6,8 @@
 //! HAL crates enable exactly one chip feature; [`crate::rf::Backend`] aliases
 //! that module's radio type.
 
-pub mod tables;
 pub mod caps;
+pub mod tables;
 
 /// DIAGNOSTIC ONLY: scheduled-TX startup boundary samples (temporary).
 
