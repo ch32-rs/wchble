@@ -52,11 +52,35 @@ Letter namespaces collide — always qualify them:
   a lower level left the output inaudible at 20 cm). RFCTRL readback on
   silicon: `0x1400`/`0x0100`/`0x3200` for 0/-20/+5 dBm. The PHY/DIR
   read-modify-writes that shared bits 12–13 with the power field are gone.
+  `ch573-observer`: passive Observer (`examples/ch573-observer`) hopping
+  37/38/39 with one 15 ms RX window per channel, ISR completion, defmt
+  counters plus a bounded per-AdvA table, no TX call. A 600 s run logged
+  683 `Done` over 29,533 windows (367 parseable, 20 advertisers, 0
+  `bad_len`/`mismatch`).
+  Paired with a simultaneous nRF Sniffer (~128 AdvA-bearing records/s) it
+  exposed a **receive deficit**: the board hears 0.07–1.2% of what the
+  sniffer logs and reports RSSI 20–45 dB lower for the same advertisers,
+  with ~46% of received frames failing CRC. The cleanest datum is the
+  adjacent CH585 board left advertising on ch37 only: the sniffer logged
+  16,651 of its frames, the observer 149 (0.9%), at −96 dBm vs the sniffer's
+  −58. Window length is not the cause
+  (`win_dt_us` avg 14.5 ms; `rx_basic` returns in µs). The RSSI/CRC
+  verification then ruled out the RSSI field (board matches the vendor
+  `ll_scan_rx` byte in 82/82 sampled `Done`) and the RFEND/BB init (three
+  mask typos fixed, RSSI unchanged). A controlled CH585 source at 0 dBm read
+  −91…−99 dBm on the board (median −95) against −39 on the sniffer and was
+  caught in 16 of the ~60 events whose windows it overlapped (~27%) — near
+  the sensitivity floor, consistent with the received level being far below
+  the sniffer's. The 55 dB sniffer-vs-board level gap is unresolved: it
+  cannot be split into antenna/placement loss vs RX gain without co-located
+  receivers or vendor firmware on the same board. `RFEND_SetSensitivity`
+  exists in the EVT but is never called by `libCH57xBLE.a`. Decisive next
+  test: flash the WCH EVT Observer on this board at the same position.
   Still open: quantitative RSSI-vs-level (both receivers saturate at bench
-  distance), RSSI cross-check (`BB+0x30`), per-event CRC truth, the RX
-  interleavings listed in the example README, and the rare (few per thousand)
-  skipped PDU when the bit9 kick misses its 500 µs window. Not Trouble/GATT;
-  not Phase 1 closure.
+  distance), the receive-level gap above, per-event CRC truth (the field is
+  verified; only small paired samples exist), the RX interleavings listed in
+  the example README, and the rare (few per thousand) skipped PDU when the
+  bit9 kick misses its 500 µs window. Not Trouble/GATT; not Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second
   run. After the nominal-clock and RX-completion fixes, a separate three-cycle
