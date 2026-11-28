@@ -13,7 +13,7 @@ PA9 at 115200 baud.
 ## Build and flash
 
 Place [`ch5xx-hal`](https://github.com/ch32-rs/ch5xx-hal) beside the `wchble`
-checkout. Follow its workspace requirements for `ch5xx-data`.
+checkout. Follow its workspace requirements for `ch5xx-metapac`.
 
 ```sh
 rustup target add riscv32imc-unknown-none-elf

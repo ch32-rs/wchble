@@ -91,13 +91,14 @@ pub trait Radio {
         start_cputime: Option<u32>,
     ) -> Result<()>;
 
-    /// Arm RX for `window_half_us`; completion via callback / ISR.
+    /// Arm RX for `window_half_us`; completion via the callback or a poll hook.
     ///
     /// # Safety
     ///
-    /// The LLE DMAs into `rxbuf` after this call returns. The caller must keep
-    /// `rxbuf` valid and exclusively owned until the window has completed (the
-    /// ISR observes `RX_DONE`/`CLEAR_ARM`) or the engine has been shut down.
+    /// The backend DMAs through `rxbuf` after this call returns. The caller
+    /// must keep `rxbuf` valid and exclusively owned until the window completes
+    /// (the ISR, or a poll-driven backend's poll hook, observes
+    /// `RX_DONE`/`CLEAR_ARM`) or the engine has been shut down.
     ///
     /// Re-arming while a window is still armed is allowed only while the old
     /// buffer is still live: the implementation force-stops the old window,

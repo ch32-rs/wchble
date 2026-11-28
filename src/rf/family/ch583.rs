@@ -1,4 +1,5 @@
 //! CH582/CH583 BLE RF backend. Legacy 1M was tested on CH582M.
+//! Poll-driven: service completions with [`Ch583Radio::poll`].
 //!
 //! The active MMIO path uses the public ch32fun iSLER CH582/CH583 sequence.
 //! The recorded DevInit tables below retain their original provenance and are
@@ -330,6 +331,9 @@ pub struct Ch583Radio {
     initialized: bool,
 }
 
+// Soft state only; MMIO runs through fixed bases.
+unsafe impl Send for Ch583Radio {}
+
 impl Ch583Radio {
     /// Claim the BLE engine once per boot. The firmware must keep the BLE IRQ
     /// masked for polling and avoid accessing the engine through another driver.
@@ -418,6 +422,8 @@ impl Ch583Radio {
             return false;
         }
         self.rx_destination = None;
+        self.isr.rx_crc_ok = false;
+        self.isr.last_rx_len = 0;
         true
     }
 
@@ -521,6 +527,8 @@ impl Radio for Ch583Radio {
             self.request_idle();
         }
         self.rx_destination = None;
+        self.isr.rx_crc_ok = false;
+        self.isr.last_rx_len = 0;
     }
 
     fn set_channel(&mut self, channel: Channel) -> Result<()> {
@@ -621,6 +629,8 @@ impl Radio for Ch583Radio {
         }
     }
 
+    /// Completion is serviced by [`Ch583Radio::poll`], which copies the frame
+    /// into `rxbuf` and dispatches the callback.
     unsafe fn rx_basic<T: InstantUs>(
         &mut self,
         clock: &T,
