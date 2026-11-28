@@ -34,8 +34,10 @@ Letter namespaces collide — always qualify them:
   byte-exact against the `ch585-rf-smoke` transmitter plus reported RSSI
   (`examples/ch573-rx-smoke`). The real LLE interrupt works: `install_ble_irq`
   routes IRQ 20/21 through PFIC fast-interrupt slots 2/3 (VTF, RAM entry) and
-  the ISR masks the line when the window ends. Still open: CRC status, RSSI
-  cross-check (`BB+0x30`), RXFilter determinism. Not Trouble/GATT; not
+  the ISR masks the line when the window ends. `Done` carries a conservative
+  CRC gate, and `RFEND_RXFilter` now replays the vendor `CFG0C` sequence.
+  Still open: RSSI cross-check (`BB+0x30`), per-event CRC truth, and the RX
+  interleavings listed in the example README. Not Trouble/GATT; not
   Phase 1 closure.
 - P2 scannable advertising has independent on-air validation.
 - P3 connect/hold/disconnect passed ten 10-second cycles and a finite 360-second

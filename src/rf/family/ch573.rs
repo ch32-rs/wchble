@@ -657,13 +657,9 @@ impl Ch573Radio {
                 // the reads above, so the earlier `bb` could predate its CRC.
                 let bb = regs::read(BB_BASE, bb::IRQSTAT);
                 let crc_ok = bb & BB_CRC_ERR == 0;
-                // Write-zero-to-clear: ones leave the other bits alone, so a
-                // bit that asserts after the read is not cleared by this write.
-                regs::write(
-                    BB_BASE,
-                    bb::IRQSTAT,
-                    !(BB_PAYLOAD_EVENT | BB_CRC_ERR),
-                );
+                // Vendor-style whole-word `~mask` clear: ones leave the other
+                // bits alone, so a bit that asserts after the read survives.
+                regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR));
                 Self::clear_lle_irq(0xffff);
                 return RxPoll::Done { len, rssi, crc_ok };
             }
@@ -1359,7 +1355,7 @@ impl Radio for Ch573Radio {
         unsafe { regs::write(PFIC_BASE, PFIC_IPRR, (1 << 21) | (1 << 20)) };
         // Drop per-frame BB bits too; a CRC error left by a window that ended
         // without RX_DONE would otherwise mark the next frame bad. Ones leave
-        // the other bits alone (write-zero-to-clear).
+        // the other bits alone (vendor `~mask` style).
         unsafe { regs::write(BB_BASE, bb::IRQSTAT, !(BB_PAYLOAD_EVENT | BB_CRC_ERR)) };
         self.program_channel(self.channel);
         self.apply_aa_crc_regs();

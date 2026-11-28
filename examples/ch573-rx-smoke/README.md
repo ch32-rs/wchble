@@ -3,7 +3,7 @@
 On-target RX path for the CH573 backend:
 
 1. Apply DevInit + `DMA_DevInit`, then arm one RX window per channel
-   (`ch37/38/39`, 20 ms each) with `rx_basic`.
+   (`ch37/38/39`, 10 ms each = 20,000 half-µs) with `rx_basic`.
 2. Service the window from the **real LLE interrupt** (PFIC IRQ 21, routed
    through fast-interrupt slot 2); `rx_poll` remains as the `USE_ISR = false`
    fallback.
@@ -145,17 +145,20 @@ cost cannot be separated from air loss with this method. The buffer holds no
 CRC bytes to re-check in software (`(len+5)&0x1fc` is `[status u16][rssi][x]`).
 
 The stale-flag fix also removed the old "Done with an all-`0xAA` buffer"
-artefacts (212 `Done` / 554 windows all carried data, vs 102 empty `Done`
-before).
+artefacts; the post-gate runs carry data in every `Done`.
 
 Not exercised by the evidence above; needs targeted board tests before P3a:
 timer/timeout interleaving (`Done` does not abort the window, so a later
 frame can overwrite the buffer the ISR is about to publish), several frames
 inside one window, re-arming while an old window is still active, and
-priority nesting with other PFIC lines. Accepted for now because the gate only
-publishes a name-matched `Done` and no wrong-init frame was passed; the
-correct-init KAT run did exercise the timeout path (166 `timeout` / 30 `Armed`
-alongside 13 `Done`) without a false `Done`.
+priority nesting with other PFIC lines. Accepted for now on the strength of
+the call contract above (thread-context arming, masked lines on `Busy`) and
+the observed runs: the correct-init KAT exercised the timeout path (166
+`timeout` / 30 `Armed` alongside 13 `Done`) without a false `Done`. Name
+matching is offline selection only — the driver publishes every `Done` and
+this example answers on `crc_ok && len <= 37`; the wrong-init run also had
+5 non-name ambient `valid=true` `Done`, so these runs do not establish the
+gate for arbitrary frames.
 
 Still open: RSSI comes from the status word; cnlohr's iSLER reads
 `BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
