@@ -413,7 +413,7 @@ impl Ch573Radio {
             regs::rmw(RFEND_BASE, rfend::CFG50, 0x0000_f000, 0x0000_4000);
             regs::rmw(RFEND_BASE, rfend::CFG54, 0xf, 0xc);
             regs::rmw(RFEND_BASE, rfend::CFG54, 0, 0x80);
-            regs::rmw(RFEND_BASE, rfend::CFG54, 0x0000_1000, 0);
+            regs::rmw(RFEND_BASE, rfend::CFG54, 0x0001_0000, 0);
 
             // +0x3c
             regs::rmw(RFEND_BASE, 0x3c, 0x0000_f000, 0x0000_8000);
@@ -434,7 +434,7 @@ impl Ch573Radio {
             regs::rmw(RFEND_BASE, rfend::CFG30, 0x7000_0000, 0x5000_0000);
 
             // +0x38
-            regs::rmw(RFEND_BASE, rfend::CFG38, 0x0038_0000, 0x0018_0000);
+            regs::rmw(RFEND_BASE, rfend::CFG38, 0x00f8_0000, 0x0018_0000);
             regs::rmw(RFEND_BASE, rfend::CFG38, 0, 0x8000_0000);
 
             for _ in 0..100 {
@@ -686,7 +686,8 @@ impl Ch573Radio {
                     }
                 }
                 let code = regs::read(RFEND_BASE, MEAS) & 0xf;
-                regs::rmw(RFEND_BASE, rfend::TUNE, 0x1000, 0);
+                // Stop the ADC sample: vendor clears TUNE bit16, not bit12.
+                regs::rmw(RFEND_BASE, rfend::TUNE, rfend::TUNE_RXADC, 0);
                 if code != 0xf {
                     nonzero += 1;
                 }
@@ -709,7 +710,7 @@ impl Ch573Radio {
             } else {
                 min
             };
-            regs::rmw(RFEND_BASE, rfend::CFG58, 0x781, code << 7);
+            regs::rmw(RFEND_BASE, rfend::CFG58, 0x780, code << 7);
         }
         Ok(())
     }
@@ -1414,7 +1415,8 @@ impl Radio for Ch573Radio {
             regs::rmw(BB_BASE, bb::RFCTRL, 0, rfctrl::INIT_BIT28);
             // RX PHY cfg: clear bits[26:25]/[23:16], keep bit24, set bit29.
             regs::rmw(BB_BASE, bb::RXCFG18, 0xf900_0000, 0x2000_0000);
-            regs::rmw(BB_BASE, bb::RXCFG18, 0x7d, 0x18);
+            // Vendor `ble_ll_hw_api_rx` preserves RXCFG18 bit0 (mask 0x7c).
+            regs::rmw(BB_BASE, bb::RXCFG18, 0x7c, 0x18);
             // BLE RX runs in channel-number mode.
             regs::rmw(RFEND_BASE, rfend::FREQMODE, rfend::FREQMODE_EN, 0);
             // Vendor BLE RX uses TX's 0x1f AA/CRC cfg, not `RF_Rx`'s 0x1e.
