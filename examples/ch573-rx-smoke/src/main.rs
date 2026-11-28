@@ -260,8 +260,8 @@ fn main() -> ! {
             }
 
             info!(
-                "ch{=u8} state={=u8} len={=u8} rssi={=i8} crc={=bool} valid={=bool} timeout={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
-                ch, state, len, rssi, crc_ok, valid, waited, count, isr_delta, tx_kick_count(),
+                "ch{=u8} state={=u8} len={=u8} rssi={=i8} crc={=bool} valid={=bool} timeout={=bool} trssi={=i8} tcrc={=bool} cnt={=u32:x} isr={=u32} kick={=u32} turn={=u32} dma18={=u32:x} bb30={=u32:x} bb38={=u32:x} lle08={=u32:x}",
+                ch, state, len, rssi, crc_ok, valid, waited, radio.rssi(), radio.crc_ok(), count, isr_delta, tx_kick_count(),
                 turn_us, dma18, bb30, bb38, lle08
             );
             if show_buf {

@@ -92,7 +92,7 @@ observations, RSSI −43…−47 dBm), so the RX and TX ISR paths run together.
 Earlier polling run for comparison: 13/13 exact.
 
 ```
-ch38 state=2 len=17 rssi=-99 cnt=0 isr=1 bb38=246f lle08=100000
+ch38 state=2 len=17 rssi=-99 crc=false valid=false timeout=false trssi=-99 tcrc=false cnt=0 isr=1 bb38=246f lle08=100000
 buf [66, 17, 2, 0, 0, 238, 255, 193, 2, 1, 6, 7, 9, 119, 99, 104, 53, 56, 53, …]
 ```
 
@@ -113,7 +113,10 @@ had impossible lengths (53/61/102/114/164/224…).
 ### CRC status (`crc=`, `valid=`)
 
 `RxPoll::Done` carries `crc_ok`, sampled from `BB+0x38` bit5 after `RX_DONE`
-is seen — the bit the vendor's `ble_ll_chkcrc` tests. Following the vendor's
+is seen. This is exactly the vendor predicate, not a software threshold:
+`ble_ll_chkcrc` (`ip.o`, `.highcode+0xd8`, LIB V2.20) loads `BB+0x38`,
+shifts right 5, masks bit0 and returns 1 when it is set (CRC error) before
+reading any payload byte. Following the vendor's
 whole-word `~mask` writes on this register (the timer clear is `~0x2`), the
 handler only clears the bits it consumes (`!payload`, or `!payload & ~crc`)
 and never writes a stale snapshot over a bit that asserts later. Whole-register
@@ -160,8 +163,15 @@ this example answers on `crc_ok && len <= 37`; the wrong-init run also had
 5 non-name ambient `valid=true` `Done`, so these runs do not establish the
 gate for arbitrary frames.
 
-Still open: RSSI comes from the status word; cnlohr's iSLER reads
-`BB+0x30 >> 15` for CH571/573 — worth cross-checking later.
+RSSI is the DMA byte at `((len + 5) & 0x1fc) + 2`, read by vendor
+`ble_ll_chkcrc` and copied straight into the scan-report `rssi` as a signed
+byte by `ll_scan_rx` / `ll_scan_add_advertising_to_report`. Vendor
+`BLE_ReadRssi` maps the live register the same way:
+`(BB+0x30 >> 12) as u8 as i8` — field `bits[19:12]`, sign-extended, no
+calibration subtraction. (cnlohr's iSLER uses `>> 15`; that is a different
+field/shift and does not match the CH573 V2.20 library.) The example logs the
+`Radio::rssi()` / `Radio::crc_ok()` accessors as `trssi=` / `tcrc=`; both
+return the last completed packet and now track `state=2` lines exactly.
 
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.
