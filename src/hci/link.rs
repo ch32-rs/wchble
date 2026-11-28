@@ -234,6 +234,9 @@ impl<X: LinkExtras> LinkHost for RunnerHost<'_, X> {
         }
         self.bridge_mut().take_tx_acl()
     }
+    fn has_tx_acl(&self) -> bool {
+        self.live() && self.bridge().has_tx_acl()
+    }
     fn ack_tx(&mut self, tag: TxTag) -> bool {
         self.live() && self.bridge_mut().ack_tx(tag)
     }
