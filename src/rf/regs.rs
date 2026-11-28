@@ -199,6 +199,9 @@ pub mod rfend {
     pub const TUNE: usize = 0x04;
     pub const FECTRL: usize = 0x08;
     pub const CFG0C: usize = 0x0c;
+    /// TX power mirror (`LL_SetTxPowerLevel` writes `[13:8]` when `CFG54`
+    /// bit9 asks for it).
+    pub const CFG10: usize = 0x10;
     pub const CFG28: usize = 0x28;
     pub const FREQMODE: usize = 0x2c;
     pub const CFG30: usize = 0x30;

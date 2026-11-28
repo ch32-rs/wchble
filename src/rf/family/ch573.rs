@@ -140,6 +140,33 @@ pub const CAPS: FamilyCaps = FamilyCaps {
     wait_tune_half_us: RFEND_INIT.wait_tune_half_us.value,
 };
 
+/// EVT TX power levels (`CH57xBLE_LIB.h`), ±2 dBm.
+///
+/// Each variant is the code `LL_SetTxPowerLevel` programs into
+/// `BB+0x00[13:8]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TxPower {
+    Minus20Dbm = 0x01,
+    Minus14Dbm = 0x03,
+    Minus8Dbm = 0x07,
+    Minus4Dbm = 0x0b,
+    #[default]
+    ZeroDbm = 0x14,
+    Plus1Dbm = 0x17,
+    Plus2Dbm = 0x1a,
+    Plus3Dbm = 0x1f,
+    Plus4Dbm = 0x25,
+    Plus5Dbm = 0x32,
+}
+
+impl TxPower {
+    /// Raw EVT code as written to the RFCTRL power field.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
 /// CH573 radio — DevInit + DMA-block TX/RX (V208-shaped MODE words).
 #[derive(Debug)]
 pub struct Ch573Radio {
@@ -148,6 +175,7 @@ pub struct Ch573Radio {
     phy_rx: PhyMode,
     whiten_disabled: bool,
     encrypt: bool,
+    tx_power: TxPower,
     access_address: u32,
     crc_init: u32,
     isr: IsrState,
@@ -202,6 +230,7 @@ impl Ch573Radio {
             phy_rx: PhyMode::Rate1m,
             whiten_disabled: false,
             encrypt: false,
+            tx_power: TxPower::ZeroDbm,
             access_address: 0x8e89_bed6,
             crc_init: 0x55_5555,
             isr: IsrState::default(),
@@ -213,6 +242,40 @@ impl Ch573Radio {
             rx_filter_code: 0,
             rx_filter_ok: false,
         })
+    }
+
+    /// Select the TX power level; [`Radio::init`] programs it.
+    ///
+    /// The PA tune done at init is bound to the level: on the bench, moving
+    /// to a lower level on a running radio left the output inaudible, so
+    /// this only records the value. Re-run `init` to change it live.
+    pub fn set_tx_power(&mut self, power: TxPower) {
+        self.tx_power = power;
+    }
+
+    /// Program `RFCTRL[13:8]` and the aux rail rule from `BB_DevInit` /
+    /// `LL_SetTxPowerLevel`.
+    fn apply_tx_power(&self) {
+        const SAFE_ACCESS: usize = 0x4000_1040;
+        const AUX_POWER_ADJ: usize = 0x4000_1022;
+        let code = u32::from(self.tx_power.code() & 0x3f);
+        unsafe {
+            let v = (regs::read(BB_BASE, bb::RFCTRL) | 0x1008_0000) & !0x0000_3f00 | (code << 8);
+            regs::write(BB_BASE, bb::RFCTRL, v);
+
+            // SAFE_ACCESS window: aux rail boost only above 0 dBm.
+            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0x57);
+            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0xa8);
+            let adj = core::ptr::read_volatile(AUX_POWER_ADJ as *const u16);
+            let adj = if code > 0x14 { adj | 0x10 } else { adj & !0x10 };
+            core::ptr::write_volatile(AUX_POWER_ADJ as *mut u16, adj);
+            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0);
+
+            // Vendor mirrors the level into RFEND when CFG54 bit9 asks for it.
+            if regs::read(RFEND_BASE, rfend::CFG54) & 0x200 != 0 {
+                regs::rmw(RFEND_BASE, rfend::CFG10, 0x0000_3f00, code << 8);
+            }
+        }
     }
 
     fn lle_dev_init(&mut self) {
@@ -329,23 +392,8 @@ impl Ch573Radio {
 
     /// `BB_DevInit` — RFCTRL power/trig, AUTOCFG, RXCFG18, CFG34, AUX_POWER.
     fn bb_dev_init_abs(&mut self) {
-        const SAFE_ACCESS: usize = 0x4000_1040;
-        const AUX_POWER_ADJ: usize = 0x4000_1022;
-        // EVT default TX power class (~0 dBm).
-        const TX_POWER: u32 = 0x14;
+        self.apply_tx_power();
         unsafe {
-            // OR 0x1008_0000, then replace bits[13:8] with power.
-            let v = (regs::read(BB_BASE, bb::RFCTRL) | 0x1008_0000) & !0x0000_3f00
-                | ((TX_POWER & 0x3f) << 8);
-            regs::write(BB_BASE, bb::RFCTRL, v);
-
-            // SAFE_ACCESS → AUX_POWER_ADJ bit4 (BLE LDO / aux rail).
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0x57);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0xa8);
-            let adj = core::ptr::read_volatile(AUX_POWER_ADJ as *const u16);
-            core::ptr::write_volatile(AUX_POWER_ADJ as *mut u16, adj | 0x10);
-            core::ptr::write_volatile(SAFE_ACCESS as *mut u8, 0);
-
             regs::write(BB_BASE, bb::AUTOCFG, 0x0001_0e78);
             regs::rmw(BB_BASE, bb::RXCFG18, 0, 0x8000);
             regs::rmw(BB_BASE, bb::RXCFG18, 0x7f80, 0x3500);
@@ -1022,7 +1070,8 @@ impl Radio for Ch573Radio {
     fn shut(&mut self) {
         self.engine_stop();
         unsafe {
-            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::SHUT);
+            // Only SHUT (bit7): bits[13:8] carry the TX power level on CH573.
+            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::SHUT, rfctrl::SHUT);
             let fectrl = regs::read(RFEND_BASE, rfend::FECTRL);
             regs::write(RFEND_BASE, rfend::FECTRL, fectrl & rfend::FECTRL_SHUT_MASK);
             regs::write(LLE_BASE, lle::MODE, 0);
@@ -1121,12 +1170,6 @@ impl Radio for Ch573Radio {
         // COUNT=airtime → GUARD=0xc303 (fires). No CMD/TX_TRIG.
         let hw_window = Self::tx_window_half_us(frame[1]);
         unsafe {
-            regs::rmw(
-                BB_BASE,
-                bb::RFCTRL,
-                rfctrl::PHY_MASK | rfctrl::SHUT | rfctrl::DIR_MASK,
-                rfctrl::PHY_1M,
-            );
             // EVT only ever sets FECTRL bit17 (0x20000) for RF-on; the wider
             // `FECTRL_RF_ON` mask is a CH585 constant and can gate the PA off.
             regs::rmw(RFEND_BASE, rfend::FECTRL, 0, 0x2_0000);
@@ -1292,11 +1335,8 @@ impl Radio for Ch573Radio {
         self.apply_aa_crc_regs();
 
         unsafe {
-            // EVT `ble_ll_hw_api_rx` (libCH57xBLE.a `ip.o`): the BLE RX arm
-            // used by scanning. Not the 2.4G `RF_Rx`, which differs in AA/CRC
-            // cfg (0x1e vs 0x1f) and window handling.
-            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::PHY_MASK, rfctrl::PHY_1M);
-            regs::rmw(BB_BASE, bb::RFCTRL, rfctrl::DIR_MASK, rfctrl::DIR_RX);
+            // EVT `ble_ll_hw_api_rx` only touches RFCTRL bit28 and the channel
+            // field; bits[13:8] are the TX power level, so no PHY/DIR write.
             // CH573 RF-on is FECTRL bit17 only; the CH585 constant gates PA.
             regs::rmw(RFEND_BASE, rfend::FECTRL, 0, 0x2_0000);
             regs::rmw(BB_BASE, bb::AUTOCFG, autocfg::ARM_MASK, 0x2);

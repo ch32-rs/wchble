@@ -13,7 +13,7 @@ use defmt_rtt as _;
 use hal::rcc;
 use qingke_rt::entry;
 use wchble::ll::adv::AdvState;
-use wchble::rf::family::ch573::{Ch573Radio, CAPS};
+use wchble::rf::family::ch573::{Ch573Radio, TxPower, CAPS};
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::InstantUs;
@@ -27,6 +27,22 @@ const ADV_CRC_INIT: u32 = 0x55_5555;
 const OWN_ADDR: [u8; 6] = [0xC1, 0xFF, 0xEE, 0x00, 0x00, 0x73];
 const ADV_INTERVAL_SLOTS: u16 = 0x20; // 20 ms
 const LOG_EVERY: u32 = 50;
+
+/// TX power from `CH573_ADV_TX_POWER` at build time (default 0 dBm).
+fn tx_power() -> (TxPower, &'static str) {
+    match option_env!("CH573_ADV_TX_POWER") {
+        Some("-20") => (TxPower::Minus20Dbm, "-20"),
+        Some("-14") => (TxPower::Minus14Dbm, "-14"),
+        Some("-8") => (TxPower::Minus8Dbm, "-8"),
+        Some("-4") => (TxPower::Minus4Dbm, "-4"),
+        Some("1") => (TxPower::Plus1Dbm, "+1"),
+        Some("2") => (TxPower::Plus2Dbm, "+2"),
+        Some("3") => (TxPower::Plus3Dbm, "+3"),
+        Some("4") => (TxPower::Plus4Dbm, "+4"),
+        Some("5") => (TxPower::Plus5Dbm, "+5"),
+        _ => (TxPower::ZeroDbm, "0"),
+    }
+}
 
 /// DMA-visible buffer placed by `build.rs` inside the CH573 14-bit window.
 #[repr(align(4))]
@@ -112,6 +128,9 @@ fn main() -> ! {
             loop {}
         }
     };
+    // Select the level before init: the PA tune is bound to it.
+    let (power, power_label) = tx_power();
+    radio.set_tx_power(power);
     match radio.init(&clock) {
         Ok(()) => info!("rf init ok"),
         Err(e) => {
@@ -121,6 +140,7 @@ fn main() -> ! {
     }
     radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
+    info!("tx_power={=str} dBm code={=u8}", power_label, power.code());
 
     let mut adv = AdvState::default();
     adv.enabled = true;

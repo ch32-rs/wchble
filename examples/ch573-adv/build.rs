@@ -25,4 +25,6 @@ _stack_start = SIZEOF(.dma_buffer) ? ADDR(.dma_buffer) : ORIGIN(RAM) + LENGTH(RA
     .unwrap();
     println!("cargo:rustc-link-arg-bins=-T{}", script.display());
     println!("cargo:rerun-if-changed=build.rs");
+    // `CH573_ADV_TX_POWER` is read by `main.rs` through `option_env!`.
+    println!("cargo:rerun-if-env-changed=CH573_ADV_TX_POWER");
 }
