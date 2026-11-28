@@ -39,8 +39,9 @@ const USE_ISR: bool = true;
 const PFIC_BASE: usize = 0xE000_E000;
 
 /// After a received frame, transmit one ADV and report the RX-done → TX-kick
-/// turnaround (SysTick counts / `ticks_per_us`).
-const MEASURE_RX_TX: bool = true;
+/// turnaround (SysTick counts / `ticks_per_us`). Build with
+/// `CH573_RX_NO_TX=1` for passive captures (CRC/RSSI cross-checks).
+const MEASURE_RX_TX: bool = option_env!("CH573_RX_NO_TX").is_none();
 
 /// Minimal ADV_NONCONN_IND carrying the local name `wch573`.
 fn build_adv(out: &mut [u8]) -> usize {

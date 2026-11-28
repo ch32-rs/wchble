@@ -25,4 +25,5 @@ _stack_start = SIZEOF(.dma_buffer) ? ADDR(.dma_buffer) : ORIGIN(RAM) + LENGTH(RA
     .unwrap();
     println!("cargo:rustc-link-arg-bins=-T{}", script.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CH573_RX_NO_TX");
 }

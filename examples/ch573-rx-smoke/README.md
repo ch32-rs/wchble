@@ -68,6 +68,9 @@ kick in µs (`0` = TX failed before the kick, `0xffff` = no kick seen).
 The number includes this example's own register dump and `set_channel`, so it
 is an upper bound for the driver path.
 
+Build with `CH573_RX_NO_TX=1` for a passive receiver (no answer ADV), e.g. for
+the RSSI/CRC comparison against a sniffer.
+
 26 s run, ELF `6c29b94d…`:
 
 | RX window at `Done` | n | µs |
