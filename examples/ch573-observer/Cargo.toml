@@ -16,7 +16,6 @@ ch5xx-hal = { path = "../../../ch5xx-hal", features = [
 wchble = { path = "../..", features = ["ch573", "defmt", "controller"] }
 qingke-rt = "0.8.4"
 qingke = "0.8.4"
-panic-halt = "1.0"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
 defmt = "1.0"
 defmt-rtt = "1.3"

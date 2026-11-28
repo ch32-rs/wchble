@@ -20,7 +20,19 @@ use wchble::rf::regs;
 use wchble::rf::txrx::RX_DMA_MIN;
 use wchble::rf::{new_radio_with_dma, PhyMode, Radio};
 use wchble::time::{ExtendingTicks, InstantUs};
-use {panic_halt as _, portable_atomic as _};
+use portable_atomic as _;
+
+/// Log where a panic happened instead of halting silently (`panic-halt`).
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    match info.location() {
+        Some(l) => defmt::error!("panic {}:{}", l.file(), l.line()),
+        None => defmt::error!("panic"),
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 defmt::timestamp!("{=u32}", 0u32);
 
@@ -88,6 +100,20 @@ impl<const N: usize> DmaCell<N> {
     const fn new() -> Self {
         Self(core::cell::UnsafeCell::new([0; N]))
     }
+}
+
+/// Rounds completed; read from RAM with `probe-rs read b32` to tell a stuck
+/// core from a stalled RTT session (the value keeps moving when the firmware
+/// is alive and only the log stopped).
+#[no_mangle]
+pub static OBS_ALIVE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Boot milestone, for pinning down where a stuck boot stopped.
+#[no_mangle]
+pub static BOOT_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn boot(v: u32) {
+    BOOT_STAGE.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Scratch owned by the driver (DMA init seeds its pointers from it).
@@ -436,11 +462,15 @@ fn observe_channel(
 
 #[entry]
 fn main() -> ! {
+    boot(1);
     let _p = hal::init(rcc::Config::PLL_60MHZ.into());
+    boot(2);
     info!("boot");
     info!("wchble ch573 observer sysclk={}", rcc::clocks().sysclk.0);
+    boot(3);
 
     let clock = UsClock::start();
+    boot(4);
     // SAFETY: single-threaded; the buffers are used only here.
     let scratch: &mut [u8] = unsafe { &mut *RX_SCRATCH.0.get() };
     let rx: &mut [u8; RX_DMA_MIN] = unsafe { &mut *RX_BUF.0.get() };
@@ -453,6 +483,7 @@ fn main() -> ! {
         );
         loop {}
     }
+    boot(5);
 
     let mut radio: Ch573Radio = match new_radio_with_dma(scratch) {
         Ok(r) => r,
@@ -461,6 +492,7 @@ fn main() -> ! {
             loop {}
         }
     };
+    boot(6);
     match radio.init(&clock) {
         Ok(()) => info!("rf init ok"),
         Err(e) => {
@@ -468,6 +500,7 @@ fn main() -> ! {
             loop {}
         }
     }
+    boot(7);
     radio.set_aa_crc(ADV_AA, ADV_CRC_INIT);
     radio.set_phy(PhyMode::Rate1m, PhyMode::Rate1m);
 
@@ -495,6 +528,7 @@ fn main() -> ! {
             observe_channel(&clock, &mut radio, rx, ch, ci, &mut c);
         }
         c.rounds = c.rounds.wrapping_add(1);
+        OBS_ALIVE.store(c.rounds, core::sync::atomic::Ordering::Relaxed);
         let t_s = elapsed_us(&clock, &mut ext) / 1_000_000;
         if t_s >= last_summary_s + u64::from(SUMMARY_EVERY_S) {
             last_summary_s = t_s;

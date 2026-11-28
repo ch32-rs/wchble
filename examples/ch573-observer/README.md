@@ -25,9 +25,12 @@ buffer is parsed, so frames in those gaps are missed.
   guards a lost event (`stale=`).
 - After every result the engine is shut down (`radio.shut()`) before the DMA
   buffer is read or reused, with a 5 ms settle.
-- Telemetry is RTT only. Unlike the CH585 observer this example has no
-  `STATS` RAM record: on CH573 a `probe-rs read` halts the core, which
-  invalidates a measurement more easily than it helps.
+- Telemetry is RTT only; there is no `STATS` RAM record. Two liveness words
+  exist for manual diagnosis — `OBS_ALIVE` (rounds completed) and
+  `BOOT_STAGE` (last boot milestone, 1..7) — but a `probe-rs read` halts the
+  core, so use them only to tell a stuck core from a stalled RTT session,
+  never during an acceptance run. Find their addresses with
+  `nm <elf> | grep -E 'OBS_ALIVE|BOOT_STAGE'`.
 
 ## Accounting
 
@@ -69,10 +72,22 @@ calibrated against a reference receiver.
   verification, not fixed here.
 - `early=` and `to_dt_us` cover Timeout results only; `late=` (> 30 ms
   arm→result) covers every result path. Early windows are ~15–20%.
-- The RX-arming path can hang before the first window (observed ~3/10 boot
-  attempts with an unmodified `ch573-rx-smoke` during the RSSI/CRC
-  verification, an ISR/arming race). If no `obs t=` line appears, re-run the
-  same ELF; do not attribute it to this example's code.
+- A **stalled `probe-rs run` session** is a probe failure, not a firmware hang.
+  About one session in three the flash completes (`Finished in …`) yet no RTT
+  output appears at all — not even `boot` — or output stops mid-run (seen
+  right after `sysclk`); the process ends with `disable_debug_module: could
+  not clear sw-breakpoint state: DtmOperationFailed`. The same ELF then boots
+  and finishes its full run on the next attempt (measured 2/3 and 2/4 across
+  sessions, plus the 600 s run below). Follow-up debug sessions in that state
+  report the core halted on a software breakpoint at a bogus PC, return
+  `mcause=2` at a legal instruction, and read CodeFlash back scrambled — the
+  CH5xx flash algorithm documents that a halted debug read of CodeFlash
+  returns a scrambled placeholder. None of that is firmware evidence, and an
+  earlier revision of this file that called it an "ISR/arming race" was
+  wrong. Workaround: re-run the same ELF; if repeated re-runs stay silent,
+  `probe-rs reset` or re-plug the WCH-LinkE. Firmware side was hardened
+  anyway: `ble_clock_on` and `apply_tx_power` now run their SAFE_ACCESS
+  windows with `mstatus.MIE` masked, matching `ch585`.
 
 ## Acceptance (2026-11-28, probe `5CED…`)
 
@@ -104,6 +119,10 @@ deficit datum, because the channel and the transmitter are known.
 `named=` and the `adv` table still track the ambient population, so the
 observer is usable for presence/counting at short range, but its counts are
 not a loss-rate or rate measurement.
+
+Post-fix check (same day, ELF `41b6af7d…eca`, after the SAFE_ACCESS masking
+change): `rf init ok`, 466 rounds / 1399 windows in 30 s, `arm_err=0`, counters
+in line with the numbers above.
 
 `tools/compare_observer.py --board-log rtt.log --pcap capture.pcap` prints the
 per-AdvA table (board vs sniffer counts, channels, RSSI medians). Start the
