@@ -182,6 +182,35 @@ completed packet and track `state=2` lines exactly.
 `probe-rs run` occasionally attaches RTT late and shows only the boot lines —
 re-run the same ELF before suspecting a firmware hang.
 
+### RSSI/CRC cross-check vs the nRF Sniffer
+
+Controlled source: `examples/ch585-rf-smoke --features adv-ch37` with
+`CH585_RF_SMOKE_TX_POWER=<dBm>` (CH585 stops at +4). `adv-seq` embeds a 16-bit
+counter in a manufacturer AD (`05 ff ff ff seq_lo seq_hi`) and `adv-ch37`
+broadcasts it on ch37 every 20 ms, so board and sniffer can be joined event by
+event. Build this example with `CH573_RX_NO_TX=1` as the passive receiver:
+
+```bash
+cd examples/ch585-rf-smoke
+CH585_RF_SMOKE_TX_POWER=0 cargo build --release --features adv-ch37
+probe-rs download --probe 1a86:8010:F93D8F067E10 --chip CH585 --protocol jtag \
+  --verify --start target/riscv32imc-unknown-none-elf/release/ch585-rf-smoke
+
+cd ../ch573-rx-smoke
+CH573_RX_NO_TX=1 cargo build --release
+probe-rs run --chip CH573 --probe 1a86:8010:5CED8F06E1D2 --scan-region ram \
+  target/riscv32imac-unknown-none-elf/release/ch573-rx-smoke > rtt.log 2>&1 &
+nrfutil ble-sniffer sniff --port /dev/cu.usbmodem21201 --only-advertising \
+  --output-pcap-file cap.pcap
+python3 tools/compare_rssi_crc.py rtt.log cap.pcap --seq-off 23 \
+  --adv-a C1:FF:EE:00:00:02
+```
+
+The counter sits at PDU offset 23; the CH585 random AdvA is
+`C1:FF:EE:00:00:02`. The sniffer's per-record CRC-OK flag is bit0 of the
+metadata byte 9 before the AA (byte 8 is the channel, byte 10 the RSSI
+magnitude); this was cross-checked against `crcgood`/`crcbad!` captures.
+
 ### CH573 ↔ CH585 interop (both directions)
 
 Run `ch585-rf-smoke` (probe `F93D…`) and this example (probe `5CED…`) at the
